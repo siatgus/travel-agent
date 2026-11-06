@@ -712,16 +712,19 @@ class Session:
         slots, assumptions = self._fill_assumptions(missing)
         self.slots = slots
 
-        # "别太赶"这类节奏调整：如果本来就是最松的一档，重排出来一模一样，
-        # 用户会认为按钮没生效。明说"已经到最松了"，比默默给一份相同的方案诚实。
+        # 「别太赶」而节奏本来就在最松的一档：重排出来必然一模一样。
+        # 这里**不许**再跑一遍 plan_trip（白等 50 秒），更不许说"这一版只把
+        # 时间与动线重排了一遍"——行程和预算一个字都没变，那是在骗人。
+        # 直接回答，并把真能省力的几个手段摊开（删站 / 减天 / 换住宿）。
         if "pace" in explicit and self.plan_made:
             old_pace, new_pace = prev_slots.get("pace"), slots.get("pace")
             if new_pace == old_pace:
-                _pn = {"relaxed": "轻松", "moderate": "适中",
-                       "intensive": "紧凑"}.get(new_pace, new_pace)
-                lead_notes.append(
-                    f"已经是「{_pn}」节奏（最松的一档），每天景点数没有再往下压的空间；"
-                    f"这一版只把时间与动线重排了一遍，要更空可以减天数或删景点")
+                self.slots = slots
+                text = self._pace_noop_answer(new_pace)
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode="answer", turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                             render=text)
 
         trace: list = []
         self._phase("正在核对目的地资料，准备编排…")
@@ -747,14 +750,34 @@ class Session:
         # 兴趣到底进没进行程：用户说「大熊猫 / 喝茶 / 老街」，行程里一个都没有
         # 就等于没听见。能对上的已经排进去了；一个都对不上就如实说明，
         # 而不是让这份"热门景点拼盘"冒充个性化行程。
+        # 对上也要分强弱：「喝茶」排到人民公园是靠"公园"沾边，不是真的茶馆，
+        # 这份差别必须说出来，否则用户永远不知道这条偏好到底满足了没有。
         _prefs = slots.get("soft_prefs") or []
         if _prefs:
             items = (result.get("pois") or {}).get("items") or []
             planned = {n.get("name") for d in result["days_plan"]
                        for n in d["nodes"]}
-            hit = [p for p in _prefs
-                   if any(composer.interest_hit(p, it) and it.get("name") in planned
-                          for it in items)]
+            landed: dict[str, str] = {}
+            for p in _prefs:
+                lv = ""
+                for it in items:
+                    if it.get("name") not in planned:
+                        continue
+                    m = composer.interest_match(p, it)
+                    if m and (m[0] == "strong" or not lv):
+                        lv = m[0]
+                    if lv == "strong":
+                        break
+                if lv:
+                    landed[p] = lv
+            hit = list(landed)
+            weak = [p for p, lv in landed.items() if lv == "weak"]
+            if weak:
+                assumptions.append(
+                    "兴趣「" + "、".join(weak) + "」在"
+                    + str(slots.get("destination") or "当地")
+                    + "的资料里没有直接对应的景点，只按相近的点就近安排了"
+                      "（行程里标为「近似匹配」）；想要专门的安排，说个具体名字我加进去")
             missed = [p for p in _prefs if p not in hit]
             if missed:
                 # 分清两种"没安排"：库里压根没有对应景点，还是有名额但没排进去。
@@ -891,6 +914,48 @@ class Session:
                         f"{intent._SERVICEABLE_HINT}。")
         return intent.spot_answer(city, spot, items, note=note,
                                   client=self.client)
+
+    def _pace_noop_answer(self, pace: str) -> str:
+        """节奏已经在最松一档时的回答：说清"没得再松"，并给出真能生效的选项。
+
+        不能只说"已经最松了"就完事——用户要的是更空的一天，得告诉他哪几步
+        真的会改变结果，而且这些步骤必须是他一句话就能下的指令。
+        """
+        pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
+        loosenest = pace == "relaxed"
+        plan = self.last_plan or {}
+        days_plan = plan.get("days_plan") or []
+        heavy = None
+        for d in days_plan:
+            k = len([x for x in d.get("nodes") or [] if x.get("type") == "attraction"])
+            if heavy is None or k > heavy[1]:
+                heavy = (d.get("day"), k, [x.get("name") for x in d.get("nodes") or []
+                                          if x.get("type") == "attraction"])
+        total_days = len(days_plan) or (plan.get("slots") or {}).get("days")
+
+        head = (f"现在已经是「{pn}」节奏，是最松的一档（每天最多 2 个景点），"
+                f"景点密度没有继续往下压的空间了。" if loosenest else
+                f"这就是「{pn}」节奏下的排法。")
+        lines = [head]
+        if loosenest:
+            lines[0] += "这一轮我没有改行程——改也是同样的结果。"
+        else:
+            lines[0] += "说「轻松一点」我就把节奏降一档重排。"
+
+        moves = []
+        if heavy and heavy[1] >= 2:
+            names = "、".join(heavy[2])
+            moves.append(f"删掉一站：Day {heavy[0]} 现在有 {heavy[1]} 个景点（{names}），"
+                         f"说「Day {heavy[0]} 去掉一个」我立刻重排")
+        if total_days and isinstance(total_days, int) and total_days > 2:
+            moves.append(f"少排一天：{total_days} 天改 {total_days - 1} 天，"
+                         f"剩下的每天还能再空出一段")
+        moves.append("换住宿位置：住到景点更集中的片区，每天路上的时间能省一大截")
+        if moves:
+            lines.append("真要更空，这几步确实有效：")
+            lines.extend(f"- {m}" for m in moves)
+            lines.append("选一条告诉我，我按你的选择重排；不选我就保留现在这版。")
+        return "\n".join(lines)
 
     def _plan_qa_answer(self, utterance: str) -> str:
         """回答「总结一下这个行程」「这个行程怎么样」：事实来自最近一次方案。"""

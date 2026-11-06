@@ -808,10 +808,18 @@ function dayCard(d,idx){
     +'<span class="wx">'+esc(d.date||'')+wtxt+'</span></h4><div class="bcard">';
   (d.nodes||[]).forEach(n=>{
     const uncer=String(n.transit||'').indexOf('位置待确认')>=0;
+    // 兴趣标记：强命中用青色、弱命中（沾边）用棕色，别让"近似"看起来像"已安排"
+    let itag='';
+    (n.interests||[]).forEach(it=>{
+      const s=it.level==='strong';
+      itag+=' <span style="font-size:11px;padding:1px 6px;border-radius:3px;background:'
+        +(s?'#EAF3F1':'#F6F1E4')+';color:'+(s?'#2F6F6B':'#8A6A2F')+'">'
+        +(s?'兴趣·':'近似·')+esc(it.word||'')+'</span>';
+    });
     h+='<div class="bnode" onclick="nodeMenu(event,\\''+jsq(n.name)+'\\')">'
       +'<span class="tm">'+esc(String(n.time||'').slice(0,5))+'</span>'
       +'<span class="ic">'+(TYPE_ICONS[n.type]||TYPE_ICONS.other)+'</span>'
-      +'<span class="nm">'+esc(n.name)+(uncer?' <span style="color:#B4693F;font-size:11px">位置待确认</span>':'')+'</span>'
+      +'<span class="nm">'+esc(n.name)+itag+(uncer?' <span style="color:#B4693F;font-size:11px">位置待确认</span>':'')+'</span>'
       +(n.duration_min?'<span class="mn">'+n.duration_min+'分钟</span>':'')
       +'</div>';
   });
@@ -827,8 +835,11 @@ function drawBoard(){
   if(boardTab==='all'){
     const st=(boardSlots&&boardSlots.date_range&&boardSlots.date_range.start)
       ||(p.days_plan[0]&&p.days_plan[0].date)||'';
+    // 口径看"明细里有没有交通费"，不是看有没有出发地：出发地填了但班次没查到，
+    // 金额照样不含路费，标题不写清楚就会被当成整趟花费。
+    const hasTr=(p.budget&&(p.budget.breakdown||[]).some(x=>x.category==='transport'&&x.amount>0));
     const bud=(p.budget&&p.budget.total)
-      ?(' · 预算约 ¥'+p.budget.total+((boardSlots&&boardSlots.origin)?'':'（不含大交通）')):'';
+      ?(' · 预算约 ¥'+p.budget.total+(hasTr?'':'（不含往返大交通）')):'';
     h='<div class="bsec"><h4>总览 · '+esc(dest)+' '+p.days_plan.length+' 天'
       +(st?' · '+esc(st)+' 起':'')+bud+'</h4></div>';
     p.days_plan.forEach((d,i)=>{h+=dayCard(d,i);});

@@ -144,23 +144,39 @@ def render_budget_bar(result: dict) -> str:
             f'{BUDGET_COLORS.get(cat, "#888780")};display:inline-block;"></i>'
             f'{BUDGET_LABELS.get(cat, cat)} <b style="font-weight:500;">¥{amount:,.0f}</b></div>')
 
+    note = ""
+    if not any(x["category"] == "transport" and (x["amount"] or 0) > 0
+               for x in b["breakdown"]):
+        # 没有交通项时必须写出来：光看一个 ¥3,553 会以为是整趟花费
+        note = ('<div style="font-size:12px;color:#8A6A2F;margin-top:10px;">'
+                '合计不含往返大交通（班次票价未查到或未指定出发地）</div>')
     return (f'<div style="display:flex;height:22px;border-radius:4px;overflow:hidden;'
             f'background:#F1EFE8;">{"".join(rows)}</div>'
             f'<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:14px;">'
-            f'{"".join(legend)}</div>')
+            f'{"".join(legend)}</div>' + note)
 
 
 def render_day(day: dict, color: str, weather: dict | None = None) -> str:
     rows = []
     for n in day["nodes"]:
         icon = {"attraction": "◦", "restaurant": "◇", "transit": "→", "rest": "·"}.get(n["type"], "·")
+        # 兴趣标记：让用户看得见这一站是靠哪条偏好排上的；弱命中用另一套颜色，
+        # 避免"人民公园"被当成"喝茶"已经专门安排好了。
+        badges = ""
+        for it in (n.get("interests") or []):
+            _s = it.get("level") == "strong"
+            _bg = "#EAF3F1" if _s else "#F6F1E4"
+            _fg = "#2F6F6B" if _s else "#8A6A2F"
+            _tx = f'兴趣·{esc(it.get("word", ""))}' if _s else f'近似·{esc(it.get("word", ""))}'
+            badges += (f'<span style="font-size:11px;padding:1px 6px;border-radius:3px;'
+                       f'margin-left:6px;background:{_bg};color:{_fg};">{_tx}</span>')
         rows.append(f"""
         <tr>
           <td style="width:62px;padding:10px 8px;vertical-align:top;font-variant-numeric:tabular-nums;
                      font-size:13px;color:#2C2C2A;">{esc(n['time'])}</td>
           <td style="width:16px;padding:10px 0;vertical-align:top;color:{color};font-size:14px;">{icon}</td>
           <td style="padding:10px 8px;vertical-align:top;">
-            <div style="font-size:14px;color:#1F1E1C;">{esc(n['name'])}</div>
+            <div style="font-size:14px;color:#1F1E1C;">{esc(n['name'])}{badges}</div>
             <div style="font-size:12px;color:#7A7972;margin-top:3px;line-height:1.55;">{esc(n['tip'])}</div>
           </td>
           <td style="width:150px;padding:10px 8px;vertical-align:top;font-size:12px;color:#7A7972;">
@@ -262,7 +278,10 @@ def build_html(result: dict, utterance: str) -> str:
     # 出行概要：出发地、日期、天数、人数、预算目标、节奏与偏好。
     # 出发地没说就写「未指定」并注明大交通未含——不填默认城市，不假装查过班次。
     origin = result.get("origin") or s.get("origin")
-    origin_note = "" if origin else "大交通未含"
+    # 预算里到底有没有路费：出发地填了但班次查不到时，金额同样不含大交通。
+    _no_tr = not any(x["category"] == "transport" and (x["amount"] or 0) > 0
+                     for x in b["breakdown"])
+    origin_note = "大交通未含" if _no_tr else ""
     origin_disp = esc(origin) if origin else "未指定"
     start = s["date_range"]["start"]
     end = (datetime.fromisoformat(start)
@@ -353,7 +372,7 @@ def build_html(result: dict, utterance: str) -> str:
   <div class="card" style="display:flex;gap:36px;flex-wrap:wrap;align-items:flex-end;
                            margin-bottom:6px;">
     <div>
-      <div style="font-size:12px;color:#8A8A82;">预算合计（含 10% 机动）</div>
+      <div style="font-size:12px;color:#8A8A82;">预算合计（含 10% 机动{('，不含往返大交通' if _no_tr else '')}）</div>
       <div style="font-size:34px;font-weight:500;letter-spacing:-0.02em;">¥{b['total']:,.0f}</div>
     </div>
     <div>

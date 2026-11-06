@@ -629,23 +629,42 @@ def _fmt_desc(rain_prob: int, low: float, high: float) -> str:
 
 
 def _wx_forecast(geo: list[float], start: str, end: str) -> dict[str, dict] | None:
-    """真实预报（Open-Meteo，最多 16 天）。"""
+    """真实预报（Open-Meteo，实测可请求到「今天 + 15 天」）。
+
+    越界是**整段 400**，不是少给最后一天：结束日期超窗时接口直接拒绝，
+    `_http_json` 返回 None，调用方就把这四天全部回落成历史同期——用户看到的是
+    "11/20 距今 14 天也标历史同期"，而前两天本来是能拿到真预报的。
+    所以这里把 end 逐级往回收再试，宁可少几天预报，也不要整段静默降级。
+    """
     lat, lon = geo
-    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-           f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-           f"&timezone=Asia%2FShanghai&start_date={start}&end_date={end}")
-    data = _http_json(url)
-    if not data or "daily" not in data:
+    try:
+        s = date.fromisoformat(start)
+        e = date.fromisoformat(end)
+    except ValueError:
         return None
-    d = data["daily"]
-    out = {}
-    for i, day in enumerate(d["time"]):
-        out[day] = {
-            "low": round(d["temperature_2m_min"][i]),
-            "high": round(d["temperature_2m_max"][i]),
-            "rain_prob": int(d["precipitation_probability_max"][i] or 0),
-        }
-    return out
+    today = date.today()
+    tries = [e]
+    for back in (15, 12, 10, 7, 5):
+        c = today + timedelta(days=back)
+        if s <= c < e:
+            tries.append(c)
+    for _end in tries:
+        url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+               f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               f"&timezone=Asia%2FShanghai&start_date={s.isoformat()}&end_date={_end.isoformat()}")
+        data = _http_json(url)
+        if not data or "daily" not in data:
+            continue
+        d = data["daily"]
+        out = {}
+        for i, day in enumerate(d["time"]):
+            out[day] = {
+                "low": round(d["temperature_2m_min"][i]),
+                "high": round(d["temperature_2m_max"][i]),
+                "rain_prob": int(d["precipitation_probability_max"][i] or 0),
+            }
+        return out
+    return None
 
 
 def _wx_archive(geo: list[float], month: int, day_lo: int, day_hi: int) -> dict | None:
@@ -692,12 +711,16 @@ def get_weather(city: str, start_date: str, end_date: str) -> dict[str, Any]:
                 "message": "结束日期早于开始日期", "retryable": False}}
 
     cache = _load_cache(WX_CACHE)
-    ckey = f"{city}|{start_date}|{end_date}"
+    # 缓存键带版本号：窗口口径改过一次（16→15 天、越界自愈），旧缓存里存着
+    # "四天全是历史同期"的错误结果，不清掉会继续命中 6 小时。
+    ckey = f"v2|{city}|{start_date}|{end_date}"
     if ckey in cache and time.time() - cache[ckey].get("_t", 0) < 6 * 3600:
         days = cache[ckey]["days"]
         return _ok(city=city, days=days, note=cache[ckey]["note"])
 
-    forecast_limit = date.today() + timedelta(days=16)
+    # 预报窗口取「今天 + 15 天」——Open-Meteo 实测上限就在这里，写 16 会让
+    # 请求越界整段失败（见 _wx_forecast 的说明），前几天也跟着变成历史数据。
+    forecast_limit = date.today() + timedelta(days=15)
     days: list[dict[str, Any]] = []
     fc: dict[str, dict] = {}
     arc: dict | None = None

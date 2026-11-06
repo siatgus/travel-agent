@@ -68,6 +68,41 @@ def _safe_date(y: int, m: int, d: int) -> date:
     return date(y, m, min(d, calendar.monthrange(y, m)[1]))
 
 
+# 「20号到23号」「20日至23日」「20-23号」：用户给了起止，天数就该算出来，
+# 不该再问一句"玩几天"。之前只认开始日期，说了"到23号"还要被追问一次。
+_RANGE_END_RE = re.compile(
+    r"(?:到|至|~|—|－|-|一直到)\s*(?:(\d{1,2})\s*[月/]\s*)?(\d{1,2})\s*[日号]")
+
+
+def _range_end(text: str, start: date | None = None,
+               start_day: int | None = None) -> date | None:
+    """从"到 23 号"里推出结束日期。无法确定或跨得离谱时返回 None。"""
+    m = _RANGE_END_RE.search(text)
+    if not m:
+        return None
+    try:
+        day = int(m.group(2))
+        month = int(m.group(1)) if m.group(1) else None
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= day <= 31:
+        return None
+    if start is not None:
+        mo, yr = (month or start.month), start.year
+        if month and month < start.month:      # 11月20日到1月3日 → 跨年
+            yr += 1
+        end = _safe_date(yr, mo, day)
+        if end < start:                        # 只说日：23号 < 20号 → 下个月
+            yr, mo = (yr + 1, 1) if mo == 12 else (yr, mo + 1)
+            end = _safe_date(yr, mo, day)
+        if 1 <= (end - start).days + 1 <= 30:
+            return end
+        return None
+    if start_day is not None and start_day < day <= 31:
+        return date(2000, 1, day)              # 只用于算天数，日期本身无意义
+    return None
+
+
 # 出发地提取时剥掉的人称/意图前缀（长词在前，避免被短词截断）
 _STRIP_PREFIX = re.compile(
     r"^(?:一个人|两个人|我们俩|他俩|我俩|我们|你们|他们|她们|大家|一起|"
@@ -370,6 +405,11 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         if start < today:               # 当月已过的日子 → 顺延到明年
             start = _safe_date(year + 1, month, day)
         slots["date_range"] = {"start": start.isoformat(), "exact": True}
+        # 给了起止日期就直接算天数：「11月20号到23号」= 4 天，
+        # 不该再追问"玩几天"——用户刚说过。
+        if end := _range_end(text, start=start):
+            slots["date_range"]["end"] = end.isoformat()
+            slots["days"] = (end - start).days + 1
     elif (m := re.search(r"下个?月\s*(?:的)?\s*([一二两三四五六七八九十\d]{1,3})\s*[日号]", text)):
         # "下个月一号出发"：月和日都给了，就是完整日期，不必再折算或追问
         d = cn_to_int(m.group(1))
@@ -396,6 +436,9 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         d = cn_to_int(m.group(1))
         if d and 1 <= d <= 31:
             slots["date_range"] = {"day": d}
+            # 「20号到23号」：起止都说了，天数直接算出来
+            if (end := _range_end(text, start_day=d)) is not None:
+                slots["days"] = end.day - d + 1
     elif m := re.search(r"下个?月", text):
         slots["date_range"] = {"month": f"{today.year}-{today.month % 12 + 1:02d}", "exact": False}
         uncertain.append("date_range")
@@ -985,6 +1028,24 @@ def self_check(result: dict) -> list[dict]:
 # ------------------------------------------------------------------ 4. 输出
 
 
+def _no_transport_reason(result: dict) -> str:
+    """预算里为什么不含往返大交通。已含交通费时返回空串。
+
+    只看"有没有出发地"是不够的：上海→成都这种班次查不到的情况，明细里没有
+    交通项、金额为 0，标题照样写「预算合计」——用户会把 ¥3,553 当成整趟花费，
+    到买票时才发现路费根本没算进去。标题必须如实反映"这钱花在哪儿了"。
+    """
+    b = result.get("budget") or {}
+    for item in b.get("breakdown") or []:
+        if item.get("category") == "transport" and (item.get("amount") or 0) > 0:
+            return ""
+    origin = result.get("origin") or (result.get("slots") or {}).get("origin")
+    if not origin:
+        return "出发地未指定，没查班次与票价"
+    dest = (result.get("slots") or {}).get("destination") or ""
+    return f"{origin}→{dest} 的班次票价没查到"
+
+
 def summary_lines(result: dict) -> list[str]:
     """方案开头的「出行概要」：出发地、日期、天数、人数、预算。
 
@@ -1006,11 +1067,14 @@ def summary_lines(result: dict) -> list[str]:
     # 以前这里会悄悄填上默认城市，用户从成都走也收到一份「杭州-大理」。
     origin_disp = origin if origin else "未指定（大交通未含）"
 
-    # 预算口径必须写在标题里：不含大交通时只报"3,718 元"很容易被当成整趟花费
-    budget_head = ("- **预算合计（不含往返大交通）**" if not origin
-                   else "- **预算合计**")
+    # 预算口径必须写在标题里：不含大交通时报一个光秃秃的"3,553 元"很容易
+    # 被当成整趟花费。判定看的是"明细里到底有没有交通费"，而不是"有没有出发地"。
+    _miss = _no_transport_reason(result)
+    budget_head = ("- **预算合计（不含往返大交通）**" if _miss else "- **预算合计**")
     budget = (f"{budget_head}：约 {round(b['total']):,} 元 / {n} 人"
               f"（人均 {round(b['per_person']):,} 元，含 10% 机动）")
+    if _miss:
+        budget += f"；⚠ 大交通未计入：{_miss}"
     if b.get("target"):
         gap = b["target"] - b["total"]
         budget += (f"；你的目标 {round(b['target']):,} 元"
@@ -1046,19 +1110,45 @@ _BUDGET_CN = {
 }
 
 
+def _md_range(dates: list[str]) -> str:
+    """把日期列表压成「11-20~11-21」或「11-20、11-23」这样的短串。"""
+    ds = sorted(d for d in dates if d)
+    if not ds:
+        return ""
+    if len(ds) == 1:
+        return ds[0][5:]
+    try:
+        seq = [date.fromisoformat(d) for d in ds]
+    except ValueError:
+        return "、".join(d[5:] for d in ds)
+    contiguous = all((b - a).days == 1 for a, b in zip(seq, seq[1:]))
+    return (f"{ds[0][5:]}~{ds[-1][5:]}" if contiguous
+            else "、".join(d[5:] for d in ds))
+
+
 def _wx_caliber(weather: dict) -> str:
-    """天气口径一句话：预报窗口内是真实预报，窗口外是历史同期，必须写清楚。"""
+    """天气口径一句话。
+
+    预报窗口是**逐日**判定的：11/20 距今 14 天有真预报，11/23 距今 17 天没有。
+    不能因为有几天超窗就把整段都说成历史同期——用户会以为连着的四天全是估算。
+    """
     days = weather.get("days") or []
     if not days:
         return ""
-    forecast = [d for d in days if d.get("is_forecast")]
-    if len(forecast) == len(days):
-        return "天气数据：Open-Meteo 实时预报"
-    if not forecast:
+    flagged = [d for d in days if d.get("is_forecast") is not None]
+    if len(flagged) != len(days):
+        # 数据源没给逐日标记（旧缓存/其他实现）：退回整体说明，不编造分界
+        return weather.get("note") and f"天气数据：{weather['note']}" or ""
+    fc = [d["date"] for d in days if d.get("is_forecast")]
+    ar = [d["date"] for d in days if not d.get("is_forecast")]
+    if not ar:
+        return "天气数据：Open-Meteo 实时预报（逐日）"
+    if not fc:
         return ("天气数据：这几天的日期超出 16 天预报窗口，按 2023-2025 年"
                 "同期历史均值估算，不是实时预报，出行前请再查一次")
-    return ("天气数据：前段是 Open-Meteo 实时预报，后段日期超出 16 天窗口，"
-            "用历史同期均值估算（已在每日里标注）")
+    return (f"天气数据：{_md_range(fc)} 是 Open-Meteo 实时预报；"
+            f"{_md_range(ar)} 超出 16 天预报窗口，用 2023-2025 年同期历史均值"
+            f"估算（每日卡片已标注），出行前请再查一次")
 
 
 def render(result: dict) -> str:
@@ -1103,9 +1193,10 @@ def render(result: dict) -> str:
         cn = _BUDGET_CN.get(item["category"], item["category"])
         out.append(f"- **{cn}**　¥{round(item['amount']):,}　{item['label']}")
     out.append(f"- **机动（10% 预留）**　¥{round(b['contingency']):,}")
-    if not (result.get("origin") or s.get("origin")):
+    _miss = _no_transport_reason(result)
+    if _miss:
         out.append(f"- **合计**　**¥{round(b['total']):,}**　人均 ¥{round(b['per_person']):,}"
-                   f"（**不含往返大交通**：出发地未指定，所以没有班次与票价）")
+                   f"（**不含往返大交通**：{_miss}）")
     else:
         out.append(f"- **合计**　**¥{round(b['total']):,}**　人均 ¥{round(b['per_person']):,}")
 

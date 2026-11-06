@@ -168,7 +168,8 @@ def get_weather(city: str, start_date: str, end_date: str) -> dict[str, Any]:
         clim = city_data["climate"].get(cur.month)
         if not clim:
             clim = {"low": 10, "high": 20, "rain_prob": 20, "desc": "暂无数据"}
-        is_forecast = (cur - date.today()).days <= 14
+        # 与真实数据源保持一致：逐日判断，窗口是今天 +15 天
+        is_forecast = (cur - date.today()).days <= 15
         days.append({
             "date": cur.isoformat(),
             "low": clim["low"], "high": clim["high"],
@@ -177,7 +178,8 @@ def get_weather(city: str, start_date: str, end_date: str) -> dict[str, Any]:
         })
         cur += timedelta(days=1)
     return _ok(city=city, days=days,
-               note="超出 14 天窗口的为历史同期均值" if not days[0]["is_forecast"] else "预报数据")
+               note="超出 16 天窗口的为历史同期均值"
+               if not all(d["is_forecast"] for d in days) else "预报数据")
 
 
 def search_transport(from_city: str, to_city: str, date: str,

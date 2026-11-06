@@ -46,24 +46,44 @@ DAY_MOVE_BUDGET_MIN = 150  # 单日市内移动上限 2.5h
 # 营业时间上它合法（古城全天开放），但真实体验不成立。
 DAY_END_LATEST = 20 * 60
 
-# 兴趣词的同义扩展：用户说"看大熊猫"、库里叫"成都大熊猫繁育研究基地"，
-# 说"喝茶"、库里是"人民公园"（茶馆），说"老街"、库里是"宽窄巷子"。
-# 只靠标签精确匹配等于没做偏好——标签是英文类目，用户的兴趣是中文短语。
+# 兴趣词的同义扩展，**分两档**：
+#
+# strong（具体线索）：命中了就说明这个点确实满足该兴趣——"喝茶"撞上
+#   "茶社/盖碗/茶馆"，"老街"撞上"巷"。这类点有资格占当天的锚点。
+# broad（泛线索）：只是沾边——"喝茶"撞上"公园"（公园里通常有茶座，但
+#   望江楼公园也符合），"爬山"撞上"山"。这类只算弱命中，永远不许抢锚点。
+#
+# 不分档的后果是真实踩过的：「喝茶」的同义词里原本有「公园」，于是望江楼公园
+# 也算命中，把用户真正想看的大熊猫挤出了行程；而行程里只写"人民公园"三个字，
+# 用户根本看不出这是"喝茶"落了地，还是随便塞了个公园。
 INTEREST_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "大熊猫": ("熊猫", "繁育研究基地", "动物园"),
+    "大熊猫": ("熊猫", "繁育研究基地"),
     "熊猫": ("大熊猫", "繁育研究基地"),
-    "喝茶": ("茶", "茶馆", "茶社", "盖碗", "公园"),
-    "茶": ("喝茶", "茶馆", "茶社", "盖碗"),
-    "老街": ("巷", "古街", "古镇", "老城", "街子"),
-    "古镇": ("镇", "古城", "老街"),
+    "喝茶": ("茶馆", "茶社", "茶楼", "茶室", "茶座", "盖碗", "茶"),
+    "茶": ("茶馆", "茶社", "茶楼", "茶室", "盖碗", "喝茶"),
+    "老街": ("巷", "古街", "古镇", "老城", "老街"),
+    "古镇": ("古城", "老街", "镇"),
     "美食": ("小吃", "餐厅", "火锅", "food"),
     "小吃": ("美食", "餐厅", "火锅"),
     "博物馆": ("博物", "展览", "遗址"),
     "夜景": ("夜游", "灯光", "江边", "河畔"),
-    "爬山": ("山", "索道", "登山"),
-    "公园": ("公园", "园林"),
+    "爬山": ("登山", "索道", "山"),
+    "公园": ("园林",),
     "寺庙": ("寺", "庙", "宫", "观"),
 }
+
+INTEREST_BROAD: dict[str, tuple[str, ...]] = {
+    "喝茶": ("公园", "园林"),
+    "茶": ("公园",),
+    "老街": ("街", "古建"),
+    "古镇": ("古村",),
+}
+
+
+def _poi_hay(poi: dict) -> str:
+    """名字/区域/备注/标签拼成的检索串。"""
+    return (" ".join(str(poi.get(k) or "") for k in ("name", "area", "note"))
+            + " " + " ".join(poi.get("tags") or []))
 
 
 def _geo_uncertain(poi: dict) -> bool:
@@ -78,24 +98,64 @@ def _geo_uncertain(poi: dict) -> bool:
             or "位置按市区估算" in (poi.get("note") or ""))
 
 
-def interest_hit(interest: str, poi: dict, strong_only: bool = False) -> bool:
-    """兴趣词是否命中这个点。
+def interest_match(interest: str, poi: dict) -> tuple[str, str] | None:
+    """兴趣怎么命中的：返回 ("strong"|"weak", 命中的那个词)；没命中返回 None。
 
-    strong：兴趣原词直接出现在名称/标签/备注里（大熊猫 → 大熊猫基地）；
-    weak  ：靠同义词命中（喝茶 → 公园，因为人民公园有茶馆）。
-    名额紧张时只有 strong 才有资格当"兴趣锚点"——否则「喝茶」的同义词
-    「公园」会让望江楼公园顶掉用户真正想看的大熊猫。
+    行程里必须能说清楚"这条兴趣是靠什么落地的"。只返回布尔值的话，用户看到
+    「人民公园」永远分不清是"喝茶"真的排上了，还是公园这个词沾了边。
     """
     i = (interest or "").strip()
     if len(i) < 2:
-        return False
-    hay = " ".join(str(poi.get(k) or "") for k in
-                   ("name", "area", "note")) + " " + " ".join(poi.get("tags") or [])
+        return None
+    hay = _poi_hay(poi)
     if i in hay:
-        return True
-    if strong_only:
+        return ("strong", i)
+    for w in INTEREST_SYNONYMS.get(i, ()):
+        if w and w in hay:
+            return ("strong", w)
+    for w in INTEREST_BROAD.get(i, ()):
+        if w and w in hay:
+            return ("weak", w)
+    return None
+
+
+def interest_note(hits: list[dict], poi: dict) -> str:
+    """把兴趣命中翻成一句人能读懂的备注（写进日程备注列）。
+
+    strong：「兴趣「喝茶」（命中"茶社"）：鹤鸣茶社，盖碗茶」——把库里的
+            具体线索一起带出来，这就是"喝茶"落成的具体活动；
+    weak  ：「兴趣「喝茶」为近似匹配（公园）…」——直说只是沾边，
+            不许让用户误以为专门安排了喝茶这一项。
+    """
+    if not hits:
+        return ""
+    parts = []
+    raw = (poi.get("note") or "").strip()
+    # "模型整理，坐标为近似值，门票为参考价" 这类运维备注对用户没有信息量
+    useful = bool(raw) and len(raw) <= 30 and not any(
+        k in raw for k in ("模型整理", "近似值", "参考价", "请自行确认", "估算"))
+    for h in hits:
+        if h["level"] == "strong":
+            tail = f"：{raw}" if useful else f"（命中「{h['via']}」）"
+            parts.append(f"兴趣「{h['word']}」{tail}")
+        else:
+            parts.append(f"兴趣「{h['word']}」为近似匹配（命中「{h['via']}」），"
+                         f"不是专门为它安排的活动")
+    return "；".join(parts)
+
+
+def interest_hit(interest: str, poi: dict, strong_only: bool = False) -> bool:
+    """兴趣词是否命中这个点。
+
+    strong：兴趣原词或具体线索直接对上（大熊猫 → 大熊猫基地；喝茶 → 鹤鸣茶社）；
+    weak  ：只靠泛线索沾边（喝茶 → 人民公园，因为公园里通常有茶座）。
+    名额紧张时只有 strong 才有资格当"兴趣锚点"——否则「喝茶」的泛线索
+    「公园」会让望江楼公园顶掉用户真正想看的大熊猫。
+    """
+    m = interest_match(interest, poi)
+    if m is None:
         return False
-    return any(w and w in hay for w in INTEREST_SYNONYMS.get(i, ()))
+    return m[0] == "strong" if strong_only else True
 
 
 def name_hit(fragment: str, poi_name: str) -> bool:
@@ -346,11 +406,18 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 tip += f"　离开门 {fmt(hours[0])} 还有 {hours[0] - clock} 分钟，可先逛周边"
             if uncertain:
                 tip += "　位置为估算（未收录），可能是市郊/跨城，出发前确认交通"
+            # 兴趣标记先挂在节点上，备注前缀等整份行程排完再统一生成——
+            # 弱命中（喝茶→公园）如果每天各标一个，会变成两个公园都写"近似匹配"。
+            ints = []
+            for _w in (slots.get("soft_prefs") or []):
+                _m = interest_match(_w, p)
+                if _m:
+                    ints.append({"word": _w, "level": _m[0], "via": _m[1]})
             nodes.append(_node(fmt(clock), name, "attraction", p["duration_min"],
                                transit_txt, tip,
                                0 if rainy_swap else p["cost"],
                                booking_required=p["need_booking"] and not rainy_swap,
-                               poi_id=p["poi_id"], geo=p["geo"]))
+                               poi_id=p["poi_id"], geo=p["geo"], interests=ints))
             clock += p["duration_min"]
             # 估算坐标不能当天后续节点的基准点，否则误差会一路传下去
             if not uncertain:
@@ -441,6 +508,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         if p["name"] in deferred_names:
             log["violations"].append({"day": 0, "poi": p["name"],
                                       "why": "全程未能排入，受闭馆时间与动线限制"})
+    finalize_interests(plan, slots, {p["poi_id"]: p for p in attractions})
     return plan, log
 
 
@@ -558,13 +626,47 @@ def parse_hours(spec: str) -> tuple[int, int] | None:
         return None
 
 
+def finalize_interests(plan: list[dict], slots: dict,
+                       pois_by_id: dict[str, dict]) -> None:
+    """整份行程范围内收敛兴趣标记，并把备注前缀写上去。
+
+    两件事：
+    1. 一个弱命中不能到处标。「喝茶」靠"公园"沾边，人民公园和望江楼公园都符合，
+       可用户看到两站都写"喝茶·近似"只会觉得在凑数。强命中全留，弱命中只留第一个。
+    2. 备注里写清"靠什么落地的"，用户才知道这条偏好到底满足没有。
+    """
+    for w in (slots.get("soft_prefs") or []):
+        holders = [n for d in plan for n in d["nodes"]
+                   if any(i["word"] == w for i in n.get("interests") or [])]
+        strong = [n for n in holders
+                  if any(i["word"] == w and i["level"] == "strong"
+                         for i in n.get("interests") or [])]
+        keep = {id(n) for n in (strong or holders[:1])}
+        for n in holders:
+            if id(n) in keep:
+                continue
+            n["interests"] = [i for i in n.get("interests") or []
+                              if i["word"] != w]
+    for d in plan:
+        for n in d["nodes"]:
+            ints = n.get("interests") or []
+            if not ints or (n.get("tip") or "").startswith("兴趣「"):
+                continue
+            note = interest_note(ints, pois_by_id.get(n.get("poi_id")) or {})
+            if note:
+                n["tip"] = f"{note}　{n.get('tip') or ''}".strip()
+
+
 def _node(time_s: str, name: str, type_: str, dur: int, transit: str, tip: str,
           cost: float = 0, booking_required: bool = False,
-          poi_id: str | None = None, geo: list[float] | None = None) -> dict:
+          poi_id: str | None = None, geo: list[float] | None = None,
+          interests: list[dict] | None = None) -> dict:
     return {"time": time_s, "name": name, "type": type_, "duration_min": dur,
             "transit": transit, "tip": tip, "cost": cost,
             "booking_required": booking_required,
-            "poi_id": poi_id, "geo": geo}
+            "poi_id": poi_id, "geo": geo,
+            # 这一站满足了哪些兴趣、是强命中还是沾边（渲染层据此打标签）
+            "interests": list(interests or [])}
 
 
 def fmt(minutes: int) -> str:

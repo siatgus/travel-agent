@@ -137,6 +137,32 @@ def test_interests_landed() -> None:
     check("老街（宽窄巷子）落进行程", "宽窄巷子" in names, names)
 
 
+def test_interest_is_explainable() -> None:
+    """「喝茶」落到人民公园这件事，行程里必须写清楚是靠什么落地的。
+
+    2026-11-06 反馈：只看到"人民公园"，分不清是兴趣命中还是"公园"沾边带进来的，
+    也不知道喝茶到底落实成了什么活动。
+    """
+    plan, _ = _compose()
+    node = next((n for d in plan for n in d["nodes"] if n["name"] == "人民公园"), None)
+    check("人民公园排进了行程", node is not None)
+    if node is None:
+        return
+    ints = node.get("interests") or []
+    words = [i.get("word") for i in ints]
+    check("节点带兴趣标记", "喝茶" in words, str(ints))
+    tea = next((i for i in ints if i.get("word") == "喝茶"), {})
+    # 库里有"鹤鸣茶社、盖碗茶"这种线索 → 判为强命中，并把线索写进备注
+    check("「喝茶」是有据可依的强命中", tea.get("level") == "strong", str(tea))
+    check("备注里写明具体活动线索（茶社/盖碗）",
+          "茶社" in node["tip"] or "盖碗" in node["tip"], node["tip"])
+    # 望江楼公园也含"公园"，但不该被标成"喝茶"——否则像在凑数
+    other = [n for d in plan for n in d["nodes"] if n["name"] == "望江楼公园"]
+    check("同一个兴趣不会给两个公园都打标",
+          all(not (n.get("interests") or []) for n in other),
+          str([(n["name"], n.get("interests")) for n in other]))
+
+
 def test_interest_matcher() -> None:
     check("「大熊猫」命中大熊猫基地",
           composer.interest_hit("大熊猫", CHENGDU[0]))
@@ -146,6 +172,58 @@ def test_interest_matcher() -> None:
           composer.interest_hit("老街", CHENGDU[2]))
     check("无关兴趣不误命中",
           not composer.interest_hit("滑雪", CHENGDU[1]))
+    # 强弱分档：只有具体线索才算 strong
+    check("喝茶→人民公园（有茶社）判强命中",
+          composer.interest_match("喝茶", CHENGDU[3])[0] == "strong")
+    check("喝茶→望江楼公园只算弱命中",
+          composer.interest_match("喝茶", CHENGDU[4])[0] == "weak",
+          str(composer.interest_match("喝茶", CHENGDU[4])))
+    check("弱命中不能抢锚点",
+          not composer.interest_hit("喝茶", CHENGDU[4], strong_only=True))
+
+
+def test_weather_window_is_per_day() -> None:
+    """预报窗口必须逐日判断，不能因为最后一天越界就把前几天也说成历史同期。
+
+    2026-11-06 反馈：11/20-23 四天分别距今 14/15/16/17 天，前两天本该是真预报，
+    方案却四天全标历史同期。根因是请求的结束日期超出 Open-Meteo 上限（今天+15），
+    整个请求 400，预报整批丢失。
+    """
+    wx = {"days": [
+        {"date": "2026-11-20", "is_forecast": True},
+        {"date": "2026-11-21", "is_forecast": True},
+        {"date": "2026-11-22", "is_forecast": False},
+        {"date": "2026-11-23", "is_forecast": False},
+    ]}
+    cal = agent._wx_caliber(wx)
+    check("预报与历史同期分开说，并写明分界",
+          "11-20~11-21" in cal and "11-22" in cal, cal)
+    check("不再把整段说成历史同期", "这几天" not in cal, cal)
+
+
+def test_forecast_window_self_heal() -> None:
+    """结束日期越界会整段 400：要能把 end 收回来重试，而不是整段降级。"""
+    from travel_agent import real_tools
+    seen: list[str] = []
+
+    def fake(url: str):
+        seen.append(url)
+        if "end_date=2026-12-31" in url:
+            return None                     # 模拟越界 400
+        return {"daily": {"time": ["2026-11-20", "2026-11-21"],
+                          "temperature_2m_min": [8, 9],
+                          "temperature_2m_max": [16, 17],
+                          "precipitation_probability_max": [10, 20]}}
+
+    orig = real_tools._http_json
+    real_tools._http_json = fake
+    try:
+        out = real_tools._wx_forecast([30.66, 104.06], "2026-11-20", "2026-12-31")
+    finally:
+        real_tools._http_json = orig
+    check("越界后自动收缩结束日期重试", len(seen) >= 2, str(len(seen)))
+    check("最终仍拿到预报（不是整段历史同期）",
+          bool(out) and "2026-11-20" in out, str(out))
 
 
 # ------------------------------------------------------------------ 渲染
@@ -194,25 +272,49 @@ def test_render_budget_and_weather() -> None:
           "预算合计（不含往返大交通）" in text)
     check("天气口径写明历史同期",
           "历史同期" in text and "预报" in text, text[:400])
-    # 有出发地时不应再写"不含大交通"
-    text2 = agent.render(_fake_result(origin="杭州", has_origin=True))
-    check("有出发地时不标注不含大交通", "不含往返大交通" not in text2)
+    # 明细里确实有交通费时，才不该再写"不含大交通"
+    _with_tr = _fake_result(origin="杭州", has_origin=True)
+    _with_tr["budget"] = dict(_with_tr["budget"])
+    _with_tr["budget"]["breakdown"] = _with_tr["budget"]["breakdown"] + [
+        {"category": "transport", "label": "往 杭州-大理 ¥520", "amount": 1040}]
+    text2 = agent.render(_with_tr)
+    check("已含交通费时不标注不含大交通", "不含往返大交通" not in text2,
+          text2[-300:])
+    # 出发地填了、但班次票价没查到（明细里没有交通项）：金额同样不含路费，
+    # 必须照旧标注——否则 ¥3,553 会被当成整趟花费。
+    text3 = agent.render(_fake_result(origin="上海", has_origin=True))
+    check("有出发地但班次票价缺失仍标注不含大交通",
+          "预算合计（不含往返大交通）" in text3 and "班次票价没查到" in text3,
+          text3[:400])
 
 
 def test_pace_noop_is_honest() -> None:
-    """已经是最松档时点「别太赶」：不静默给相同方案，要明说。"""
+    """已经是最松档时点「别太赶」：不许再跑一遍排程，也不许假装重排。
+
+    2026-11-06 反馈：回复承认"已是最松"，却又说"这一版只把时间与动线重排了
+    一遍"，而行程和预算一个字都没变——白等一轮，还像在骗人。
+    正确行为：直接回答（mode=answer），明说"这一轮没有改行程"，并给出真能
+    生效的选项。
+    """
     s = Session(today=date(2026, 11, 6))
     r1 = s.turn("11月20号从杭州去大理玩4天，2人，预算6000，轻松一点")
     check("前置：第一版出来了", r1.mode == "plan", r1.mode)
+    before = r1.plan
     r2 = s.turn("行程别太赶，轻松一点")
-    check("第二次仍出方案（不追问）", r2.mode == "plan", r2.mode)
-    check("已是最松档时明说没有压缩空间",
-          "最松" in r2.render, r2.render[:200])
+    check("节奏没变时直接回答，不再出一版新方案", r2.mode == "answer", r2.mode)
+    check("明说已是最松档", "最松" in r2.render, r2.render[:200])
+    check("明说这一轮没有改行程", "没有改行程" in r2.render, r2.render[:200])
+    check("不再谎称重排过", "重排了一遍" not in r2.render, r2.render[:200])
+    check("给出真能生效的选项（删站/减天）",
+          "删掉" in r2.render and "改" in r2.render, r2.render[:400])
+    check("原方案未被覆盖", s.last_plan is before)
 
 
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
-               test_interests_landed, test_interest_matcher,
+               test_interests_landed, test_interest_is_explainable,
+               test_interest_matcher, test_weather_window_is_per_day,
+               test_forecast_window_self_heal,
                test_render_budget_and_weather, test_pace_noop_is_honest):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
