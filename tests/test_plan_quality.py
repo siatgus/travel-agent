@@ -395,13 +395,63 @@ def test_map_marks_uncertain_points() -> None:
     check("确定坐标的点仍是实心序号圆", 'fill="#fff"' in svg)
 
 
+def test_route_map_real() -> None:
+    """行程页路线图：配了 Key 用真实腾讯地图（合规底图），没配回落 SVG 示意图。"""
+    from travel_agent import render_html
+    plan, _ = _compose()
+    res = _fake_result(days_plan=plan)
+    orig = render_html.get_tmap_key
+    try:
+        render_html.get_tmap_key = lambda: ""
+        h = render_html.build_html(res, "成都4天")
+        check("没配 Key 时不加载地图 SDK", "map.qq.com/api/gljs" not in h)
+        check("没配 Key 时仍有 SVG 示意图", "<svg" in h)
+        check("没配 Key 时提示去哪里申请 Key", "lbs.qq.com" in h)
+
+        render_html.get_tmap_key = lambda: "TESTKEY1234567890"
+        h2 = render_html.build_html(res, "成都4天")
+        check("配 Key 后加载腾讯地图 GL JS", "map.qq.com/api/gljs" in h2)
+        check("地图容器与 SVG 兜底同时存在",
+              'id="route-map"' in h2 and 'id="route-fallback"' in h2)
+        check("行程点位注入地图脚本", "成都大熊猫繁育研究基地" in h2 or "宽窄巷子" in h2)
+        check("Key 只以安全字符注入", "TESTKEY1234567890" in h2)
+        check("估算点不进连线的语义写进页面", "不参与连线" in h2)
+    finally:
+        render_html.get_tmap_key = orig
+
+
+def test_route_map_js_syntax() -> None:
+    """地图脚本是普通字符串模板：对模板本体做 node --check（有 node 才查）。"""
+    import shutil
+    import subprocess
+    import tempfile
+    from travel_agent import render_html
+    node = shutil.which("node")
+    if not node:
+        print("[SKIP] 环境里没有 node，跳过 JS 语法检查")
+        return
+    js = (render_html.ROUTE_MAP_JS
+          .replace("__DATA__", '{"days":[],"home":null,"colors":[]}')
+          .replace("__KEY__", "TESTKEY"))
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(js)
+        tmp = f.name
+    try:
+        r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
+        check("地图 JS 通过 node --check", r.returncode == 0, r.stderr[-300:])
+    finally:
+        _TA_PATH(tmp).unlink(missing_ok=True)
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
                test_interest_matcher, test_weather_window_is_per_day,
                test_forecast_window_self_heal, test_transport_card_no_zero_fare,
                test_meal_fallback_is_honest, test_diet_and_tea_land_in_meals,
-               test_map_marks_uncertain_points,
+               test_map_marks_uncertain_points, test_route_map_real,
+               test_route_map_js_syntax,
                test_render_budget_and_weather, test_pace_noop_is_honest):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

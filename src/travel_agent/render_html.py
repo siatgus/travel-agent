@@ -5,17 +5,23 @@
     python render_html.py                       # 用内置默认用例
 
 设计取舍：
-- 地图用等距圆柱投影 + 纬度校正，够用且不需要地图瓦片服务；不涉及行政边界，
-  只画点位与连线，避免地图数据合规问题。
+- 路线图：配置了腾讯地图 Key（TMAP_KEY 环境变量或设置文件 tmap_key）时
+  用腾讯位置服务 GL JS 渲染真实底图；SDK 加载失败或没配 Key 时回落到
+  本地 SVG 示意图，页面永远有内容。底图来源是合规的腾讯地图。
+- 坐标系：库里的点来自 OSM/Open-Meteo（WGS-84），前端做标准 WGS→GCJ 转换。
+- 位置估算的点（geo_uncertain）在地图上用灰色「?」标注，绝不参与连线——
+  估算点连出来的线是假的。
 - 预算用横向堆叠条而非饼图：金额差异大时，条状比较更准。
-- 全部内联样式与 SVG，单文件双击可开，也方便直接打印成 PDF 带走。
+- 全部内联样式与 SVG 兜底，单文件双击可开，也方便直接打印成 PDF 带走。
 """
 
 from __future__ import annotations
 
 import argparse
 import html
+import json
 import math
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -129,6 +135,194 @@ def render_map(result: dict, w: int = 660, h: int = 380) -> str:
                              f'text-anchor="middle">{esc(n["name"][:10])}</text>')
     parts.append("</svg>")
     return "".join(parts)
+
+
+def get_tmap_key() -> str:
+    """腾讯地图 Key：环境变量 TMAP_KEY 优先，其次设置文件的 tmap_key。"""
+    k = (os.environ.get("TMAP_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        from . import llm
+        return str(llm.load_settings().get("tmap_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def route_map_data(result: dict) -> dict:
+    """抽给前端地图的最小数据集：只传坐标点位与连线所需字段。"""
+    days = []
+    for d in result["days_plan"]:
+        nodes = []
+        for n in d["nodes"]:
+            if not n.get("geo"):
+                continue
+            nodes.append({"name": n["name"], "time": n["time"],
+                          "lat": n["geo"][0], "lng": n["geo"][1],
+                          "type": n["type"],
+                          "uncertain": bool(n.get("geo_uncertain"))})
+        days.append({"day": d["day"], "nodes": nodes})
+    home = (result["hotel"].get("items") or [{}])[0].get("geo")
+    return {"days": days, "home": home, "colors": DAY_COLORS}
+
+
+# 腾讯位置服务 GL JS（合规底图）。纯字符串模板，不经 f-string 求值，
+# 便于对源码直接做 JS 语法检查。__DATA__ / __KEY__ 在渲染时替换。
+ROUTE_MAP_JS = """
+(function () {
+  var DATA = __DATA__;
+  var KEY = "__KEY__";
+  var box = document.getElementById('route-map');
+  var fb = document.getElementById('route-fallback');
+  function showFallback() {
+    if (fb) fb.style.display = '';
+    if (box) box.style.display = 'none';
+  }
+  // WGS-84 -> GCJ-02：OSM/Open-Meteo 给的是 WGS-84，腾讯底图是 GCJ-02
+  function w2g(lng, lat) {
+    var a = 6378245.0, ee = 0.00669342162296594323;
+    function tL(x, y, isLat) {
+      var r = isLat
+        ? (-100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x)))
+        : (300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x)));
+      r += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3;
+      r += (isLat
+        ? (20 * Math.sin(y * Math.PI) + 40 * Math.sin(y / 3 * Math.PI)) * 2 / 3
+        : (20 * Math.sin(x * Math.PI) + 40 * Math.sin(x / 3 * Math.PI)) * 2 / 3);
+      r += (isLat
+        ? (160 * Math.sin(y / 12 * Math.PI) + 320 * Math.sin(y * Math.PI / 30)) * 2 / 3
+        : (150 * Math.sin(x / 12 * Math.PI) + 300 * Math.sin(x / 30 * Math.PI)) * 2 / 3);
+      return r;
+    }
+    var dLat = tL(lng - 105, lat - 35, true), dLng = tL(lng - 105, lat - 35, false);
+    var rad = lat / 180 * Math.PI, magic = Math.sin(rad);
+    magic = 1 - ee * magic * magic;
+    var sq = Math.sqrt(magic);
+    return [lng + (dLng * 180) / (a / sq * Math.cos(rad) * Math.PI),
+            lat + (dLat * 180) / ((a * (1 - ee)) / (magic * sq) * Math.PI)];
+  }
+  // 别针图标：SVG -> data URI（不引用任何外部图片资源）
+  function pin(color, txt) {
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="38" viewBox="0 0 28 38">'
+      + '<path d="M14 1C7.4 1 1.5 6.2 1.5 13.6 1.5 22.4 14 36.5 14 36.5S26.5 22.4 26.5 13.6C26.5 6.2 20.6 1 14 1z" fill="' + color + '" stroke="#FFFFFF" stroke-width="1.6"/>'
+      + '<text x="14" y="18" font-size="11" font-family="Arial,sans-serif" font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  function labelStyle() {
+    return { color: '#3F3E3A', size: 11, direction: 'bottom',
+             padding: '2px 6px', backgroundColor: 'rgba(255,255,255,0.94)',
+             backgroundBorderWidth: 1, backgroundBorderColor: '#E4E2DA',
+             backgroundBorderRadius: 4 };
+  }
+  function init() {
+    if (typeof TMap === 'undefined') { showFallback(); return; }
+    if (box) box.style.display = '';
+    var mkStyles = {}, lineStyles = {}, geos = [], lines = [];
+    var lats = [], lngs = [], colors = DATA.colors;
+    function g(n) {
+      var c = w2g(n.lng, n.lat);
+      lats.push(c[1]); lngs.push(c[0]);
+      return new TMap.LatLng(c[1], c[0]);
+    }
+    DATA.days.forEach(function (d, i) {
+      var color = colors[i % colors.length];
+      var chain = [], seq = 0;
+      d.nodes.forEach(function (n) {
+        var pos = g(n);
+        if (n.uncertain) {
+          // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
+          mkStyles['unc'] = mkStyles['unc'] || new TMap.MarkerStyle(Object.assign(
+            { width: 26, height: 36, anchor: { x: 13, y: 36 },
+              src: pin('#9A9992', '?') }, labelStyle()));
+          geos.push({ id: 'u' + d.day + '_' + geos.length, styleId: 'unc',
+                      position: pos, content: n.name + '（位置待确认）' });
+          return;
+        }
+        chain.push(pos);
+        if (n.type !== 'attraction') { return; }   // 餐位/赶路只进动线不插旗
+        seq += 1;
+        var sid = 'd' + d.day + '_' + seq;
+        mkStyles[sid] = new TMap.MarkerStyle(Object.assign(
+          { width: 26, height: 36, anchor: { x: 13, y: 36 },
+            src: pin(color, String(seq)) }, labelStyle()));
+        geos.push({ id: sid, styleId: sid, position: pos,
+                    content: 'D' + d.day + ' ' + n.name });
+      });
+      if (chain.length >= 2) {
+        lineStyles['p' + i] = new TMap.PolylineStyle(
+          { color: color, width: 4, dashArray: [8, 8], lineCap: 'round' });
+        lines.push({ id: 'line' + d.day, styleId: 'p' + i, paths: chain });
+      }
+    });
+    if (DATA.home) {
+      var hp = g({ lng: DATA.home[1], lat: DATA.home[0] });
+      mkStyles['hotel'] = new TMap.MarkerStyle(Object.assign(
+        { width: 26, height: 36, anchor: { x: 13, y: 36 },
+          src: pin('#444441', '宿') }, labelStyle()));
+      geos.push({ id: 'hotel', styleId: 'hotel', position: hp, content: '住宿' });
+    }
+    if (!geos.length) { showFallback(); return; }
+    var map = new TMap.Map('route-map', { center: geos[0].position, zoom: 12 });
+    if (lines.length) {
+      new TMap.MultiPolyline({ map: map, styles: lineStyles, geometries: lines });
+    }
+    new TMap.MultiMarker({ map: map, styles: mkStyles, geometries: geos });
+    if (lats.length > 1 && typeof TMap.LatLngBounds !== 'undefined') {
+      try {
+        map.fitBounds(new TMap.LatLngBounds(
+          new TMap.LatLng(Math.min.apply(null, lats), Math.min.apply(null, lngs)),
+          new TMap.LatLng(Math.max.apply(null, lats), Math.max.apply(null, lngs))));
+      } catch (e) { /* 少数版本无 fitBounds，保持初始中心 */ }
+    }
+    if (fb) fb.style.display = 'none';
+  }
+  var s = document.createElement('script');
+  s.src = 'https://map.qq.com/api/gljs?v=1.exp&key=' + encodeURIComponent(KEY);
+  var settled = false;
+  var timer = setTimeout(function () {
+    if (!settled) { settled = true; showFallback(); }
+  }, 8000);
+  s.onload = function () {
+    if (settled) return;
+    settled = true; clearTimeout(timer);
+    try { init(); } catch (e) { showFallback(); }
+  };
+  s.onerror = function () {
+    if (settled) return;
+    settled = true; clearTimeout(timer); showFallback();
+  };
+  (document.head || document.documentElement).appendChild(s);
+})();
+"""
+
+
+def render_route_map(result: dict) -> str:
+    """路线区：真实地图（腾讯 GL JS）优先，SVG 示意图兜底。
+
+    - 没配 Key：只渲染 SVG 示意图，并提示在哪里配 Key；
+    - 配了 Key：地图容器 + SVG 兜底（SDK 8 秒加载不出来就回落），
+      弱网/打印时页面也不会是空白。
+    """
+    svg = render_map(result)
+    key = get_tmap_key()
+    if not key:
+        hint = ('<div style="font-size:12px;color:#9A9992;margin-top:10px;">'
+                '当前为示意图。在管理后台「模型设置」填入腾讯地图 Key，或设置环境变量 '
+                'TMAP_KEY（lbs.qq.com 免费申请，勾选 WebServiceAPI/WebGL）后，'
+                '这里会显示真实地图。</div>')
+        return f'<div class="card" style="padding:12px;">{svg}</div>{hint}'
+    data = json.dumps(route_map_data(result), ensure_ascii=False).replace("<", "\\u003c")
+    safe_key = "".join(ch for ch in key if ch.isalnum() or ch == "-")
+    if not safe_key:
+        return f'<div class="card" style="padding:12px;">{svg}</div>'
+    js = ROUTE_MAP_JS.replace("__DATA__", data).replace("__KEY__", safe_key)
+    return (
+        f'<div class="card" style="padding:12px;">'
+        f'<div id="route-map" style="height:430px;border-radius:8px;display:none;"></div>'
+        f'<div id="route-fallback">{svg}</div>'
+        f'<div style="font-size:12px;color:#9A9992;margin-top:10px;">'
+        f'连线为景点间直线示意，不是实际道路；灰色「?」为位置估算点，不参与连线。</div>'
+        f'</div><script>{js}</script>')
 
 
 def render_budget_bar(result: dict) -> str:
@@ -437,7 +631,7 @@ def build_html(result: dict, utterance: str) -> str:
     <span style="display:inline-flex;align-items:center;gap:6px;">
       <i style="width:9px;height:9px;border-radius:50%;border:2px dashed #B4693F;display:inline-block;"></i>位置估算（坐标不可信，仅示意）</span>
   </div>
-  <div class="card" style="padding:12px;">{render_map(result)}</div>
+  <div class="card" style="padding:12px;">{render_route_map(result)}</div>
 
   <h2>每日行程</h2>
   {days_html}
@@ -464,6 +658,8 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="../output/行程.html")
     ap.add_argument("--llm", action="store_true",
                     help="用真实模型抽取槽位与重排候选（需 OPENAI_API_KEY）")
+    ap.add_argument("--tmap-key", default="",
+                    help="腾讯地图 Key（也可用 TMAP_KEY 环境变量或设置文件）")
     args = ap.parse_args()
 
     client = None
@@ -478,6 +674,8 @@ def main() -> None:
         print(f"信息不足，需先追问：{missing}")
         return
     result = plan_trip(slots, [], client=client)
+    if args.tmap_key:
+        os.environ["TMAP_KEY"] = args.tmap_key
     html_text = build_html(result, args.utterance)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

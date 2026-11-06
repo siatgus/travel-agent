@@ -992,6 +992,9 @@ def settings_summary() -> dict:
         "timeout": s.get("timeout") or 60,
         "has_key": bool(s.get("api_key")),
         "key_masked": mask_key(s.get("api_key")),
+        # 腾讯地图 Key（行程页真实地图用），同一设置文件、同样只显示脱敏形式
+        "has_tmap_key": bool(s.get("tmap_key")),
+        "tmap_masked": mask_key(s.get("tmap_key")),
         "updated_at": str(s.get("updated_at") or ""),
         "env_fallback": bool(os.environ.get("OPENAI_API_KEY")),
         "env_model": os.environ.get("OPENAI_MODEL", ""),
