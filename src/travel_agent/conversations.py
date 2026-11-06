@@ -134,9 +134,13 @@ def list_conversations(uid: int) -> list[dict]:
 
 
 def get_conversation(uid: int, sid: str) -> dict | None:
-    """一次对话的完整内容：元数据 + 逐条消息（按时间序）。"""
+    """一次对话的完整内容：元数据 + 逐条消息（按时间序）+ 方案与槽位。
+
+    plan/slots 供前端回放后恢复右侧交互式行程面板；没有方案时为 None。
+    """
     with _conn() as c:
-        row = c.execute("SELECT sid,title,dest,has_plan,created_at,updated_at"
+        row = c.execute("SELECT sid,title,dest,has_plan,plan_json,state_json,"
+                        "created_at,updated_at"
                         " FROM conversations WHERE uid=? AND sid=?",
                         (uid, sid)).fetchone()
         if row is None:
@@ -147,6 +151,15 @@ def get_conversation(uid: int, sid: str) -> dict | None:
     out = dict(row)
     out["has_plan"] = bool(out["has_plan"])
     out["messages"] = [dict(m) for m in msgs]
+    try:
+        out["plan"] = json.loads(out.pop("plan_json") or "null")
+    except json.JSONDecodeError:
+        out["plan"] = None
+    try:
+        state = json.loads(out.pop("state_json") or "{}")
+    except json.JSONDecodeError:
+        state = {}
+    out["slots"] = state.get("slots") or {}
     return out
 
 

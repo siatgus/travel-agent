@@ -1034,6 +1034,7 @@ async function loadConv(sid_){
   }
   if(j.has_plan){
     addBot(mdBlocks('> 这是这次对话排出的行程。直接在下面继续说话就能在它基础上调整。').join(''), '', '/plan/'+sid);
+    if(j.plan){ renderBoard(j.plan, j.slots||{}); }   // 恢复右侧交互式行程面板
   }
   chat.scrollTop=chat.scrollHeight;
 }
