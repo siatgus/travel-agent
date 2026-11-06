@@ -534,7 +534,9 @@ function md(text){return mdBlocks(text).join('');}
 function addUser(t){const d=document.createElement('div');d.className='msg user';
   d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
 function addBot(html,meta,planUrl){const d=document.createElement('div');d.className='msg bot';
-  d.innerHTML=html;
+  // mdBlocks 返回数组；数组直接赋给 innerHTML 会被 toString 成逗号分隔的串，
+  // 表现为"每个区块之间多一个逗号"（历史行程回放踩过）。
+  d.innerHTML=Array.isArray(html)?html.join(''):html;
   if(meta){const m=document.createElement('div');m.className='meta';m.textContent=meta;d.appendChild(m);}
   if(planUrl){const a=document.createElement('a');a.className='plan-link';a.href=planUrl;
     a.target='_blank';a.textContent='🗺 查看可视化行程页';d.appendChild(a);}
@@ -1028,10 +1030,10 @@ async function loadConv(sid_){
   chat.innerHTML='';
   for(const m of (j.messages||[])){
     if(m.role==='user') addUser(m.content);
-    else addBot(mdBlocks(m.content));
+    else addBot(mdBlocks(m.content).join(''));
   }
   if(j.has_plan){
-    addBot(mdBlocks('> 这是这次对话排出的行程。直接在下面继续说话就能在它基础上调整。'), '', '/plan/'+sid);
+    addBot(mdBlocks('> 这是这次对话排出的行程。直接在下面继续说话就能在它基础上调整。').join(''), '', '/plan/'+sid);
   }
   chat.scrollTop=chat.scrollHeight;
 }
