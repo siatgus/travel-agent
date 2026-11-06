@@ -769,8 +769,82 @@ def test_plan_weather_advice() -> None:
           f"rainy={[d['rain_prob'] for d in rainy]} advice={r.plan['weather'].get('advice')}")
 
 
+# ------------------------------------------------------------------ 行程问答 / 周边问答 / 通用问题
+
+
+def test_plan_summary_not_replan() -> None:
+    """「将行程总结成一段话」要总结刚出的方案，而不是重排一份。"""
+    s = session()
+    p = s.turn("11月8号从杭州去大理玩4天，2人，预算6000")
+    check("前置：方案已出", p.mode == "plan" and p.plan is not None)
+    r = s.turn("将行程总结成一段话")
+    check("总结按问答处理，不重排", r.mode == "answer" and r.plan is None,
+          f"mode={r.mode}")
+    check("总结包含目的地与逐日安排",
+          "大理" in r.render and "第 1 天" in r.render, r.render[:120])
+    # 没出过方案时，总结类话术不能拦住正常排行程
+    s2 = session()
+    r2 = s2.turn("帮我把行程总结成一段话")
+    check("没有行程时总结话术不拦路", r2.mode == "clarify", f"mode={r2.mode}")
+
+
+def test_nearby_qa() -> None:
+    """「大理古城周边有什么」按距离报周边景点，不进排行程。"""
+    s = session()
+    s.turn("11月8号从杭州去大理玩4天，2人，预算6000")
+    r = s.turn("大理古城周边有什么")
+    check("周边问答直接答", r.mode == "answer" and r.plan is None,
+          f"mode={r.mode}")
+    check("周边答案带距离与具体景点",
+          "公里" in r.render and ("崇圣寺" in r.render or "廊道" in r.render
+                                  or "码头" in r.render), r.render[:160])
+
+
+def test_general_question_fallback() -> None:
+    """通用问题：有模型走「LLM 兜底分类 + 联网检索」，检索失败/无模型不崩、不编。"""
+    from travel_agent.llm import ScriptedClient
+    import travel_agent.websearch as ws
+
+    orig = ws.search
+    try:
+        # 1) 规则认不出 → LLM 分类为 general → 改写检索词 → 检索有结果 → 模型组织
+        ws.search = lambda q, **k: {"ok": True, "note": "联网检索完成",
+            "results": [{"title": "日本签证办理指南",
+                         "url": "https://www.example.cn/visa",
+                         "snippet": "需提前通过指定旅行社递签",
+                         "site": "example.cn"}]}
+        c = ScriptedClient(['{"intent":"general"}',
+                            "日本 旅游签证 办理",
+                            "去日本需要提前办理签证，一般通过指定旅行社递签，"
+                            "建议出发前一个月开始准备，具体要求请以官方为准。"])
+        s = Session(today=TODAY, client=c)
+        r = s.turn("去日本需要办签证吗")
+        check("通用问题被 LLM 兜底接住", r.mode == "answer", f"mode={r.mode}")
+        check("回答注明联网来源", "example.cn" in r.render, r.render[:120])
+        # 2) 检索失败但有模型 → 仍给回答（模型自答）
+        ws.search = lambda q, **k: {"ok": False, "results": [],
+                                    "note": "联网检索失败"}
+        c2 = ScriptedClient(['{"intent":"general"}',
+                             "旅行 治安 注意事项",
+                             "这个我暂时没法联网核实，凭常识看问题不大，"
+                             "出行前请再确认最新要求。"])
+        s2 = Session(today=TODAY, client=c2)
+        r2 = s2.turn("那边治安怎么样")
+        check("检索失败仍能作答并声明不实时", r2.mode == "answer", r2.render[:80])
+        # 3) 分类失败（脚本用尽）→ 回落排行程流水线，不崩
+        c3 = ScriptedClient([])
+        s3 = Session(today=TODAY, client=c3)
+        r3 = s3.turn("那边治安怎么样")
+        check("兜底失败回落原流程", r3.mode in ("clarify", "plan"),
+              f"mode={r3.mode}")
+    finally:
+        ws.search = orig
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
+               test_plan_summary_not_replan, test_nearby_qa,
+               test_general_question_fallback,
                test_ask_at_most_two_fields, test_ask_has_default_hint,
                test_two_rounds_then_plan, test_no_plan_when_city_has_no_data,
                test_no_repeat_question,

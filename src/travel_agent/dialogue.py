@@ -28,8 +28,11 @@ from datetime import date
 from . import agent
 from . import autofetch
 from . import intent
+from . import llm
 from . import real_tools
+from . import websearch
 from .composer import name_hit   # 点名/排除与 POI 名的双向匹配（与编排器同源）
+from .tools import haversine_km
 
 
 # ------------------------------------------------------------------ 追问规则
@@ -306,6 +309,9 @@ class Session:
         self.pending_spot: str | None = None
         # 已经记进 must_visit、但还没出过方案的点名（跨轮带到出方案那一轮去汇报）
         self.pending_must: list[str] = []
+        # 最近一次出方案的完整结果（plan_trip 返回值）。「总结一下这个行程」
+        # 这类行程问答的事实来源——没有它就只能重新算一遍。
+        self.last_plan: dict | None = None
 
     # -------------------------------------------------- 存档（历史行程/续聊）
     # 上下文范围 = 一次对话（一个 sid 一个 Session）。存档让这份上下文在进程
@@ -332,6 +338,7 @@ class Session:
             "last_plan_desc": self.last_plan_desc,
             "pending_spot": self.pending_spot,
             "pending_must": list(self.pending_must),
+            "last_plan": self.last_plan,
             "history": [dict(m) for m in self.history],
             "_cov": dict(self._cov),
         }
@@ -356,6 +363,7 @@ class Session:
         self.last_plan_desc = snap.get("last_plan_desc")
         self.pending_spot = snap.get("pending_spot")
         self.pending_must = list(snap.get("pending_must") or [])
+        self.last_plan = snap.get("last_plan") or None
         self.history = [dict(m) for m in (snap.get("history") or [])]
         self._cov = dict(snap.get("_cov") or {})
 
@@ -366,7 +374,10 @@ class Session:
         配了模型时，工具查到的事实会交给模型组织成人话（intent 里做）；
         没配模型或模型输出跑偏，返回的就是模板——两条路的事实完全一致。
         """
-        city = intent.city_in(utterance) or self.last_city
+        # 城市判定顺序：本句里的城市 > 当前行程目的地 > 最近提到的城市。
+        # 「天安门广场周边有什么」一句里未必带"北京"，但行程本身在北京。
+        city = (intent.city_in(utterance) or self.slots.get("destination")
+                or self.last_city or self.trip_dest)
         if kind == "weather":
             if not city:
                 return intent.weather_answer("", utterance)
@@ -384,6 +395,8 @@ class Session:
             # 具体点名当成泛推荐，回一串不相干的热门景点。
             spot = intent.spot_mention(utterance, city)
             if spot:
+                if re.search(r"周边|附近|周围", utterance):
+                    return self._nearby_qa(city, spot)
                 return self._spot_qa(city, spot)
             return intent.poi_answer(city, client=self.client)
         if kind == "transport":
@@ -396,6 +409,13 @@ class Session:
                                            client=self.client)
         if kind == "smalltalk":
             return intent.smalltalk_answer(utterance, client=self.client)
+        if kind == "plan_qa":
+            # 没出过方案就不拦：这句可能是在闲聊，交回排行程流程正常处理
+            if not (self.plan_made and self.last_plan):
+                return None
+            return self._plan_qa_answer(utterance)
+        if kind == "general":
+            return self._general_answer(utterance)
         return None
 
     # -------------------------------------------------- 主入口
@@ -407,7 +427,16 @@ class Session:
         # 之前所有输入都被当成「补槽位」，于是问天气会被回「排行程还差 2 件事」，
         # 问到第三轮还会硬凑出一份别的城市的行程。
         kind = intent.classify(utterance)
-        if kind in ("weather", "poi", "transport", "smalltalk"):
+        # 规则认不出（other）但句子像个提问时，让模型兜底分类一次。
+        # 「故宫需要预约吗」这类问法词表覆盖不全，靠这一层接住；
+        # 分类失败/说 none 就照旧走排行程流水线。
+        if kind == "other" and self.client is not None \
+                and intent.looks_like_question(utterance):
+            alt = llm.classify_intent(self.client, utterance)
+            if alt in ("weather", "poi", "transport", "plan_qa", "general"):
+                kind = alt
+        if kind in ("weather", "poi", "transport", "smalltalk",
+                    "plan_qa", "general"):
             text = self._answer(kind, utterance)
             if text is not None:
                 self.history.append({"role": "agent", "content": text})
@@ -730,6 +759,7 @@ class Session:
 
         # 记下这次出过方案：后续"重新排/再加一个"都按改现有行程处理
         self.plan_made = True
+        self.last_plan = result
         self.last_plan_desc = f"{slots.get('destination')} {slots.get('days')} 天"
         self.pending_spot = None
         self.pending_must = []
@@ -791,6 +821,106 @@ class Session:
                         f"{intent._SERVICEABLE_HINT}。")
         return intent.spot_answer(city, spot, items, note=note,
                                   client=self.client)
+
+    def _plan_qa_answer(self, utterance: str) -> str:
+        """回答「总结一下这个行程」「这个行程怎么样」：事实来自最近一次方案。"""
+        r = self.last_plan or {}
+        s = r.get("slots") or {}
+        days_plan = r.get("days_plan") or []
+        budget = r.get("budget") or {}
+        facts = {
+            "目的地": s.get("destination"),
+            "出发地": s.get("origin") or "未指定",
+            "出行日期": s.get("date_range"),
+            "天数": s.get("days"),
+            "人数": s.get("party_size"),
+            "预算总额元": budget.get("total"),
+            "每天安排": [{"第几天": d.get("day"),
+                        "内容": [n.get("name") for n in d.get("nodes") or []]}
+                       for d in days_plan],
+            "需要提前预约": sorted({n.get("name") for d in days_plan
+                              for n in d.get("nodes") or []
+                              if n.get("booking_required")}),
+            "备注假设": (r.get("assumptions") or [])[:4],
+        }
+        said = llm.compose_reply(self.client, "plan_qa", facts, utterance,
+                                 must_keep=[x for x in (s.get("destination"),)
+                                            if x])
+        if said:
+            return said
+        lines = [f"这份行程概括：{s.get('destination')} {s.get('days')} 天"]
+        if s.get("origin"):
+            lines[0] += f"（从{s['origin']}出发）"
+        for d in days_plan:
+            names = " → ".join(n.get("name") for n in d.get("nodes") or [])
+            lines.append(f"- 第 {d.get('day')} 天：{names}")
+        if budget.get("total"):
+            lines.append(f"- 预算合计约 {budget['total']} 元")
+        return "\n".join(lines)
+
+    def _general_answer(self, utterance: str) -> str | None:
+        """通用旅行问题：先联网检索，再让模型组织；没模型就渲染带来源的摘要列表。
+
+        检索词：模型改写 > websearch.keywords() 启发式。整句自然语言直接
+        丢给搜索引擎会被稀释成前两个字，这一步决定检索质量。
+        返回 None 表示连联网也没查到且没有模型可用——交回原流程，
+        宁可被追问一句，也不编一段像模像样的假答案。
+        """
+        q = websearch.keywords(utterance)
+        if self.client is not None:
+            better = llm.rewrite_query(self.client, utterance)
+            if better:
+                q = better
+        res = websearch.search(q)
+        results = res.get("results") or []
+        facts = {"问题": utterance,
+                 "检索状态": res.get("note") or "",
+                 "检索结果": [{"标题": x.get("title"), "摘要": x.get("snippet"),
+                             "来源": x.get("site")} for x in results]}
+        said = llm.compose_reply(self.client, "general", facts, utterance)
+        if said:
+            sources = list(dict.fromkeys(
+                x.get("site") for x in results if x.get("site")))[:4]
+            if sources:
+                said += "\n\n> 信息来源：" + "、".join(sources) + "（联网检索）"
+            return said
+        if not results:
+            return None
+        lines = ["我在网上查了一下，摘几条供参考："]
+        for x in results[:4]:
+            lines.append(f"- **{x.get('title')}**：{x.get('snippet')}"
+                         f"（{x.get('site')}）")
+        lines.append("\n以上是网页摘要；涉及价格、政策、时刻的，请以官方渠道为准。")
+        return "\n".join(lines)
+
+    def _nearby_qa(self, city: str, spot: str) -> str:
+        """「XX周边/附近有什么」：以点名景点为圆心，报出库里最近的几个景点。"""
+        r = agent.dispatch("search_poi", {"city": city, "keyword": spot,
+                                          "limit": 1})
+        base = (r.get("items") or [None])[0] if r.get("ok") else None
+        if not (base and base.get("geo")):
+            # 点名没查到坐标：按普通景点问答处理（在线补资料的那套都在那边）
+            return self._spot_qa(city, spot)
+        # 展示名用库里的全名：城市剥前缀后 spot 可能只剩「古城」半个词
+        spot_disp = base.get("name") or spot
+        lat, lon = base["geo"][0], base["geo"][1]
+        allp = agent.dispatch("search_poi", {"city": city, "limit": 60})
+        items = (allp.get("items") or []) if allp.get("ok") else []
+        near = []
+        for p in items:
+            if not p.get("geo") or p.get("category") != "attraction":
+                continue
+            pname = p.get("name") or ""
+            if pname == spot_disp or pname in spot or spot in pname:
+                continue          # 中心点自己不算"周边"
+            km = haversine_km((lat, lon), p["geo"])
+            if km <= 20:
+                near.append({**p, "_km": round(km, 1)})
+        near.sort(key=lambda p: p["_km"])
+        if not near:
+            return (f"「{spot_disp}」周边 20 公里内的景点数据我收录得还不够，不敢瞎推荐。\n"
+                    f"可以问「{city}有什么好玩的」，或者直接让我排一份{city}的行程。")
+        return intent.nearby_answer(city, spot_disp, near[:5], client=self.client)
 
     def _coverage(self, dest: str) -> bool:
         """目的地是否有可排数据；没有就先在线查一次并入库（每城一次）。

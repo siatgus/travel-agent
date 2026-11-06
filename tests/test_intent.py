@@ -52,6 +52,25 @@ def test_classify() -> None:
         ("11月8号去大理玩4天，2人，预算6000", "plan"),
         ("北京天气好的话帮我排个行程", "plan"),   # 混合句以规划为准
         ("下个月想去大理玩五天", "plan"),
+        # 行程问答必须赢过"行程"这个规划关键词
+        ("将行程总结成一段话", "plan_qa"),
+        ("帮我概括一下这个行程", "plan_qa"),
+        ("这个行程怎么样", "plan_qa"),
+        ("把行程总结一下发我", "plan_qa"),
+        # 改行程的说法不是问答
+        ("重新排一下这个行程", "plan"),
+        ("这个行程加上迪士尼再排", "plan"),
+        # 点名 + 周边/附近 → 景点问答
+        ("天安门广场周边有什么", "poi"),
+        ("外滩附近有什么好玩的", "poi"),
+        ("介绍一下故宫", "poi"),
+        # 疑问句里没有规划动词：在问事，不是要行程（曾把"日本"当景点排进去）
+        ("去日本旅游需要办签证吗", "other"),
+        ("去北京玩怎么样？", "other"),
+        ("大理旅游贵不贵", "other"),
+        # 有规划动词的问句仍是规划请求
+        ("能帮我安排一下吗", "plan"),
+        ("帮我排个大理的行程吧？", "plan"),
     ]
     bad = [(t, want, intent.classify(t)) for t, want in cases
            if intent.classify(t) != want]
@@ -224,12 +243,47 @@ def test_no_destination_no_plan() -> None:
           "城市" in r.question or "哪儿" in r.question, r.question[:60])
 
 
+def test_question_shape() -> None:
+    """通用问句探测 + 周边问句剥词：LLM 兜底分类和周边问答的门卫。"""
+    check("「天安门广场周边有什么」是问句",
+          intent.looks_like_question("天安门广场周边有什么"))
+    check("「预算6000」不是问句",
+          not intent.looks_like_question("预算6000"))
+    check("「杭州」不是问句", not intent.looks_like_question("杭州"))
+    check("「去大理玩四天吧」不是问句",
+          not intent.looks_like_question("去大理玩四天吧"))
+    check("「需要办签证吗」是问句",
+          intent.looks_like_question("去日本需要办签证吗"))
+    # 周边问句要能剥出中心景点名
+    check("剥出「天安门广场」",
+          intent.spot_mention("天安门广场周边有什么", "北京") == "天安门广场")
+    check("剥出「外滩」",
+          intent.spot_mention("外滩附近有什么", "上海") == "外滩")
+    # 泛问（城市+周边）不剥出假景点
+    check("「上海周边有什么」不剥出景点",
+          intent.spot_mention("上海周边有什么", "上海") is None)
+
+
+def test_nearby_answer_template() -> None:
+    """周边问答的模板路径：有数据按距离列、没数据如实说。"""
+    pois = [{"name": "崇圣寺三塔", "area": "古城北", "cost": 75,
+             "duration_min": 150, "_km": 2.8},
+            {"name": "洱海生态廊道", "area": "才村码头", "cost": 0,
+             "duration_min": 120, "_km": 2.7}]
+    out = intent.nearby_answer("大理", "大理古城", pois)
+    check("模板按距离列出周边景点", "崇圣寺三塔" in out and "2.8" in out, out[:80])
+    check("模板中心点写全名", "大理古城" in out)
+    empty = intent.nearby_answer("大理", "无名点", [])
+    check("没数据时如实说，不编", "不敢瞎推荐" in empty or "不够" in empty)
+
+
 def main() -> int:
     for fn in (test_classify, test_city_parsing, test_weather_answer_format,
                test_weather_never_becomes_plan, test_weather_then_plan_switch,
                test_poi_answer_no_invent, test_spot_mention,
                test_spot_answer_template, test_poi_answer_autofetch,
-               test_smalltalk,
+               test_smalltalk, test_question_shape,
+               test_nearby_answer_template,
                test_no_destination_no_plan):
         fn()
 

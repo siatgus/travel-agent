@@ -715,6 +715,15 @@ _KIND_TASK = {
                "这是第几次问已经写明，第二次问要换说法，别复读上一轮。",
     "assumption": "信息不全但要先给方案。用【假设】里的内容说清你替他定了什么，"
                   "语气是商量（「我先按…」），不是通知。",
+    "plan_qa": "用户要你总结/概括/评价当前这份行程。只根据【事实】里的内容回答："
+               "说清每天去哪儿、住哪、大概花销和要注意的假设；"
+               "用户要一段话就给一段通顺的话，不要列表。"
+               "禁止新增事实里没有的景点、日期或金额。",
+    "general": "用户问了一个通用旅行问题，【检索】是刚从网上搜到的结果摘要。"
+               "优先依据检索内容回答，关键信息顺带注明来源（如「据马蜂窝」）；"
+               "检索结果为空或与问题无关时，凭常识回答，并明确说一句"
+               "这不是实时查证的信息、出行相关细节请再核实。"
+               "不编造具体价格、政策条文和时刻。",
 }
 
 _REPLY_LIMIT = 700
@@ -809,6 +818,65 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     if not _numbers_faithful(text, facts):
         return None
     return text
+
+
+def rewrite_query(client: Client | None, question: str) -> str | None:
+    """把用户的自然语言问题改写成搜索引擎关键词（空格分隔）。
+
+    实测必应对整句自然语言会稀释成前两个字，必须给关键词。
+    任何失败返回 None，调用方回落 websearch.keywords() 启发式。
+    """
+    if client is None:
+        return None
+    q = (question or "").strip()
+    if len(q) < 2:
+        return None
+    sys_p = ("把旅行问题改写成 2~4 个适合搜索引擎的关键词，用空格分隔。"
+             "只输出关键词本身：不要标点、不要引号、不要解释。"
+             "例：「去日本旅游需要办签证吗」→ 日本 旅游签证 办理")
+    try:
+        text = _clean_reply(client.chat(sys_p, q), 60)
+        text = text.strip().strip("\"'“”‘’「」")
+        if not text or len(text) > 60:
+            return None
+        return text
+    except LLMError:
+        return None
+
+
+# ------------------------------------------------------------------ 意图兜底
+
+_INTENT_LABELS = ("weather", "poi", "transport", "plan_qa", "general", "none")
+
+_INTENT_SYS = (
+    "你是旅行助手的意图分类器。判断用户这句话想做什么，只输出 JSON："
+    '{"intent":"..."}，不要解释。可选值：\n'
+    "weather=问天气；poi=问景点/地方/门票/介绍/周边；transport=问交通班次；\n"
+    "plan_qa=要总结或评价当前行程；general=其他旅行相关问题"
+    "（签证、证件、注意事项、常识等）；\n"
+    "none=都不是——比如在回答追问、报信息、说需求、闲聊。"
+)
+
+
+def classify_intent(client: Client | None, text: str) -> str | None:
+    """规则分类器判为 other 时的 LLM 兜底：这句话到底是问什么。
+
+    只在调用方觉得"这句像个问题但规则认不出"时用（省一次调用）。
+    返回 _INTENT_LABELS 之一；模型/网络/输出格式任何问题都返回 None，
+    调用方回落原流程。QuotaError 不在这里捕——额度不足要拒绝服务。
+    """
+    if client is None:
+        return None
+    t = (text or "").strip()
+    if len(t) < 2:
+        return None
+    try:
+        raw = client.chat(_INTENT_SYS, t)
+        data, _ = extract_json(raw)
+        v = data.get("intent") if isinstance(data, dict) else None
+        return v if v in _INTENT_LABELS else None
+    except LLMError:
+        return None
 
 
 # ------------------------------------------------------------------ 工厂

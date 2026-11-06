@@ -31,7 +31,9 @@ WEATHER_KW = ("天气", "气温", "多少度", "几度", "冷不冷", "热不热
               "下雪", "晒不晒", "穿什么", "预报", "气候", "风大")
 POI_KW = ("有什么好玩", "有啥好玩", "好玩的地方", "好玩吗", "必去", "值得去",
           "景点", "打卡", "攻略", "怎么玩", "推荐玩", "有什么可以玩",
-          "门票", "开放时间", "营业时间", "闭馆")
+          "门票", "开放时间", "营业时间", "闭馆",
+          # 「天安门广场周边有什么」「外滩附近有什么」这类点名+泛问，也归景点问答
+          "周边", "附近", "周围", "介绍一下", "介绍下")
 TRANSPORT_KW = ("高铁", "动车", "火车", "机票", "航班", "班次", "车次", "票价",
                 "怎么去", "怎么走", "多久到", "怎么到")
 PLAN_KW = ("行程", "安排", "规划", "计划", "排一下", "排个", "帮我排", "玩几天",
@@ -39,22 +41,68 @@ PLAN_KW = ("行程", "安排", "规划", "计划", "排一下", "排个", "帮�
 SMALLTALK_KW = ("你是谁", "你叫什么", "你能做什么", "你会什么", "你好", "您好",
                 "谢谢", "谢了", "再见", "拜拜", "在吗", "早上好", "晚上好", "晚安")
 
+# 行程问答：用户要总结/评价当前这份行程，不是要重排。
+# 必须赶在 has_plan 之前判断——「将行程总结成一段话」里的"行程"会撞上 PLAN_KW，
+# 然后被拿去重新排一份一模一样的。
+_PLAN_QA_RE = re.compile(
+    r"总结|概括|汇总|一段话|几句话|简述|这个行程|这份行程|该行程|"
+    r"行程怎么样|行程如何|行程合理|行程有什么问题|行程点评|点评一下行程|"
+    r"讲讲这份|说说这份")
+# 这些是"改行程"的说法，虽然也带"行程"二字，但不是问答
+_PLAN_EDIT_RE = re.compile(
+    r"重新排|重排|再排|重新安排|换个排法|改一下|改成|调整|"
+    r"加上|加个|加一个|去掉|删掉|不要去|避开|换成")
+# 明确的"动手排"动词：句子里有它才算规划请求
+_PLAN_VERB_RE = re.compile(r"排|规划|安排|做.{0,3}攻略|做.{0,3}行程|定制")
+# 疑问句式：问句 + 没有规划动词 ≈ 在问问题，不是要出行程
+# （「去日本旅游需要办签证吗」之前被"旅游"关键词劫去重排行程）
+_INTERROG_RE = re.compile(
+    r"[？?]\s*$|[吗呢]\s*[。.？?！!]?\s*$|是不是|能不能|要不要|需不需要|可不可以"
+    r"|贵不贵|便不便宜|值不值|好不好玩|方不方便|远不远|难不难|累不累|多不多")
+
 # 数据覆盖说明：只对这几个城市能排具体行程（真实 POI/酒店）
 _SERVICEABLE_HINT = "大理、丽江、香格里拉、杭州、上海、邯郸"
 
 
-def classify(text: str) -> str:
-    """返回 weather / poi / transport / plan / smalltalk / other。
+def is_plan_qa(text: str) -> bool:
+    """这句话是在总结/评价当前行程吗（而不是要重排）。"""
+    t = text or ""
+    if not _PLAN_QA_RE.search(t):
+        return False
+    return not _PLAN_EDIT_RE.search(t)
 
-    优先级：规划意图 > 天气 > 景点 > 交通 > 闲聊。
+
+# 通用问句探测：给 LLM 兜底分类做门卫，也决定要不要走联网问答
+_QUESTION_RE = re.compile(
+    r"[?？]|什么|怎么|怎样|多少|几[点号月天个]|为什么|是否|能不能|可不可以|"
+    r"有没有|是不是|哪[里儿个座条]|介绍一下|讲讲|说说|告诉我|[吗呢]\s*[。.]?$")
+
+
+def looks_like_question(text: str) -> bool:
+    """像不像一个提问（而非在回答追问、补充信息）。超过 60 字的长句不拦。"""
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    return bool(_QUESTION_RE.search(t))
+
+
+def classify(text: str) -> str:
+    """返回 weather / poi / transport / plan / plan_qa / smalltalk / other。
+
+    优先级：行程问答 > 规划意图 > 天气 > 景点 > 交通 > 闲聊。
     「北京天气好的话排个行程」这类混合句按规划处理（用户最终要的是行程）。
     """
     t = text or ""
+    if is_plan_qa(t):
+        return "plan_qa"
     has_plan = (any(k in t for k in PLAN_KW)
                 or re.search(r"玩\s*[一二三四五六七八九十\d]+\s*天", t) is not None
                 or re.search(r"去.{2,6}(玩|旅游|旅行|度假)", t) is not None)
     if has_plan:
-        return "plan"
+        # 疑问句里没有规划动词的不当规划处理：「去日本旅游需要办签证吗」
+        # 是在问事，不是要行程——留给后面的意图（或 LLM 兜底）接。
+        if not (_INTERROG_RE.search(t) and not _PLAN_VERB_RE.search(t)):
+            return "plan"
     if any(k in t for k in WEATHER_KW):
         return "weather"
     if any(k in t for k in POI_KW):
@@ -335,7 +383,8 @@ _SPOT_EDGE = ("门票多少钱", "门票多少", "门票贵吗", "门票要钱�
               "怎么玩", "怎么走", "推荐一下", "值得吗", "推荐吗", "推荐", "攻略",
               "多少钱", "多少", "需要预约吗", "需要预约", "要预约吗", "预约",
               "想问问", "想知道", "想了解", "想去", "想去逛", "想逛", "请问",
-              "问一下", "问下", "告诉我", "查一下", "查下", "看看", "一下", "听说")
+              "问一下", "问下", "告诉我", "查一下", "查下", "看看", "一下", "听说",
+              "周边有什么", "附近有什么", "周围有什么", "周边", "附近", "周围")
 # 剥完还剩这些/以这些开头，说明用户问的是泛问题，不是某个具体景点
 _SPOT_GENERIC = ("景点", "好玩", "地方", "推荐", "天气", "行程", "几天", "交通",
                  "美食", "住宿", "酒店")
@@ -407,6 +456,35 @@ def spot_answer(city: str, spot: str, pois: list[dict], note: str = "",
     if note:
         lines.append(f"\n{note}")
     lines.append("\n想把它排进行程？说「我想去" + spot + "」我就重排。")
+    return "\n".join(lines)
+
+
+def nearby_answer(city: str, spot: str, pois: list[dict], client=None) -> str:
+    """回答「XX周边/附近有什么」：事实是库里按距离排好的邻近景点。"""
+    if not pois:
+        return (f"「{spot}」周边的景点数据我收录得还不够，不敢瞎推荐。\n"
+                f"可以问「{city}有什么好玩的」，或者直接让我排{city}的行程。")
+    facts = {"城市": city, "中心景点": spot,
+             "周边": [{"名称": p.get("name"), "区域": p.get("area"),
+                       "距离公里": p.get("_km"), "门票元": p.get("cost"),
+                       "建议游玩分钟": p.get("duration_min")}
+                      for p in pois[:5]]}
+    said = _speak(client, "poi", facts, f"{spot}周边有什么好玩的",
+                  [p.get("name") for p in pois[:2]] + [spot])
+    if said:
+        return said
+    lines = [f"**{spot}** 周边值得看看的（按距离从近到远）："]
+    for p in pois[:5]:
+        extra = []
+        if p.get("_km") is not None:
+            extra.append(f"约 {p['_km']} 公里")
+        if p.get("area"):
+            extra.append(p["area"])
+        if p.get("cost"):
+            extra.append(f"门票 {p['cost']} 元")
+        tail = f"（{'，'.join(extra)}）" if extra else ""
+        lines.append(f"- **{p['name']}**{tail}")
+    lines.append("\n想把哪个加进行程？说「我想去XX」就行。")
     return "\n".join(lines)
 
 
