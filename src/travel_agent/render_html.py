@@ -94,14 +94,29 @@ def render_map(result: dict, w: int = 660, h: int = 380) -> str:
         if not geos:
             continue
         coords = [pt(g) for g in geos]
-        if len(coords) > 1:
-            path = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+        # 坐标不可信的点位不进连线：估算点画出来的线段是假的，
+        # 只画确定坐标之间的段，虚线圆圈单独示意。
+        certain = [(n, c) for n, c in zip([x for x in d["nodes"] if x.get("geo")], coords)
+                   if not n.get("geo_uncertain")]
+        if len(certain) > 1:
+            path = " ".join(f"{c[1][0]:.1f},{c[1][1]:.1f}" for c in certain)
             parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" '
                          f'stroke-width="2" stroke-opacity="0.55" stroke-dasharray="6 4"/>')
         seq = 0
         placed: list[tuple[float, float]] = []
         for n, (x, y) in zip([x for x in d["nodes"] if x.get("geo")], coords):
             if n["type"] != "attraction":
+                continue
+            if n.get("geo_uncertain"):
+                # 位置估算：虚线空心圈 + ？，明确"这个点的坐标不可信"
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" fill="none" '
+                             f'stroke="{color}" stroke-width="2" stroke-dasharray="3 3"/>')
+                parts.append(f'<text x="{x:.1f}" y="{y+3.5:.1f}" font-size="10" fill="{color}" '
+                             f'text-anchor="middle">?</text>')
+                if all(abs(x - px) > 62 or abs(y - py) > 15 for px, py in placed):
+                    placed.append((x, y))
+                    parts.append(f'<text x="{x:.1f}" y="{y+21:.1f}" font-size="10" fill="#B4693F" '
+                                 f'text-anchor="middle">{esc(n["name"][:10])}·位置估算</text>')
                 continue
             seq += 1
             parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" fill="{color}"/>')
@@ -244,14 +259,22 @@ def render_transport(result: dict) -> str:
                 f'<span style="font-size:14px;color:#9A9992;">未安排</span>　'
                 f'<span style="font-size:12px;color:#9A9992;">未指定出发地</span></div>')
             continue
-        items = res.get("items") or [{}]
-        it = items[0]
+        items = res.get("items") or []
+        it = items[0] if items else {}
+        fare = it.get("total_price") or 0
+        if not it or not fare:
+            # 班次/票价没查到：显示 ¥0 会被当成"免费"，必须明说没查到、没计入
+            parts.append(
+                f'<div><span style="color:#8A8A82;font-size:12px;">{label}</span><br>'
+                f'<span style="font-size:14px;color:#9A9992;">未查到班次/票价</span><br>'
+                f'<span style="font-size:12px;color:#9A9992;">未计入预算，出发前请自行确认</span></div>')
+            continue
         parts.append(
             f'<div><span style="color:#8A8A82;font-size:12px;">{label}</span><br>'
             f'<span style="font-size:14px;">{esc(it.get("code", "—"))}</span>　'
             f'<span style="font-size:13px;color:#5F5E5A;">'
             f'{esc(it.get("depart", ""))} - {esc(it.get("arrive", ""))}　'
-            f'¥{it.get("total_price", 0):,.0f}</span></div>')
+            f'¥{fare:,.0f}</span></div>')
     return (f'<div class="card" style="margin-top:14px;display:flex;gap:48px;'
             f'flex-wrap:wrap;">{"".join(parts)}</div>')
 
@@ -274,6 +297,18 @@ def build_html(result: dict, utterance: str) -> str:
         for i, d in enumerate(days))
     checks_html = render_checks(result)
     transport_html = render_transport(result)
+    # 假设与建议（住宿片区、位置估算说明、预算口径）同步到页面，
+    # 别让用户只在聊天文本里见过一次，打开方案页却找不到依据。
+    _assum = result.get("assumptions") or []
+    _assumptions_html = ""
+    if _assum:
+        _assumptions_html = (
+            '<div style="border:1px solid #E8D9C8;background:#FCF8F2;border-radius:12px;'
+            'padding:14px 20px;margin-top:14px;">'
+            '<div style="font-size:13px;color:#8A5A26;margin-bottom:6px;">假设与建议</div>'
+            + "".join(f'<div style="font-size:13px;color:#5F5E5A;line-height:1.7;">'
+                      f'· {esc(a)}</div>' for a in _assum)
+            + '</div>')
 
     # 出行概要：出发地、日期、天数、人数、预算目标、节奏与偏好。
     # 出发地没说就写「未指定」并注明大交通未含——不填默认城市，不假装查过班次。
@@ -389,6 +424,8 @@ def build_html(result: dict, utterance: str) -> str:
 
   {transport_html}
 
+  {_assumptions_html}
+
   <h2>路线</h2>
   <div style="margin-bottom:10px;font-size:12px;color:#7A7972;">
     {''.join(f'<span style="display:inline-flex;align-items:center;gap:6px;margin-right:16px;">'
@@ -397,6 +434,8 @@ def build_html(result: dict, utterance: str) -> str:
              for i, d in enumerate(days))}
     <span style="display:inline-flex;align-items:center;gap:6px;">
       <i style="width:9px;height:9px;border-radius:2px;background:#444441;display:inline-block;"></i>住宿</span>
+    <span style="display:inline-flex;align-items:center;gap:6px;">
+      <i style="width:9px;height:9px;border-radius:50%;border:2px dashed #B4693F;display:inline-block;"></i>位置估算（坐标不可信，仅示意）</span>
   </div>
   <div class="card" style="padding:12px;">{render_map(result)}</div>
 

@@ -281,6 +281,10 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     all_pois = pois_res.get("items") or []
     attractions = [p for p in all_pois if p["category"] == "attraction"]
     foods = [p for p in all_pois if p["category"] == "restaurant"]
+    # 「不吃辣」这类硬口径：有就驱动餐厅筛选与点单提示，不许只躺在槽位里
+    _restrict = " ".join((slots.get("diet") or []) + (slots.get("hard_prefs") or [])
+                         + (slots.get("avoid") or []))
+    spicy_free = "辣" in _restrict
     days = slots["days"]
     cap = PACE_CAP[slots["pace"]]
     start = date.fromisoformat(slots["date_range"]["start"])
@@ -304,7 +308,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             hh, mm = (int(x) for x in outbound_arrive.split(":"))
             arrive = hh * 60 + mm
             nodes.append(_node(outbound_arrive, "抵达 + 入住", "transit", 90,
-                               "车站/机场打车", "先放行李再出门，老城住宿多在巷子里，导航到巷口下车"))
+                               "车站/机场打车", "先放行李再出门，稍作休整"))
             start_min = arrive + 90
             day_cap = 1 if arrive < 15 * 60 else 0
         elif i == days - 1:
@@ -360,20 +364,18 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             # 只在已经接近饭点（11:00 后）时才插，避免一早上就吃午饭。
             if (not lunch_done and i not in (0, days - 1) and clock >= 11 * 60
                     and clock + p["duration_min"] > 12 * 60 + 30):
-                pool = [f for f in foods if f.get("poi_id") not in used_food]
-                lunch = (_nearest(pool, "午餐", prev_geo, max_km=3.0)
-                         or _nearest(pool, "晚餐", prev_geo, max_km=6.0))
+                lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
+                                           ("晚餐", prev_geo, 6.0)],
+                                   spicy_free, used_food)
                 if lunch:
-                    lkm = haversine_km(prev_geo, lunch.get("geo") or prev_geo)
-                    lmode, lmin = transit_estimate(lkm, prev_geo, lunch.get("geo") or prev_geo)
+                    meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
+                                            spicy_free, slots, "先吃饭再逛，避免拖到下午两点")
                     clock += lmin
-                    nodes.append(_node(fmt(clock), lunch["name"], "restaurant",
-                                       lunch["duration_min"],
-                                       f"{lmode} {lmin}分钟（{lkm}km）",
-                                       "先吃饭再逛，避免拖到下午两点", lunch["cost"],
-                                       poi_id=lunch["poi_id"], geo=lunch["geo"]))
+                    nodes.append(meal)
                     used_food.add(lunch["poi_id"])
                     clock += lunch["duration_min"]
+                else:
+                    nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                 lunch_done = True
                 # 吃完再算一次到景点的路程（估算坐标不算）
                 if uncertain or prev_uncertain:
@@ -417,7 +419,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                                transit_txt, tip,
                                0 if rainy_swap else p["cost"],
                                booking_required=p["need_booking"] and not rainy_swap,
-                               poi_id=p["poi_id"], geo=p["geo"], interests=ints))
+                               poi_id=p["poi_id"], geo=p["geo"], interests=ints,
+                               geo_uncertain=uncertain))
             clock += p["duration_min"]
             # 估算坐标不能当天后续节点的基准点，否则误差会一路传下去
             if not uncertain:
@@ -428,47 +431,45 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             # 午餐：本段结束后已过 12:00 且当天还没吃，就近补一顿
             if (not lunch_done and i != days - 1 and clock >= 12 * 60
                     and clock <= 14 * 60 + 30):
-                pool = [f for f in foods if f.get("poi_id") not in used_food]
-                lunch = (_nearest(pool, "午餐", prev_geo, max_km=3.0)
-                         or _nearest(pool, "晚餐", prev_geo, max_km=6.0))
+                lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
+                                           ("晚餐", prev_geo, 6.0)],
+                                   spicy_free, used_food)
                 if lunch:
-                    lkm = haversine_km(prev_geo, lunch.get("geo") or prev_geo)
-                    lmode, lmin = transit_estimate(lkm, prev_geo, lunch.get("geo") or prev_geo)
+                    meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
+                                            spicy_free, slots, "当地口味，按你的忌口筛过一轮")
                     clock += lmin
-                    nodes.append(_node(fmt(clock), lunch["name"], "restaurant",
-                                       lunch["duration_min"],
-                                       f"{lmode} {lmin}分钟（{lkm}km）",
-                                       "当地小吃，不辣版本要主动说", lunch["cost"],
-                                       poi_id=lunch["poi_id"], geo=lunch["geo"]))
+                    nodes.append(meal)
                     used_food.add(lunch["poi_id"])
                     clock += lunch["duration_min"]
+                else:
+                    nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                 lunch_done = True
 
-        # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿
-        if not lunch_done and i not in (0, days - 1) and used_pois and foods:
+        # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
+        # 库里没有餐厅也得留出这段时间——"每天有明确用餐点"不是有数据才成立的承诺。
+        if not lunch_done and i not in (0, days - 1) and used_pois:
             clock = max(clock, 11 * 60 + 30)
-            pool = [f for f in foods if f.get("poi_id") not in used_food]
-            lunch = (_nearest(pool, "午餐", prev_geo, max_km=6.0)
-                     or _nearest(pool, "晚餐", prev_geo, max_km=6.0))
+            lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
+                                       ("晚餐", prev_geo, 6.0)],
+                               spicy_free, used_food)
             if lunch:
-                lkm = haversine_km(prev_geo, lunch.get("geo") or prev_geo)
-                lmode, lmin = transit_estimate(lkm, prev_geo, lunch.get("geo") or prev_geo)
+                meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
+                                        spicy_free, slots, "当天唯一一顿坐下来吃的，不用赶")
                 clock += lmin
-                nodes.append(_node(fmt(clock), lunch["name"], "restaurant",
-                                   lunch["duration_min"], f"{lmode} {lmin}分钟（{lkm}km）",
-                                   "当天唯一一顿坐下来吃的，不用赶", lunch["cost"],
-                                   poi_id=lunch["poi_id"], geo=lunch["geo"]))
+                nodes.append(meal)
                 used_food.add(lunch["poi_id"])
                 clock += lunch["duration_min"]
+            else:
+                nodes.append(_meal_fallback(clock, "午餐", spicy_free))
             lunch_done = True
 
         # 晚餐：定位到当日最后一个点位附近
         remaining = [x for x in remaining if x not in used_pois]
 
-        if i < days - 1 and foods:
-            pool = [f for f in foods if f.get("poi_id") not in used_food]
-            dinner = (_nearest(pool, "晚餐", prev_geo, max_km=6.0)
-                      or _nearest(pool, "晚餐", home, max_km=6.0))
+        if i < days - 1:
+            dinner = _pick_meal(foods, [("晚餐", prev_geo, 6.0),
+                                        ("晚餐", home, 6.0)],
+                                spicy_free, used_food)
             if dinner:
                 dkm = haversine_km(prev_geo, dinner.get("geo") or prev_geo)
                 dmode, dmin = transit_estimate(dkm, prev_geo, dinner.get("geo") or prev_geo)
@@ -477,11 +478,17 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     nodes.append(_node(fmt(clock + 30), "自由活动 / 回客栈休息", "rest",
                                        dinner_start - clock - 30, "—",
                                        "不强塞景点：这一段留白，累了就早回"))
+                d_tip = "回住宿方向顺路吃"
+                if spicy_free:
+                    d_tip += "；已按「不吃辣」优先不辣的店，点单时再确认一次"
                 nodes.append(_node(fmt(dinner_start), dinner["name"],
                                    "restaurant", dinner["duration_min"],
-                                   f"{dmode} {dmin}分钟（{dkm}km）",
-                                   "回住宿方向顺路吃，点单说明不要辣不要蘸水", dinner["cost"],
-                                   poi_id=dinner["poi_id"], geo=dinner["geo"]))
+                                   f"{dmode} {dmin}分钟（{dkm}km）", d_tip,
+                                   dinner["cost"], poi_id=dinner["poi_id"],
+                                   geo=dinner.get("geo"),
+                                   interests=_meal_interests(dinner, slots)))
+            else:
+                nodes.append(_meal_fallback(max(clock, 18 * 60), "晚餐", spicy_free))
 
         nodes.sort(key=lambda x: x["time"])
         cost = sum(n["cost"] for n in nodes if n["type"] == "attraction")
@@ -613,6 +620,83 @@ def _nearest(foods: list[dict], label: str, geo: list[float] | None,
     return best
 
 
+# 「不吃辣」能不能自动落实，取决于候选餐厅自己带不带辣线索：
+# 名字/标签/备注里出现麻辣词且没有"清汤/不辣"这类豁免标记的，先往后排。
+_SPICY_WORDS = ("麻辣", "红油", "火锅", "串串", "辣", "麻婆", "水煮", "香锅", "冒菜")
+_MILD_WORDS = ("清汤", "不辣", "免辣", "清淡", "素", "甜", "豆花", "茶")
+
+
+def _looks_spicy(f: dict) -> bool:
+    hay = f["name"] + "".join(f.get("tags") or []) + (f.get("note") or "")
+    if any(w in hay for w in _MILD_WORDS):
+        return False
+    return any(w in hay for w in _SPICY_WORDS)
+
+
+def _food_pool(foods: list[dict], spicy_free: bool) -> list[dict]:
+    """不吃辣时优先不辣的店；全城只有辣的也没办法，仍给全部，靠点单提示兜底。"""
+    if not spicy_free:
+        return foods
+    safe = [f for f in foods if not _looks_spicy(f)]
+    return safe or foods
+
+
+def _pick_meal(foods: list[dict], attempts: list[tuple[str, list[float] | None, float]],
+               spicy_free: bool, used_food: set[str]) -> dict | None:
+    """跨天选餐位。attempts 按顺序尝试（标签, 参照点, 最远距离）。
+
+    不吃辣的三级候选：没用过的不辣店 → 不辣店（哪怕中午刚去过——
+    回头吃茶馆也好过把人推进麻辣川菜）→ 实在没有才放开到全部。
+    """
+    unused = [f for f in foods if f.get("poi_id") not in used_food]
+    if spicy_free:
+        cands = ([f for f in unused if not _looks_spicy(f)]
+                 or [f for f in foods if not _looks_spicy(f)]
+                 or unused)
+    else:
+        cands = unused
+    for label, geo, mk in attempts:
+        pick = _nearest(cands, label, geo, max_km=mk)
+        if pick:
+            return pick
+    return None
+
+
+def _meal_fallback(clock: int, label: str, spicy_free: bool) -> dict:
+    """资料库没有餐厅也要照常留用餐时段：如实写"就近自选"，不冒充具体店。"""
+    tip = "资料库暂无当地餐厅，建议在上一站周边就近用餐，出发前看点评确认营业情况"
+    if spicy_free:
+        tip += "；不吃辣的话点单时说明要清汤/不辣"
+    return _node(fmt(clock), f"{label} · 就近自选", "restaurant", 60,
+                 "步行（就近）", tip, 60)
+
+
+def _meal_node(pick: dict, label: str, from_geo: list[float] | None,
+               clock: int, spicy_free: bool, slots: dict, tip: str) -> tuple[dict, int]:
+    """库里选中的餐位 → 节点。不吃辣时提示已筛过、点单再确认；茶馆强命中也挂兴趣标记。"""
+    km = haversine_km(from_geo or pick.get("geo") or [0, 0],
+                      pick.get("geo") or from_geo or [0, 0])
+    mode, tmin = transit_estimate(km, from_geo, pick.get("geo"))
+    full_tip = tip
+    if spicy_free:
+        full_tip += "；已按「不吃辣」优先不辣的店，点单时再确认一次"
+    node = _node(fmt(clock + tmin), pick["name"], "restaurant",
+                 pick["duration_min"], f"{mode} {tmin}分钟（{km}km）",
+                 full_tip, pick["cost"], poi_id=pick["poi_id"],
+                 geo=pick.get("geo"), interests=_meal_interests(pick, slots))
+    return node, tmin
+
+
+def _meal_interests(poi: dict, slots: dict) -> list[dict]:
+    """餐位也满足兴趣：喝茶这类就是靠茶馆落地的。只认强命中，弱命中别凑热闹。"""
+    ints = []
+    for w in (slots.get("soft_prefs") or []):
+        m = interest_match(w, poi)
+        if m and m[0] == "strong":
+            ints.append({"word": w, "level": m[0], "via": m[1]})
+    return ints
+
+
 def parse_hours(spec: str) -> tuple[int, int] | None:
     """解析 "08:30-16:00" → (510, 960)；"全天"/空值返回 None。"""
     if not spec or "-" not in spec:
@@ -660,13 +744,16 @@ def finalize_interests(plan: list[dict], slots: dict,
 def _node(time_s: str, name: str, type_: str, dur: int, transit: str, tip: str,
           cost: float = 0, booking_required: bool = False,
           poi_id: str | None = None, geo: list[float] | None = None,
-          interests: list[dict] | None = None) -> dict:
+          interests: list[dict] | None = None,
+          geo_uncertain: bool = False) -> dict:
     return {"time": time_s, "name": name, "type": type_, "duration_min": dur,
             "transit": transit, "tip": tip, "cost": cost,
             "booking_required": booking_required,
             "poi_id": poi_id, "geo": geo,
             # 这一站满足了哪些兴趣、是强命中还是沾边（渲染层据此打标签）
-            "interests": list(interests or [])}
+            "interests": list(interests or []),
+            # 坐标不可信：地图画虚线空心圈、不算里程（渲染层据此改样式）
+            "geo_uncertain": bool(geo_uncertain)}
 
 
 def fmt(minutes: int) -> str:

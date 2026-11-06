@@ -237,6 +237,8 @@ def _fake_result(**over):
         "assumptions": [],
         "weather": dict(WEATHER),
         "outbound": None, "inbound": None,
+        "hotel": {"ok": True, "items": [{"name": "客栈", "price": 400,
+                                         "geo": [30.66, 104.06]}]},
         "days_plan": [{
             "day": 1, "date": "2026-11-20", "theme": "抵达适应",
             "intensity": "low", "move_min": 20, "day_budget": 300,
@@ -310,11 +312,96 @@ def test_pace_noop_is_honest() -> None:
     check("原方案未被覆盖", s.last_plan is before)
 
 
+def test_transport_card_no_zero_fare() -> None:
+    """班次/票价没查到时不渲染「去程 — ¥0」：0 元会被当成免费。
+
+    2026-11-06 反馈：页面已注明大交通未含，交通卡仍显示两行 ¥0 占位。
+    """
+    from travel_agent.render_html import render_transport
+    h = render_transport(_fake_result(
+        outbound={"ok": True, "items": []}, inbound={"ok": True, "items": []}))
+    check("班次没查到时不渲染 ¥0", "¥0" not in h, h[:300])
+    check("写明未查到与未计入预算", "未查到" in h and "未计入预算" in h, h[:300])
+    h2 = render_transport(_fake_result(
+        outbound={"ok": True, "items": [
+            {"code": "G123", "depart": "08:00", "arrive": "11:30",
+             "total_price": 520}]},
+        inbound=None))
+    check("有票价时正常显示班次与金额", "G123" in h2 and "¥520" in h2, h2[:300])
+
+
+def test_meal_fallback_is_honest() -> None:
+    """库里没有餐厅也要留用餐时段，且如实写「就近自选」，不冒充具体店。"""
+    slots = dict(SLOTS)
+    slots["days"] = 3
+    slots["date_range"] = {"start": "2026-11-20", "end": "2026-11-22"}
+    no_food = [p for p in CHENGDU if p["category"] != "restaurant"]
+    plan, _ = composer.compose(slots, {"items": no_food}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    meals = [(d["day"], n) for d in plan for n in d["nodes"]
+             if n["type"] == "restaurant"]
+    check("无餐厅数据时仍排用餐时段", bool(meals),
+          str([(d, n["name"]) for d, n in meals]))
+    check("兜底餐如实写「就近自选」",
+          all("就近自选" in n["name"] for _, n in meals),
+          str([n["name"] for _, n in meals]))
+    check("兜底餐说明资料库没有餐厅数据",
+          all("资料库暂无当地餐厅" in n["tip"] for _, n in meals),
+          str([n["tip"] for _, n in meals]))
+    # 返程日不排正餐（早市/伴手礼后直接返程），抵达日与中间日都该有
+    days_with_meal = {d for d, _ in meals}
+    check("除返程日外每天都有用餐点", days_with_meal >= {1, 2},
+          str(days_with_meal))
+
+
+def test_diet_and_tea_land_in_meals() -> None:
+    """「不吃辣」驱动选店，「喝茶」靠茶馆落地成具体活动。"""
+    slots = dict(SLOTS)
+    slots["days"] = 3
+    slots["date_range"] = {"start": "2026-11-20", "end": "2026-11-22"}
+    mild = _poi("t1", "鹤鸣茶社", [30.6596, 104.0565], cat="restaurant",
+                dur=60, cost=30, hours="08:00-22:00",
+                tags=["茶馆", "喝茶", "盖碗茶", "午餐", "晚餐", "不辣"],
+                note="盖碗茶，竹椅露天")
+    hot = _poi("t2", "陈麻婆豆腐", [30.66, 104.06], cat="restaurant",
+               dur=60, cost=80, hours="11:00-21:00",
+               tags=["辣", "川菜"], note="麻辣川菜")
+    pool = [p for p in CHENGDU if p["category"] != "restaurant"] + [mild, hot]
+    plan, _ = composer.compose(slots, {"items": pool}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    meals = [n for d in plan for n in d["nodes"]
+             if n["type"] == "restaurant" and "就近自选" not in n["name"]]
+    check("不吃辣时不选麻辣川菜",
+          bool(meals) and all("陈麻婆" not in n["name"] for n in meals),
+          str([n["name"] for n in meals]))
+    tea = [n for d in plan for n in d["nodes"] if n["name"] == "鹤鸣茶社"]
+    check("茶馆作为用餐位排进行程", bool(tea))
+    if tea:
+        ints = tea[0].get("interests") or []
+        check("餐位节点也标兴趣（喝茶·强命中）",
+              any(i["word"] == "喝茶" and i["level"] == "strong" for i in ints),
+              str(ints))
+        check("点单提示按不吃辣生成", "不吃辣" in tea[0]["tip"], tea[0]["tip"])
+
+
+def test_map_marks_uncertain_points() -> None:
+    """坐标估算的点在示意图上必须一眼能认出来：虚线空心圈 + 位置估算标注。"""
+    from travel_agent.render_html import render_map
+    plan, _ = _compose()
+    svg = render_map(_fake_result(days_plan=plan))
+    check("不确定点画虚线空心圈", 'stroke-dasharray="3 3"' in svg, svg[:400])
+    check("旁边标注「位置估算」", "位置估算" in svg, svg[:400])
+    # 确定坐标的点还是实心圆序号
+    check("确定坐标的点仍是实心序号圆", 'fill="#fff"' in svg)
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
                test_interest_matcher, test_weather_window_is_per_day,
-               test_forecast_window_self_heal,
+               test_forecast_window_self_heal, test_transport_card_no_zero_fare,
+               test_meal_fallback_is_honest, test_diet_and_tea_land_in_meals,
+               test_map_marks_uncertain_points,
                test_render_budget_and_weather, test_pace_noop_is_honest):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

@@ -198,6 +198,8 @@ def _explicit_fields(text: str, delta: dict) -> set[str]:
         got.add("avoid")
     if re.search(r"不想太赶|轻松|躺平|休闲|特种兵|尽量多|打卡", text):
         got.add("pace")
+    if delta.get("stay_pref"):
+        got.add("stay_pref")
     return got
 
 

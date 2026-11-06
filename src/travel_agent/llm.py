@@ -299,8 +299,8 @@ def coerce_slots(raw: dict, today: date | None = None):
 
     known = {"destination", "origin", "date_range", "days", "party_size",
              "budget_total", "budget_per_person", "hard_prefs", "soft_prefs",
-             "pace", "must_visit", "avoid", "uncertain_fields", "confidence",
-             "note"}
+             "pace", "must_visit", "avoid", "stay_pref",
+             "uncertain_fields", "confidence", "note"}
     for k in raw:
         if k not in known:
             warnings.append(f"丢弃未知字段 {k}")
@@ -309,8 +309,13 @@ def coerce_slots(raw: dict, today: date | None = None):
         "destination": None, "origin": None, "date_range": None, "days": None,
         "party_size": 1, "budget_total": None, "budget_per_person": None,
         "hard_prefs": [], "soft_prefs": [], "must_visit": [], "avoid": [],
-        "pace": "moderate", "uncertain_fields": [],
+        "pace": "moderate", "uncertain_fields": [], "stay_pref": None,
     }
+
+    # 住宿偏好：一句话原样保留，选房建议要用它指片区
+    v = raw.get("stay_pref")
+    if isinstance(v, str) and v.strip():
+        slots["stay_pref"] = v.strip()[:60]
 
     for key, lo, hi in (("days", 1, 30), ("party_size", 1, 20),
                         ("budget_total", 100, 200000),
@@ -517,6 +522,7 @@ SLOT_SYSTEM = """你是行程需求抽取器。只输出一个 JSON 对象，不
 - 改口：「把X加回来」「X还是安排上吧」「不去X了，改主意了」一律把 X 写进 must_visit，
   并且**不要**同时写进 avoid（两个数组互为反义，同时出现会让需求自相矛盾）
 - pace: "relaxed" | "moderate" | "intensive"
+- stay_pref: 住宿偏好一句话原样摘录（「住宿靠近地铁安静点」「住古城里」），没提填 null
 - uncertain_fields: 你不确定的字段名数组
 
 规则：

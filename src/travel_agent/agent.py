@@ -361,7 +361,7 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         "destination": None, "origin": None, "date_range": None, "days": None,
         "party_size": 1, "budget_total": None, "budget_per_person": None,
         "hard_prefs": [], "pace": "moderate",
-        "must_visit": [], "avoid": [],
+        "must_visit": [], "avoid": [], "stay_pref": None,
     }
     uncertain: list[str] = []
 
@@ -487,6 +487,16 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         slots["pace"] = "relaxed"
     elif re.search(r"特种兵|尽量多|打卡", text):
         slots["pace"] = "intensive"
+
+    # ---- 住宿偏好：「住宿靠近地铁安静点」「住地铁口附近」----
+    # 之前只认"住X晚"这种天数口径，偏好描述整句丢掉，选房建议无从谈起。
+    _stay = None
+    if m := re.search(r"(?:住宿|住的地方|酒店|民宿)[^，。；\n]{0,24}", text):
+        _stay = m.group(0)
+    elif m := re.search(r"住[^，。；\n]{0,4}(?:靠近|离|挨着|附近)[^，。；\n]{0,18}", text):
+        _stay = m.group(0)
+    if _stay:
+        slots["stay_pref"] = _stay.strip()
 
     # ---- 点名必去 / 明确排除：行程修改的入口 ----
     # 「想去上海迪士尼玩，我不想去豫园」之后行程原封不动，是因为这两个槽位
@@ -814,6 +824,27 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         assumptions.append(
             f"{dest} 暂无住宿报价，住宿按 {hotel_price} 元/晚的常见均价估算，"
             f"订房前以实际房价为准")
+    # 住宿偏好要落到可执行的选房建议：按已排景点的几何中心指一个片区，
+    # 而不是把「近地铁安静」原样复述一遍。依据是行程数据，不是编的地名。
+    _stay_pref = " ".join(filter(None, [slots.get("stay_pref") or "", slots.get("lodge") or ""]))
+    if _stay_pref:
+        from .tools import haversine_km as _hk
+        _spots = [(n["name"], n["geo"]) for d in days_plan for n in d["nodes"]
+                  if n["type"] == "attraction" and n.get("geo")
+                  and not n.get("geo_uncertain")]
+        if _spots:
+            _c = (sum(g[0] for _, g in _spots) / len(_spots),
+                  sum(g[1] for _, g in _spots) / len(_spots))
+            _near2 = sorted(_spots, key=lambda x: _hk(_c, x[1]))[:2]
+            _area_txt = "、".join(nm for nm, _ in _near2)
+            assumptions.append(
+                f"住宿建议（偏好：{_stay_pref}）：大部分景点集中在 {_area_txt} 一带，"
+                f"订房选这一片步行/一站地铁可达的位置最省路上时间；"
+                f"要安静就避开主干道临街和酒吧区，优先小区型公寓/民宿")
+        else:
+            assumptions.append(
+                f"住宿建议（偏好：{_stay_pref}）：景点位置数据不全，"
+                f"建议等行程确定后再挑景点之间的位置订房")
     if hotel_relaxed and hotel.get("items"):
         assumptions.append(
             f"预算内（≤{price_cap} 元/晚）没有可用住宿，已放宽到 "
@@ -873,7 +904,11 @@ def outbound_label(res: dict | None) -> str:
         return "未安排"
     items = res.get("items") or []
     if not items:
-        return "交通（数据缺失）"
+        return "未查到班次/票价"
+    it = items[0]
+    if not (it.get("total_price") or it.get("price")):
+        # 班次查到了但没票价：文本侧也不许只说"交通"，让人误以为免费
+        return f"{it.get('code', '班次')}（票价未查到）"
     return f"{items[0]['code']} {items[0]['depart']}-{items[0]['arrive']}"
 
 
