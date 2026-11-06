@@ -1,0 +1,194 @@
+{
+  "$comment": "智能旅行规划助手 · 工具契约 v1.0。OpenAI function-calling 兼容格式，可直接喂给支持 tools 参数的模型，也可映射为 MCP / LangChain Tool。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询目的地指定日期区间的天气预报，用于决定户外/室内行程配比与装备建议。返回逐日天气，日期超出预报窗口（14 天）时返回历史同期气候均值并标记 is_forecast=false。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "城市名，中文，如「大理」「东京」。不要传省份名。"
+            },
+            "start_date": {
+              "type": "string",
+              "description": "开始日期，ISO 格式 YYYY-MM-DD"
+            },
+            "end_date": {
+              "type": "string",
+              "description": "结束日期，ISO 格式 YYYY-MM-DD"
+            }
+          },
+          "required": ["city", "start_date", "end_date"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_transport",
+        "description": "查询两地之间的交通方案（航班、高铁、长途汽车）。返回含出发到达时间、耗时、参考价的选项列表，按推荐度排序。用于确定首尾两天的行程时间窗。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "from_city": { "type": "string", "description": "出发城市中文名" },
+            "to_city": { "type": "string", "description": "到达城市中文名" },
+            "date": { "type": "string", "description": "出发日期 YYYY-MM-DD" },
+            "transport_type": {
+              "type": "string",
+              "enum": ["flight", "train", "coach", "any"],
+              "description": "交通方式，默认 any"
+            },
+            "party_size": {
+              "type": "integer",
+              "description": "同行人数，用于计算总价",
+              "minimum": 1
+            }
+          },
+          "required": ["from_city", "to_city", "date"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_hotel",
+        "description": "按城市、入住区间和预算搜索酒店。返回酒店名、区域、星级、参考价/晚、距核心景点距离。优先返回可免费取消的选项。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string", "description": "城市中文名" },
+            "check_in": { "type": "string", "description": "入住日期 YYYY-MM-DD" },
+            "check_out": { "type": "string", "description": "退房日期 YYYY-MM-DD" },
+            "guests": { "type": "integer", "description": "入住人数（含儿童）", "minimum": 1 },
+            "rooms": { "type": "integer", "description": "房间数，默认 1", "minimum": 1 },
+            "max_price_per_night": {
+              "type": "number",
+              "description": "每晚最高预算（元），不传则不限制"
+            },
+            "preferred_area": {
+              "type": "string",
+              "description": "偏好区域，如「古城南门」「近地铁」。用于动线优化。"
+            },
+            "star_level": {
+              "type": "integer",
+              "description": "最低星级 1-5，不传则不限制",
+              "minimum": 1,
+              "maximum": 5
+            }
+          },
+          "required": ["city", "check_in", "check_out", "guests"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_poi",
+        "description": "按城市和主题搜索景点/餐厅/体验类 POI。返回名称、类型、坐标、建议游玩时长、门票参考价、营业时间、是否需预约。用于单日路线排序。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string", "description": "城市中文名" },
+            "keyword": {
+              "type": "string",
+              "description": "主题或关键词，如「古城」「亲子」「本地菜」「博物馆」「徒步」"
+            },
+            "category": {
+              "type": "string",
+              "enum": ["attraction", "restaurant", "experience", "any"],
+              "description": "POI 类型，默认 any"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回条数上限，默认 8，最大 20",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "near": {
+              "type": "string",
+              "description": "希望靠近的地点或区域名，用于地理聚类"
+            }
+          },
+          "required": ["city"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "calc_budget",
+        "description": "汇总行程各项费用并核算总预算、人均费用、与目标区间的差额。纯计算工具，不做网络查询。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "items": {
+              "type": "array",
+              "description": "费用明细列表",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": ["transport", "hotel", "ticket", "food", "local_transit", "other"]
+                  },
+                  "label": { "type": "string", "description": "明细说明，如「大理→丽江 高铁 2 等座」" },
+                  "amount": { "type": "number", "description": "该项总金额（元，全队合计）" }
+                },
+                "required": ["category", "label", "amount"]
+              }
+            },
+            "party_size": { "type": "integer", "description": "人数，用于算人均", "minimum": 1 },
+            "budget_target": {
+              "type": "number",
+              "description": "用户预算上限（元，全队合计），用于算差额"
+            },
+            "contingency_rate": {
+              "type": "number",
+              "description": "机动预留比例，默认 0.1",
+              "minimum": 0,
+              "maximum": 0.5
+            }
+          },
+          "required": ["items", "party_size"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "save_preference",
+        "description": "将用户的长期稳定偏好写入用户档案，供后续会话复用。仅在用户明确表达或确认偏好时调用，单次行程约束不要写入。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "偏好键，使用小写下划线，如 food_avoid、no_hiking、wake_up_early、home_city"
+            },
+            "value": { "type": "string", "description": "偏好值，尽量具体，如「不吃香菜和内脏」" },
+            "confidence": {
+              "type": "number",
+              "description": "置信度 0-1。用户直述=0.9，推断=0.6",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "source": {
+              "type": "string",
+              "description": "来源，user_explicit 或 inferred"
+            }
+          },
+          "required": ["key", "value"]
+        }
+      }
+    }
+  ],
+  "error_contract": {
+    "empty_result": "返回 { \"ok\": true, \"items\": [] }，由 Agent 决定放宽条件或告知用户",
+    "tool_failure": "返回 { \"ok\": false, \"error\": { \"code\": \"UPSTREAM_TIMEOUT\", \"message\": \"...\", \"retryable\": true } }",
+    "retry_policy": "retryable=true 时最多重试 1 次，且必须变更参数；仍失败则降级告知用户"
+  }
+}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "travel-agent"
+version = "1.0.0"
+description = "智能旅行规划助手：真实天气/路网/班次数据驱动的本地旅行规划服务（纯标准库，零 pip 依赖）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+travel-agent = "travel_agent.server:main"
+travel-admin = "travel_agent.admin:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# 运行时数据（data/）不进分发包：账号库含凭据、设置文件含 API Key

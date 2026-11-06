@@ -1,0 +1,18 @@
+# 运行时数据（账号/积分/对话/知识库/模型配置，均不得入库）
+data/
+*.db
+*.db-shm
+*.db-wal
+.user_prefs.json
+.llm_settings.json
+
+# Python 产物
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# 本地产物
+output/
+.workbuddy/
