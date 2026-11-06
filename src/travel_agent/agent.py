@@ -615,7 +615,17 @@ def resolve_date_range(slots: dict, today: date | None = None
 
 
 def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None,
-              today: date | None = None) -> dict:
+              today: date | None = None,
+              on_phase: "Callable[[str], None] | None" = None) -> dict:
+    """on_phase：阶段回调（给等待页显示"现在在做什么"），不参与任何决策。"""
+    def _phase(text: str) -> None:
+        if on_phase:
+            try:
+                on_phase(text)
+            except Exception:
+                pass
+
+    _phase("正在查天气、酒店与景点数据…")
     # today 必须可传入：Session 有自己的模拟日期，但这里原来用 date.today()，
     # 日期一跨月测试里「下个月一号」就翻成明年，同一份代码昨天绿今天红。
     slots, date_note = resolve_date_range(slots, today=today)
@@ -647,8 +657,7 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
     price_cap = round((slots["budget_total"] or 6000) * 0.08)
     hotel = call("search_hotel", {"city": dest, "check_in": start.isoformat(),
                                   "check_out": end.isoformat(), "guests": n,
-                                  "max_price_per_night": price_cap,
-                                  "preferred_area": "古城南门"}, 1)
+                                  "max_price_per_night": price_cap}, 1)
     hotel_relaxed = False
     if hotel.get("ok") and not hotel.get("items"):
         # 条件过严无匹配 → 换参数重试（放宽价格上限），而不是拿空列表往下走
@@ -728,6 +737,7 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                                       else f"降级规则排序：{rec.degraded}")})
             return order
 
+    _phase("正在编排每日动线与用餐…")
     days_plan, decision_log = compose(slots, pois, weather, arrival,
                                       outbound_depart_last=depart_last,
                                       hotel_geo=hotel_geo,
@@ -771,12 +781,14 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                        if node["type"] == "attraction") * n
     items = []
     if has_origin:
-        items += [
-            {"category": "transport", "label": f"往 {outbound_label(outbound)}",
-             "amount": pick(outbound, 0) * n},
-            {"category": "transport", "label": f"返 {outbound_label(inbound)}",
-             "amount": pick(inbound, 0) * n},
-        ]
+        # 班次没查到（价格 0）就不要往预算里塞一行「¥0 交通（数据缺失）」：
+        # 0 元大交通会让人以为路费不要钱，假设里已经写明"请自行确认"。
+        for _leg, _res in (("往", outbound), ("返", inbound)):
+            _amt = pick(_res, 0) * n
+            if _amt:
+                items.append({"category": "transport",
+                              "label": f"{_leg} {outbound_label(_res)}",
+                              "amount": _amt})
     items += [
         {"category": "hotel", "label": f"{(hotel.get('items') or [{}])[0].get('name', '住宿（按城市均价估算）')} {nights}晚×{rooms}间",
          "amount": hotel_price * nights * rooms},
@@ -786,6 +798,7 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         {"category": "local_transit", "label": "市内交通（人均 60/天估算）",
          "amount": 60 * days * n},
     ]
+    _phase("正在核算预算与校验行程可行性…")
     budget = dispatch("calc_budget", {"items": items, "party_size": n,
                                       "budget_target": slots["budget_total"],
                                       "contingency_rate": 0.1})
@@ -993,7 +1006,10 @@ def summary_lines(result: dict) -> list[str]:
     # 以前这里会悄悄填上默认城市，用户从成都走也收到一份「杭州-大理」。
     origin_disp = origin if origin else "未指定（大交通未含）"
 
-    budget = (f"- **预算合计**：约 {round(b['total']):,} 元 / {n} 人"
+    # 预算口径必须写在标题里：不含大交通时只报"3,718 元"很容易被当成整趟花费
+    budget_head = ("- **预算合计（不含往返大交通）**" if not origin
+                   else "- **预算合计**")
+    budget = (f"{budget_head}：约 {round(b['total']):,} 元 / {n} 人"
               f"（人均 {round(b['per_person']):,} 元，含 10% 机动）")
     if b.get("target"):
         gap = b["target"] - b["total"]
@@ -1023,6 +1039,28 @@ def _wx_line(w: dict) -> str:
     return f"{desc}，{w['low']}~{w['high']}℃"
 
 
+# 预算分类的中文名（与 render_html.BUDGET_LABELS 同源；正文里不能直接打英文键）
+_BUDGET_CN = {
+    "transport": "往返大交通", "hotel": "住宿", "ticket": "门票",
+    "food": "餐饮", "local_transit": "市内交通", "other": "其他",
+}
+
+
+def _wx_caliber(weather: dict) -> str:
+    """天气口径一句话：预报窗口内是真实预报，窗口外是历史同期，必须写清楚。"""
+    days = weather.get("days") or []
+    if not days:
+        return ""
+    forecast = [d for d in days if d.get("is_forecast")]
+    if len(forecast) == len(days):
+        return "天气数据：Open-Meteo 实时预报"
+    if not forecast:
+        return ("天气数据：这几天的日期超出 16 天预报窗口，按 2023-2025 年"
+                "同期历史均值估算，不是实时预报，出行前请再查一次")
+    return ("天气数据：前段是 Open-Meteo 实时预报，后段日期超出 16 天窗口，"
+            "用历史同期均值估算（已在每日里标注）")
+
+
 def render(result: dict) -> str:
     s, b = result["slots"], result["budget"]
     out = [
@@ -1033,6 +1071,9 @@ def render(result: dict) -> str:
         out.append(f"> 假设：{'；'.join(result['assumptions'])}")
     if (result.get("weather") or {}).get("advice"):
         out.append(f"> 天气提醒：{result['weather']['advice']}")
+    _cal = _wx_caliber(result.get("weather") or {})
+    if _cal:
+        out.append(f"> {_cal}")
     out += [
         "### 出行概要",
         *summary_lines(result),
@@ -1056,12 +1097,17 @@ def render(result: dict) -> str:
         out.append(f"\n**今日预算**：约 {d['day_budget']} 元　**雨天备案**：{d['rainy_plan']}\n")
 
     out.append("### 预算明细")
-    out.append("| 项目 | 金额 | 说明 |")
-    out.append("|---|---|---|")
     for item in b["breakdown"]:
-        out.append(f"| {item['category']} | {item['amount']} | {item['label']} |")
-    out.append(f"| 机动 | {b['contingency']} | 10% 预留 |")
-    out.append(f"| **合计** | **{b['total']}** | 人均 {b['per_person']} |")
+        # 以前直接打 category（local_transit 这种英文键名），用户看不懂；
+        # 表格窄列还会把金额和说明挤断行。改成「中文项目 —— 金额：说明」的列表。
+        cn = _BUDGET_CN.get(item["category"], item["category"])
+        out.append(f"- **{cn}**　¥{round(item['amount']):,}　{item['label']}")
+    out.append(f"- **机动（10% 预留）**　¥{round(b['contingency']):,}")
+    if not (result.get("origin") or s.get("origin")):
+        out.append(f"- **合计**　**¥{round(b['total']):,}**　人均 ¥{round(b['per_person']):,}"
+                   f"（**不含往返大交通**：出发地未指定，所以没有班次与票价）")
+    else:
+        out.append(f"- **合计**　**¥{round(b['total']):,}**　人均 ¥{round(b['per_person']):,}")
 
     if result.get("cut_plans"):
         over = b["total"] - b["target"]

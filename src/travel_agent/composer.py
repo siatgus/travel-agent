@@ -46,6 +46,57 @@ DAY_MOVE_BUDGET_MIN = 150  # 单日市内移动上限 2.5h
 # 营业时间上它合法（古城全天开放），但真实体验不成立。
 DAY_END_LATEST = 20 * 60
 
+# 兴趣词的同义扩展：用户说"看大熊猫"、库里叫"成都大熊猫繁育研究基地"，
+# 说"喝茶"、库里是"人民公园"（茶馆），说"老街"、库里是"宽窄巷子"。
+# 只靠标签精确匹配等于没做偏好——标签是英文类目，用户的兴趣是中文短语。
+INTEREST_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "大熊猫": ("熊猫", "繁育研究基地", "动物园"),
+    "熊猫": ("大熊猫", "繁育研究基地"),
+    "喝茶": ("茶", "茶馆", "茶社", "盖碗", "公园"),
+    "茶": ("喝茶", "茶馆", "茶社", "盖碗"),
+    "老街": ("巷", "古街", "古镇", "老城", "街子"),
+    "古镇": ("镇", "古城", "老街"),
+    "美食": ("小吃", "餐厅", "火锅", "food"),
+    "小吃": ("美食", "餐厅", "火锅"),
+    "博物馆": ("博物", "展览", "遗址"),
+    "夜景": ("夜游", "灯光", "江边", "河畔"),
+    "爬山": ("山", "索道", "登山"),
+    "公园": ("公园", "园林"),
+    "寺庙": ("寺", "庙", "宫", "观"),
+}
+
+
+def _geo_uncertain(poi: dict) -> bool:
+    """这个点的坐标是不是"按市区估算"的（未收录景点兜底）。
+
+    autofetch 的最后兜底会把用户点名的景点按城市中心落点，凑合排进行程。
+    这种坐标不能拿去算距离：都江堰会被算成"离武侯祠 8.81 公里、打车 16 分钟"，
+    而它其实在另一个市。位置不可靠就不给精确路线。
+    """
+    tags = poi.get("tags") or []
+    return ("用户点名" in tags or "位置估算" in tags
+            or "位置按市区估算" in (poi.get("note") or ""))
+
+
+def interest_hit(interest: str, poi: dict, strong_only: bool = False) -> bool:
+    """兴趣词是否命中这个点。
+
+    strong：兴趣原词直接出现在名称/标签/备注里（大熊猫 → 大熊猫基地）；
+    weak  ：靠同义词命中（喝茶 → 公园，因为人民公园有茶馆）。
+    名额紧张时只有 strong 才有资格当"兴趣锚点"——否则「喝茶」的同义词
+    「公园」会让望江楼公园顶掉用户真正想看的大熊猫。
+    """
+    i = (interest or "").strip()
+    if len(i) < 2:
+        return False
+    hay = " ".join(str(poi.get(k) or "") for k in
+                   ("name", "area", "note")) + " " + " ".join(poi.get("tags") or [])
+    if i in hay:
+        return True
+    if strong_only:
+        return False
+    return any(w and w in hay for w in INTEREST_SYNONYMS.get(i, ()))
+
 
 def name_hit(fragment: str, poi_name: str) -> bool:
     """用户点名的景点与 POI 名是否指同一个地方：双向包含。
@@ -76,11 +127,16 @@ def score_poi(poi: dict, slots: dict, rain_prob: int, last_geo: list[float] | No
         s += w["must_visit"]
         reasons.append("用户点名必去")
 
-    prefs = " ".join(slots.get("soft_prefs") or [])
-    hits = [t for t in poi.get("tags", []) if t in prefs]
-    if hits:
-        s += w["interest_match"] * len(hits)
-        reasons.append(f"命中偏好 {'/'.join(hits)}")
+    prefs = slots.get("soft_prefs") or []
+    hit_words = [w for w in prefs if interest_hit(w, poi)]
+    if hit_words:
+        s += w["interest_match"] * len(hit_words)
+        reasons.append(f"命中偏好 {'/'.join(hit_words)}")
+
+    # 位置估算的点（未收录景点）：坐标是城市中心兜底值，不能当距离用
+    uncertain = _geo_uncertain(poi)
+    if uncertain:
+        reasons.append("位置待确认（估算坐标，不计交通）")
 
     if slots.get("pace") == "relaxed" and poi["intensity"] == "high":
         s += w["intensity_penalty"]
@@ -103,7 +159,7 @@ def score_poi(poi: dict, slots: dict, rain_prob: int, last_geo: list[float] | No
         s += w["rain_penalty"]
         reasons.append(f"降雨概率 {rain_prob}%")
 
-    if last_geo and poi.get("geo"):
+    if last_geo and poi.get("geo") and not uncertain:
         km = haversine_km(last_geo, poi["geo"])
         s += w["far_penalty"] * km
         if km > MAX_HOP_KM:
@@ -201,21 +257,37 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             day_cap = cap
 
         # 选点：先取最高分做锚点，再按距离就近成团
-        picked = _pick_chain(remaining, slots, rain, home, day_cap, d, log, pref_rank)
+        # 位置待确认的点不排进抵达/返程日——它可能是跨城一日游，需要完整一天；
+        # 排在"13:30 出发、4 小时逛完"的抵达日下午是最容易崩的排法。
+        if i in (0, days - 1):
+            pool_remaining = [p for p in remaining if not _geo_uncertain(p)]
+        else:
+            pool_remaining = remaining
+        picked = _pick_chain(pool_remaining, slots, rain, home, day_cap, d, log, pref_rank)
         # 紧迫度高（闭馆早、耗时长）的先占时段，同等紧迫度保持原有成团顺序
         picked = sorted(picked, key=lambda x: (_must_start(x), picked.index(x)))
 
         # 时间轴装配
-        clock = start_min if i == 0 else 9 * 60
+        # clock 必须从 start_min 起：返程日 09:00 已排了「早市/伴手礼」（60 分钟），
+        # 景点若也从 09:00 起排，就会出现「早市 09:00-10:00、望江楼 09:15」的重叠。
+        clock = start_min
         prev_geo = home
+        prev_uncertain = False
         lunch_done = False
         used_food: set[str] = set()
         move_total = 0
         dropped: list[dict] = []
         used_pois: list[dict] = []
         for p in picked:
-            km = haversine_km(prev_geo, p["geo"])
-            mode, tmin = transit_estimate(km, prev_geo, p["geo"])
+            uncertain = _geo_uncertain(p)
+            if uncertain or prev_uncertain:
+                # 位置估算的点不算里程、不给精确耗时——估出来的"16 分钟"是假的
+                km, tmin, mode = None, 0, "位置待确认"
+                transit_txt = "位置待确认，交通时间未计入"
+            else:
+                km = haversine_km(prev_geo, p["geo"])
+                mode, tmin = transit_estimate(km, prev_geo, p["geo"])
+                transit_txt = f"{mode} {tmin}分钟（{km}km）"
             move_total += tmin
             clock += tmin
             rainy_swap = rain > 60 and p["intensity"] != "low" and p.get("indoor_alternative")
@@ -243,9 +315,14 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     used_food.add(lunch["poi_id"])
                     clock += lunch["duration_min"]
                 lunch_done = True
-                # 吃完再算一次到景点的路程
-                km = haversine_km(prev_geo, p["geo"])
-                mode, tmin = transit_estimate(km, prev_geo, p["geo"])
+                # 吃完再算一次到景点的路程（估算坐标不算）
+                if uncertain or prev_uncertain:
+                    tmin = 0
+                    transit_txt = "位置待确认，交通时间未计入"
+                else:
+                    km = haversine_km(prev_geo, p["geo"])
+                    mode, tmin = transit_estimate(km, prev_geo, p["geo"])
+                    transit_txt = f"{mode} {tmin}分钟（{km}km）"
                 move_total += tmin
                 clock += tmin
             # 营业时间校验：到达 + 时长是否越过闭馆
@@ -267,13 +344,18 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 continue
             if hours and clock < hours[0]:
                 tip += f"　离开门 {fmt(hours[0])} 还有 {hours[0] - clock} 分钟，可先逛周边"
+            if uncertain:
+                tip += "　位置为估算（未收录），可能是市郊/跨城，出发前确认交通"
             nodes.append(_node(fmt(clock), name, "attraction", p["duration_min"],
-                               f"{mode} {tmin}分钟（{km}km）", tip,
+                               transit_txt, tip,
                                0 if rainy_swap else p["cost"],
                                booking_required=p["need_booking"] and not rainy_swap,
                                poi_id=p["poi_id"], geo=p["geo"]))
             clock += p["duration_min"]
-            prev_geo = p["geo"]
+            # 估算坐标不能当天后续节点的基准点，否则误差会一路传下去
+            if not uncertain:
+                prev_geo = p["geo"]
+            prev_uncertain = uncertain
             used_pois.append(p)
 
             # 午餐：本段结束后已过 12:00 且当天还没吃，就近补一顿
@@ -345,6 +427,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             "move_min": move_total,
             "day_budget": cost * slots["party_size"] + 150 * slots["party_size"],
             "rainy_plan": "已按降雨概率调整" if rain > 60 else "户外优先",
+            # 当天有点位坐标不可靠：前端/文案据此标注"位置待确认"
+            "geo_uncertain": any(_geo_uncertain(p) for p in used_pois),
         })
         if dropped:
             log.setdefault("deferred", []).extend(dropped)
@@ -402,7 +486,26 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
         # 起手点 = 分数最高者（含 LLM 偏好加成）。
         # 闭馆紧迫度只在后面决定"谁先排"，不参与"选谁"——否则用户明说想去的点
         # 会被一个"关门早"的点顶掉，偏好就失效了。
-        picked = [scored[0][1]] if scored else []
+        #
+        # 但"分数最高"不够：名额紧张时（4 天里有 1 天给了跨城一日游），
+        # 用户点名的兴趣（大熊猫）会被几个近处的热门点挤出局。
+        # 兴趣点因此优先占锚点位置——这是"用户说了想看"，不是"系统觉得好"。
+        prefs = slots.get("soft_prefs") or []
+        # 先看"名字直接对上"的兴趣（大熊猫 → 大熊猫基地），这类必须优先占位；
+        # 只有同义词命中的（喝茶 → 公园）放在次一档，避免把名额占满。
+        strong = [p for p in pool
+                  if any(interest_hit(w, p, strong_only=True) for w in prefs)]
+        weak = [p for p in pool
+                if p not in strong and any(interest_hit(w, p) for w in prefs)]
+        score_by_id = {p["poi_id"]: s for s, p, _ in scored}
+        cand = strong or weak or [scored[0][1] if scored else None]
+        cand = [p for p in cand if p]
+        picked = [max(cand, key=lambda p: score_by_id.get(p.get("poi_id"), 0))] if cand else []
+
+    # 位置估算的点单独占一天：交通时间未知，硬跟市区景点凑团只会排出假动线。
+    # 它不是"顺路多逛一个"，而是一整段需要用户确认的行程。
+    if any(_geo_uncertain(p) for p in picked):
+        return [p for p in picked if _geo_uncertain(p)]
 
     move, prev = 0, picked[0]["geo"]
     for p in picked[1:]:

@@ -391,10 +391,22 @@ def coerce_slots(raw: dict, today: date | None = None):
         if not isinstance(v, list):
             continue
         for item in v:
-            if isinstance(item, str) and item in vocab:
-                slots[key].append(item)
+            if not isinstance(item, str):
+                warnings.append(f"丢弃非字符串软偏好 {item!r}")
+                continue
+            word = item.strip()
+            if not word:
+                continue
+            # 兴趣是开放词表：用户说「大熊猫 / 喝茶 / 老街」，白名单里没有也不能丢——
+            # 丢了就等于"偏好没被听见"，行程里自然一个都不出现。
+            # 只做长度与数量限制，避免模型塞进一整句话。
+            if word in vocab or 2 <= len(word) <= 8:
+                slots[key].append(word)
+                if word not in vocab:
+                    warnings.append(f"软偏好 {word!r} 不在标准词表，按自由兴趣保留")
             else:
-                warnings.append(f"未知软偏好 {item!r} 已丢弃")
+                warnings.append(f"软偏好 {word!r} 过长，已丢弃")
+        slots[key] = list(dict.fromkeys(slots[key]))[:6]
 
     mv = raw.get("must_visit")
     if isinstance(mv, list):
@@ -498,7 +510,8 @@ SLOT_SYSTEM = """你是行程需求抽取器。只输出一个 JSON 对象，不
 - budget_total: 全队合计预算（整数，元），未提及填 null
 - budget_per_person: 人均预算（整数，元），未提及填 null
 - hard_prefs: 数组，只能从这些里选：不吃辣、忌高海拔、需无障碍、带幼儿、素食、忌海鲜、怕晒、忌长时间步行、需亲子设施
-- soft_prefs: 数组，只能是景点标签：古城、古镇、洱海、苍山、骑行、徒步、摄影、人文、古建、夜市、小吃、白族、户外、博物馆、温泉、索道
+- soft_prefs: 数组，用户的兴趣偏好。常见值：古城、古镇、骑行、徒步、摄影、人文、古建、夜市、小吃、博物馆、温泉、索道；
+  也**保留用户原话里的具体兴趣**（如大熊猫、喝茶、老街、看展、逛菜市场），每个 2~8 个字，最多 6 个
 - must_visit: 用户点名的景点名数组（「想去X」「必去X」「一定要去X」「帮我加上X」「增加X」）
 - avoid: 用户明确不想去/要求排除的景点名数组（「不想去X」「不去X」「别安排X」「去掉X」）
 - 改口：「把X加回来」「X还是安排上吧」「不去X了，改主意了」一律把 X 写进 must_visit，

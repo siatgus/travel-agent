@@ -180,7 +180,12 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
                 f'　☁ {esc(w.get("desc", "") or "待查")}'
                 + (f' {lo}~{hi}℃' if known else "")
                 + (f'　降水 {rain}%' if (known and rain is not None) else "")
+                + ('　<span style="color:#8A6A2F;">历史同期参考</span>'
+                   if w.get("is_forecast") is False else "")
                 + '</span>')
+    if day.get("geo_uncertain"):
+        wtxt += ('<span style="font-size:12px;color:#B4693F;">　⚠ 有点位位置待确认，'
+                 '交通时间未计入</span>')
     return f"""
     <section style="border:1px solid #E4E2DA;border-radius:12px;overflow:hidden;
                     margin-bottom:22px;background:#fff;">

@@ -351,7 +351,7 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
         "geo": [round(center[0], 4), round(center[1], 4)],
         "appeal": 5, "duration_min": 240, "cost": 0,
         "open_hours": "全天", "open_days": "每天",
-        "need_booking": True, "tags": ["用户点名"],
+        "need_booking": True, "tags": ["用户点名", "位置估算"],
         "intensity": "medium", "indoor_alternative": "",
         "note": "用户点名安排；未收录，位置按市区估算，开放时间与门票请自行确认",
     }

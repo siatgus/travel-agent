@@ -38,6 +38,7 @@ import argparse
 import json
 import sys
 import threading
+import urllib.parse
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +53,7 @@ from . import auth
 from . import conversations
 from . import llm as llm_layer
 from . import paths
+from . import progress
 from .dialogue import Session, PreferenceMemory
 from .render_html import build_html
 
@@ -359,7 +361,7 @@ PAGE = """<!DOCTYPE html>
 <header>
   <div class="logo">&#9992;</div>
   <div><h1>智能旅行规划助手</h1>
-       <div class="sub">真实天气 &middot; 真实路网耗时 &middot; 在售酒店班次 &middot; 全部本地运行</div></div>
+       <div class="sub">天气 16 天内为实时预报 &middot; 真实路网耗时 &middot; 在售酒店班次 &middot; 全部本地运行</div></div>
   <button id="guestbar" onclick="showLogin('登录后即可开始规划')" title="点击登录">未登录 · 点此登录</button>
   <div class="userwrap" id="userwrap" style="display:none">
     <span class="userbox" id="userbox" title="当前登录账号">
@@ -415,6 +417,8 @@ PAGE = """<!DOCTYPE html>
     <div class="grid">
       <div class="f w2"><label>想去哪里<span class="req">*</span></label>
         <input id="pf-dest" placeholder="例如：大理，或上海、京都"></div>
+      <div class="f"><label>从哪儿出发<span class="opt">可选</span></label>
+        <input id="pf-origin" placeholder="填了才算往返大交通"></div>
       <div class="f"><label>旅行范围<span class="opt">可选</span></label>
         <select id="pf-scope"><option>自动判断</option><option>国内</option><option>出境</option></select></div>
       <div class="f"><label>出发日期<span class="req">*</span></label>
@@ -431,7 +435,7 @@ PAGE = """<!DOCTYPE html>
       <div class="f"><label>旅行节奏<span class="opt">可选</span></label>
         <select id="pf-pace"><option>刚刚好</option><option>紧凑打卡</option><option>轻松慢逛</option></select></div>
       <div class="f"><label>兴趣偏好<span class="opt">可选</span></label>
-        <input id="pf-interest" placeholder="美食、建筑、自然"></div>
+        <input id="pf-interest" placeholder="大熊猫、喝茶、老街"></div>
       <div class="f"><label>住宿偏好<span class="opt">可选</span></label>
         <input id="pf-stay" placeholder="交通方便、近景点"></div>
       <div class="f"><label>饮食需求<span class="opt">可选</span></label>
@@ -473,7 +477,7 @@ PAGE = """<!DOCTYPE html>
     <textarea id="inp" rows="1" placeholder="说出你的旅行想法，回车发送…"></textarea>
     <button id="send" onclick="send()">发送</button>
   </div>
-  <div id="foot">数据口径：Open-Meteo 真实预报 / OSRM 真实路网 / 2026-10-29 查价的班次与酒店 &middot; 仅供演示</div>
+  <div id="foot">数据口径：天气 16 天内为 Open-Meteo 实时预报、更远日期为历史同期参考 &middot; OSRM 真实路网 &middot; 2026-10-29 查价的班次与酒店 &middot; 仅供演示</div>
 </div>
 <script>
 // localStorage 在沙箱 iframe 里会抛 SecurityError，任何存储访问都必须兜住，
@@ -543,6 +547,24 @@ function addBot(html,meta,planUrl){const d=document.createElement('div');d.class
   chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
 // 思考气泡：点击发送立即出现，按等待时长分阶段更新文案
 let thinkTimer=null;
+// 服务端阶段（/api/progress）：真实进度优先，拿不到才退回按秒猜的文案
+let lastPhase='', lastPhaseAt=0, progTimer=null;
+function startProgress(){
+  stopProgress(); lastPhase=''; lastPhaseAt=0;
+  progTimer=setInterval(async()=>{
+    try{
+      const r=await fetch('/api/progress?sid='+encodeURIComponent(sid));
+      const j=await r.json();
+      if(j&&j.progress&&j.progress.phase){
+        lastPhase=j.progress.phase+' · 已等 '+j.progress.elapsed+'s';
+        lastPhaseAt=Date.now();
+      }
+    }catch(e){}
+  },900);
+}
+function stopProgress(){
+  if(progTimer){clearInterval(progTimer);progTimer=null;}
+}
 function typing(on){
   let t=document.querySelector('.typing');
   if(on){
@@ -552,8 +574,10 @@ function typing(on){
     clearInterval(thinkTimer);
     const el=t.querySelector('.ttext'); const t0=Date.now();
     thinkTimer=setInterval(()=>{const s=(Date.now()-t0)/1000;
-      if(s>6)el.textContent='还在编排行程与预算，马上好…';
-      else if(s>2.2)el.textContent='正在查真实天气、路网耗时、酒店班次…';},600);
+      // 5 秒内拿到过服务端阶段就显示真实阶段，别再显示猜的
+      if(lastPhase&&Date.now()-lastPhaseAt<5000){el.textContent=lastPhase;return;}
+      if(s>6)el.textContent='还在编排行程与预算，马上好…（已等 '+Math.round(s)+'s）';
+      else if(s>2.2)el.textContent='正在查天气、路网耗时、酒店班次…';},600);
     chat.scrollTop=chat.scrollHeight;
   }else{
     clearInterval(thinkTimer);
@@ -777,18 +801,22 @@ function dayCard(d,idx){
   if(wx){
     wtxt=(wx.low!=null&&wx.high!=null)?(' '+wx.low+'~'+wx.high+'℃'):'';
     if(wx.desc)wtxt=esc(wx.desc)+wtxt;
+    // 口径标注：超出预报窗口的日期是历史同期，不能和"实时预报"长得一样
+    if(wx.is_forecast===false)wtxt+=' <span style="color:#8A6A2F">历史同期</span>';
   }
   let h='<div class="bday"><h4>第'+d.day+'天 · '+esc(d.theme||'')
     +'<span class="wx">'+esc(d.date||'')+wtxt+'</span></h4><div class="bcard">';
   (d.nodes||[]).forEach(n=>{
+    const uncer=String(n.transit||'').indexOf('位置待确认')>=0;
     h+='<div class="bnode" onclick="nodeMenu(event,\\''+jsq(n.name)+'\\')">'
       +'<span class="tm">'+esc(String(n.time||'').slice(0,5))+'</span>'
       +'<span class="ic">'+(TYPE_ICONS[n.type]||TYPE_ICONS.other)+'</span>'
-      +'<span class="nm">'+esc(n.name)+'</span>'
+      +'<span class="nm">'+esc(n.name)+(uncer?' <span style="color:#B4693F;font-size:11px">位置待确认</span>':'')+'</span>'
       +(n.duration_min?'<span class="mn">'+n.duration_min+'分钟</span>':'')
       +'</div>';
   });
   h+='</div>';
+  if(d.geo_uncertain)h+='<div class="bnote" style="margin-top:4px;color:#B4693F">\\u26A0 这天有点位没查到确切位置，交通时间未计入，出发前请确认</div>';
   if(d.move_min)h+='<div class="bnote" style="margin-top:4px">\\u{1F6B6} 当天步行/乘车约 '+d.move_min+' 分钟 · '+(d.rainy_plan||'')+'</div>';
   return h+'</div>';
 }
@@ -799,7 +827,8 @@ function drawBoard(){
   if(boardTab==='all'){
     const st=(boardSlots&&boardSlots.date_range&&boardSlots.date_range.start)
       ||(p.days_plan[0]&&p.days_plan[0].date)||'';
-    const bud=(p.budget&&p.budget.total)?' · 预算约 ¥'+p.budget.total:'';
+    const bud=(p.budget&&p.budget.total)
+      ?(' · 预算约 ¥'+p.budget.total+((boardSlots&&boardSlots.origin)?'':'（不含大交通）')):'';
     h='<div class="bsec"><h4>总览 · '+esc(dest)+' '+p.days_plan.length+' 天'
       +(st?' · '+esc(st)+' 起':'')+bud+'</h4></div>';
     p.days_plan.forEach((d,i)=>{h+=dayCard(d,i);});
@@ -858,7 +887,7 @@ async function send(text){
     return;
   }
   inp.value=''; inp.style.height='auto';
-  addUser(msg); sendBtn.disabled=true; typing(true);
+  addUser(msg); sendBtn.disabled=true; typing(true); startProgress();
   const t0=Date.now();
   try{
     const j=await chatRequest(msg);
@@ -884,6 +913,7 @@ async function send(text){
       if(j.plan)renderBoard(j.plan,j.slots);   // 右侧行程面板随方案更新
     }
   }catch(e){ typing(false); addBot(esc('请求失败：'+e)); }
+  finally{ stopProgress(); }
   sendBtn.disabled=false; inp.focus();
 }
 
@@ -934,7 +964,9 @@ function submitPlanner(){
   }
   err.style.display='none';
   const parts=[];
-  parts.push((sd.getMonth()+1)+'月'+sd.getDate()+'号去'+dest+(days?'玩'+days+'天':''));
+  const origin=document.getElementById('pf-origin').value.trim();
+  parts.push((origin?'从'+origin+'出发，':'')
+    +(sd.getMonth()+1)+'月'+sd.getDate()+'号去'+dest+(days?'玩'+days+'天':''));
   const party=parseInt(document.getElementById('pf-party').value,10);
   if(party>0)parts.push(party+'个人');
   const budget=parseFloat(document.getElementById('pf-budget').value);
@@ -1132,6 +1164,12 @@ class Handler(BaseHTTPRequestHandler):
             self._html(PAGE)
         elif path == "/api/health":
             self._json({"ok": True, "sessions": len(_SESSIONS), "llm": _llm_state()})
+        elif path == "/api/progress":
+            # 等待页轮询：只返回"现在在做什么"和已等待秒数，不含任何用户数据
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            sid = (q.get("sid") or [""])[0]
+            st = progress.get(sid) if sid else None
+            self._json({"ok": True, "progress": st})
         elif path == "/api/me":
             user = self._auth_user()
             if user is None:
@@ -1223,7 +1261,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with _LOCK:          # 编排涉及外部 API，串行执行
                     s = _get_session(uid, sid)
-                    reply = s.turn(msg)
+                    # 等待页进度：Session 进入每个阶段时写一条，前端轮询
+                    # /api/progress?sid= 显示。会话对象复用，用完清掉回调。
+                    progress.begin(sid)
+                    s.on_phase = lambda txt: progress.phase(sid, txt)
+                    try:
+                        reply = s.turn(msg)
+                    finally:
+                        s.on_phase = None
+                        progress.finish(sid)
                     if reply.mode == "plan" and reply.plan:
                         _LAST_PLAN[sid] = (reply.plan, msg)
                     # 自动存档：没有历史就按新对话建档保存，有就追加。

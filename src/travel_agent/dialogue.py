@@ -27,6 +27,7 @@ from datetime import date
 
 from . import agent
 from . import autofetch
+from . import composer
 from . import intent
 from . import llm
 from . import real_tools
@@ -312,6 +313,8 @@ class Session:
         # 最近一次出方案的完整结果（plan_trip 返回值）。「总结一下这个行程」
         # 这类行程问答的事实来源——没有它就只能重新算一遍。
         self.last_plan: dict | None = None
+        # 阶段回调（服务端注入，用于等待页进度）；None 表示不上报
+        self.on_phase = None
 
     # -------------------------------------------------- 存档（历史行程/续聊）
     # 上下文范围 = 一次对话（一个 sid 一个 Session）。存档让这份上下文在进程
@@ -447,6 +450,8 @@ class Session:
         delta = agent.extract_slots(utterance, today=self.today, client=self.client)
         explicit = _explicit_fields(utterance, delta)
         lead_notes: list[str] = []
+        # 这轮改动前的槽位：用来判断"用户要的调整是不是本来就已经满足"
+        prev_slots = dict(self.slots or {})
 
         # 上一轮问过「X 在哪个城市」，这一轮用户答的城市要把 X 带上。
         # 少了这一步，"迪士尼在哪个城市？"→"上海" 会把迪士尼本身弄丢，
@@ -707,13 +712,66 @@ class Session:
         slots, assumptions = self._fill_assumptions(missing)
         self.slots = slots
 
+        # "别太赶"这类节奏调整：如果本来就是最松的一档，重排出来一模一样，
+        # 用户会认为按钮没生效。明说"已经到最松了"，比默默给一份相同的方案诚实。
+        if "pace" in explicit and self.plan_made:
+            old_pace, new_pace = prev_slots.get("pace"), slots.get("pace")
+            if new_pace == old_pace:
+                _pn = {"relaxed": "轻松", "moderate": "适中",
+                       "intensive": "紧凑"}.get(new_pace, new_pace)
+                lead_notes.append(
+                    f"已经是「{_pn}」节奏（最松的一档），每天景点数没有再往下压的空间；"
+                    f"这一版只把时间与动线重排了一遍，要更空可以减天数或删景点")
+
         trace: list = []
-        result = agent.plan_trip(slots, trace, client=self.client, today=self.today)
+        self._phase("正在核对目的地资料，准备编排…")
+        result = agent.plan_trip(slots, trace, client=self.client, today=self.today,
+                                 on_phase=self._phase)
         # 把折算后的槽位写回会话：plan_trip 内部会把"下个月"折算成具体日期，
         # 不回写的话后续轮次拿到的还是 month-only，且 Reply.slots 与方案不一致。
         self.slots = result["slots"]
         slots = result["slots"]
         assumptions = result.get("assumptions", []) + assumptions
+
+        # 位置是估算的点（未收录景点）必须在方案抬头就说明，不能只写在当天卡片里：
+        # 用户看到"都江堰"以为交通时间都算过了，实际这一站根本没算路。
+        _uncertain = sorted({n["name"] for d in result["days_plan"]
+                             for n in d["nodes"]
+                             if "位置待确认" in (n.get("transit") or "")})
+        if _uncertain:
+            assumptions.append(
+                "、".join(_uncertain) + " 的位置是估算的（资料库没收录确切坐标），"
+                "这一站没有计入交通时间；如果它在市郊或跨城，单程可能要 1~2 小时，"
+                "告诉我我按跨城一日游留足往返时间")
+
+        # 兴趣到底进没进行程：用户说「大熊猫 / 喝茶 / 老街」，行程里一个都没有
+        # 就等于没听见。能对上的已经排进去了；一个都对不上就如实说明，
+        # 而不是让这份"热门景点拼盘"冒充个性化行程。
+        _prefs = slots.get("soft_prefs") or []
+        if _prefs:
+            items = (result.get("pois") or {}).get("items") or []
+            planned = {n.get("name") for d in result["days_plan"]
+                       for n in d["nodes"]}
+            hit = [p for p in _prefs
+                   if any(composer.interest_hit(p, it) and it.get("name") in planned
+                          for it in items)]
+            missed = [p for p in _prefs if p not in hit]
+            if missed:
+                # 分清两种"没安排"：库里压根没有对应景点，还是有名额但没排进去。
+                # 混成一句"没有对应景点"会让用户以为系统不认识大熊猫。
+                exists = [p for p in missed
+                          if any(composer.interest_hit(p, it) for it in items)]
+                if exists:
+                    assumptions.append(
+                        "你的兴趣「" + "、".join(exists) + "」对应的景点这版没排进去"
+                        "（天数/节奏装不下），加一天或删掉一个别的我就补上")
+                rest = [p for p in missed if p not in exists]
+                if rest:
+                    assumptions.append(
+                        "你的兴趣「" + "、".join(rest) + "」在"
+                        + str(slots.get("destination") or "当地")
+                        + "的资料里没有直接对应的景点，这版只能先按当地热门点排；"
+                          "说个具体名字（比如某家茶馆、某条老街），我加进去")
 
         # 行程修改的可见反馈：用户点名/排除之后必须明说"改了什么"。
         # 否则重排出来的方案看起来和上一份一样（"不想去豫园"像被无视），
@@ -731,8 +789,10 @@ class Session:
             if rep.get("custom"):
                 assumptions.append(
                     "按你说的名称安排：" + "、".join(rep["custom"])
-                    + "（资料库没收录、在线也没查到，位置按市区估算，"
-                      "开放时间和门票请在出发前自行确认）")
+                    + "（资料库没收录、在线也没查到，位置是按市区估算的，"
+                      "所以这一站不给距离和交通时间；如果它其实在市区外或跨城，"
+                      "单程可能 1~2 小时，告诉我我按一日游重排，"
+                      "开放时间和门票也请在出发前确认）")
             if unknown:
                 # 和"排不下"分开说：库里压根没有这个景点，加天数也变不出来
                 assumptions.append(
@@ -787,6 +847,16 @@ class Session:
                      fetched=dict(self.fetched))
 
     # -------------------------------------------------- 内部
+    def _phase(self, text: str) -> None:
+        """上报"现在在做什么"给等待页；回调异常绝不影响排程本身。"""
+        cb = getattr(self, "on_phase", None)
+        if cb is None:
+            return
+        try:
+            cb(text)
+        except Exception:
+            pass
+
     def _has(self, f: str) -> bool:
         if f == "date_range":
             dr = self.slots.get("date_range") or {}
