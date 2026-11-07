@@ -376,6 +376,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     clock += lunch["duration_min"]
                 else:
                     nodes.append(_meal_fallback(clock, "午餐", spicy_free))
+                    clock += 60      # 兜底餐也要吃时间：否则下一站从 12:27+23min=12:50 排，与餐位重叠
                 lunch_done = True
                 # 吃完再算一次到景点的路程（估算坐标不算）
                 if uncertain or prev_uncertain:
@@ -443,6 +444,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     clock += lunch["duration_min"]
                 else:
                     nodes.append(_meal_fallback(clock, "午餐", spicy_free))
+                    clock += 60      # 同上：兜底餐占 60 分钟，时间轴照常往后推
                 lunch_done = True
 
         # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
@@ -461,7 +463,32 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 clock += lunch["duration_min"]
             else:
                 nodes.append(_meal_fallback(clock, "午餐", spicy_free))
+                clock += 60
             lunch_done = True
+
+        # 返程日：下午/傍晚才发车的话，中午也得坐下来吃一顿再走。
+        # 原来只在非返程日补餐，16 点的班次配着"早市 + 一个景点"就是饿着肚子赶车，
+        # 质检还因为"最后一天豁免"假装通过。
+        if i == days - 1 and not any(n["type"] == "restaurant" for n in nodes):
+            try:
+                dep_h = int(str(outbound_depart_last).split(":")[0])
+            except (ValueError, AttributeError):
+                dep_h = 18
+            if dep_h >= 13:
+                clock = max(clock, 12 * 60)
+                lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
+                                           ("晚餐", prev_geo, 6.0)],
+                                   spicy_free, used_food)
+                if lunch:
+                    meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
+                                            spicy_free, slots, "下午才发车，吃饱再走")
+                    clock += lmin
+                    nodes.append(meal)
+                    used_food.add(lunch["poi_id"])
+                    clock += lunch["duration_min"]
+                else:
+                    nodes.append(_meal_fallback(clock, "午餐", spicy_free))
+                    clock += 60
 
         # 晚餐：定位到当日最后一个点位附近
         remaining = [x for x in remaining if x not in used_pois]
@@ -488,7 +515,9 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                                    geo=dinner.get("geo"),
                                    interests=_meal_interests(dinner, slots)))
             else:
-                nodes.append(_meal_fallback(max(clock, 18 * 60), "晚餐", spicy_free))
+                fb = _meal_fallback(max(clock, 18 * 60), "晚餐", spicy_free)
+                nodes.append(fb)
+                clock = max(clock, 18 * 60) + 60   # 与午餐兜底一致：兜底餐也占时间
 
         nodes.sort(key=lambda x: x["time"])
         cost = sum(n["cost"] for n in nodes if n["type"] == "attraction")

@@ -443,10 +443,34 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         slots["date_range"] = {"month": f"{today.year}-{today.month % 12 + 1:02d}", "exact": False}
         uncertain.append("date_range")
 
+    _spot_day = None   # 「给X安排一天 / 安排一天去X」里要留整天的那个点
     if m := re.search(r"([一二两三四五六七八九十\d]{1,3})\s*天", text):
         n = cn_to_int(m.group(1))
+        pre = text[max(0, m.start() - 2):m.start()]
+        # 「安排/留/住 + N天」有两种常见含义，都不是"整趟 N 天"：
+        #   ① 句里有加点的说法（「加上都江堰，安排一天」）→ 给那个点留时长；
+        #   ② 「给X安排一天」「安排一天去X」→ X 才是要去的地方。
+        # 单独的「帮我安排三天行程」仍是整趟天数，照常生效。
+        _spot_ctx = bool(re.search(r"加上|增加|添上|顺便去|顺便逛|再去|也去", text)) \
+            or bool(re.search(r"给[\u4e00-\u9fa5A-Za-z0-9]{2,8}安排", text)) \
+            or bool(re.search(r"[一二两三四五六七八九十\d]+\s*天\s*(?:去|逛)", text))
         if n and 1 <= n <= 30:
-            slots["days"] = n
+            if re.search(r"(?:安排|排|留|住)$", pre) and _spot_ctx:
+                # 「给都江堰安排一天 / 安排一天去熊猫基地」：给点留时长，天数不动。
+                # 点名的校验要用 _valid_poi（在下方定义），先记下候选，稍后落库。
+                for pat in (r"给\s*([\u4e00-\u9fa5A-Za-z0-9]{2,8}?)\s*安排",
+                            r"[一二两三四五六七八九十\d]+\s*天\s*(?:去|逛)"
+                            r"\s*([\u4e00-\u9fa5A-Za-z0-9]{2,10}?)(?=[，。,；;\s]|$)"):
+                    sm = re.search(pat, text)
+                    if sm and sm.group(1):
+                        _spot_day = sm.group(1)
+                        break
+            elif re.search(r"(?:延长|多玩|多住|多待|加)$", pre):
+                # 「多住一天 / 延长两天 / 加一天」是顺延，不是"整趟 N 天"；
+                # 基数在上一轮天数里，规则层先记增量，对话层（有上下文）落值
+                slots["days_extend"] = n
+            else:
+                slots["days"] = n
     if m := re.search(r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?人"
                       r"(?!\s*[¥￥]?\s*\d{3,5})", text):
         # 「两个人」「三个人」原先只认阿拉伯数字，中文数字一律漏掉，
@@ -556,6 +580,9 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         frag = _poi_frag(m.group(1))
         if _valid_poi(frag) and frag not in slots["must_visit"]:
             slots["must_visit"].append(frag)
+    # 「给都江堰安排一天 / 安排一天去熊猫基地」：那个点收进必去（天数保持不动）
+    if _spot_day and _valid_poi(_spot_day) and _spot_day not in slots["must_visit"]:
+        slots["must_visit"].append(_spot_day)
     for m in re.finditer(
             r"(?:不想去|不想逛|不去|别去|别逛|别安排|不要安排|不想安排|不安排|排除|去掉|删掉|避开)"
             r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
@@ -665,6 +692,32 @@ def resolve_date_range(slots: dict, today: date | None = None
 
 
 # ------------------------------------------------------------------ 2. 编排
+
+
+def uncertain_ticket_notes(days_plan: list[dict]) -> list[str]:
+    """位置估算的点的门票口径，两种都要写明：
+
+    - 查到价（cost>0）：按多少/人估、未核实、已计入；
+    - 没查到价（cost=0）：**没有计入预算**——不说这句，用户看到门票 ¥110
+      分不清是不是含都江堰（实际是别的景点的票）。
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in days_plan:
+        for nd in d["nodes"]:
+            if not nd.get("geo_uncertain") or nd["name"] in seen:
+                continue
+            seen.add(nd["name"])
+            c = nd.get("cost") or 0
+            if c > 0:
+                out.append(
+                    f"{nd['name']} 的门票按 {c} 元/人估算（位置与价格都未核实），"
+                    f"已计入门票预算；实际票价与开放情况以景区官方为准")
+            else:
+                out.append(
+                    f"{nd['name']} 的门票没有计入预算（资料库没查到票价，位置也未核实）；"
+                    f"预留多少请按景区官方价估，或告诉我票价，我补进预算")
+    return out
 
 
 def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None,
@@ -795,6 +848,10 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                                       outbound_depart_last=depart_last,
                                       hotel_geo=hotel_geo,
                                       reranker=reranker)
+
+    # 位置估算的点连门票也是估的：¥110 明细里看不出是不是都江堰的票，
+    # 必须写明"按多少/人估、未核实"，不然用户会当成查证过的景区票价。
+    assumptions.extend(uncertain_ticket_notes(days_plan))
 
     # 天气主动提醒：查到的天气预报不能只当装饰——雨大的日子、极端温度
     # 要主动说一句，用户才知道该带伞、该挪室内。
@@ -982,11 +1039,28 @@ def self_check(result: dict) -> list[dict]:
     days_plan = result["days_plan"]
     budget = result["budget"]
 
+    # 用餐点：抵达/返程日按班次时间判断，其余每天都必须有坐下来吃的时段。
+    # 原来无条件豁免最后一天——16 点才发车还整天没饭，质检照样亮绿灯。
+    def _dep_hour() -> int:
+        it = ((result.get("inbound") or {}).get("items") or [{}])[0]
+        try:
+            return int(str(it.get("depart") or "18:00").split(":")[0])
+        except (ValueError, AttributeError):
+            return 18
+
+    no_meal = []
+    for d in days_plan:
+        if any(n["type"] == "restaurant" for n in d["nodes"]):
+            continue
+        if d["day"] == len(days_plan) and _dep_hour() < 13:
+            continue          # 中午前就发车，不安排正餐说得通
+        no_meal.append(f"Day{d['day']}")
     checks.append({
-        "item": "每天有明确用餐点",
-        "result": "pass" if all(
-            any(n["type"] == "restaurant" for n in d["nodes"]) or d["day"] == len(days_plan)
-            for d in days_plan) else "fail",
+        "item": "每天有明确用餐点"
+                + ("" if len(days_plan) < 2 or _dep_hour() >= 13
+                   else "（返程日在发车前不排正餐）"),
+        "result": "pass" if not no_meal else "fail",
+        "evidence": f"缺用餐点：{'、'.join(no_meal)}" if no_meal else "",
     })
     over = [d["day"] for d in days_plan if len(d["nodes"]) > 5]
     checks.append({"item": "单日节点数不超额", "result": "pass" if not over else "fail",

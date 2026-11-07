@@ -56,7 +56,7 @@ CHENGDU = [
     _poi("p4", "人民公园", [30.66, 104.06], hours="06:00-22:00",
          tags=["park"], note="鹤鸣茶社，盖碗茶"),
     _poi("p5", "望江楼公园", [30.63, 104.09], hours="06:00-21:00", tags=["park"]),
-    _poi("p6", "都江堰", [30.572, 104.066], appeal=5, dur=240, hours="全天",
+    _poi("p6", "都江堰", [30.572, 104.066], appeal=5, dur=240, cost=55, hours="全天",
          tags=["用户点名", "位置估算"], intensity="medium",
          note="用户点名安排；未收录，位置按市区估算"),
     _poi("f1", "陈麻婆豆腐", [30.66, 104.06], cat="restaurant", dur=60, cost=80,
@@ -384,6 +384,97 @@ def test_diet_and_tea_land_in_meals() -> None:
         check("点单提示按不吃辣生成", "不吃辣" in tea[0]["tip"], tea[0]["tip"])
 
 
+def test_spot_day_phrase_is_not_trip_days() -> None:
+    """「加上都江堰，安排一天」是给点留时长，不是"整趟 1 天"。
+
+    2026-11-07 反馈：这样一句话把 4 天行程改成"成都 1 天 1 晚"，
+    都江堰也没排进去；改成「加上都江堰」才正常。
+    """
+    r1 = agent.extract_slots("加上都江堰，安排一天")
+    check("「加上都江堰，安排一天」不把天数抽成 1", not r1.get("days"),
+          str(r1.get("days")))
+    r2 = agent.extract_slots("安排一天去大熊猫基地")
+    check("「安排一天去X」天数不动", not r2.get("days"), str(r2.get("days")))
+    check("「安排一天去X」X 进必去", "大熊猫基地" in (r2.get("must_visit") or []),
+          str(r2.get("must_visit")))
+    check("「帮我安排三天的行程」仍是 3 天",
+          agent.extract_slots("帮我安排三天的行程").get("days") == 3)
+    check("「去成都玩4天」仍是 4 天",
+          agent.extract_slots("去成都玩4天").get("days") == 4)
+    check("「安排三天玩」仍是 3 天",
+          agent.extract_slots("安排三天玩").get("days") == 3)
+    check("「多住一天」记为延长增量而不是天数 1",
+          agent.extract_slots("多住一天").get("days_extend") == 1)
+    # 对话层：已排 4 天后说「安排一天」，天数必须还是 4
+    s = Session(today=date(2026, 11, 6))
+    r = s.turn("11月20号从杭州去大理玩4天，2人，预算6000，轻松一点")
+    check("前置：4 天方案出来了", r.mode == "plan", r.mode)
+    s.turn("加上都江堰，安排一天")
+    check("对话层兜住：天数保持 4", (s.slots or {}).get("days") == 4,
+          str((s.slots or {}).get("days")))
+
+
+def test_fallback_meal_consumes_time() -> None:
+    """兜底餐「就近自选」也要占 60 分钟，否则下一站从餐位开始 23 分钟后排。
+
+    2026-11-07 反馈：午餐 12:27-13:27，望江楼公园却排在 12:50。
+    """
+    slots = dict(SLOTS)
+    slots["days"] = 3
+    slots["date_range"] = {"start": "2026-11-20", "end": "2026-11-22"}
+    no_food = [p for p in CHENGDU if p["category"] != "restaurant"]
+    plan, _ = composer.compose(slots, {"items": no_food}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    bad = []
+    for d in plan:
+        ns = sorted(d["nodes"], key=lambda x: x["time"])
+        for a, b in zip(ns, ns[1:]):
+            if _minutes(b["time"]) < _minutes(a["time"]) + int(a["duration_min"]):
+                bad.append(f"Day{d['day']} {a['name']}({a['time']}) 与 {b['name']}({b['time']})")
+    check("兜底餐占时间后全行程无重叠", not bad, "；".join(bad))
+
+
+def test_return_day_lunch_and_honest_check() -> None:
+    """返程日 13 点后发车要有午餐；质检按发车时间判断，不再无条件豁免。"""
+    plan, _ = _compose()          # outbound_depart_last 默认 18:00
+    last = plan[-1]
+    check("返程日（傍晚发车）排了午餐",
+          any(n["type"] == "restaurant" for n in last["nodes"]),
+          str([(n["time"], n["name"]) for n in last["nodes"]]))
+    res = _fake_result(days_plan=plan)
+    meal = next(c for c in agent.self_check(res) if "用餐点" in c["item"])
+    check("质检：返程日有餐 → 通过", meal["result"] == "pass", meal.get("evidence", ""))
+    # 人为删掉返程日的餐位：下午才发车却没饭，质检必须亮红灯
+    stripped = [dict(d) for d in plan]
+    stripped[-1] = dict(stripped[-1])
+    stripped[-1]["nodes"] = [n for n in stripped[-1]["nodes"]
+                             if n["type"] != "restaurant"]
+    meal2 = next(c for c in agent.self_check(_fake_result(days_plan=stripped))
+                 if "用餐点" in c["item"])
+    check("质检：下午发车却没餐 → fail", meal2["result"] == "fail",
+          str(meal2))
+
+
+def test_uncertain_ticket_assumption() -> None:
+    """位置估算的点，门票口径必须写明：有价=已计入估算，没价=未计入。"""
+    plan, _ = _compose()
+    notes = agent.uncertain_ticket_notes(plan)
+    check("都江堰门票口径写进假设", any("都江堰" in x for x in notes), str(notes))
+    if notes:
+        check("写明按多少/人估算且未核实",
+              all("元/人估算" in x and "未核实" in x for x in notes), str(notes))
+    # 库里没票价（cost=0）：要说"没有计入预算"，不能让用户以为门票 ¥110 含它
+    _no_cost = [dict(p) for p in CHENGDU]
+    _no_cost[5] = dict(_no_cost[5])
+    _no_cost[5]["cost"] = 0
+    _slots = dict(SLOTS)
+    plan2, _ = composer.compose(_slots, {"items": _no_cost}, WEATHER,
+                                "12:00", "18:00", [30.66, 104.06])
+    notes2 = agent.uncertain_ticket_notes(plan2)
+    check("没查到票价时明说门票未计入",
+          any("都江堰" in x and "没有计入预算" in x for x in notes2), str(notes2))
+
+
 def test_map_marks_uncertain_points() -> None:
     """坐标估算的点在示意图上必须一眼能认出来：虚线空心圈 + 位置估算标注。"""
     from travel_agent.render_html import render_map
@@ -416,6 +507,8 @@ def test_route_map_real() -> None:
         check("行程点位注入地图脚本", "成都大熊猫繁育研究基地" in h2 or "宽窄巷子" in h2)
         check("Key 只以安全字符注入", "TESTKEY1234567890" in h2)
         check("估算点不进连线的语义写进页面", "不参与连线" in h2)
+        check("页脚不再说数据来自 mock 工具层", "mock 工具层" not in h2)
+        check("页脚写明真实数据口径", "Open-Meteo" in h2 and "历史同期" in h2)
     finally:
         render_html.get_tmap_key = orig
 
@@ -450,6 +543,10 @@ def main() -> int:
                test_interest_matcher, test_weather_window_is_per_day,
                test_forecast_window_self_heal, test_transport_card_no_zero_fare,
                test_meal_fallback_is_honest, test_diet_and_tea_land_in_meals,
+               test_spot_day_phrase_is_not_trip_days,
+               test_fallback_meal_consumes_time,
+               test_return_day_lunch_and_honest_check,
+               test_uncertain_ticket_assumption,
                test_map_marks_uncertain_points, test_route_map_real,
                test_route_map_js_syntax,
                test_render_budget_and_weather, test_pace_noop_is_honest):

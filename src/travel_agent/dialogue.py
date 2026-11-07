@@ -455,6 +455,33 @@ class Session:
         # 这轮改动前的槽位：用来判断"用户要的调整是不是本来就已经满足"
         prev_slots = dict(self.slots or {})
 
+        # 「加上都江堰，安排一天」不是"整趟 1 天"——是给新加的景点留一整天；
+        # 「多住一天 / 延长两天 / 加一天」是顺延，不是"整趟 N 天"。
+        # 规则层已挡一轮（agent.extract_slots），这里兜住 LLM 抽出来的结果。
+        _dm = re.search(r"(安排|排|留|住|延长|加|多玩)\s*([一二两三四五六七八九十\d]+)\s*天",
+                        utterance)
+        if _dm and self.plan_made:
+            _n = agent.cn_to_int(_dm.group(2)) or 1
+            _verb = _dm.group(1)
+            _is_ext = (_verb in ("延长", "加", "多玩")
+                       or bool(re.search(r"多住|多玩|多待|多加|延长", utterance)))
+            if _is_ext:
+                _new = (prev_slots.get("days") or 1) + _n
+                if (delta.get("days") or 0) != _new or delta.get("days_extend"):
+                    delta = dict(delta)
+                    delta["days"] = _new
+                    delta.pop("days_extend", None)
+                    explicit.add("days")
+                    lead_notes.append(f"按「{_dm.group(0)}」把行程延长到 {_new} 天")
+            elif "days" in explicit and (prev_slots.get("days") or 0) > (delta.get("days") or 0):
+                delta = dict(delta)
+                delta["days"] = None
+                delta.pop("days_extend", None)
+                explicit.discard("days")
+                lead_notes.append(
+                    f"「{_dm.group(0)}」按给新加的景点留出整天理解，"
+                    f"行程仍是 {prev_slots.get('days')} 天")
+
         # 上一轮问过「X 在哪个城市」，这一轮用户答的城市要把 X 带上。
         # 少了这一步，"迪士尼在哪个城市？"→"上海" 会把迪士尼本身弄丢，
         # 用户看到的是一份跟迪士尼毫无关系的上海行程。

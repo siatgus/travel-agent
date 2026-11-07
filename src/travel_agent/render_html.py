@@ -643,8 +643,10 @@ def build_html(result: dict, utterance: str) -> str:
 
   <div style="margin-top:36px;padding-top:16px;border-top:1px solid #E4E2DA;
               font-size:11px;color:#9A9992;line-height:1.8;">
-    价格为参考值，以实际预订页为准 · 生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}<br>
-    本页由 prompts/01-system-prompt.md 定义的输出规范渲染，数据来自 mock 工具层。
+    天气：16 天内为 Open-Meteo 实时预报，更远日期为历史同期参考（每日卡片已标注）；
+    景点坐标来自知识库与 OSM，位置估算项均已标注「位置待确认」；
+    路线图为景点间直线示意，非实际道路导航；班次、票价与开放时间可能缺失或有变动，出行前请自行确认。<br>
+    价格为参考值，以实际预订页为准 · 生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}
   </div>
 </div>
 </body>
