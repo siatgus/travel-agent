@@ -276,14 +276,36 @@ ROUTE_MAP_JS = """
     try {
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
-      mk.addEventListener('mouseover', function () { mk.openInfoWindow(iw); });
+      // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
+      // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关
+      mk.addEventListener('mouseover', function () {
+        hoverStay(); RT.openMk = mk; mk.openInfoWindow(iw);
+      });
+      mk.addEventListener('mouseout', function () { hoverClose(); });
       if (uncertain) {
         // 只有估算点用 click 打开（它没有 hover 卡片，保留点按习惯）
-        mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
+        mk.addEventListener('click', function () {
+          hoverStay(); RT.openMk = mk; mk.openInfoWindow(iw);
+        });
       }
     } catch (e) {}
     return mk;
   }
+  // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
+  var RT = { timer: null, openMk: null };
+  function hoverStay() {
+    if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
+  }
+  function hoverClose() {
+    hoverStay();
+    var m = RT.openMk;
+    if (!m) { return; }
+    RT.timer = setTimeout(function () {
+      try { m.closeInfoWindow(); } catch (e) {}
+      if (RT.openMk === m) { RT.openMk = null; }
+    }, 350);
+  }
+  window.RThover = { stay: hoverStay, leave: hoverClose };
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
   function poiCard(n) {
     var L = n.link || {};
@@ -292,7 +314,7 @@ ROUTE_MAP_JS = """
     var img = imgCss
       ? '<div class="rt-card-img" style="background-image:url(' + imgCss + ');"></div>'
       : '<div class="rt-card-img rt-card-noimg">' + String(n.name).slice(0, 1) + '</div>';
-    return '<div class="rt-card">' + img
+    return '<div class="rt-card" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">' + img
       + '<div class="rt-card-body"><div class="rt-card-name">' + n.name + '</div>'
       + (L.site ? '<div class="rt-card-src">介绍来源：' + L.site
         + ' · 点击下方链接查看完整攻略</div>' : '')
@@ -804,10 +826,10 @@ def render_route_map(result: dict) -> str:
         f'.rt-card-src{{font-size:11px;color:#8A8A82;margin-top:3px;}}'
         f'.rt-card-snip{{font-size:12px;color:#55544E;margin-top:5px;line-height:1.55;'
         f'word-break:break-all;}}'
-        f'.rt-card-link{{display:block;margin:8px 10px 10px;padding:6px 0;text-align:center;'
-        f'background:#2F6F6B;color:#FFFFFF;border-radius:7px;font-size:13px;'
-        f'text-decoration:none;}}'
-        f'.rt-card-link:hover{{background:#255A57;}}'
+        f'.rt-card-link{{display:block;margin:8px 10px 10px;padding:7px 0;text-align:center;'
+        f'background:#2F6F6B;color:#FFFFFF!important;border-radius:7px;font-size:13px;'
+        f'font-weight:bold;letter-spacing:.05em;text-decoration:none!important;}}'
+        f'.rt-card-link:hover{{background:#255A57;color:#FFFFFF!important;}}'
         f'</style>'
         f'{tabs}'
         f'<div class="rt-wrap">'

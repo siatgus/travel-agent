@@ -517,6 +517,19 @@ def test_route_map_real() -> None:
         check("有天数筛选页签（总览/第N天）",
               'id="rt-tabs"' in h2 and 'data-idx="-1"' in h2 and "第2天" in h2)
         check("页签带每日配色圆点", ".rt-tabs button i" in h2)
+        # hover 卡片：按钮白字必须 !important（天地图 InfoWindow 的 a 样式会盖掉普通声明）
+        check("介绍按钮白字带 !important",
+              ".rt-card-link{display:block" in h2.replace(" ", "")
+              or "color:#FFFFFF!important" in h2)
+        # hover 开、移出关：状态机 + 卡片内联事件必须同时在
+        check("hover 关闭状态机存在",
+              "function hoverStay" in h2 and "function hoverClose" in h2
+              and "setTimeout" in h2)
+        check("卡片挂移入/移出内联事件",
+              'onmouseenter="RThover.stay()"' in h2
+              and 'onmouseleave="RThover.leave()"' in h2
+              and "window.RThover" in h2)
+        check("图钉挂 mouseout 关闭", "addEventListener('mouseout'" in h2)
         check("地图容器 620px 高（放大版）",
               'id="route-map" style="height:620px' in h2)
         check("地图卡横向突破正文栏宽（rt-mapcard）",
