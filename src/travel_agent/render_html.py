@@ -307,6 +307,8 @@ ROUTE_MAP_JS = """
   }
   window.RThover = { stay: hoverStay, leave: hoverClose };
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
+  // 「图片卡」标记：介绍页没搜到、只有搜索来的图，站点名固定为必应图片
+  var IMG_ONLY_TAG = '必应图片';
   function poiCard(n) {
     var L = n.link || {};
     // CSS url() 不带引号，危险字符直接剥掉（缩略图 URL 本来也不含这些）
@@ -316,12 +318,14 @@ ROUTE_MAP_JS = """
       : '<div class="rt-card-img rt-card-noimg">' + String(n.name).slice(0, 1) + '</div>';
     return '<div class="rt-card" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">' + img
       + '<div class="rt-card-body"><div class="rt-card-name">' + n.name + '</div>'
-      + (L.site ? '<div class="rt-card-src">介绍来源：' + L.site
-        + ' · 点击下方链接查看完整攻略</div>' : '')
+      + (L.site ? '<div class="rt-card-src">' + (L.site == IMG_ONLY_TAG
+        ? '图片来源：' + L.site : '介绍来源：' + L.site
+        + ' · 点击下方链接查看完整攻略') + '</div>' : '')
       + (L.snippet ? '<div class="rt-card-snip">' + L.snippet + '</div>' : '')
       + '</div>'
       + (L.url ? '<a class="rt-card-link" href="' + L.url
-        + '" target="_blank" rel="noopener">查看介绍 ↗</a>' : '')
+        + '" target="_blank" rel="noopener">'
+        + (L.site == IMG_ONLY_TAG ? '查看更多图片 ↗' : '查看介绍 ↗') + '</a>' : '')
       + '</div>';
   }
   function addLabel(text, pos, dx) {

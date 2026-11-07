@@ -746,6 +746,18 @@ def test_poi_info_cards() -> None:
                             "snippet": "别的", "site": "a.com"}], "宽窄巷子") is None)
     check("非 http 链接被丢弃", all(r["url"].startswith("http") for r in rs))
 
+    # 图片搜索兜底：介绍页无缩略图 → 必应图片搜索补图
+    img_page = ('<html><body>'
+                '<div class="imgpt" m="{&quot;murl&quot;:&quot;https://x.com/a.svg&quot;,'
+                '&quot;turl&quot;:&quot;https://ts1.mm.bing.net/th?id=OIP.svg1&quot;}"></div>'
+                '<div class="imgpt" m="{&quot;murl&quot;:&quot;https://x.com/b.jpg&quot;,'
+                '&quot;turl&quot;:&quot;https://ts2.mm.bing.net/th?id=OIP.jpg2&quot;}"></div>'
+                '</body></html>')
+    got = poi_links._parse_image_page(img_page)
+    check("图片解析跳过 svg 取 jpg", got == "https://ts2.mm.bing.net/th?id=OIP.jpg2&w=480&h=320&c=7",
+          str(got))
+    check("无图页面解析为空", poi_links._parse_image_page("<html></html>") == "")
+
     orig_fetch = poi_links.websearch._fetch
     try:
         poi_links.websearch._fetch = lambda url, timeout=8: page
@@ -753,6 +765,23 @@ def test_poi_info_cards() -> None:
         info = poi_links.fetch_one("宽窄巷子", "成都")
         check("fetch_one 拿到知乎链接", bool(info) and "zhihu.com" in info["url"],
               str(info and info["url"]))
+        # 介绍页有链接但无缩略图 → 二次图片搜索补图
+        poi_links._cache.pop("成都|鹤鸣茶社", None)
+        poi_links.websearch._fetch = lambda url, timeout=8: (
+            img_page if "/images/search" in url else page)
+        info2 = poi_links.fetch_one("鹤鸣茶社", "成都")
+        check("无图卡片自动补搜图片", bool(info2) and info2.get("img", "").startswith(
+            "https://ts"), str(info2 and info2.get("img", ""))[:80])
+        # 介绍页宁缺毋滥没搜到 → 出「图片卡」，站点标记为必应图片
+        nohit_page = ('<html><body><li class="b_algo"><h2><a href="https://a.com/x">'
+                      '完全无关</a></h2><p>别的</p></li></body></html>')
+        poi_links._cache.pop("成都|无名山", None)
+        poi_links.websearch._fetch = lambda url, timeout=8: (
+            img_page if "/images/search" in url else nohit_page)
+        info3 = poi_links.fetch_one("无名山", "成都")
+        check("介绍页缺失时出图片卡", bool(info3) and info3.get("site") == "必应图片"
+              and info3.get("img", "").startswith("https://ts"),
+              str(info3 and info3.get("site")))
         poi_links._cache.pop("成都|都江堰", None)
         poi_links.websearch._fetch = lambda url, timeout=8: (_ for _ in ()).throw(
             IOError("断网"))
@@ -793,6 +822,15 @@ def test_poi_info_cards() -> None:
     check("没卡片的景点不带 link 字段",
           all(not n.get("link") for d in md["days"] for n in d["nodes"]
               if n["name"] != "宽窄巷子"))
+
+    # 图片卡（site=必应图片）：来源行与按钮换成图片文案
+    res3 = _fake_result(days_plan=plan)
+    res3["poi_links"] = {"宽窄巷子": {
+        "url": "https://cn.bing.com/images/search?q=%E5%AE%BD%E7%AA%84%E5%B7%B7%E5%AD%90",
+        "site": "必应图片", "snippet": "", "img": "https://ts1.mm.bing.net/th?id=OIP.9"}}
+    h3 = render_html.build_html(res3, "成都4天")
+    check("图片卡按钮显示「查看更多图片」", "查看更多图片" in h3, "按钮文案缺失")
+    check("图片卡来源行显示「图片来源」", "图片来源：" in h3)
 
 
 def main() -> int:

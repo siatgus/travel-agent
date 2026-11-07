@@ -1,8 +1,10 @@
 """景点介绍卡片：hover 地图图钉显示图片与摘要，点击跳转介绍网页。
 
-数据来源：必应国内版（cn.bing.com）搜索「<景点> <城市> 景点介绍」：
+数据来源：必应国内版（cn.bing.com）搜索「<景点> 攻略」选介绍页：
 - 链接优先选知乎、百度百科、马蜂窝、携程等介绍页，都没有就取第一条；
-- 缩略图直接用必应结果里的 rms_img（th.bing.com 代理，境内可直连热链）。
+- 缩略图优先用介绍页结果里的 rms_img（th.bing.com 代理，境内可直连热链）；
+- 没图的再单独搜必应图片「<景点> 风景」补一张；介绍页宁缺毋滥没搜到的，
+  也出「图片卡」（点击跳必应图片搜索结果页），不让景点光秃秃没图。
 
 工程约束：
 - 零依赖：抓取与解析复用 websearch 的标准库实现；
@@ -42,6 +44,12 @@ _BLOCK = websearch._BING_BLOCK
 _URL = websearch._BING_URL
 _SNIPPET = websearch._BING_SNIPPET
 _IMG = re.compile(r'<img[^>]+class="[^"]*rms_img[^"]*"[^>]+src="([^"]+)"', re.S)
+
+# 必应图片搜索：结果 JSON 藏在 m="{&quot;...&quot;}" 属性里，引号是 HTML 转义的
+# turl 域名有两套：th.bing.com（国际版）/ ts*.mm.bing.net（国内版），都可热链
+_IMG_PAGE_M = re.compile(r' m="([^"]+)"', re.S)
+_IMG_MURL = re.compile(r'"murl":"(https?:[^"]+)"')
+_IMG_TURL = re.compile(r'"turl":"(https?://(?:th\.bing\.com|ts\d*\.mm\.bing\.net)[^"]+)"')
 
 
 def enabled() -> bool:
@@ -122,6 +130,47 @@ def _search_one(name: str, city: str, timeout: int) -> dict | None:
     return None
 
 
+def _parse_image_page(page: str) -> str:
+    """从必应图片搜索结果页解析一张可热链的缩略图 URL；离线可测。
+
+    - 优先 turl（th.bing.com 代理，境内直连、无防盗链），murl 原图多有
+      referer 防护，热链常 403，只用来兜底确认存在；
+    - 把缩略图尺寸参数放大到 w=480（卡片背景 cover，480 够清晰）；
+    - 只要 jpg/png/webp，跳过 svg/gif 动图。
+    """
+    for m in _IMG_PAGE_M.finditer(page):
+        data = m.group(1).replace("&quot;", '"').replace("&amp;", "&")
+        mt = _IMG_TURL.search(data)
+        if not mt:
+            continue
+        turl = mt.group(1)
+        mm = _IMG_MURL.search(data)
+        if mm and re.search(r"\.(svg|gif)(\?|$)", mm.group(1), re.I):
+            continue                      # 跳过动图/矢量图
+        # 统一放大到卡片够用的尺寸（无参数的补上，有参数的改写）
+        if "?" not in turl:
+            turl += "?w=480&h=320&c=7"
+        else:
+            turl = re.sub(r"([?&])w=\d+", r"\1w=480", turl)
+            turl = re.sub(r"([?&])h=\d+", r"\1h=320", turl)
+            if "w=" not in turl:
+                turl += "&w=480&h=320&c=7"
+        return turl
+    return ""
+
+
+def _search_image(name: str, timeout: int) -> str:
+    """必应图片搜索「<景点> 风景」，返回一张可热链缩略图；失败返回空串。"""
+    try:
+        page = websearch._fetch("https://cn.bing.com/images/search?" +
+                                urllib.parse.urlencode(
+                                    {"q": f"{name} 风景", "mkt": "zh-CN", "first": "1"}),
+                                timeout)
+        return _parse_image_page(page)
+    except Exception:
+        return ""
+
+
 def fetch_one(name: str, city: str, timeout: int = _TIMEOUT) -> dict | None:
     """查一个景点的介绍卡片；失败返回 None（前端就没卡片，不报错）。"""
     key = f"{city}|{name}"
@@ -134,6 +183,24 @@ def fetch_one(name: str, city: str, timeout: int = _TIMEOUT) -> dict | None:
         info = _search_one(name, city, timeout)
     except Exception:
         info = None
+    if info is not None and not info.get("img"):
+        # 介绍页有了但没缩略图（知乎等来源常见）：单独搜一张景点图补上
+        try:
+            info["img"] = _search_image(name, timeout)
+        except Exception:
+            pass
+    elif info is None:
+        # 介绍页宁缺毋滥没搜到，但图片可以独立给：出「图片卡」，
+        # 点击跳必应图片搜索结果页（比没卡片直观）
+        try:
+            img = _search_image(name, timeout)
+        except Exception:
+            img = ""
+        if img:
+            info = {"title": name,
+                    "url": "https://cn.bing.com/images/search?" +
+                           urllib.parse.urlencode({"q": f"{name} 风景", "mkt": "zh-CN"}),
+                    "snippet": "", "site": "必应图片", "img": img}
     with _lock:
         if len(_cache) > 500:
             for k in sorted(_cache, key=lambda k: _cache[k][0])[:250]:
