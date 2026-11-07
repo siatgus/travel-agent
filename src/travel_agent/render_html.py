@@ -24,6 +24,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -868,8 +869,17 @@ def render_budget_bar(result: dict) -> str:
 
 def render_day(day: dict, color: str, weather: dict | None = None) -> str:
     rows = []
-    for n in day["nodes"]:
-        icon = {"attraction": "◦", "restaurant": "◇", "transit": "→", "rest": "·"}.get(n["type"], "·")
+    nodes = day["nodes"]
+    # 右列语义：交通行写"怎么去 + 距离"，第二行写"这一站要待多久"，
+    # 避免两个"分钟"并排被误读成重复/错乱
+    stay_label = {"attraction": "游玩", "restaurant": "用餐",
+                  "transit": "车程", "rest": "休息"}
+    dot_style = {"attraction": f"background:{color};",
+                 "restaurant": f"background:#FFFFFF;border:2.5px solid {color};",
+                 "transit": f"background:{color};border-radius:2px;",
+                 "rest": "background:#C9C7BE;"}
+    for i, n in enumerate(nodes):
+        first, last = (i == 0), (i == len(nodes) - 1)
         # 兴趣标记：让用户看得见这一站是靠哪条偏好排上的；弱命中用另一套颜色，
         # 避免"人民公园"被当成"喝茶"已经专门安排好了。
         badges = ""
@@ -880,18 +890,47 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
             _tx = f'兴趣·{esc(it.get("word", ""))}' if _s else f'近似·{esc(it.get("word", ""))}'
             badges += (f'<span style="font-size:11px;padding:1px 6px;border-radius:3px;'
                        f'margin-left:6px;background:{_bg};color:{_fg};">{_tx}</span>')
+        # 交通文案里的"(19.32km)"拆到第二行，主行只留"打车 27 分钟"
+        transit = n["transit"] or ""
+        dist = ""
+        m_dist = re.search(r"\s*[（(]\s*([\d.]+\s*km)\s*[)）]", transit)
+        if m_dist:
+            dist = m_dist.group(1)
+            transit = (transit[:m_dist.start()] + transit[m_dist.end():]).strip()
+        transit = transit.strip(" ·，,") or "—"
+        right = (f'<div style="font-size:12px;color:#5F5E5A;line-height:1.5;">'
+                 f'{esc(transit)}'
+                 + (f'<br><span style="color:#9A9992;">{esc(dist)}</span>' if dist else "")
+                 + '</div>'
+                 + f'<div style="font-size:12px;color:#7A7972;margin-top:3px;">'
+                   f'{stay_label.get(n["type"], "停留")} {n["duration_min"]} 分钟'
+                 + ('　<span style="color:#8A6A2F;">需预约</span>'
+                    if n["booking_required"] else "")
+                 + '</div>')
+        # 时间轴：上下两段竖线 + 一个类型圆点（首行不画上段，末行不画下段）
+        axis = (
+            ('' if first else
+             f'<div style="position:absolute;left:50%;top:0;height:18px;width:2px;'
+             f'margin-left:-1px;background:#E8E6DE;"></div>')
+            + ('' if last else
+               f'<div style="position:absolute;left:50%;top:18px;bottom:0;width:2px;'
+               f'margin-left:-1px;background:#E8E6DE;"></div>')
+            + f'<div style="position:absolute;left:50%;top:13px;width:10px;height:10px;'
+              f'margin-left:-5px;border-radius:50%;box-shadow:0 0 0 3px #FFFFFF;'
+              f'{dot_style.get(n["type"], "background:#C9C7BE;")}"></div>')
         rows.append(f"""
         <tr>
-          <td style="width:62px;padding:10px 8px;vertical-align:top;font-variant-numeric:tabular-nums;
-                     font-size:13px;color:#2C2C2A;">{esc(n['time'])}</td>
-          <td style="width:16px;padding:10px 0;vertical-align:top;color:{color};font-size:14px;">{icon}</td>
-          <td style="padding:10px 8px;vertical-align:top;">
-            <div style="font-size:14px;color:#1F1E1C;">{esc(n['name'])}{badges}</div>
+          <td style="width:54px;padding:13px 10px 13px 18px;vertical-align:top;text-align:right;
+                     font-variant-numeric:tabular-nums;font-size:13px;color:#2C2C2A;
+                     white-space:nowrap;">{esc(n['time'])}</td>
+          <td style="width:24px;padding:0;vertical-align:top;position:relative;
+                     border-bottom:none;">{axis}</td>
+          <td style="padding:13px 10px;vertical-align:top;">
+            <div style="font-size:14px;color:#1F1E1C;line-height:1.5;">{esc(n['name'])}{badges}</div>
             <div style="font-size:12px;color:#7A7972;margin-top:3px;line-height:1.55;">{esc(n['tip'])}</div>
           </td>
-          <td style="width:150px;padding:10px 8px;vertical-align:top;font-size:12px;color:#7A7972;">
-            {esc(n['transit'])}<br>{n['duration_min']} 分钟
-            {f'<br><span style="color:#8A6A2F;">需预约</span>' if n['booking_required'] else ''}
+          <td style="width:152px;padding:13px 18px 13px 8px;vertical-align:top;">
+            {right}
           </td>
         </tr>""")
     w = weather or {}
@@ -915,8 +954,8 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
     return f"""
     <section style="border:1px solid #E4E2DA;border-radius:12px;overflow:hidden;
                     margin-bottom:22px;background:#fff;">
-      <div style="padding:14px 20px;border-bottom:1px solid #EFEDE6;
-                  display:flex;align-items:baseline;gap:12px;">
+      <div style="padding:14px 18px;border-bottom:1px solid #EFEDE6;
+                  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;row-gap:6px;">
         <span style="font-size:13px;padding:3px 9px;border-radius:4px;background:{color};
                      color:#fff;">Day {day['day']}</span>
         <span style="font-size:14px;color:#1F1E1C;">{esc(day['date'])} · {esc(day['theme'])}</span>
@@ -1073,7 +1112,7 @@ def build_html(result: dict, utterance: str) -> str:
   .chip {{ display:inline-block; font-size:12px; padding:3px 9px; border-radius:4px;
            background:#EFEDE6; color:#5F5E5A; margin-right:6px; }}
   .card {{ background:#fff; border:1px solid #E4E2DA; border-radius:12px; padding:22px 24px; }}
-  table td {{ border-bottom:1px solid #F4F2EC; }}
+  table td {{ border-bottom:1px solid #EDEBE3; }}
   table tr:last-child td {{ border-bottom:none; }}
   @media print {{
     body {{ background:#fff; }}
@@ -1147,7 +1186,8 @@ def build_html(result: dict, utterance: str) -> str:
               font-size:11px;color:#9A9992;line-height:1.8;">
     天气：16 天内为 Open-Meteo 实时预报，更远日期为历史同期参考（每日卡片已标注）；
     景点坐标来自知识库与 OSM，位置估算项均已标注「位置待确认」；
-    路线图底图为天地图（国家地理信息公共服务平台），连线为景点间直线示意，非实际道路导航；
+    路线图底图与路径规划来自天地图（国家地理信息公共服务平台），动线为驾车路线
+    规划结果（非实时路况，规划失败段回退直线示意）；
     班次、票价与开放时间可能缺失或有变动，出行前请自行确认。<br>
     价格为参考值，以实际预订页为准 · 生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}
   </div>
