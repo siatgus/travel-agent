@@ -274,10 +274,21 @@ ROUTE_MAP_JS = """
     } catch (e) { return null; }
   }
   // 线上的「第N天」徽标（效仿行程类 App：色块圆角标签骑在动线上）
+  // 白字要压得住底色：每日色直接铺底时（如第4天的暗金）白字会发飘，
+  // 徽标底色统一加深一档，再给字加投影
+  function darken(hex, f) {
+    var m = /^#?([0-9a-fA-F]{6})$/.exec(hex || '');
+    if (!m) { return hex; }
+    var n = parseInt(m[1], 16);
+    return 'rgb(' + Math.round(((n >> 16) & 255) * f) + ','
+      + Math.round(((n >> 8) & 255) * f) + ','
+      + Math.round((n & 255) * f) + ')';
+  }
   function addBadge(text, pos, color) {
     try {
       var lb = new T.Label({
-        text: '<span class="rt-badge" style="background:' + color + ';">' + text + '</span>',
+        text: '<span class="rt-badge" style="background:' + darken(color, 0.68)
+          + ';">' + text + '</span>',
         position: pos, offset: new T.Point(-26, -14) });
       map.addOverLay(lb);
       return lb;
@@ -729,7 +740,8 @@ def render_route_map(result: dict) -> str:
         f'.tdt-label{{background:transparent!important;border:none!important;'
         f'box-shadow:none!important;font-size:12px;color:#3B3A36;'
         f'text-shadow:0 0 3px #FFF,0 0 3px #FFF,0 0 3px #FFF;white-space:nowrap;}}'
-        f'.rt-badge{{display:inline-block;color:#FFFFFF;border-radius:10px;'
+        f'.rt-badge{{display:inline-block;color:#FFFFFF;font-weight:bold;'
+        f'text-shadow:0 1px 2px rgba(0,0,0,.35);border-radius:10px;'
         f'padding:1px 9px;font-size:12px;white-space:nowrap;'
         f'box-shadow:0 1px 3px rgba(0,0,0,.25);}}'
         f'.rt-wrap{{position:relative;}}'

@@ -518,6 +518,9 @@ def test_route_map_real() -> None:
               'id="rt-tabs"' in h2 and 'data-idx="-1"' in h2 and "第2天" in h2)
         check("页签带每日配色圆点", ".rt-tabs button i" in h2)
         check("动线上有「第N天」徽标", "rt-badge" in h2 and "addBadge" in h2)
+        check("徽标底色加深一档（白字不发飘）",
+              "function darken" in h2 and "darken(color, 0.68)" in h2
+              and "text-shadow:0 1px 2px" in h2)
         check("点击页签只看某天（show/hide 逻辑）",
               "setTab" in h2 and "o.show()" in h2 and "o.hide()" in h2)
         check("按天分色实线动线", "new T.Polyline(chain" in h2 or "new T.Polyline(" in h2)
