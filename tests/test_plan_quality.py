@@ -520,7 +520,18 @@ def test_route_map_real() -> None:
         check("动线上有「第N天」徽标", "rt-badge" in h2 and "addBadge" in h2)
         check("点击页签只看某天（show/hide 逻辑）",
               "setTab" in h2 and "o.show()" in h2 and "o.hide()" in h2)
-        check("按天分色实线动线", "new T.Polyline(chain" in h2)
+        check("按天分色实线动线", "new T.Polyline(chain" in h2 or "new T.Polyline(" in h2)
+        check("用天地图路径规划服务画真实道路",
+              "new T.DrivingRoute(" in h2 and "getPlan(0).getPath()" in h2)
+        check("规划结果按天替换直线占位", "replaceGhost" in h2 and "lineStyle: 'dashed'" in h2)
+        check("路径规划失败也退回直线（不会白屏）",
+              "规划失败已退回直线" in h2)
+        check("有「我的位置」定位按钮", 'id="rt-locate"' in h2)
+        check("定位走浏览器定位 + IP 定位兜底",
+              "navigator.geolocation" in h2 and "new T.Geolocation()" in h2)
+        check("定位点用蓝点 + 精度圈显示", "locCircle" in h2 and "new T.Circle(" in h2)
+        check("页脚说明动线来自路径规划而非直线示意",
+              "驾车路线规划" in h2 and "非实时路况" in h2)
 
         render_html.get_tdt_key = lambda: "abc';alert(1)//"
         h3 = render_html.build_html(res, "成都4天")

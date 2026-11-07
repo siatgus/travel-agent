@@ -178,10 +178,15 @@ ROUTE_MAP_JS = """
   var box = document.getElementById('route-map');
   var fb = document.getElementById('route-fallback');
   var tabs = document.getElementById('rt-tabs');
+  var note = document.getElementById('rt-route-note');
+  var locBtn = document.getElementById('rt-locate');
+  var locTip = document.getElementById('rt-locate-tip');
   function showFallback() {
     if (fb) fb.style.display = '';
     if (box) box.style.display = 'none';
     if (tabs) tabs.style.display = 'none';
+    if (locBtn) locBtn.style.display = 'none';
+    if (locTip) locTip.style.display = 'none';
   }
   // 坐标系：天地图底图是 CGCS2000（与 WGS-84 差厘米级），库里的点本来就是
   // WGS-84，所以直接上图即可，不做 GCJ-02 纠偏——纠了反而整体偏约 500 米。
@@ -192,7 +197,14 @@ ROUTE_MAP_JS = """
       + '<text x="14" y="18" font-size="11" font-family="Arial,sans-serif" font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text></svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   }
-  var map, all = [], dayRecs = [], homeOv = null;
+  // 「我的位置」蓝点：内联 SVG，不引外部图
+  function dot() {
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
+      + '<circle cx="10" cy="10" r="7" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2.6"/></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  var map, all = [], dayRecs = [], homeOv = null, curTab = -1;
+  var locMarker = null, locCircle = null;
   function ll(lng, lat) {
     var p = new T.LngLat(lng, lat);
     all.push(p);
@@ -233,16 +245,18 @@ ROUTE_MAP_JS = """
       return lb;
     } catch (e) { return null; }
   }
+  function visible(o, on) {
+    if (!o) return;
+    try { if (on) { o.show(); } else { o.hide(); } } catch (e) {}
+  }
   function setTab(idx) {
+    curTab = idx;
     var btns = tabs ? tabs.querySelectorAll('button[data-idx]') : [];
     dayRecs.forEach(function (rec, i) {
-      var vis = (idx < 0) || (i === idx);
-      rec.ov.forEach(function (o) {
-        if (!o) return;
-        try { if (vis) { o.show(); } else { o.hide(); } } catch (e) {}
-      });
+      var on = (idx < 0) || (i === idx);
+      rec.ov.forEach(function (o) { visible(o, on); });
     });
-    if (homeOv) { try { if (idx < 0) { homeOv.show(); } else { homeOv.hide(); } } catch (e) {} }
+    visible(homeOv, idx < 0);
     try {
       var pts = (idx < 0) ? all : dayRecs[idx].pts;
       if (pts && pts.length > 1) { map.setViewport(pts); }
@@ -264,6 +278,239 @@ ROUTE_MAP_JS = """
       })(btns[k]);
     }
   }
+
+  // ---------- 沿道路画路径（天地图路径规划服务） ----------
+  // T.DrivingRoute 正常是「传 map 就自动画」，但我们自己按天配色画线，
+  // 所以先用不挂地图（或 4x4 隐藏地图）的实例只取点位，再自己画 Polyline。
+  var router = null, routerMode = null, ghostMap = null;
+  function ghostMapOf() {
+    if (ghostMap) return ghostMap;
+    var d = document.createElement('div');
+    d.id = 'rt-ghost-map';
+    d.style.cssText = 'position:absolute;left:-9999px;top:0;width:4px;height:4px;overflow:hidden;';
+    document.body.appendChild(d);
+    try { ghostMap = new T.Map('rt-ghost-map'); } catch (e) { ghostMap = null; }
+    return ghostMap;
+  }
+  function routerOf(mode) {
+    if (router && routerMode === mode) return router;
+    router = null;
+    try {
+      if (mode === 'bare') {
+        router = new T.DrivingRoute(null, { policy: 0 });
+      } else {
+        var gm = ghostMapOf();
+        if (!gm) return null;
+        router = new T.DrivingRoute(gm, { policy: 0 });
+      }
+    } catch (e) { router = null; }
+    routerMode = router ? mode : null;
+    return router;
+  }
+  // 从规划结果里取沿道路的点串（不同小版本字段有差异，三条路都试一遍）
+  function extractPath(res) {
+    var pts = [], k;
+    try {
+      var path = res.getPlan(0).getPath() || [];
+      for (k = 0; k < path.length; k++) { if (path[k]) pts.push(path[k]); }
+    } catch (e) {}
+    if (pts.length < 2) {
+      pts = [];
+      try {
+        var raw = res.result && res.result.result && res.result.result.routelatlon;
+        var arr = raw ? String(raw).split(';') : [];
+        var swap = false;
+        if (arr.length) {
+          var f = arr[0].split(',');
+          if (f.length === 2 && Math.abs(parseFloat(f[0])) > 90) { swap = true; }
+        }
+        for (k = 0; k < arr.length; k++) {
+          var xy = arr[k].split(',');
+          if (xy.length !== 2) { continue; }
+          var a = parseFloat(xy[0]), b = parseFloat(xy[1]);
+          if (isNaN(a) || isNaN(b)) { continue; }
+          pts.push(swap ? new T.LngLat(b, a) : new T.LngLat(a, b));
+        }
+      } catch (e) {}
+    }
+    return pts.length > 1 ? pts : null;
+  }
+  function thin(pts, maxPts) {
+    if (pts.length <= maxPts) return pts;
+    var step = Math.ceil(pts.length / maxPts), out = [], i;
+    for (i = 0; i < pts.length; i += step) { out.push(pts[i]); }
+    if (out[out.length - 1] !== pts[pts.length - 1]) { out.push(pts[pts.length - 1]); }
+    return out;
+  }
+  function planSeg(a, b, cb) {
+    var finished = false, tried = {}, seq = 0, timers = [];
+    function done(path) {
+      if (finished) return;
+      finished = true;
+      for (var i = 0; i < timers.length; i++) { clearTimeout(timers[i]); }
+      cb(path);
+    }
+    // 先试「不挂地图」的实例；拿不到点位就换 4x4 隐藏地图实例再试一次
+    function attempt(mode) {
+      if (finished || tried[mode]) return;
+      tried[mode] = true;
+      var r = routerOf(mode);
+      if (!r) return;
+      var token = ++seq;
+      timers.push(setTimeout(function () {
+        if (finished || token !== seq) return;
+        if (mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); return; }
+        done(null);
+      }, 7000));
+      try {
+        if (r.setSearchCompleteCallback) {
+          r.setSearchCompleteCallback(function (res) {
+            if (finished || token !== seq) return;
+            var p = extractPath(res);
+            if (!p && mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); return; }
+            done(p);
+          });
+        }
+        r.search(a, b);
+      } catch (e) {
+        if (mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); } else { done(null); }
+      }
+    }
+    attempt('bare');
+  }
+  // 全局串行队列：天地图路径服务有 QPS 限制，同城多段一次打出去容易被限流
+  var jobQueue = [], jobRunning = false;
+  function nextJob() {
+    if (!jobQueue.length) { jobRunning = false; return; }
+    var fn = jobQueue.shift();
+    fn(function () { setTimeout(nextJob, 150); });
+  }
+  function enqueue(fn) {
+    jobQueue.push(fn);
+    if (!jobRunning) { jobRunning = true; nextJob(); }
+  }
+  // 一天的相邻点位逐段规划，失败段自动退回直线
+  function planDay(rec, cb) {
+    var chain = rec.chain, idx = 0, segs = [], okCount = 0;
+    function schedule() {
+      if (idx >= chain.length - 1) { cb(segs, okCount); return; }
+      var a = chain[idx], b = chain[idx + 1];
+      enqueue(function (release) {
+        planSeg(a, b, function (path) {
+          if (path) { segs.push(path); okCount += 1; }
+          else { segs.push([a, b]); }
+          idx += 1;
+          release();
+          schedule();
+        });
+      });
+    }
+    schedule();
+  }
+  function flatten(segs) {
+    var out = [], i, k;
+    for (i = 0; i < segs.length; i++) {
+      for (k = 0; k < segs[i].length; k++) {
+        var p = segs[i][k], last = out[out.length - 1];
+        if (last && last.lng === p.lng && last.lat === p.lat) { continue; }
+        out.push(p);
+      }
+    }
+    return out;
+  }
+  function midOf(pts) { return pts[Math.floor(pts.length / 2)] || pts[0]; }
+  function replaceGhost(rec, pts) {
+    var real = null;
+    try {
+      real = new T.Polyline(thin(pts, 320), { color: rec.color, weight: 5, opacity: 0.85 });
+      map.addOverLay(real);
+    } catch (e) { return; }
+    rec.ov = rec.ov.filter(function (o) { return o !== rec.ghost; });
+    try { map.removeOverLay(rec.ghost); } catch (e) {}
+    rec.ghost = null;
+    rec.ov.push(real);
+    if (rec.badge) {
+      rec.ov = rec.ov.filter(function (o) { return o !== rec.badge; });
+      try { map.removeOverLay(rec.badge); } catch (e) {}
+    }
+    rec.badge = addBadge('第' + rec.day + '天', midOf(pts), rec.color);
+    rec.ov.push(rec.badge);
+    var on = (curTab < 0) || (curTab === rec.idx);
+    visible(real, on);
+    visible(rec.badge, on);
+  }
+
+  // ---------- 定位：浏览器高精度定位 → IP 定位兜底 ----------
+  function placeMe(lng, lat, acc) {
+    var pos = new T.LngLat(lng, lat);
+    if (!locMarker) {
+      try {
+        locMarker = new T.Marker(pos, { icon: new T.Icon({
+          iconUrl: dot(), iconSize: new T.Point(20, 20),
+          iconAnchor: new T.Point(10, 10) }) });
+        map.addOverLay(locMarker);
+      } catch (e) { locMarker = null; }
+    } else {
+      try { locMarker.setLngLat(pos); } catch (e) {}
+    }
+    try {
+      if (locCircle) { map.removeOverLay(locCircle); locCircle = null; }
+      if (acc && acc > 30) {
+        locCircle = new T.Circle(pos, Math.min(acc, 3000), {
+          color: '#1A73E8', weight: 1, fillColor: '#1A73E8', fillOpacity: 0.12 });
+        map.addOverLay(locCircle);
+      }
+    } catch (e) {}
+    try {
+      var z = 15;
+      try { z = Math.max(map.getZoom(), 15); } catch (e) {}
+      map.centerAndZoom(pos, z);
+    } catch (e) {}
+  }
+  function bindLocate() {
+    if (!locBtn) return;
+    locBtn.style.display = '';
+    locBtn.addEventListener('click', function () {
+      locBtn.disabled = true;
+      locBtn.textContent = '定位中…';
+      if (locTip) { locTip.style.display = ''; locTip.textContent = ''; }
+      function ok(lng, lat, acc) {
+        placeMe(lng, lat, acc);
+        locBtn.disabled = false;
+        locBtn.textContent = '◎ 我的位置';
+        if (locTip) {
+          locTip.textContent = '已定位到当前位置'
+            + (acc ? '（浏览器精度约 ' + Math.round(acc) + ' 米）' : '（IP 粗定位）');
+        }
+      }
+      function fail(msg) {
+        locBtn.disabled = false;
+        locBtn.textContent = '◎ 我的位置';
+        if (locTip) { locTip.textContent = msg; }
+      }
+      function ipLocate() {
+        try {
+          var geo = new T.Geolocation();
+          geo.getCurrentPosition(function (r) {
+            var pt = null, st = 0;
+            try { pt = (r && (r.point || r.lnglat)) || geo.getPoint(); } catch (e) {}
+            try { st = geo.getStatus(); } catch (e) {}
+            var lng = pt ? (pt.lng !== undefined ? pt.lng : pt.lon) : null;
+            var lat = pt ? (pt.lat !== undefined ? pt.lat : pt.latitude) : null;
+            if (st === 0 && lng !== null && lat !== null) { ok(lng, lat, 0); }
+            else { fail('定位失败：浏览器未授权定位，IP 定位也不可用'); }
+          });
+        } catch (e) { fail('定位失败：当前浏览器不支持定位'); }
+      }
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          function (p) { ok(p.coords.longitude, p.coords.latitude, p.coords.accuracy); },
+          function () { ipLocate(); },
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 });
+      } else { ipLocate(); }
+    });
+  }
+
   function init() {
     if (typeof T === 'undefined') { showFallback(); return; }
     var days = DATA.days || [];
@@ -286,8 +533,9 @@ ROUTE_MAP_JS = """
 
     days.forEach(function (d, i) {
       var color = colors[i % colors.length] || '#2F6F6B';
-      var rec = { ov: [], pts: [] };
-      var chain = [], seq = 0;
+      var rec = { idx: i, day: d.day, color: color, ov: [], pts: [], chain: [],
+                  ghost: null, badge: null };
+      var seq = 0;
       (d.nodes || []).forEach(function (n) {
         var pos = ll(n.lng, n.lat);
         rec.pts.push(pos);
@@ -297,20 +545,22 @@ ROUTE_MAP_JS = """
           rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
         }
-        chain.push(pos);
+        rec.chain.push(pos);
         if (n.type !== 'attraction') { return; }   // 餐位/赶路只进动线不插旗
         seq += 1;
         rec.ov.push(addMarker(pos, color, String(seq), 'D' + d.day + ' ' + n.name, false));
         rec.ov.push(addLabel(n.name, pos, -10));
       });
-      if (chain.length >= 2) {
+      if (rec.chain.length >= 2) {
         try {
-          // 按天分色的实线动线（虚线会显得稀碎，实线更接近行程 App 的观感）
-          var pl = new T.Polyline(chain, { color: color, weight: 5, opacity: 0.8 });
-          map.addOverLay(pl);
-          rec.ov.push(pl);
-          rec.ov.push(addBadge('第' + d.day + '天',
-                               chain[Math.floor(chain.length / 2)], color));
+          // 先铺一条虚线直线占位，路径规划回来后替换成沿道路的实线
+          rec.ghost = new T.Polyline(rec.chain, { color: color, weight: 3,
+                                                  opacity: 0.35,
+                                                  lineStyle: 'dashed' });
+          map.addOverLay(rec.ghost);
+          rec.ov.push(rec.ghost);
+          rec.badge = addBadge('第' + d.day + '天', midOf(rec.chain), color);
+          rec.ov.push(rec.badge);
         } catch (e) {}
       }
       dayRecs.push(rec);
@@ -325,6 +575,37 @@ ROUTE_MAP_JS = """
     }
     if (fb) fb.style.display = 'none';
     bindTabs();
+    bindLocate();
+
+    // 逐天把直线占位换成真实道路走线；全失败也不影响页面可用
+    var pending = dayRecs.filter(function (r) { return r.chain.length >= 2; }).length;
+    var doneDays = 0, okSegs = 0, allSegs = 0;
+    if (!pending) {
+      if (note) { note.textContent = '点位不足，未生成动线。'; }
+      return;
+    }
+    if (note) { note.textContent = '正在按道路规划路线（' + pending + ' 天）…'; }
+    dayRecs.forEach(function (rec) {
+      if (rec.chain.length < 2) { return; }
+      planDay(rec, function (segs, ok) {
+        if (segs.length) {
+          replaceGhost(rec, flatten(segs));
+        }
+        okSegs += ok;
+        allSegs += segs.length;
+        doneDays += 1;
+        if (note && doneDays >= pending) {
+          if (okSegs === allSegs) {
+            note.textContent = '动线已按驾车路线沿道路绘制（' + allSegs + ' 段全部规划成功）。';
+          } else if (okSegs > 0) {
+            note.textContent = '动线按驾车路线绘制，' + (allSegs - okSegs)
+              + ' 段规划失败已退回直线连接（共 ' + allSegs + ' 段）。';
+          } else {
+            note.textContent = '路径规划服务不可用，动线为直线示意（不是实际道路）。';
+          }
+        }
+      });
+    });
   }
   var s = document.createElement('script');
   s.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=' + encodeURIComponent(TK);
@@ -402,13 +683,29 @@ def render_route_map(result: dict) -> str:
         f'.rt-badge{{display:inline-block;color:#FFFFFF;border-radius:10px;'
         f'padding:1px 9px;font-size:12px;white-space:nowrap;'
         f'box-shadow:0 1px 3px rgba(0,0,0,.25);}}'
+        f'.rt-wrap{{position:relative;}}'
+        f'#rt-locate{{position:absolute;top:10px;right:10px;z-index:20;display:none;'
+        f'border:1px solid #D8D7D0;background:#FFFFFF;color:#2F6F6B;border-radius:16px;'
+        f'padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit;'
+        f'box-shadow:0 1px 4px rgba(0,0,0,.15);}}'
+        f'#rt-locate:disabled{{color:#9A9992;cursor:default;}}'
+        f'#rt-locate-tip{{position:absolute;left:10px;bottom:10px;z-index:20;display:none;'
+        f'font-size:12px;color:#3B3A36;background:rgba(255,255,255,.92);'
+        f'padding:2px 9px;border-radius:10px;max-width:74%;line-height:1.5;}}'
+        f'#rt-locate-tip:empty{{display:none;}}'
         f'</style>'
         f'{tabs}'
+        f'<div class="rt-wrap">'
         f'<div id="route-map" style="height:430px;border-radius:8px;display:none;"></div>'
+        f'<button id="rt-locate" type="button" title="定位到我的当前位置">◎ 我的位置</button>'
+        f'<div id="rt-locate-tip"></div>'
+        f'</div>'
         f'<div id="route-fallback">{svg}</div>'
-        f'<div style="font-size:12px;color:#9A9992;margin-top:10px;">'
-        f'底图：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
-        f'连线为景点间直线示意，不是实际道路；灰色「?」为位置估算点，不参与连线。</div>'
+        f'<div style="font-size:12px;color:#9A9992;margin-top:8px;">'
+        f'<span id="rt-route-note">正在按道路规划路线…</span><br>'
+        f'底图与路径规划：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
+        f'动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'
+        f'灰色「?」为位置估算点，不参与连线。</div>'
         f'</div><script>{js}</script>')
 
 
