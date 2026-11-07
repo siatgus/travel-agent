@@ -655,6 +655,81 @@ def test_kid_party_and_schedule() -> None:
           str({k: merged.get(k) for k in ("party_size", "children", "party_detail")}))
 
 
+def test_poi_info_cards() -> None:
+    """景点介绍卡片：必应解析（离线样本）、来源优先级、断网降级、注入渲染与转义。"""
+    from travel_agent import poi_links, render_html
+    check("POI_LINKS 默认开启", poi_links.enabled())
+
+    page = ('<html><body>'
+            '<li class="b_algo"><h2><a href="https://www.mafengwo.cn/poi/123.html">'
+            '宽窄巷子攻略</a></h2><p>宽窄巷子是成都著名历史街区…</p>'
+            '<img class="rms_img" src="//th.bing.com/th?id=ABC"></li>'
+            '<li class="b_algo"><h2><a href="https://www.zhihu.com/question/999">'
+            '去成都宽窄巷子玩是什么体验？</a></h2>'
+            '<p>本地人视角的宽窄巷子逛吃指南…</p></li>'
+            '</body></html>')
+
+    rs = poi_links._parse_page(page, 8)
+    check("离线解析出 2 条候选", len(rs) == 2, str(len(rs)))
+    check("缩略图补全 https 前缀", rs and rs[0]["img"] == "https://th.bing.com/th?id=ABC",
+          str(rs[:1]))
+    pick = poi_links._pick(rs, "宽窄巷子")
+    check("介绍页优先选知乎", pick is not None and "zhihu.com" in pick["url"],
+          str(pick and pick["url"]))
+    check("结果不含景点名时宁缺毋滥",
+          poi_links._pick([{"title": "完全无关", "url": "https://a.com/x",
+                            "snippet": "别的", "site": "a.com"}], "宽窄巷子") is None)
+    check("非 http 链接被丢弃", all(r["url"].startswith("http") for r in rs))
+
+    orig_fetch = poi_links.websearch._fetch
+    try:
+        poi_links.websearch._fetch = lambda url, timeout=8: page
+        poi_links._cache.pop("成都|宽窄巷子", None)
+        info = poi_links.fetch_one("宽窄巷子", "成都")
+        check("fetch_one 拿到知乎链接", bool(info) and "zhihu.com" in info["url"],
+              str(info and info["url"]))
+        poi_links._cache.pop("成都|都江堰", None)
+        poi_links.websearch._fetch = lambda url, timeout=8: (_ for _ in ()).throw(
+            IOError("断网"))
+        check("断网时返回 None 不抛异常", poi_links.fetch_one("都江堰", "成都") is None)
+    finally:
+        poi_links.websearch._fetch = orig_fetch
+
+    plan, _ = _compose()
+    orig_fo = poi_links.fetch_one
+    try:
+        poi_links.fetch_one = lambda name, city, timeout=6: {
+            "url": "https://www.zhihu.com/question/999", "site": "zhihu.com",
+            "snippet": "本地人视角的宽窄巷子逛吃指南", "img": "https://th.bing.com/x.jpg"}
+        res = _fake_result(days_plan=plan)
+        poi_links.attach(res)
+        got = res.get("poi_links") or {}
+        check("attach 把卡片写进 poi_links",
+              bool(got) and all("url" in v for v in got.values()), str(list(got))[:120])
+        h = render_html.build_html(res, "成都4天")
+        check("行程页带 hover 卡片结构", "rt-card" in h and "查看介绍" in h)
+        check("缩略图 URL 注入", "th.bing.com/x.jpg" in h)
+        check("卡片带来源与摘要", "介绍来源" in h and "逛吃指南" in h)
+        check("悬停打开卡片（mouseover）", "mouseover" in h)
+    finally:
+        poi_links.fetch_one = orig_fo
+
+    # 转义：url/snippet 里的恶意内容不能原样进 HTML
+    res2 = _fake_result(days_plan=plan)
+    res2["poi_links"] = {"宽窄巷子": {
+        "url": "https://x.com/?a=1&b=<script>", "site": "x.com",
+        "snippet": "<img src=x onerror=alert(1)>", "img": ""}}
+    md = render_html.route_map_data(res2)
+    links = [n["link"] for d in md["days"] for n in d["nodes"] if n.get("link")]
+    check("route_map_data 转义恶意 url/snippet",
+          links and "<script>" not in links[0]["url"]
+          and "<img" not in links[0]["snippet"]
+          and "&lt;" in links[0]["snippet"], str(links[:1]))
+    check("没卡片的景点不带 link 字段",
+          all(not n.get("link") for d in md["days"] for n in d["nodes"]
+              if n["name"] != "宽窄巷子"))
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -668,6 +743,7 @@ def main() -> int:
                test_kid_party_and_schedule,
                test_map_marks_uncertain_points, test_route_map_real,
                test_route_map_js_syntax,
+               test_poi_info_cards,
                test_render_budget_and_weather, test_pace_noop_is_honest):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

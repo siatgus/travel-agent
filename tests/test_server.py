@@ -26,6 +26,9 @@ import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+
+# 景点介绍卡片要联网搜索，测试里一律关掉：不真出网、也不拖慢用例
+os.environ["POI_LINKS"] = "0"
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")

@@ -152,17 +152,32 @@ def get_tdt_key() -> str:
 
 
 def route_map_data(result: dict) -> dict:
-    """抽给前端地图的最小数据集：只传坐标点位与连线所需字段。"""
+    """抽给前端地图的最小数据集：只传坐标点位与连线所需字段。
+
+    景点带 poi_links 里的介绍卡片（搜索来的介绍页+缩略图），
+    url/snippet 在这里统一做 HTML 属性转义，前端直接拼 innerHTML。
+    """
+    links = result.get("poi_links") or {}
     days = []
     for d in result["days_plan"]:
         nodes = []
         for n in d["nodes"]:
             if not n.get("geo"):
                 continue
-            nodes.append({"name": n["name"], "time": n["time"],
-                          "lat": n["geo"][0], "lng": n["geo"][1],
-                          "type": n["type"],
-                          "uncertain": bool(n.get("geo_uncertain"))})
+            node = {"name": esc(n["name"]), "time": n["time"],
+                    "lat": n["geo"][0], "lng": n["geo"][1],
+                    "type": n["type"],
+                    "uncertain": bool(n.get("geo_uncertain"))}
+            if n["type"] == "attraction":
+                info = links.get(n["name"])
+                if info and info.get("url"):
+                    node["link"] = {
+                        "url": esc(str(info["url"])),
+                        "site": esc(str(info.get("site") or "")),
+                        "snippet": esc(str(info.get("snippet") or "")),
+                        "img": esc(str(info.get("img") or "")),
+                    }
+            nodes.append(node)
         days.append({"day": d["day"], "nodes": nodes})
     home = (result["hotel"].get("items") or [{}])[0].get("geo")
     return {"days": days, "home": home, "colors": DAY_COLORS}
@@ -248,22 +263,43 @@ ROUTE_MAP_JS = """
     all.push(p);
     return p;
   }
-  function addMarker(pos, color, kind, txt, title, uncertain) {
+  function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
     try {
       var icon = new T.Icon({ iconUrl: pin(color, kind, txt),
                               iconSize: new T.Point(30, 40),
                               iconAnchor: new T.Point(15, 38) });
-      mk = new T.Marker(pos, { icon: icon, title: title });
+      mk = new T.Marker(pos, { icon: icon });
     } catch (e) { mk = new T.Marker(pos); }
     map.addOverLay(mk);
     try {
-      var iw = new T.InfoWindow(
-        title + (uncertain ? '<br>位置待确认（坐标按市区估算，交通时间未计入）' : ''),
-        { offset: new T.Point(0, -36) });
-      mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
+      var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
+                                            maxWidth: 250 });
+      mk.addEventListener('mouseover', function () { mk.openInfoWindow(iw); });
+      if (uncertain) {
+        // 只有估算点用 click 打开（它没有 hover 卡片，保留点按习惯）
+        mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
+      }
     } catch (e) {}
     return mk;
+  }
+  // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
+  function poiCard(n) {
+    var L = n.link || {};
+    // CSS url() 不带引号，危险字符直接剥掉（缩略图 URL 本来也不含这些）
+    var imgCss = String(L.img || '').replace(/[()\\s'"]/g, '');
+    var img = imgCss
+      ? '<div class="rt-card-img" style="background-image:url(' + imgCss + ');"></div>'
+      : '<div class="rt-card-img rt-card-noimg">' + String(n.name).slice(0, 1) + '</div>';
+    return '<div class="rt-card">' + img
+      + '<div class="rt-card-body"><div class="rt-card-name">' + n.name + '</div>'
+      + (L.site ? '<div class="rt-card-src">介绍来源：' + L.site
+        + ' · 点击下方链接查看完整攻略</div>' : '')
+      + (L.snippet ? '<div class="rt-card-snip">' + L.snippet + '</div>' : '')
+      + '</div>'
+      + (L.url ? '<a class="rt-card-link" href="' + L.url
+        + '" target="_blank" rel="noopener">查看介绍 ↗</a>' : '')
+      + '</div>';
   }
   function addLabel(text, pos, dx) {
     try {
@@ -590,25 +626,28 @@ ROUTE_MAP_JS = """
         rec.pts.push(pos);
         if (n.uncertain) {
           // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
-          rec.ov.push(addMarker(pos, '#9A9992', 'unknown', '?', n.name, true));
+          rec.ov.push(addMarker(pos, '#9A9992', 'unknown', '?',
+            '<b>' + n.name + '</b><br><span style="font-size:11px;color:#8A8A82;">'
+            + '位置待确认（坐标按市区估算，交通时间未计入）</span>', true));
           rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
         }
         rec.chain.push(pos);
         if (n.type === 'restaurant') {
           // 餐位也插旗（刀叉图标），但不加名字标签，避免景点名被盖住
-          rec.ov.push(addMarker(pos, color, 'restaurant', '', n.name, false));
+          rec.ov.push(addMarker(pos, color, 'restaurant', '', '<b>' + n.name + '</b>', false));
           return;
         }
         if (n.type === 'transit') {
           // 车站/抵达：列车图标
-          rec.ov.push(addMarker(pos, color, 'transit', '', n.name, false));
+          rec.ov.push(addMarker(pos, color, 'transit', '', '<b>' + n.name + '</b>', false));
           return;
         }
         if (n.type !== 'attraction') { return; }   // 午休/自由活动只进动线不插旗
         seq += 1;
+        // hover 弹介绍卡片（图片+来源+摘要+跳转链接）；没搜到就退回名字气泡
         rec.ov.push(addMarker(pos, color, 'sight', String(seq),
-                              'D' + d.day + ' ' + n.name, false));
+                              n.link ? poiCard(n) : '<b>' + n.name + '</b>', false));
         rec.ov.push(addLabel(n.name, pos, -10));
       });
       if (rec.chain.length >= 2) {
@@ -754,6 +793,21 @@ def render_route_map(result: dict) -> str:
         f'font-size:12px;color:#3B3A36;background:rgba(255,255,255,.92);'
         f'padding:2px 9px;border-radius:10px;max-width:74%;line-height:1.5;}}'
         f'#rt-locate-tip:empty{{display:none;}}'
+        # 景点介绍卡片（hover 图钉弹出，效仿行程类 App 的大卡）
+        f'.rt-card{{width:238px;font-family:inherit;}}'
+        f'.rt-card-img{{height:120px;border-radius:8px 8px 0 0;background:#D8D6CE center/cover no-repeat;}}'
+        f'.rt-card-noimg{{display:flex;align-items:center;justify-content:center;'
+        f'background:linear-gradient(135deg,#2F6F6B,#4A5C8A);color:#FFFFFF;'
+        f'font-size:34px;font-weight:bold;}}'
+        f'.rt-card-body{{padding:8px 10px 2px;}}'
+        f'.rt-card-name{{font-size:14px;font-weight:bold;color:#3B3A36;}}'
+        f'.rt-card-src{{font-size:11px;color:#8A8A82;margin-top:3px;}}'
+        f'.rt-card-snip{{font-size:12px;color:#55544E;margin-top:5px;line-height:1.55;'
+        f'word-break:break-all;}}'
+        f'.rt-card-link{{display:block;margin:8px 10px 10px;padding:6px 0;text-align:center;'
+        f'background:#2F6F6B;color:#FFFFFF;border-radius:7px;font-size:13px;'
+        f'text-decoration:none;}}'
+        f'.rt-card-link:hover{{background:#255A57;}}'
         f'</style>'
         f'{tabs}'
         f'<div class="rt-wrap">'
@@ -765,7 +819,8 @@ def render_route_map(result: dict) -> str:
         f'<div style="font-size:12px;color:#9A9992;margin-top:8px;">'
         f'<span id="rt-route-note">正在按道路规划路线…</span><br>'
         f'底图与路径规划：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
-        f'图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点。'
+        f'图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点；'
+        f'鼠标悬停景点图钉可看介绍卡片，点击「查看介绍」跳转攻略网页。</div>'
         f'动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'
         f'位置估算点不参与连线。</div>'
         f'</div><script>{js}</script>')

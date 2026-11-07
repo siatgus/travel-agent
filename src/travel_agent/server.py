@@ -1282,6 +1282,13 @@ class Handler(BaseHTTPRequestHandler):
                         s.on_phase = None
                         progress.finish(sid)
                     if reply.mode == "plan" and reply.plan:
+                        # 景点介绍卡片：搜介绍页（知乎/百科/攻略站）+ 缩略图，
+                        # 行程页 hover 图钉显示、点击跳原网页。锦上添花，失败不影响方案。
+                        try:
+                            from . import poi_links
+                            poi_links.attach(reply.plan)
+                        except Exception:
+                            pass
                         _LAST_PLAN[sid] = (reply.plan, msg)
                     # 自动存档：没有历史就按新对话建档保存，有就追加。
                     # 方案与会话状态一并落库——行程页重启后能捞、续聊能接上。
