@@ -190,11 +190,49 @@ ROUTE_MAP_JS = """
   }
   // 坐标系：天地图底图是 CGCS2000（与 WGS-84 差厘米级），库里的点本来就是
   // WGS-84，所以直接上图即可，不做 GCJ-02 纠偏——纠了反而整体偏约 500 米。
-  // 别针图标：SVG -> data URI（不引用任何外部图片资源）
-  function pin(color, txt) {
-    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="38" viewBox="0 0 28 38">'
-      + '<path d="M14 1C7.4 1 1.5 6.2 1.5 13.6 1.5 22.4 14 36.5 14 36.5S26.5 22.4 26.5 13.6C26.5 6.2 20.6 1 14 1z" fill="' + color + '" stroke="#FFFFFF" stroke-width="1.6"/>'
-      + '<text x="14" y="18" font-size="11" font-family="Arial,sans-serif" font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text></svg>';
+  // 「圆章式」图钉（效仿行程类 App）：上半是序号/标识，下半是类型小图标。
+  // 图标全部内联 SVG 白色线条，不引用任何外部图片资源。
+  function glyph(kind) {
+    var s = 'stroke="#FFFFFF" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+    switch (kind) {
+      case 'sight':        // 地标建筑（景点）
+        return '<rect x="4.6" y="3.2" width="2.8" height="7.3" fill="#FFFFFF"/>'
+          + '<path d="M6 0.6v2.6M2.6 10.6h6.8" ' + s + ' stroke-width="1.2"/>';
+      case 'restaurant':   // 刀叉（餐饮）
+        return '<path d="M3.4 1v2.9M5 1v2.9M6.6 1v2.9M5 4.6v6.2" '
+          + s + ' stroke-width="1.1"/>'
+          + '<path d="M8.9 1c-1.1 1.6-1.1 4.3 0 5.5v4.3" ' + s + ' stroke-width="1.1"/>';
+      case 'transit':      // 车站/列车
+        return '<rect x="3.2" y="1.6" width="5.6" height="7" rx="1.5" '
+          + s + ' stroke-width="1.2"/>'
+          + '<path d="M3.2 5.1h5.6M4.7 8.6l-1.3 2.4M7.3 8.6l1.3 2.4" '
+          + s + ' stroke-width="1.1"/>';
+      case 'hotel':        // 床（住宿）
+        return '<path d="M1.6 10.8V5.2M1.6 8.5h8.8v2.3M10.4 8.5V7c0-.9-.7-1.6-1.6-1.6H5.2" '
+          + s + ' stroke-width="1.2"/>'
+          + '<circle cx="3.6" cy="6.6" r="1.15" fill="#FFFFFF"/>';
+      case 'rest':         // 月牙（午休/自由活动）
+        return '<path d="M7.6 1.4a4.7 4.7 0 1 0 3 7.2A5 5 0 0 1 7.6 1.4z" fill="#FFFFFF"/>';
+      default:
+        return '';
+    }
+  }
+  function pin(color, kind, txt) {
+    var inner;
+    if (txt) {
+      // 上半序号 + 下半小图标
+      inner = '<text x="15" y="12.2" font-size="10.5" font-family="Arial,sans-serif"'
+        + ' font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text>'
+        + '<g transform="translate(9.5,13.8) scale(0.72)" opacity="0.95">'
+        + glyph(kind) + '</g>';
+    } else {
+      inner = '<g transform="translate(9.3,7.6) scale(0.95)" opacity="0.95">'
+        + glyph(kind) + '</g>';
+    }
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="40" viewBox="0 0 30 40">'
+      + '<path d="M10 23.5L15 38.5l5-15z" fill="' + color + '"/>'
+      + '<circle cx="15" cy="13.5" r="12.2" fill="' + color + '" stroke="#FFFFFF" stroke-width="1.8"/>'
+      + inner + '</svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   }
   // 「我的位置」蓝点：内联 SVG，不引外部图
@@ -210,19 +248,19 @@ ROUTE_MAP_JS = """
     all.push(p);
     return p;
   }
-  function addMarker(pos, color, txt, title, uncertain) {
+  function addMarker(pos, color, kind, txt, title, uncertain) {
     var mk;
     try {
-      var icon = new T.Icon({ iconUrl: pin(color, txt),
-                              iconSize: new T.Point(26, 36),
-                              iconAnchor: new T.Point(13, 36) });
+      var icon = new T.Icon({ iconUrl: pin(color, kind, txt),
+                              iconSize: new T.Point(30, 40),
+                              iconAnchor: new T.Point(15, 38) });
       mk = new T.Marker(pos, { icon: icon, title: title });
     } catch (e) { mk = new T.Marker(pos); }
     map.addOverLay(mk);
     try {
       var iw = new T.InfoWindow(
         title + (uncertain ? '<br>位置待确认（坐标按市区估算，交通时间未计入）' : ''),
-        { offset: new T.Point(0, -34) });
+        { offset: new T.Point(0, -36) });
       mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
     } catch (e) {}
     return mk;
@@ -541,14 +579,25 @@ ROUTE_MAP_JS = """
         rec.pts.push(pos);
         if (n.uncertain) {
           // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
-          rec.ov.push(addMarker(pos, '#9A9992', '?', n.name, true));
+          rec.ov.push(addMarker(pos, '#9A9992', 'unknown', '?', n.name, true));
           rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
         }
         rec.chain.push(pos);
-        if (n.type !== 'attraction') { return; }   // 餐位/赶路只进动线不插旗
+        if (n.type === 'restaurant') {
+          // 餐位也插旗（刀叉图标），但不加名字标签，避免景点名被盖住
+          rec.ov.push(addMarker(pos, color, 'restaurant', '', n.name, false));
+          return;
+        }
+        if (n.type === 'transit') {
+          // 车站/抵达：列车图标
+          rec.ov.push(addMarker(pos, color, 'transit', '', n.name, false));
+          return;
+        }
+        if (n.type !== 'attraction') { return; }   // 午休/自由活动只进动线不插旗
         seq += 1;
-        rec.ov.push(addMarker(pos, color, String(seq), 'D' + d.day + ' ' + n.name, false));
+        rec.ov.push(addMarker(pos, color, 'sight', String(seq),
+                              'D' + d.day + ' ' + n.name, false));
         rec.ov.push(addLabel(n.name, pos, -10));
       });
       if (rec.chain.length >= 2) {
@@ -567,7 +616,7 @@ ROUTE_MAP_JS = """
     });
     if (DATA.home) {
       var hp = ll(DATA.home[1], DATA.home[0]);
-      homeOv = addMarker(hp, '#444441', '宿', '住宿', false);
+      homeOv = addMarker(hp, '#444441', 'hotel', '', '住宿', false);
       addLabel('住宿', hp, -22);
     }
     if (all.length > 1) {
@@ -704,8 +753,9 @@ def render_route_map(result: dict) -> str:
         f'<div style="font-size:12px;color:#9A9992;margin-top:8px;">'
         f'<span id="rt-route-note">正在按道路规划路线…</span><br>'
         f'底图与路径规划：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
+        f'图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点。'
         f'动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'
-        f'灰色「?」为位置估算点，不参与连线。</div>'
+        f'位置估算点不参与连线。</div>'
         f'</div><script>{js}</script>')
 
 

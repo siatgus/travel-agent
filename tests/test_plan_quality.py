@@ -532,6 +532,13 @@ def test_route_map_real() -> None:
         check("定位点用蓝点 + 精度圈显示", "locCircle" in h2 and "new T.Circle(" in h2)
         check("页脚说明动线来自路径规划而非直线示意",
               "驾车路线规划" in h2 and "非实时路况" in h2)
+        check("图钉分类型图标（楼/刀叉/列车/床）",
+              all(f"case '{k}'" in h2 for k in ("sight", "restaurant", "transit", "hotel")))
+        check("餐位/车站也插旗（不只景点）",
+              "n.type === 'restaurant'" in h2 and "n.type === 'transit'" in h2)
+        check("估算点是灰色?图钉", "'#9A9992', 'unknown', '?'" in h2)
+        check("住宿用床图标", "'hotel', '', '住宿'" in h2)
+        check("页脚有图钉图例", "序号+楼=景点" in h2 and "刀叉=餐饮" in h2)
 
         render_html.get_tdt_key = lambda: "abc';alert(1)//"
         h3 = render_html.build_html(res, "成都4天")
