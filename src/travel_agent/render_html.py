@@ -539,7 +539,8 @@ def build_html(result: dict, utterance: str) -> str:
         fact("出发地 → 目的地", f"{origin_disp} → {esc(s['destination'])}", origin_note),
         fact("出发日期", f"{start} 至 {end}"),
         fact("行程天数", f"{s['days']} 天 {max(s['days'] - 1, 1)} 晚"),
-        fact("出行人数", f"{s['party_size']} 人"),
+        fact("出行人数", (f"{s['party_size']} 人（{esc(s['party_detail'])}）"
+                          if s.get("party_detail") else f"{s['party_size']} 人")),
         fact("预算目标", f"¥{b['target']:,.0f}" if b.get("target") else "未设定"),
         fact("节奏 / 硬性偏好", f"{pace} / {esc(prefs)}"),
         fact("首日天气",

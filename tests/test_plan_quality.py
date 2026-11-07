@@ -559,6 +559,74 @@ def test_route_map_js_syntax() -> None:
         _TA_PATH(tmp).unlink(missing_ok=True)
 
 
+def test_kid_party_and_schedule() -> None:
+    """2大1小：孩子计入人数与预算口径；带幼儿落成午休/推车/家庭房安排。"""
+    s = agent.extract_slots_rules("2大1小（3岁）下月从杭州去大理玩4天，不太想赶")
+    check("2大1小 人数=3（孩子算人）", s["party_size"] == 3, str(s.get("party_size")))
+    check("大人与孩子拆开存", s["adults"] == 2 and s["children"] == 1)
+    check("孩子年龄被抽到", s["child_age"] == 3)
+    check("人数构成可读", "2 大 1 小" in (s["party_detail"] or "")
+          and "3 岁" in (s["party_detail"] or ""))
+    check("带幼儿偏好命中", "带幼儿" in s["hard_prefs"])
+    s2 = agent.extract_slots_rules("一家三口去厦门玩3天")
+    check("一家三口 = 2大1小", s2["party_size"] == 3 and s2["children"] == 1)
+    s3 = agent.extract_slots_rules("我和老婆带5岁的娃去成都玩4天")
+    check("我和老婆带5岁的娃 = 3人", s3["party_size"] == 3 and s3["child_age"] == 5,
+          str({k: s3[k] for k in ("party_size", "child_age")}))
+    check("纯大人句式不受影响",
+          agent.extract_slots_rules("两个人去西安")["party_size"] == 2)
+    # 预算口径：3 岁免票、8 岁半价、没说年龄也按半价；家庭房
+    check("3 岁免票只按大人算门票", agent.kid_fare_heads(1, 3, 2, 3) == 2.0)
+    check("8 岁按半价折算", agent.kid_fare_heads(1, 8, 2, 3) == 2.5)
+    check("没说年龄也按半价", agent.kid_fare_heads(1, None, 2, 3) == 2.5)
+    check("2大1小订 1 间家庭房", agent.hotel_rooms(1, 3) == (1, "家庭房/加床"))
+    check("纯大人 3 人仍是 2 间", agent.hotel_rooms(0, 3) == (2, "间"))
+
+    # 行程落地：午休节点 + 推车提示
+    kid_slots = dict(SLOTS, party_size=3, adults=2, children=1, child_age=3,
+                     party_detail="2 大 1 小（孩子 3 岁）")
+    plan, _ = composer.compose(kid_slots, {"items": CHENGDU}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    naps = [n for d in plan for n in d["nodes"] if "午休" in n["name"]]
+    check("中间日有 90 分钟午休节点",
+          bool(naps) and all(n["duration_min"] == 90 for n in naps))
+    check("午休不在抵达/返程日",
+          all(d["day"] not in (1, len(plan)) for d in plan
+              for n in d["nodes"] if "午休" in n["name"]))
+    check("景点备注带推车/台阶提示",
+          any("带娃提示" in (n.get("tip") or "")
+              for d in plan for n in d["nodes"] if n["type"] == "attraction"))
+    check("街巷类景点提示推车不便",
+          any("推车不便" in (n.get("tip") or "")
+              for d in plan for n in d["nodes"]))
+    bad = []
+    for d in plan:
+        ns = d["nodes"]
+        for a, b in zip(ns, ns[1:]):
+            if _minutes(b["time"]) < _minutes(a["time"]) + int(a["duration_min"]):
+                bad.append((d["day"], a["name"], b["name"]))
+    check("插入午休后时间轴仍无重叠", not bad, str(bad[:3]))
+
+    # 概要与可视化页都要说构成，不能只报"3 人"
+    res = _fake_result(days_plan=plan)
+    res["slots"] = kid_slots
+    check("概要写人数构成",
+          any("2 大 1 小" in ln and "共 3 人" in ln for ln in agent.summary_lines(res)),
+          "\n".join(agent.summary_lines(res)))
+    from travel_agent import render_html
+    check("可视化页人数也写构成", "2 大 1 小" in render_html.build_html(res, "2大1小成都4天"))
+
+    # 人数改口：2大1小 → 5个人，构成字段全部清空
+    from travel_agent.dialogue import merge_slots, _explicit_fields
+    delta = agent.extract_slots_rules("变成5个人")
+    exp = _explicit_fields("变成5个人", delta)
+    merged, _ = merge_slots(kid_slots, delta, exp, False)
+    check("改口 5 个人后孩子字段清空",
+          merged["party_size"] == 5 and not merged["children"]
+          and not merged["party_detail"],
+          str({k: merged.get(k) for k in ("party_size", "children", "party_detail")}))
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -569,6 +637,7 @@ def main() -> int:
                test_fallback_meal_consumes_time,
                test_return_day_lunch_and_honest_check,
                test_uncertain_ticket_assumption,
+               test_kid_party_and_schedule,
                test_map_marks_uncertain_points, test_route_map_real,
                test_route_map_js_syntax,
                test_render_budget_and_weather, test_pace_noop_is_honest):

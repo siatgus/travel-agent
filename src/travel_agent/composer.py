@@ -212,7 +212,7 @@ def score_poi(poi: dict, slots: dict, rain_prob: int, last_geo: list[float] | No
     if "带幼儿" in (slots.get("hard_prefs") or []) and (
             poi["intensity"] == "high" or poi["duration_min"] >= 240):
         s += w["high_altitude_penalty"]
-        reasons.append("带 3 岁以下幼儿，强度/时长不适")
+        reasons.append("带孩子出行，强度/时长不适")
 
     rain_prob = rain_prob or 0
     if rain_prob > 60 and poi["intensity"] != "low":
@@ -251,7 +251,7 @@ def veto(poi: dict, slots: dict) -> str | None:
     if "忌高海拔" in hp and "高海拔" in poi.get("tags", []):
         return "用户忌高海拔"
     if "带幼儿" in hp and poi["intensity"] == "high":
-        return "带 3 岁以下幼儿，不宜高强度"
+        return "带孩子出行，不宜高强度"
     # 用户明确排除的景点是最高优先级硬约束——"我不想豫园"之后豫园还出现在
     # 行程里，用户只会认为系统没在听。排除比必去更优先：两者冲突时不去。
     av = slots.get("avoid") or []
@@ -265,6 +265,41 @@ def _open_on(poi: dict, d: date) -> bool:
     if "博物馆" in poi["name"] or "博物院" in poi["name"]:
         return d.weekday() != 0
     return True
+
+
+def _with_kid(slots: dict) -> bool:
+    """这趟带没带幼儿：偏好标签、人数构成、孩子年龄任一命中就算。"""
+    return ("带幼儿" in (slots.get("hard_prefs") or [])
+            or (slots.get("children") or 0) > 0
+            or slots.get("child_age") is not None)
+
+
+# 推车通行情况库里有数据的不多，按景点类型的常识给口径，措辞必须留"以现场为准"
+_KID_ROUGH = ("古镇", "古城", "老街", "巷", "山", "梯", "坡", "洞", "长城")
+_KID_SMOOTH = ("博物馆", "馆", "动物园", "海洋", "乐园", "公园", "园区")
+
+
+def _kid_tip(name: str) -> str:
+    if any(k in name for k in _KID_ROUGH):
+        return "带娃提示：石板路/台阶可能多，推车不便，建议用背带"
+    if any(k in name for k in _KID_SMOOTH):
+        return "带娃提示：园区道路一般平整可推车（台阶情况以现场为准）"
+    return "带娃提示：路面情况未核实，推车通行以现场为准"
+
+
+def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
+                    with_kid: bool) -> int:
+    """带幼儿：午饭后写死 90 分钟午休，返回新 clock（没插就原样返回）。
+
+    "带幼儿"不能只是概要里的一个标签——幼儿下午没有这一觉，晚饭前必崩。
+    抵达/返程日行程本来就轻，不插。
+    """
+    if not with_kid or day_idx in (0, days - 1) or clock >= 15 * 60:
+        return clock
+    nodes.append(_node(fmt(clock), "午休（带幼儿，回酒店小睡）", "rest", 90, "—",
+                       "幼儿作息排进时间轴：午饭后睡 90 分钟再出发，"
+                       "下午的安排已整体顺延；离酒店远就改车里睡/找母婴室歇脚"))
+    return clock + 90
 
 
 def compose(slots: dict, pois_res: dict, weather_res: dict,
@@ -285,6 +320,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     _restrict = " ".join((slots.get("diet") or []) + (slots.get("hard_prefs") or [])
                          + (slots.get("avoid") or []))
     spicy_free = "辣" in _restrict
+    with_kid = _with_kid(slots)
     days = slots["days"]
     cap = PACE_CAP[slots["pace"]]
     start = date.fromisoformat(slots["date_range"]["start"])
@@ -409,6 +445,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 tip += f"　离开门 {fmt(hours[0])} 还有 {hours[0] - clock} 分钟，可先逛周边"
             if uncertain:
                 tip += "　位置为估算（未收录），可能是市郊/跨城，出发前确认交通"
+            if with_kid:
+                tip += f"　{_kid_tip(name)}"
             # 兴趣标记先挂在节点上，备注前缀等整份行程排完再统一生成——
             # 弱命中（喝茶→公园）如果每天各标一个，会变成两个公园都写"近似匹配"。
             ints = []
@@ -446,6 +484,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                     clock += 60      # 同上：兜底餐占 60 分钟，时间轴照常往后推
                 lunch_done = True
+                clock = _insert_kid_nap(nodes, clock, i, days, with_kid)
 
         # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
         # 库里没有餐厅也得留出这段时间——"每天有明确用餐点"不是有数据才成立的承诺。
@@ -465,6 +504,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                 clock += 60
             lunch_done = True
+            clock = _insert_kid_nap(nodes, clock, i, days, with_kid)
 
         # 返程日：下午/傍晚才发车的话，中午也得坐下来吃一顿再走。
         # 原来只在非返程日补餐，16 点的班次配着"早市 + 一个景点"就是饿着肚子赶车，

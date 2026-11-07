@@ -300,6 +300,7 @@ def coerce_slots(raw: dict, today: date | None = None):
     known = {"destination", "origin", "date_range", "days", "party_size",
              "budget_total", "budget_per_person", "hard_prefs", "soft_prefs",
              "pace", "must_visit", "avoid", "stay_pref",
+             "child_age", "party_detail",
              "uncertain_fields", "confidence", "note"}
     for k in raw:
         if k not in known:
@@ -310,6 +311,8 @@ def coerce_slots(raw: dict, today: date | None = None):
         "party_size": 1, "budget_total": None, "budget_per_person": None,
         "hard_prefs": [], "soft_prefs": [], "must_visit": [], "avoid": [],
         "pace": "moderate", "uncertain_fields": [], "stay_pref": None,
+        "adults": None, "children": None, "child_age": None,
+        "party_detail": None,
     }
 
     # 住宿偏好：一句话原样保留，选房建议要用它指片区
@@ -328,6 +331,22 @@ def coerce_slots(raw: dict, today: date | None = None):
             errors.append(err)
         else:
             slots[key] = n
+
+    # 孩子年龄与人数构成：门票口径、家庭房、午休安排都靠它们，
+    # 只拿 party_size 一个总数会把"2大1小"压扁成"3个大人"
+    if raw.get("child_age") is not None:
+        v, err = _to_int(raw.get("child_age"), 0, 17, "child_age")
+        if err:
+            errors.append(err)
+        else:
+            slots["child_age"] = v
+    v = raw.get("party_detail")
+    if isinstance(v, str) and v.strip():
+        slots["party_detail"] = v.strip()[:60]
+        _fm = re.search(r"(\d{1,2})\s*大(?:人)?\s*(\d{1,2})\s*(?:个)?"
+                        r"(?:小|小孩|儿童|孩子|娃)", slots["party_detail"])
+        if _fm:
+            slots["adults"], slots["children"] = int(_fm.group(1)), int(_fm.group(2))
 
     for key in ("destination", "origin"):
         v = raw.get(key)
@@ -511,7 +530,9 @@ SLOT_SYSTEM = """你是行程需求抽取器。只输出一个 JSON 对象，不
 - destination / origin: 城市名，字符串或 null
 - date_range: {"start":"YYYY-MM-DD"} 或 {"month":"YYYY-MM"} 或 {"day":N}（只说了"20号"这类裸日子时），无法确定填 null
 - days: 整数 1-30，出发日与返程日算在同一天数内
-- party_size: 整数 1-20，含本人
+- party_size: 整数 1-20，含本人，**孩子也算人**（「2大1小」→ 3）
+- child_age: 最小孩子年龄（整数 0-17），没提年龄填 null
+- party_detail: 人数构成一句话（「2 大 1 小（孩子 3 岁）」「夫妻2人」），没提填 null
 - budget_total: 全队合计预算（整数，元），未提及填 null
 - budget_per_person: 人均预算（整数，元），未提及填 null
 - hard_prefs: 数组，只能从这些里选：不吃辣、忌高海拔、需无障碍、带幼儿、素食、忌海鲜、怕晒、忌长时间步行、需亲子设施

@@ -362,6 +362,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         "party_size": 1, "budget_total": None, "budget_per_person": None,
         "hard_prefs": [], "pace": "moderate",
         "must_visit": [], "avoid": [], "stay_pref": None,
+        # 人数构成：「2大1小（3岁）」里的大人/孩子拆开存，儿童票、家庭房、
+        # 午休安排都要用。party_size 永远是总人数（含孩子）。
+        "adults": None, "children": None, "child_age": None,
+        "party_detail": None,
     }
     uncertain: list[str] = []
 
@@ -471,20 +475,73 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
                 slots["days_extend"] = n
             else:
                 slots["days"] = n
-    if m := re.search(r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?人"
-                      r"(?!\s*[¥￥]?\s*\d{3,5})", text):
+    # ---- 人数：支持「2大1小（3岁）」「一家三口」「我和老婆带5岁的娃」----
+    # 旧实现只认「N个人/我和老婆/孩子」三种句式，"2大1小"四个字全都不匹配，
+    # 孩子被整个丢掉：餐饮、市内交通、门票全按大人的人数估，预算系统性低估。
+    _adults: int | None = None
+    _kids: int | None = None
+    _fm = re.search(r"([一二两三四五六七八九十\d]{1,3})\s*大(?:人)?\s*"
+                    r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?"
+                    r"(?:小|小孩|儿童|孩子|娃)", text)
+    if _fm:
+        _adults = cn_to_int(_fm.group(1))
+        _kids = cn_to_int(_fm.group(2))
+    else:
+        _ma = re.search(r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?(?:大人|成人)",
+                        text)
+        _mc = re.search(r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?"
+                        r"(?:小孩|儿童|孩子|娃)", text)
+        if _ma:
+            _adults = cn_to_int(_ma.group(1))
+        if _mc:
+            _kids = cn_to_int(_mc.group(1))
+    _mk = re.search(r"一家([三四五六])口", text)
+    if _mk and _adults is None and _kids is None:
+        _adults, _kids = 2, (cn_to_int(_mk.group(1)) or 3) - 2
+    _child_age = None
+    if re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿", text) or _fm or _mc:
+        _ma2 = re.search(r"(\d{1,2}|[一二两三四五六七八九十]{1,2})\s*岁", text)
+        if _ma2:
+            _a = cn_to_int(_ma2.group(1))
+            if _a is not None and 0 <= _a <= 17:
+                _child_age = _a
+    # 「我和老婆/我们俩」补充大人数；提到孩子但没说几个 → 按 1 个算
+    if _adults is None and re.search(r"我和(?:老婆|老公|爱人|对象)|夫妻"
+                                     r"|(?:我们|我)(?:俩|两)", text):
+        _adults = 2
+    if _kids is None and (re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿", text)
+                          or _child_age is not None):
+        _kids = 1
+    # 「N个人」显式总数：有构成信息时用来推大人数量，没有时直接当总人数
+    _n_total = None
+    _mn = re.search(r"([一二两三四五六七八九十\d]{1,3})\s*(?:个)?人"
+                    r"(?!\s*[¥￥]?\s*\d{3,5})", text)
+    if _mn:
+        _t = cn_to_int(_mn.group(1))
+        if _t and 1 <= _t <= 20:
+            _n_total = _t
+    if _adults is None and _kids is not None and _n_total:
+        _adults = max(_n_total - _kids, 1)
+    if _adults is not None or _kids is not None:
+        # 只说「带孩子」没提大人：按 1 大 1 小（沿用旧口径，不凭空造同行人）
+        _adults = _adults if _adults is not None else 1
+        _kids = _kids or 0
+        if 1 <= _adults + _kids <= 20:
+            slots["adults"] = _adults
+            slots["children"] = _kids
+            slots["child_age"] = _child_age
+            slots["party_size"] = _adults + _kids
+            if _kids:
+                slots["party_detail"] = (f"{_adults} 大 {_kids} 小"
+                                         + (f"（孩子 {_child_age} 岁）"
+                                            if _child_age is not None else ""))
+            elif re.search(r"我和(?:老婆|老公|爱人|对象)|夫妻", text):
+                slots["party_detail"] = "夫妻2人"
+    elif _n_total:
         # 「两个人」「三个人」原先只认阿拉伯数字，中文数字一律漏掉，
         # 结果用户说"两个人"系统还是按 1 人算房型和预算。
         # 结尾的负向断言挡住「预算一人3000」——那是人均预算，不是 1 个人。
-        n = cn_to_int(m.group(1))
-        if n and 1 <= n <= 20:
-            slots["party_size"] = n
-    elif re.search(r"我和(?:老婆|老公|爱人|对象)|夫妻", text):
-        slots["party_size"] = 2
-        slots["party_detail"] = "夫妻2人"
-    elif re.search(r"孩子|娃|宝宝", text):
-        slots["party_size"] = 2
-        slots["party_detail"] = "1 大 1 小"
+        slots["party_size"] = _n_total
 
     if m := re.search(r"一人\s*(\d{3,5})|人均\s*(\d{3,5})", text):
         slots["budget_per_person"] = int(m.group(1) or m.group(2))
@@ -502,10 +559,15 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         "不吃辣": ("不吃辣", "不能吃辣", "微辣都不行"),
         "忌高海拔": ("恐高", "高反", "心脏"),
         "需无障碍": ("轮椅", "腿脚不便"),
-        "带幼儿": ("孩子", "宝宝", "娃"),
+        "带幼儿": ("孩子", "宝宝", "娃", "小孩", "儿童", "儿子", "女儿"),
     }.items():
         if any(k in text for k in keywords):
             slots["hard_prefs"].append(pref)
+
+    # 「2大1小」这种句式一个关键词都不含，但带娃的事实已从人数构成里确认——
+    # 不能让孩子只影响预算、不影响行程强度与作息
+    if (slots.get("children") or 0) > 0 and "带幼儿" not in slots["hard_prefs"]:
+        slots["hard_prefs"].append("带幼儿")
 
     if re.search(r"不想太赶|轻松|躺平|休闲", text):
         slots["pace"] = "relaxed"
@@ -720,6 +782,27 @@ def uncertain_ticket_notes(days_plan: list[dict]) -> list[str]:
     return out
 
 
+def kid_fare_heads(children: int | None, child_age: int | None,
+                   adults: int, total: int) -> float:
+    """门票按人头口径：6 岁以下多数景区免票，6 岁及以上按半价，没说年龄也按半价。
+
+    返回"折算大人头数"（半价=0.5）。孩子不计或按半价，都写进假设里说清楚。
+    """
+    kids = children or 0
+    if not kids:
+        return float(total)
+    if child_age is not None and child_age < 6:
+        return float(adults)
+    return adults + 0.5 * kids
+
+
+def hotel_rooms(children: int | None, total: int) -> tuple[int, str]:
+    """带孩子的房型：2大1小订 1 间家庭房/加床比两间标间便宜也方便。"""
+    if (children or 0) and total <= 4:
+        return 1, "家庭房/加床"
+    return (1 if total <= 2 else (total + 1) // 2), "间"
+
+
 def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None,
               today: date | None = None,
               on_phase: "Callable[[str], None] | None" = None) -> dict:
@@ -741,6 +824,13 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
     days = slots["days"]
     end = start + timedelta(days=days - 1)
     n = slots["party_size"]
+    # 人数构成：party_size 是含孩子的总人数；门票/房型要按大人小孩分开算
+    _kids = slots.get("children") or 0
+    _child_age = slots.get("child_age")
+    _adults = slots.get("adults") if slots.get("adults") is not None else n - _kids
+    _adults = max(_adults, 1)
+    # 儿童门票口径：6 岁以下多数景区免票，6 岁及以上按半价估；没说年龄也按半价
+    # （折算在 kid_fare_heads 里做，这里只保留口径说明用的变量）
     # 出发地：用户说了才算数。没说就不安排往返大交通——以前悄悄按默认城市
     # （杭州）查班次、把交通费算进预算，用户从成都走也会收到一份「杭州-大理」。
     origin = slots.get("origin")
@@ -907,9 +997,28 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             f"预算内（≤{price_cap} 元/晚）没有可用住宿，已放宽到 "
             f"{hotel['items'][0]['price']} 元/晚的{hotel['items'][0]['name']}")
     nights = max(days - 1, 1)
-    rooms = 1 if n <= 2 else (n + 1) // 2
-    ticket_total = sum(node["cost"] for d in days_plan for node in d["nodes"]
-                       if node["type"] == "attraction") * n
+    rooms, room_label = hotel_rooms(_kids, n)
+    if rooms == 1 and room_label == "家庭房/加床":
+        assumptions.append(
+            "带幼儿出行：按 1 间家庭房/加床估算（报价用城市双人间均价，"
+            "家庭房差价未计入），订房时选「家庭房」或可加床房型")
+    _ticket_base = sum(node["cost"] for d in days_plan for node in d["nodes"]
+                       if node["type"] == "attraction")
+    ticket_total = round(_ticket_base * kid_fare_heads(_kids, _child_age,
+                                                       _adults, n))
+    if _kids:
+        if _child_age is not None and _child_age < 6:
+            assumptions.append(
+                f"{_child_age} 岁儿童按多数景区「6 岁以下/1.2m 以下免票」口径，"
+                "门票只按大人算；个别景点现场要买儿童票的话告诉我，我重算预算")
+        else:
+            assumptions.append(
+                "儿童门票按半价估算（多数景区 6 岁以下/1.2m 以下免票，"
+                "以各景区现场口径为准）")
+        # 大交通：高铁 6 岁以下免费不占座、机票 2~11 岁约半价，这里没单独折算
+        assumptions.append(
+            "往返大交通按全价×全部人数估算，儿童票（高铁 6 岁下免费、"
+            "机票 2~11 岁约半价）未单独折算，实际通常比这里低")
     items = []
     if has_origin:
         # 班次没查到（价格 0）就不要往预算里塞一行「¥0 交通（数据缺失）」：
@@ -921,12 +1030,12 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                               "label": f"{_leg} {outbound_label(_res)}",
                               "amount": _amt})
     items += [
-        {"category": "hotel", "label": f"{(hotel.get('items') or [{}])[0].get('name', '住宿（按城市均价估算）')} {nights}晚×{rooms}间",
+        {"category": "hotel", "label": f"{(hotel.get('items') or [{}])[0].get('name', '住宿（按城市均价估算）')} {nights}晚×{rooms}{room_label}",
          "amount": hotel_price * nights * rooms},
         {"category": "ticket", "label": "景点门票与索道", "amount": ticket_total},
-        {"category": "food", "label": f"餐饮 {days}天（人均 180/天估算）",
+        {"category": "food", "label": f"餐饮 {days}天×{n}人（人均 180/天估算）",
          "amount": 180 * days * n},
-        {"category": "local_transit", "label": "市内交通（人均 60/天估算）",
+        {"category": "local_transit", "label": f"市内交通 {days}天×{n}人（人均 60/天估算）",
          "amount": 60 * days * n},
     ]
     _phase("正在核算预算与校验行程可行性…")
@@ -1166,6 +1275,10 @@ def summary_lines(result: dict) -> list[str]:
     origin = result.get("origin") or s.get("origin")
     dest = s["destination"]
     n = s.get("party_size") or 1
+    # 人数要说构成：「2 人」会把"2大1小"里的孩子藏起来，用户以为没算孩子
+    _party = s.get("party_detail") or f"{n} 人"
+    if s.get("party_detail") and ("大" in _party or "小" in _party):
+        _party += f"，共 {n} 人"
     start = date.fromisoformat(s["date_range"]["start"])
     days = s["days"]
     end = start + timedelta(days=max(days - 1, 0))
@@ -1196,7 +1309,7 @@ def summary_lines(result: dict) -> list[str]:
         f"- **出发地 → 目的地**：{origin_disp} → {dest}",
         f"- **行程日期**：{start.isoformat()} 至 {end.isoformat()}"
         f"（{days} 天 {nights} 晚）",
-        f"- **出行人数**：{n} 人　|　**节奏**：{pace}"
+        f"- **出行人数**：{_party}　|　**节奏**：{pace}"
         + (f"　|　**硬性偏好**：{prefs}" if prefs else ""),
         budget,
     ]

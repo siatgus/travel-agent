@@ -182,8 +182,14 @@ def _explicit_fields(text: str, delta: dict) -> set[str]:
     if re.search(r"[一二两三四五六七八九十\d]+\s*天", text):
         got.add("days")
     if re.search(r"[一二两三四五六七八九十\d]+\s*(?:个)?人|我和|夫妻|孩子|娃|宝宝|"
-                 r"(?:我们|我)(?:俩|两)|一家[三四五]口|全家", text):
+                 r"小孩|儿童|一家[三四五六]口|全家|(?:我们|我)(?:俩|两)|"
+                 r"[一二两三四五六七八九十\d]+\s*大\s*[一二两三四五六七八九十\d]+\s*小",
+                 text):
         got.add("party_size")
+        # 人数构成的字段跟着人数一起算"这轮说过"，否则 merge 会留上一轮的旧值
+        for k in ("adults", "children", "child_age", "party_detail"):
+            if delta.get(k) not in (None, "", [], {}):
+                got.add(k)
     if delta.get("budget_per_person"):
         got.add("budget_per_person")
     if re.search(r"(?:总共|一共|预算)[^\d]{0,6}\d{3,6}", text) and delta.get("budget_total"):
@@ -254,6 +260,12 @@ def merge_slots(base: dict, delta: dict, explicit: set[str],
     if new_must and out.get("avoid"):
         out["avoid"] = [a for a in out["avoid"]
                         if not any(name_hit(m, a) for m in new_must)]
+
+    # 这轮只说了「N 个人」而没提构成 → 大人/孩子/年龄的旧值全部作废。
+    # 否则先说"2大1小"再说"5个人"，children 还挂着 1，门票口径就乱了。
+    if "party_size" in explicit and "party_detail" not in explicit:
+        for k in ("adults", "children", "child_age", "party_detail"):
+            out[k] = None
 
     # 排除赢过必去：这轮刚说"不想去豫园"而 must_visit 里还留着它（LLM 上一轮
     # 抽进去的）时，必须从必去清单里拿掉，否则两份约束互相打架。
@@ -997,7 +1009,8 @@ class Session:
             "出发地": s.get("origin") or "未指定",
             "出行日期": s.get("date_range"),
             "天数": s.get("days"),
-            "人数": s.get("party_size"),
+            "人数": (f"{s.get('party_size')} 人（{s.get('party_detail')}）"
+                     if s.get("party_detail") else s.get("party_size")),
             "预算总额元": budget.get("total"),
             "每天安排": [{"第几天": d.get("day"),
                         "内容": [n.get("name") for n in d.get("nodes") or []]}
