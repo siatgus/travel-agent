@@ -358,9 +358,9 @@ PAGE = """<!DOCTYPE html>
       <button onclick="testLlm()">测试连接</button>
     </div>
     <div class="row">
-      <input id="llm-tmapkey" type="password" placeholder="腾讯地图 Key（选填）" size="30">
+      <input id="llm-tdtkey" type="password" placeholder="天地图 Key（选填）" size="30">
       <span style="font-size:12px;color:#8A8A82;align-self:center;">
-        行程页真实地图用 · lbs.qq.com 免费申请（勾选 WebServiceAPI）</span>
+        行程页真实地图用 · console.tianditu.gov.cn 免费申请（应用类型选「浏览器端」）</span>
     </div>
     <div class="fresh">保存后对话服务下一句话即刻生效，无需重启。Key 只保存在本机设置文件中，界面上永远只显示脱敏形式；留空表示不修改。</div>
   </section>
@@ -775,9 +775,9 @@ async function loadLlm(){
   $('llm-timeout').value=s.timeout||60;
   $('llm-key').value='';
   $('llm-key').placeholder=s.has_key?('已保存 '+s.key_masked+'（留空则不修改）'):'API Key';
-  $('llm-tmapkey').value='';
-  $('llm-tmapkey').placeholder=s.has_tmap_key
-    ?('已保存 '+s.tmap_masked+'（留空则不修改）'):'腾讯地图 Key（选填）';
+  $('llm-tdtkey').value='';
+  $('llm-tdtkey').placeholder=s.has_tdt_key
+    ?('已保存 '+s.tdt_masked+'（留空则不修改）'):'天地图 Key（选填）';
   $('llm-state').textContent=(s.chat&&s.chat.online)
     ?(s.chat.has_detail?'对话服务在线 · 实时读取':'对话服务在线 · 旧版本，按配置显示')
     :'对话服务未探测到 · 显示配置值';
@@ -789,7 +789,7 @@ async function saveLlm(){
     provider:$('llm-provider').value, base_url:$('llm-base').value.trim(),
     model:$('llm-model').value.trim(), timeout:Number($('llm-timeout').value)||60,
     api_key:$('llm-key').value.trim(),
-    tmap_key:$('llm-tmapkey').value.trim()});
+    tdt_key:$('llm-tdtkey').value.trim()});
   showLlm(r.ok, r.ok?'已保存 —— 对话服务下一句话即刻生效':('保存失败：'+(r.error||'未知错误')));
   loadLlm();
 }
@@ -1164,15 +1164,15 @@ class Handler(BaseHTTPRequestHandler):
         elif enabled and not llm.load_settings().get("api_key"):
             self._json({"ok": False, "error": "启用 LLM 需要先填写 API Key"}, 400)
             return
-        # 腾讯地图 Key（行程页真实地图用），选填；留空表示不修改
-        tkey = str(data.get("tmap_key") or "").strip()
-        if tkey:
-            if not all(ch.isalnum() or ch == "-" for ch in tkey) or len(tkey) < 10:
+        # 天地图 Key（行程页真实地图用），选填；留空表示不修改
+        tdt_key = str(data.get("tdt_key") or "").strip()
+        if tdt_key:
+            if not tdt_key.isalnum() or not 16 <= len(tdt_key) <= 64:
                 self._json({"ok": False,
-                            "error": "腾讯地图 Key 格式异常（字母/数字/连字符，"
-                                     "lbs.qq.com 控制台可查）"}, 400)
+                            "error": "天地图 Key 格式异常（通常为 32 位字母数字，"
+                                     "console.tianditu.gov.cn「应用管理」可查）"}, 400)
                 return
-            cfg["tmap_key"] = tkey
+            cfg["tdt_key"] = tdt_key
         llm.save_settings(cfg)
         self._json({"ok": True})
 

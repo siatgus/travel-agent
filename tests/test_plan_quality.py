@@ -487,30 +487,52 @@ def test_map_marks_uncertain_points() -> None:
 
 
 def test_route_map_real() -> None:
-    """行程页路线图：配了 Key 用真实腾讯地图（合规底图），没配回落 SVG 示意图。"""
+    """行程页路线图：配了 Key 用天地图（国家地理信息公共服务平台），没配回落 SVG。"""
     from travel_agent import render_html
     plan, _ = _compose()
     res = _fake_result(days_plan=plan)
-    orig = render_html.get_tmap_key
+    orig = render_html.get_tdt_key
     try:
-        render_html.get_tmap_key = lambda: ""
+        render_html.get_tdt_key = lambda: ""
         h = render_html.build_html(res, "成都4天")
-        check("没配 Key 时不加载地图 SDK", "map.qq.com/api/gljs" not in h)
+        check("没配 Key 时不加载地图 SDK", "api.tianditu.gov.cn" not in h)
+        check("不再引用腾讯地图", "map.qq.com" not in h)
         check("没配 Key 时仍有 SVG 示意图", "<svg" in h)
-        check("没配 Key 时提示去哪里申请 Key", "lbs.qq.com" in h)
+        check("没配 Key 时提示去哪里申请 Key", "console.tianditu.gov.cn" in h)
 
-        render_html.get_tmap_key = lambda: "TESTKEY1234567890"
+        render_html.get_tdt_key = lambda: "0123456789abcdef0123456789abcdef"
         h2 = render_html.build_html(res, "成都4天")
-        check("配 Key 后加载腾讯地图 GL JS", "map.qq.com/api/gljs" in h2)
+        check("配 Key 后加载天地图 JS API", "api.tianditu.gov.cn/api?v=4.0&tk=" in h2)
         check("地图容器与 SVG 兜底同时存在",
               'id="route-map"' in h2 and 'id="route-fallback"' in h2)
         check("行程点位注入地图脚本", "成都大熊猫繁育研究基地" in h2 or "宽窄巷子" in h2)
-        check("Key 只以安全字符注入", "TESTKEY1234567890" in h2)
+        check("Key 只以安全字符注入",
+              'var TK = "0123456789abcdef0123456789abcdef"' in h2)
+        check("标注底图来源是天地图", "国家地理信息公共服务平台" in h2)
+        check("WGS-84 直接上图，不做 GCJ-02 纠偏",
+              "w2g" not in h2 and "0.00669342162296594323" not in h2)
         check("估算点不进连线的语义写进页面", "不参与连线" in h2)
         check("页脚不再说数据来自 mock 工具层", "mock 工具层" not in h2)
         check("页脚写明真实数据口径", "Open-Meteo" in h2 and "历史同期" in h2)
+
+        render_html.get_tdt_key = lambda: "abc';alert(1)//"
+        h3 = render_html.build_html(res, "成都4天")
+        check("非法字符的 Key 被过滤成纯字母数字", "alert(1)" not in h3)
     finally:
-        render_html.get_tmap_key = orig
+        render_html.get_tdt_key = orig
+
+    # 环境变量优先于设置文件（部署时不想落盘就设 TIANDITU_KEY）
+    import os
+    orig_env = os.environ.get("TIANDITU_KEY")
+    try:
+        os.environ["TIANDITU_KEY"] = "envkey0123456789abcdef0123456789"
+        check("TIANDITU_KEY 环境变量生效",
+              render_html.get_tdt_key() == "envkey0123456789abcdef0123456789")
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIANDITU_KEY", None)
+        else:
+            os.environ["TIANDITU_KEY"] = orig_env
 
 
 def test_route_map_js_syntax() -> None:
