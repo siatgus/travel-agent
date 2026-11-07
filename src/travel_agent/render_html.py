@@ -177,9 +177,11 @@ ROUTE_MAP_JS = """
   var TK = "__KEY__";
   var box = document.getElementById('route-map');
   var fb = document.getElementById('route-fallback');
+  var tabs = document.getElementById('rt-tabs');
   function showFallback() {
     if (fb) fb.style.display = '';
     if (box) box.style.display = 'none';
+    if (tabs) tabs.style.display = 'none';
   }
   // 坐标系：天地图底图是 CGCS2000（与 WGS-84 差厘米级），库里的点本来就是
   // WGS-84，所以直接上图即可，不做 GCJ-02 纠偏——纠了反而整体偏约 500 米。
@@ -189,6 +191,78 @@ ROUTE_MAP_JS = """
       + '<path d="M14 1C7.4 1 1.5 6.2 1.5 13.6 1.5 22.4 14 36.5 14 36.5S26.5 22.4 26.5 13.6C26.5 6.2 20.6 1 14 1z" fill="' + color + '" stroke="#FFFFFF" stroke-width="1.6"/>'
       + '<text x="14" y="18" font-size="11" font-family="Arial,sans-serif" font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text></svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  var map, all = [], dayRecs = [], homeOv = null;
+  function ll(lng, lat) {
+    var p = new T.LngLat(lng, lat);
+    all.push(p);
+    return p;
+  }
+  function addMarker(pos, color, txt, title, uncertain) {
+    var mk;
+    try {
+      var icon = new T.Icon({ iconUrl: pin(color, txt),
+                              iconSize: new T.Point(26, 36),
+                              iconAnchor: new T.Point(13, 36) });
+      mk = new T.Marker(pos, { icon: icon, title: title });
+    } catch (e) { mk = new T.Marker(pos); }
+    map.addOverLay(mk);
+    try {
+      var iw = new T.InfoWindow(
+        title + (uncertain ? '<br>位置待确认（坐标按市区估算，交通时间未计入）' : ''),
+        { offset: new T.Point(0, -34) });
+      mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
+    } catch (e) {}
+    return mk;
+  }
+  function addLabel(text, pos, dx) {
+    try {
+      var lb = new T.Label({ text: text, position: pos,
+                             offset: new T.Point(dx, 12) });
+      map.addOverLay(lb);
+      return lb;
+    } catch (e) { return null; }
+  }
+  // 线上的「第N天」徽标（效仿行程类 App：色块圆角标签骑在动线上）
+  function addBadge(text, pos, color) {
+    try {
+      var lb = new T.Label({
+        text: '<span class="rt-badge" style="background:' + color + ';">' + text + '</span>',
+        position: pos, offset: new T.Point(-26, -14) });
+      map.addOverLay(lb);
+      return lb;
+    } catch (e) { return null; }
+  }
+  function setTab(idx) {
+    var btns = tabs ? tabs.querySelectorAll('button[data-idx]') : [];
+    dayRecs.forEach(function (rec, i) {
+      var vis = (idx < 0) || (i === idx);
+      rec.ov.forEach(function (o) {
+        if (!o) return;
+        try { if (vis) { o.show(); } else { o.hide(); } } catch (e) {}
+      });
+    });
+    if (homeOv) { try { if (idx < 0) { homeOv.show(); } else { homeOv.hide(); } } catch (e) {} }
+    try {
+      var pts = (idx < 0) ? all : dayRecs[idx].pts;
+      if (pts && pts.length > 1) { map.setViewport(pts); }
+      else if (pts && pts.length === 1) { map.centerAndZoom(pts[0], 14); }
+    } catch (e) {}
+    for (var k = 0; k < btns.length; k++) {
+      btns[k].className =
+        (btns[k].getAttribute('data-idx') === String(idx)) ? 'on' : '';
+    }
+  }
+  function bindTabs() {
+    if (!tabs) return;
+    var btns = tabs.querySelectorAll('button[data-idx]');
+    for (var k = 0; k < btns.length; k++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          setTab(parseInt(b.getAttribute('data-idx'), 10));
+        });
+      })(btns[k]);
+    }
   }
   function init() {
     if (typeof T === 'undefined') { showFallback(); return; }
@@ -202,7 +276,6 @@ ROUTE_MAP_JS = """
     if (!first) { showFallback(); return; }
     // 容器必须先有尺寸再初始化，否则瓦片按 0x0 计算，地图是空白
     if (box) box.style.display = '';
-    var map;
     try {
       map = new T.Map('route-map');
       map.centerAndZoom(new T.LngLat(first.lng, first.lat), 12);
@@ -211,69 +284,47 @@ ROUTE_MAP_JS = """
     try { map.addControl(new T.Control.Zoom()); } catch (e) {}
     try { map.addControl(new T.Control.MapType()); } catch (e) {}   // 矢量/影像切换
 
-    var all = [];
-    function ll(lng, lat) {
-      var p = new T.LngLat(lng, lat);
-      all.push(p);
-      return p;
-    }
-    function addMarker(pos, color, txt, title, uncertain) {
-      var mk;
-      try {
-        var icon = new T.Icon({ iconUrl: pin(color, txt),
-                                iconSize: new T.Point(26, 36),
-                                iconAnchor: new T.Point(13, 36) });
-        mk = new T.Marker(pos, { icon: icon, title: title });
-      } catch (e) { mk = new T.Marker(pos); }
-      map.addOverLay(mk);
-      try {
-        var iw = new T.InfoWindow(
-          title + (uncertain ? '<br>位置待确认（坐标按市区估算，交通时间未计入）' : ''),
-          { offset: new T.Point(0, -34) });
-        mk.addEventListener('click', function () { mk.openInfoWindow(iw); });
-      } catch (e) {}
-      return mk;
-    }
-    function addLabel(text, pos, dx) {
-      try {
-        map.addOverLay(new T.Label({ text: text, position: pos,
-                                     offset: new T.Point(dx, 12) }));
-      } catch (e) {}
-    }
     days.forEach(function (d, i) {
       var color = colors[i % colors.length] || '#2F6F6B';
+      var rec = { ov: [], pts: [] };
       var chain = [], seq = 0;
       (d.nodes || []).forEach(function (n) {
         var pos = ll(n.lng, n.lat);
+        rec.pts.push(pos);
         if (n.uncertain) {
           // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
-          addMarker(pos, '#9A9992', '?', n.name, true);
-          addLabel(n.name + '·位置估算', pos, -44);
+          rec.ov.push(addMarker(pos, '#9A9992', '?', n.name, true));
+          rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
         }
         chain.push(pos);
         if (n.type !== 'attraction') { return; }   // 餐位/赶路只进动线不插旗
         seq += 1;
-        addMarker(pos, color, String(seq), 'D' + d.day + ' ' + n.name, false);
-        addLabel(n.name, pos, -10);
+        rec.ov.push(addMarker(pos, color, String(seq), 'D' + d.day + ' ' + n.name, false));
+        rec.ov.push(addLabel(n.name, pos, -10));
       });
       if (chain.length >= 2) {
         try {
-          map.addOverLay(new T.Polyline(chain, { color: color, weight: 4,
-                                                 opacity: 0.62,
-                                                 lineStyle: 'dashed' }));
+          // 按天分色的实线动线（虚线会显得稀碎，实线更接近行程 App 的观感）
+          var pl = new T.Polyline(chain, { color: color, weight: 5, opacity: 0.8 });
+          map.addOverLay(pl);
+          rec.ov.push(pl);
+          rec.ov.push(addBadge('第' + d.day + '天',
+                               chain[Math.floor(chain.length / 2)], color));
         } catch (e) {}
       }
+      dayRecs.push(rec);
     });
     if (DATA.home) {
       var hp = ll(DATA.home[1], DATA.home[0]);
-      addMarker(hp, '#444441', '宿', '住宿', false);
+      homeOv = addMarker(hp, '#444441', '宿', '住宿', false);
       addLabel('住宿', hp, -22);
     }
     if (all.length > 1) {
       try { map.setViewport(all); } catch (e) {}   // 自动缩放到包含全部点位
     }
     if (fb) fb.style.display = 'none';
+    bindTabs();
   }
   var s = document.createElement('script');
   s.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=' + encodeURIComponent(TK);
@@ -325,8 +376,34 @@ def render_route_map(result: dict) -> str:
     if not safe_key:
         return f'<div class="card" style="padding:12px;">{svg}</div>'
     js = ROUTE_MAP_JS.replace("__DATA__", data).replace("__KEY__", safe_key)
+    # 天数页签（效仿行程类 App 的「总览/第1天/第2天…」筛选），点击只看某天的动线
+    md = route_map_data(result)
+    tabs = ('<div id="rt-tabs" class="rt-tabs">'
+            '<button type="button" class="on" data-idx="-1">总览</button>')
+    for i, d in enumerate(md["days"]):
+        c = DAY_COLORS[i % len(DAY_COLORS)]
+        tabs += (f'<button type="button" data-idx="{i}">'
+                 f'<i style="background:{c};"></i>第{d["day"]}天</button>')
+    tabs += '</div>'
     return (
         f'<div class="card" style="padding:12px;">'
+        f'<style>'
+        f'.rt-tabs{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}}'
+        f'.rt-tabs button{{border:1px solid #D8D7D0;background:#FFFFFF;color:#444441;'
+        f'border-radius:14px;padding:3px 12px;font-size:12px;cursor:pointer;'
+        f'display:inline-flex;align-items:center;gap:5px;font-family:inherit;}}'
+        f'.rt-tabs button i{{width:8px;height:8px;border-radius:50%;display:inline-block;}}'
+        f'.rt-tabs button.on{{background:#2F6F6B;color:#FFFFFF;border-color:#2F6F6B;}}'
+        f'.rt-tabs button.on i{{background:#FFFFFF;}}'
+        # 线上「第N天」徽标与景点名标签：透明底 + 白描边字，接近行程 App 观感
+        f'.tdt-label{{background:transparent!important;border:none!important;'
+        f'box-shadow:none!important;font-size:12px;color:#3B3A36;'
+        f'text-shadow:0 0 3px #FFF,0 0 3px #FFF,0 0 3px #FFF;white-space:nowrap;}}'
+        f'.rt-badge{{display:inline-block;color:#FFFFFF;border-radius:10px;'
+        f'padding:1px 9px;font-size:12px;white-space:nowrap;'
+        f'box-shadow:0 1px 3px rgba(0,0,0,.25);}}'
+        f'</style>'
+        f'{tabs}'
         f'<div id="route-map" style="height:430px;border-radius:8px;display:none;"></div>'
         f'<div id="route-fallback">{svg}</div>'
         f'<div style="font-size:12px;color:#9A9992;margin-top:10px;">'

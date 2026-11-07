@@ -514,6 +514,13 @@ def test_route_map_real() -> None:
         check("估算点不进连线的语义写进页面", "不参与连线" in h2)
         check("页脚不再说数据来自 mock 工具层", "mock 工具层" not in h2)
         check("页脚写明真实数据口径", "Open-Meteo" in h2 and "历史同期" in h2)
+        check("有天数筛选页签（总览/第N天）",
+              'id="rt-tabs"' in h2 and 'data-idx="-1"' in h2 and "第2天" in h2)
+        check("页签带每日配色圆点", ".rt-tabs button i" in h2)
+        check("动线上有「第N天」徽标", "rt-badge" in h2 and "addBadge" in h2)
+        check("点击页签只看某天（show/hide 逻辑）",
+              "setTab" in h2 and "o.show()" in h2 and "o.hide()" in h2)
+        check("按天分色实线动线", "new T.Polyline(chain" in h2)
 
         render_html.get_tdt_key = lambda: "abc';alert(1)//"
         h3 = render_html.build_html(res, "成都4天")
