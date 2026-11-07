@@ -587,6 +587,48 @@ def test_route_map_js_syntax() -> None:
         _TA_PATH(tmp).unlink(missing_ok=True)
 
 
+def test_wrap_contains_daily() -> None:
+    """结构性回归：每日行程/质检结果必须还在 .wrap 容器里。
+
+    2026-11-07 事故：地图页脚改文案时多写了一个 </div>，把 .wrap 提前关闭，
+    「每日行程」之后全部掉出容器变全宽——div 数量恰好全局配平，字符串级
+    测试（含 node --check）全查不出来。这里用真正的 HTML 解析器查嵌套。
+    """
+    from html.parser import HTMLParser
+    from travel_agent import render_html
+    plan, _ = _compose()
+    res = _fake_result(days_plan=plan)
+    h = render_html.build_html(res, "成都4天")
+
+    class WrapTracker(HTMLParser):
+        """喂入 HTML 前缀，报告「此刻是否还在 .wrap 里」。"""
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.depth = 0            # .wrap 内再嵌套的 div 层级
+            self.in_wrap = False
+        def handle_starttag(self, tag, attrs):
+            if dict(attrs).get("class") == "wrap":
+                self.in_wrap = True
+                self.depth = 0
+            elif self.in_wrap and tag == "div":
+                self.depth += 1
+        def handle_endtag(self, tag):
+            if self.in_wrap and tag == "div":
+                if self.depth == 0:
+                    self.in_wrap = False   # .wrap 被提前关闭
+                else:
+                    self.depth -= 1
+
+    for marker in ("每日行程", "质检结果"):
+        pos = h.find(marker)
+        assert pos > 0, marker
+        t = WrapTracker()
+        t.feed(h[:pos])
+        check(f"「{marker}」仍在 .wrap 容器内", t.in_wrap,
+              "wrap 已被提前关闭（DOM 结构破损，页面会变全宽）")
+
+
 def test_kid_party_and_schedule() -> None:
     """2大1小：孩子计入人数与预算口径；带幼儿落成午休/推车/家庭房安排。"""
     s = agent.extract_slots_rules("2大1小（3岁）下月从杭州去大理玩4天，不太想赶")
@@ -742,7 +784,7 @@ def main() -> int:
                test_uncertain_ticket_assumption,
                test_kid_party_and_schedule,
                test_map_marks_uncertain_points, test_route_map_real,
-               test_route_map_js_syntax,
+               test_route_map_js_syntax, test_wrap_contains_daily,
                test_poi_info_cards,
                test_render_budget_and_weather, test_pace_noop_is_honest):
         fn()
