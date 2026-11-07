@@ -751,11 +751,11 @@ def render_route_map(result: dict) -> str:
                 '当前为示意图。在管理后台「模型设置」填入天地图 Key，或设置环境变量 '
                 'TIANDITU_KEY（console.tianditu.gov.cn 免费申请，应用类型选'
                 '「浏览器端」）后，这里会显示真实地图。</div>')
-        return f'<div class="card" style="padding:12px;">{svg}</div>{hint}'
+        return f'{svg}{hint}'
     data = json.dumps(route_map_data(result), ensure_ascii=False).replace("<", "\\u003c")
     safe_key = "".join(ch for ch in key if ch.isalnum())
     if not safe_key:
-        return f'<div class="card" style="padding:12px;">{svg}</div>'
+        return svg
     js = ROUTE_MAP_JS.replace("__DATA__", data).replace("__KEY__", safe_key)
     # 天数页签（效仿行程类 App 的「总览/第1天/第2天…」筛选），点击只看某天的动线
     md = route_map_data(result)
@@ -767,7 +767,6 @@ def render_route_map(result: dict) -> str:
                  f'<i style="background:{c};"></i>第{d["day"]}天</button>')
     tabs += '</div>'
     return (
-        f'<div class="card" style="padding:12px;">'
         f'<style>'
         f'.rt-tabs{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}}'
         f'.rt-tabs button{{border:1px solid #D8D7D0;background:#FFFFFF;color:#444441;'
@@ -812,7 +811,7 @@ def render_route_map(result: dict) -> str:
         f'</style>'
         f'{tabs}'
         f'<div class="rt-wrap">'
-        f'<div id="route-map" style="height:430px;border-radius:8px;display:none;"></div>'
+        f'<div id="route-map" style="height:620px;border-radius:8px;display:none;"></div>'
         f'<button id="rt-locate" type="button" title="定位到我的当前位置">◎ 我的位置</button>'
         f'<div id="rt-locate-tip"></div>'
         f'</div>'
@@ -824,7 +823,7 @@ def render_route_map(result: dict) -> str:
         f'鼠标悬停景点图钉可看介绍卡片，点击「查看介绍」跳转攻略网页。'
         f'动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'
         f'位置估算点不参与连线。</div>'
-        f'</div><script>{js}</script>')
+        f'<script>{js}</script>')
 
 
 def render_budget_bar(result: dict) -> str:
@@ -1112,6 +1111,13 @@ def build_html(result: dict, utterance: str) -> str:
   .chip {{ display:inline-block; font-size:12px; padding:3px 9px; border-radius:4px;
            background:#EFEDE6; color:#5F5E5A; margin-right:6px; }}
   .card {{ background:#fff; border:1px solid #E4E2DA; border-radius:12px; padding:22px 24px; }}
+  /* 地图卡横向突破正文 860px 栏宽（大屏放大看图，窄屏自动回落 100%） */
+  .rt-mapcard {{ width:min(1160px, calc(100vw - 24px)); margin-left:50%;
+                 transform:translateX(-50%); }}
+  @media (max-width:900px) {{
+    .rt-mapcard {{ width:100%; margin-left:0; transform:none; }}
+    #route-map {{ height:440px !important; }}
+  }}
   table td {{ border-bottom:1px solid #EDEBE3; }}
   table tr:last-child td {{ border-bottom:none; }}
   @media print {{
@@ -1172,7 +1178,7 @@ def build_html(result: dict, utterance: str) -> str:
     <span style="display:inline-flex;align-items:center;gap:6px;">
       <i style="width:9px;height:9px;border-radius:50%;border:2px dashed #B4693F;display:inline-block;"></i>位置估算（坐标不可信，仅示意）</span>
   </div>
-  <div class="card" style="padding:12px;">{render_route_map(result)}</div>
+  <div class="card rt-mapcard" style="padding:12px;">{render_route_map(result)}</div>
 
   <h2>每日行程</h2>
   {days_html}

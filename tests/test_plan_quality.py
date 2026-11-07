@@ -517,6 +517,16 @@ def test_route_map_real() -> None:
         check("有天数筛选页签（总览/第N天）",
               'id="rt-tabs"' in h2 and 'data-idx="-1"' in h2 and "第2天" in h2)
         check("页签带每日配色圆点", ".rt-tabs button i" in h2)
+        check("地图容器 620px 高（放大版）",
+              'id="route-map" style="height:620px' in h2)
+        check("地图卡横向突破正文栏宽（rt-mapcard）",
+              'card rt-mapcard' in h2 and ".rt-mapcard" in h2
+              and "translateX(-50%)" in h2)
+        check("窄屏回落为全宽 440 高",
+              "@media (max-width:900px)" in h2 and "height:440px" in h2)
+        check("地图不再嵌套双层卡片",
+              h2.count('<div class="card rt-mapcard"') == 1
+              and '<div class="card" style="padding:12px;">' not in h2)
         check("动线上有「第N天」徽标", "rt-badge" in h2 and "addBadge" in h2)
         check("徽标底色加深一档（白字不发飘）",
               "function darken" in h2 and "darken(color, 0.68)" in h2
