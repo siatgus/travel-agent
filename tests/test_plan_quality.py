@@ -805,6 +805,11 @@ def test_poi_info_cards() -> None:
         check("缩略图 URL 注入", "th.bing.com/x.jpg" in h)
         check("卡片带来源与摘要", "介绍来源" in h and "逛吃指南" in h)
         check("悬停打开卡片（mouseover）", "mouseover" in h)
+        check("贴边自动平移地图给卡片腾位（panForCard）",
+              "function panForCard" in h and "getBounds" in h and "setCenter" in h)
+        check("平移后图钉挪出鼠标下方改走 watch 模式",
+              "watchCard" in h and "RT.panned" in h
+              and "removeEventListener" in h)
     finally:
         poi_links.fetch_one = orig_fo
 

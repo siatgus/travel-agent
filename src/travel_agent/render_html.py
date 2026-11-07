@@ -264,6 +264,32 @@ ROUTE_MAP_JS = """
     all.push(p);
     return p;
   }
+  // 图钉贴近视口边缘时，先把视野往里挪一截给卡片腾位置（Google Maps 同款体验）；
+  // 返回是否发生了平移——平移会把图钉挪出鼠标下方，mouseout 要改走 watch 模式
+  function panForCard(p) {
+    var moved = false;
+    try {
+      var b = map.getBounds();
+      if (b && b.getSouthWest) {
+        var sw = b.getSouthWest(), ne = b.getNorthEast();
+        var span = ne.getLat() - sw.getLat(), spanLng = ne.getLng() - sw.getLng();
+        var c = map.getCenter(), dLat = 0, dLng = 0;
+        if (span > 0 && p.getLat() > ne.getLat() - span * 0.30) {
+          dLat = span * 0.28;               // 顶边：视野上移，图钉下移
+        }
+        if (spanLng > 0 && p.getLng() < sw.getLng() + spanLng * 0.15) {
+          dLng = -spanLng * 0.15;           // 左边：视野左移，图钉右移
+        } else if (spanLng > 0 && p.getLng() > ne.getLng() - spanLng * 0.15) {
+          dLng = spanLng * 0.15;            // 右边：视野右移，图钉左移
+        }
+        if (dLat || dLng) {
+          map.setCenter(new T.LngLat(c.getLng() + dLng, c.getLat() + dLat));
+          moved = true;
+        }
+      }
+    } catch (e) {}
+    return moved;
+  }
   function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
     try {
@@ -276,27 +302,36 @@ ROUTE_MAP_JS = """
     try {
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
+      function openCard() {
+        hoverStay(); RT.openMk = mk;
+        RT.panned = panForCard(pos) ? mk : null;
+        mk.openInfoWindow(iw);
+      }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
       // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关
-      mk.addEventListener('mouseover', function () {
-        hoverStay(); RT.openMk = mk; mk.openInfoWindow(iw);
+      mk.addEventListener('mouseover', openCard);
+      mk.addEventListener('mouseout', function () {
+        if (RT.panned === mk) {
+          // 卡片是靠平移腾出空间的，图钉已被挪出鼠标下方，
+          // 这次的 mouseout 不是用户主动移开：改由 watchCard 接管关闭
+          RT.panned = null; watchCard(); return;
+        }
+        hoverClose();
       });
-      mk.addEventListener('mouseout', function () { hoverClose(); });
       if (uncertain) {
         // 只有估算点用 click 打开（它没有 hover 卡片，保留点按习惯）
-        mk.addEventListener('click', function () {
-          hoverStay(); RT.openMk = mk; mk.openInfoWindow(iw);
-        });
+        mk.addEventListener('click', openCard);
       }
     } catch (e) {}
     return mk;
   }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
-  var RT = { timer: null, openMk: null };
+  var RT = { timer: null, openMk: null, panned: null, watch: null };
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
   }
   function hoverClose() {
+    stopWatch();
     hoverStay();
     var m = RT.openMk;
     if (!m) { return; }
@@ -304,6 +339,25 @@ ROUTE_MAP_JS = """
       try { m.closeInfoWindow(); } catch (e) {}
       if (RT.openMk === m) { RT.openMk = null; }
     }, 350);
+  }
+  // 平移开卡后鼠标已不在图钉上（不会再触发 mouseout）：
+  // 文档级 mousemove 监听，鼠标移出卡片矩形就关；气泡卡没有 .rt-card，
+  // 任意移动即关
+  function stopWatch() {
+    if (RT.watch) { document.removeEventListener('mousemove', RT.watch); RT.watch = null; }
+  }
+  function watchCard() {
+    stopWatch();
+    RT.watch = function (ev) {
+      var el = document.querySelector('.rt-card');
+      var r = el ? el.getBoundingClientRect() : null;
+      if (!r) { stopWatch(); hoverClose(); return; }
+      if (ev.clientX < r.left - 8 || ev.clientX > r.right + 8 ||
+          ev.clientY < r.top - 8 || ev.clientY > r.bottom + 8) {
+        stopWatch(); hoverClose();
+      }
+    };
+    document.addEventListener('mousemove', RT.watch);
   }
   window.RThover = { stay: hoverStay, leave: hoverClose };
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
