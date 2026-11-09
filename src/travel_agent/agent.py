@@ -1277,10 +1277,19 @@ def self_check(result: dict) -> list[dict]:
                    "evidence": "、".join(move_over)})
 
     # 营业时间冲突
+    # 营业时间冲突。violations 里 day=0 是「全程未能排入」的内部标记
+    # （composer 用 0 占位），用户看到 "Day0 灵隐寺" 会当成不存在的第 0 天
+    # （杭州实测）——渲染成正常说法，编号只对真实行程天使用。
+    def _vio_label(v: dict) -> str:
+        day = v.get("day")
+        if isinstance(day, int) and day > 0:
+            return f"Day{day} {v['poi']}"
+        return f"{v['poi']}（全程未能排入）"
+
     vio = (result.get("decision_log") or {}).get("violations") or []
     checks.append({"item": "无闭馆时间冲突",
                    "result": "pass" if not vio else "fail",
-                   "evidence": "；".join(f"Day{v['day']} {v['poi']}：{v['why']}" for v in vio)})
+                   "evidence": "；".join(f"{_vio_label(v)}：{v['why']}" for v in vio)})
 
     # 景点不拖到深夜：营业时间允许但体验不成立的排法（21:05 逛完古城）
     late = []

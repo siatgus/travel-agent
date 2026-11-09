@@ -1084,6 +1084,14 @@ def test_return_day_station_buffer() -> None:
     lun = next(c for c in chk if c["item"].startswith("午餐"))
     check("质检：午餐窗口按实际排出的时间判 → pass", lun["result"] == "pass",
           str(lun))
+    # 用户可见编号：全程未能排入的点是内部 day=0 标记，不能显示成「Day0」
+    res2 = dict(res)
+    res2["decision_log"] = {"violations": [
+        {"day": 0, "poi": "灵隐寺", "why": "全程未能排入，受闭馆时间与动线限制"}]}
+    vio = next(c for c in agent.self_check(res2) if c["item"] == "无闭馆时间冲突")
+    check("质检编号：全程未排入不显示 Day0",
+          "Day0" not in vio["evidence"] and "全程未能排入" in vio["evidence"],
+          vio["evidence"])
 
 
 def test_return_day_pack_and_go() -> None:
