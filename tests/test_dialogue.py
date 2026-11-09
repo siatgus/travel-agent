@@ -167,6 +167,25 @@ def test_change_mind() -> None:
           f"dest={r.slots.get('destination')} days={r.slots.get('days')}")
 
 
+def test_clock_precise_reschedule_honest() -> None:
+    """分钟级精确改排（把午餐排到 15:20 结束）：如实说做不到，不静默重排。"""
+    from travel_agent import intent
+    check("分钟时刻+改排动词被识别",
+          intent.wants_clock_schedule("把 Day 3 午餐排到 15:20 结束后接 90 分钟午休"))
+    check("整点说法不误伤",
+          not intent.wants_clock_schedule("下午3点出发去大理"))
+    s = session()
+    s.turn("11月8号去大理玩4天，2人，预算6000")
+    before = s.plan_made and s.last_plan is not None
+    r = s.turn("把 Day 3 午餐排到 15:20 结束后接 90 分钟午休")
+    check("分钟级改排请求返回诚实说明而不是新方案",
+          r.mode == "answer" and "具体时刻" in r.render,
+          f"mode={r.mode}")
+    check("说明里给出可用的改排方式", "景点" in r.render and "多住一天" in r.render)
+    check("普通改排不受影响",
+          s.turn("去掉苍山").mode == "plan" and before)
+
+
 # ------------------------------------------------------------------ 预算三档
 
 
@@ -856,6 +875,7 @@ def main() -> int:
                test_day_weather_rendered, test_plan_weather_advice,
                test_slots_not_clobbered, test_per_person_tracks_party_size,
                test_explicit_total_is_sticky, test_change_mind,
+               test_clock_precise_reschedule_honest,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,
                test_province_asks_city, test_unsupported_destination_never_replaced,
                test_month_only_date, test_solo_traveler, test_hotel_relax_notice,

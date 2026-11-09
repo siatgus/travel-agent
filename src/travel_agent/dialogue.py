@@ -461,6 +461,23 @@ class Session:
                              ask_rounds=self.ask_rounds, slots=dict(self.slots),
                              render=text)
 
+        # 「把 Day 3 午餐排到 15:20 结束」——分钟级精确排程能力还不存在，
+        # 静默重排一份常规时间轴只会让人以为指令没生效（亲子测试实测）。
+        # 放在意图直答之后：天气/交通/景点问答里出现时刻不归这管
+        if self.plan_made and intent.wants_clock_schedule(utterance):
+            text = (
+                "这条先没动行程：**暂时做不到按具体时刻（比如 15:20）精确排程**——"
+                "时间轴由景点时长、交通耗时和用餐时段自动推算，接了也只会重排出"
+                "一份常规时间轴，看着就像没生效。\n\n"
+                "我能做的调整：换/删/加景点（「去掉锦里」「Day 2 加上熊猫基地」）、"
+                "改天数（「多住一天」）、节奏与预算。\n\n"
+                "顺带说明：带幼儿或点名午休的行程，编排器会保证中间日午餐后"
+                "插入 90 分钟午休（最晚 16 点前开始），不需要手动指定时刻。")
+            self.history.append({"role": "agent", "content": text})
+            return Reply(mode="answer", turn_no=self.turn_no,
+                         ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                         render=text)
+
         delta = agent.extract_slots(utterance, today=self.today, client=self.client)
         explicit = _explicit_fields(utterance, delta)
         lead_notes: list[str] = []
