@@ -810,9 +810,10 @@ def test_poi_info_cards() -> None:
               and "getBoundingClientRect" in h and "panBy" not in h)
         check("只认可见卡片矩形（防隐藏旧节点误判）",
               "function visibleCardRect" in h and "querySelectorAll('.rt-card')" in h)
-        check("避让图钉图标：量可见 .tdt-marker-icon 并排除当前 marker",
-              "function markerRects" in h and "tdt-marker-icon" in h
-              and "getLngLat" in h and "offsetParent === null" in h)
+        check("只避让选中图标：anchorRect 按锚点构造矩形（不查 DOM）",
+              "function anchorRect" in h and "getLngLat" in h
+              and "lngLatToContainerPoint" in h
+              and "markerRects" not in h)
         check("避让位移按方向算分离量（对称 overlap 会推不够）",
               "q.right - r.left" in h and "r.right - q.left" in h)
         check("挪卡不动图：旧平移兜底机制已清干净",

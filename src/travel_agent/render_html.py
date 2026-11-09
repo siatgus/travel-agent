@@ -291,41 +291,24 @@ ROUTE_MAP_JS = """
       return best || fallback;
     } catch (e) { return null; }
   }
-  // 可见图钉图标矩形（IMG.tdt-marker-icon，实测 class）：
-  // 隐藏图层（切页签 hide）offsetParent 为 null 自动排除；
-  // 排除离 mk 锚点最近的图标 = 当前 marker 自身（卡片本来就悬在它旁边）。
-  // marker 实例没有 _icon 暴露（实测），但 getLngLat() 存在，
-  // 锚点像素用 map.lngLatToContainerPoint 换算
-  function markerRects(mk) {
+  // 当前选中图钉的图标矩形：不查 DOM——「离锚点最近的图标」判定在图钉密集时
+  // 会选错（邻钉可能比自己的图标离锚点更近，实测踩过）。图钉图标规格固定
+  // iconSize(30,40)/iconAnchor(15,38)，锚点像素 = lngLatToContainerPoint 换算，
+  // 直接按锚点构造矩形（实测渲染 25x41，各放宽 2px 余量）
+  function anchorRect(mk) {
     try {
-      var scope = map && map.getContainer ? map.getContainer()
-                                          : document.getElementById('route-map');
-      if (!scope || !scope.querySelectorAll) { return []; }
-      var near = -1, nd = 1e18, ax = null;
-      if (mk && mk.getLngLat && map && map.lngLatToContainerPoint) {
-        var p = map.lngLatToContainerPoint(mk.getLngLat());
-        var m0 = scope.getBoundingClientRect();
-        ax = { x: m0.left + p.x, y: m0.top + p.y };
-      }
-      var out = [];
-      var els = scope.querySelectorAll('.tdt-marker-icon');
-      for (var i = 0; i < els.length; i++) {
-        if (els[i].offsetParent === null) { continue; }   // 隐藏图层
-        var r = els[i].getBoundingClientRect();
-        if (r.width < 4) { continue; }
-        if (ax) {
-          var d = Math.pow(r.left + r.width / 2 - ax.x, 2)
-                + Math.pow(r.top + r.height / 2 - ax.y, 2);
-          if (d < nd) { nd = d; near = out.length; }
-        }
-        out.push(r);
-      }
-      if (ax && near >= 0) { out.splice(near, 1); }
-      return out;
-    } catch (e) { return []; }
+      if (!mk || !mk.getLngLat || !map || !map.lngLatToContainerPoint) { return null; }
+      var scope = map.getContainer ? map.getContainer()
+                                   : document.getElementById('route-map');
+      if (!scope) { return null; }
+      var m0 = scope.getBoundingClientRect();
+      var p = map.lngLatToContainerPoint(mk.getLngLat());
+      var ax = m0.left + p.x, ay = m0.top + p.y;
+      return { left: ax - 16, right: ax + 16, top: ay - 40, bottom: ay + 4 };
+    } catch (e) { return null; }
   }
-  // 三段式位置收敛（挪卡片不动地图）：① 钳进地图可视区；② 避让图钉图标——
-  // 与可见图标矩形重叠时沿重叠较小的轴推离（+2px 余量）；③ 复测兜残差。
+  // 三段式位置收敛（挪卡片不动地图）：① 钳进地图可视区；② 避让选中图标——
+  // 与当前图钉图标矩形重叠时沿分离所需方向推离；③ 复测兜残差。
   // 避让可能与钳制打架，靠多轮收敛（最多 3 轮，每轮 620ms）；
   // offset 以 RTbase（首次记录的原始锚点偏移）为基准，每次开卡先复位，
   // 保证换缩放级别后不会跨次累计漂移
@@ -353,19 +336,28 @@ ROUTE_MAP_JS = """
         else if (r.bottom > m.bottom - pad) { sy = -Math.round(r.bottom - (m.bottom - pad)); }
         if (r.left < m.left + pad) { sx = Math.round(m.left + pad - r.left); }
         else if (r.right > m.right - pad) { sx = -Math.round(r.right - (m.right - pad)); }
-        var icons = markerRects(mk);
-        for (var i = 0; i < icons.length; i++) {
-          var q = icons[i];
-          if (r.right <= q.left || r.left >= q.right ||
-              r.bottom <= q.top || r.top >= q.bottom) { continue; }   // 不相交
-          // 分离位移按方向算（对称 overlap 会推不够）：
-          // 水平左推 = 卡片右缘-图标左缘，右推 = 图标右缘-卡片左缘；垂直同理。
-          // 取各轴较小的方向，再选绝对值更小的轴，一次推到完全分离
-          var dx = (r.right - q.left <= q.right - r.left)
-            ? -(r.right - q.left + 2) : (q.right - r.left + 2);
-          var dy = (r.bottom - q.top <= q.bottom - r.top)
-            ? -(r.bottom - q.top + 2) : (q.bottom - r.top + 2);
-          if (Math.abs(dx) <= Math.abs(dy)) { sx += dx; } else { sy += dy; }
+        var q = anchorRect(mk);
+        if (q && r.right > q.left && r.left < q.right &&
+            r.bottom > q.top && r.top < q.bottom) {
+          // 分离位移按方向算（对称 overlap 会推不够）：左推=卡片右缘-图标左缘…
+          // 方向与轴的选择都要考虑边界可行性，否则贴边图钉会「避让↔钳制」振荡：
+          // 每轴先挑「推完仍留在地图内」的方向（两向可行取小），可行轴优先
+          var dxL = -(r.right - q.left + 2), dxR = q.right - r.left + 2;
+          var dyU = -(r.bottom - q.top + 2), dyD = q.bottom - r.top + 2;
+          var lOK = r.left + dxL >= m.left + pad;
+          var rOK = r.right + dxR <= m.right - pad;
+          var uOK = r.top + dyU >= m.top + pad;
+          var dOK = r.bottom + dyD <= m.bottom - pad;
+          var dx = (lOK && rOK) ? (Math.abs(dxL) <= Math.abs(dxR) ? dxL : dxR)
+                : lOK ? dxL : (rOK ? dxR
+                : (Math.abs(dxL) <= Math.abs(dxR) ? dxL : dxR));
+          var dy = (uOK && dOK) ? (Math.abs(dyU) <= Math.abs(dyD) ? dyU : dyD)
+                : uOK ? dyU : (dOK ? dyD
+                : (Math.abs(dyU) <= Math.abs(dyD) ? dyU : dyD));
+          var xOK = (lOK || rOK);
+          var yOK = (uOK || dOK);
+          if (xOK && (!yOK || Math.abs(dx) <= Math.abs(dy))) { sx += dx; }
+          else { sy += dy; }
         }
         if (!sx && !sy) { return; }
         var o = iw.getOffset();

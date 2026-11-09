@@ -23,7 +23,7 @@ def extract(name):
 
 
 funcs = "\n".join(extract(n) for n in
-                  ("visibleCardRect", "markerRects", "fitCardInMap"))
+                  ("visibleCardRect", "anchorRect", "fitCardInMap"))
 
 probe = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -59,9 +59,9 @@ window.onload = function(){
       function rectAbs(){ var c=document.querySelector('.rt-card');
         var r=c.getBoundingClientRect();
         return [r.top, r.bottom, r.left, r.right]; }
-      // 需要避让的图标集合：与真实代码同源——markerRects(mk) 已排除当前 marker
-      function guardRects(){ return markerRects(mk).map(function(r){
-        return [r.top, r.bottom, r.left, r.right]; }); }
+      // 需要避让的图标：与真实代码同源——只保证不遮挡选中的图标（anchorRect）
+      function guardRects(){ var r=anchorRect(mk);
+        return r ? [[r.top, r.bottom, r.left, r.right]] : []; }
       function iconRects(){ var box=document.getElementById('route-map');
         var m=box.getBoundingClientRect(); var out=[];
         box.querySelectorAll('.tdt-marker-icon').forEach(function(e){
@@ -77,6 +77,7 @@ window.onload = function(){
         fitCardInMap(iw, mk, 0);
         setTimeout(function(){
           var after = rect();
+          var cardAfter = rectAbs();
           var guardsAfter = guardRects();
           // 第二次开卡：offset 应先复位再重新收敛（不跨次累计漂移）
           setTimeout(function(){
@@ -86,15 +87,38 @@ window.onload = function(){
               fitCardInMap(iw, mk, 0);
               setTimeout(function(){
                 var after2 = rect();
+                var cardAfter2 = rectAbs();
                 var guardsAfter2 = guardRects();
-                document.getElementById('out').textContent = 'INFO=' + JSON.stringify({
-                  before: before, after: after,
-                  icons_before: iconsBefore,
-                  guards_after: guardsAfter, card_abs: rectAbs(),
-                  reopen_before: before2, reopen_after: after2,
-                  guards_after2: guardRects(), card_abs2: rectAbs(),
-                  offset_final: (function(o){return o?[o.x,o.y]:null;})(iw.getOffset())
-                });
+                // 场景 C：图钉在地图中部，卡片默认悬在上方本就不遮图标——不应乱动
+                var mkC = new T.Marker(new T.LngLat(104.075, 30.615));
+                map.addOverLay(mkC);
+                var iwC = new T.InfoWindow('<div class="rt-card">card</div>',
+                                           {offset:new T.Point(0,-38), maxWidth:250});
+                setTimeout(function(){
+                  mk.closeInfoWindow();
+                  mkC.openInfoWindow(iwC);
+                  setTimeout(function(){
+                    var cBefore = rect();
+                    fitCardInMap(iwC, mkC, 0);
+                    setTimeout(function(){
+                      var cAfter = rect();
+                      var cG = anchorRect(mkC);
+                      var cGuards = cG ? [[cG.top, cG.bottom, cG.left, cG.right]] : [];
+                      document.getElementById('out').textContent = 'INFO=' + JSON.stringify({
+                        before: before, after: after,
+                        icons_before: iconsBefore,
+                        guards_after: guardsAfter, card_abs: cardAfter,
+                        reopen_before: before2, reopen_after: after2,
+                        guards_after2: guardsAfter2, card_abs2: cardAfter2,
+                        c_before: cBefore, c_after: cAfter,
+                        c_guards: cGuards, c_card: rectAbs(),
+                        c_offset: (function(o){return o?[o.x,o.y]:null;})(iwC.getOffset()),
+                        c_base: iwC.RTbase ? [iwC.RTbase.x, iwC.RTbase.y] : null,
+                        offset_final: (function(o){return o?[o.x,o.y]:null;})(iw.getOffset())
+                      });
+                    }, 2200);
+                  }, 700);
+                }, 200);
               }, 2200);
             }, 700);
           }, 200);
@@ -147,13 +171,19 @@ ok1 = in_map(data["after"])
 ok2 = not overlaps_abs(data["card_abs"], data["guards_after"])
 ok3 = (in_map(data["reopen_after"])
        and not overlaps_abs(data["card_abs2"], data["guards_after2"]))
+# 场景 C：图钉居中，默认位置不遮图标 → 收敛后仍不遮 + offset 保持 base
+ok4 = (not overlaps_abs(data["c_card"], data["c_guards"])
+       and data["c_offset"] == data["c_base"])
 print("图钉矩形:", data["icons_before"])
 print("首次开卡  before=%s after=%s -> %s / %s" % (
     data["before"], data["after"],
     "PASS 卡片在地图内" if ok1 else "FAIL 仍被裁",
-    "PASS 不遮挡图标" if ok2 else "FAIL 遮挡图标"))
+    "PASS 不遮挡选中图标" if ok2 else "FAIL 遮挡选中图标"))
 print("再次开卡  before=%s after=%s -> %s" % (
     data["reopen_before"], data["reopen_after"],
     "PASS 复位后重新收敛" if ok3 else "FAIL"))
+print("图钉居中  before=%s after=%s offset=%s -> %s" % (
+    data["c_before"], data["c_after"], data["c_offset"],
+    "PASS 默认位置不动" if ok4 else "FAIL 位置被乱调"))
 print("最终 offset =", data["offset_final"])
-sys.exit(0 if ok1 and ok2 and ok3 else 1)
+sys.exit(0 if ok1 and ok2 and ok3 and ok4 else 1)
