@@ -529,7 +529,9 @@ def test_route_map_real() -> None:
               'onmouseenter="RThover.stay()"' in h2
               and 'onmouseleave="RThover.leave()"' in h2
               and "window.RThover" in h2)
-        check("图钉挂 mouseout 关闭", "addEventListener('mouseout'" in h2)
+        check("图钉只挂 mouseover 开卡（mouseout 不再驱动关闭）",
+              "addEventListener('mouseover'" in h2
+              and "addEventListener('mouseout'" not in h2)
         # 两态图标：未选中小圆点，选中展开完整圆章 + 弹入过渡动画
         check("图钉默认小圆点（未选中态）",
               "function mDot" in h2 and "mIcon(mDot(color), 22, 22, 11, 11)" in h2)
@@ -542,11 +544,21 @@ def test_route_map_real() -> None:
               and "transform-origin:50% 100%" in h2)
         check("换选回落旧钉（不留残钉）", "selMk(RT.openMk, false)" in h2)
         check("关闭卡片图标回落小圆点", "selMk(m, false)" in h2)
-        # 防闪烁：光标坐标实时兜底，不信 DOM 边界事件（卡片挪位时它们来回误报）
-        check("悬停防闪烁以光标在卡片矩形内实时判定",
-              "if (RT.openMk && RT.timer)" in h2
-              and "ev.clientX >= r.left && ev.clientX <= r.right" in h2
-              and "ev.clientY >= r.top && ev.clientY <= r.bottom" in h2)
+        # 防闪烁：关卡唯一裁判是光标坐标，与 DOM 边界事件完全无关——
+        # 静止光标下浏览器照样派发 mouseout/mouseover（卡片挪位/DOM 变化），
+        # 事件驱动开关就是录屏里的「一直闪烁、图标跟着闪」死循环
+        check("关卡由光标坐标唯一裁判（hoverTick）",
+              "function hoverTick" in h2 and "function cursorOnCard" in h2
+              and "function cursorOnPin" in h2
+              and "cursorOnCard(p) || cursorOnPin(p)" in h2)
+        check("延时关前再判一次（定时期间光标可能移回）",
+              "cursorOnCard(q) || cursorOnPin(q)" in h2)
+        check("光标压图标才保持打开（±6px 压住而非邻近）",
+              "p.x >= r.left - 6 && p.x <= r.right + 6" in h2)
+        check("避让守卫在 openCard 瞬间采集（光标必然压在本图钉上）",
+              "iw.RTguard0" in h2 and "iw.RTguard = iw.RTguard0" in h2)
+        check("首轮避让修正 0ms（base 闪帧压到不可见）",
+              "round ? 620 : 0" in h2)
         check("圆章内类别小图标与序号同轴心（用户指出不匹配）",
               "translate(10.3,14.2) scale(0.78)" in h2)
         check("地图容器 620px 高（放大版）",

@@ -401,10 +401,12 @@ ROUTE_MAP_JS = """
         var box = document.getElementById('route-map');
         if (!r || !box) { return; }
         var m = box.getBoundingClientRect();
-        // 守卫矩形只认「选中的图标」（光标所在），首轮记到 iw.RTguard，
-        // 复测轮沿用同一个——复测时鼠标可能已移开，实时识别会换来换去
+        // 守卫矩形只认「选中的图标」：优先用 openCard 瞬间采集的
+        // iw.RTguard0（那一刻光标必然压在本图钉上，不会选错），
+        // 复测轮沿用同一个——复测时光标可能已移进卡片，实时识别会换来换去
         if (round === 0) {
-          iw.RTguard = RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null;
+          iw.RTguard = iw.RTguard0
+            || (RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null);
         }
         var guards = iw.RTguard ? [iw.RTguard] : [];
         var pad = 8, cx = 0, cy = 0;
@@ -440,7 +442,9 @@ ROUTE_MAP_JS = """
         iw.update();
         fitCardInMap(iw, round + 1);
       } catch (e) {}
-    }, round ? 620 : 60);
+      // 首轮 0ms：openInfoWindow 同步渲染完 DOM，立即量立即挪——把
+      // 「base 位置闪一帧（可能压住图标）」压到肉眼不可见；复测轮留 620ms
+    }, round ? 620 : 0);
   }
   function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
@@ -459,15 +463,20 @@ ROUTE_MAP_JS = """
         if (RT.openMk === mk) { hoverStay(); return; }
         if (RT.openMk) { selMk(RT.openMk, false); }   // 换选：旧钉回落小圆点
         hoverStay(); RT.openMk = mk;
-        selMk(mk, true);
+        selMk(mk, true);   // 先展开圆章，守卫量的才是展开后的图标矩形
         mk.openInfoWindow(iw);
+        // 避让守卫必须在 openCard 这一刻采集：触发它的是 mouseover，
+        // 光标必然正压在本图钉上，iconRectAt 不会选错；拖到 fitCardInMap
+        // 的定时器里再量，光标可能已移进卡片 → 守卫 null → 卡片压住图标
+        iw.RTguard0 = RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null;
         fitCardInMap(iw, 0);
       }
-      // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
-      // 光标坐标实时兜底见文档级 mousemove（不信 DOM 边界事件——卡片挪位
-      // 时它们来回误报，就是「一直闪烁」的根源）。
+      // hover 开卡；关卡不挂任何 DOM 边界事件——卡片随 fitCardInMap 挪位时
+      // mouseenter/mouseleave 挪前挪后各误报一次，事件驱动的开关在静止光标
+      // 下也死循环（浏览器在 DOM 变化下照样派发边界事件）：卡片盖图标 →
+      // mouseout → 关 → 图标露出 → mouseover → 开 → 又盖住……就是用户
+      // 录屏里的「一直闪烁、图标跟着闪」。关卡唯一裁判 = 光标坐标，见 hoverTick
       mk.addEventListener('mouseover', openCard);
-      mk.addEventListener('mouseout', hoverClose);
       if (uncertain) {
         // 只有估算点用 click 打开（它没有 hover 卡片，保留点按习惯）
         mk.addEventListener('click', openCard);
@@ -512,28 +521,57 @@ ROUTE_MAP_JS = """
   // 不用事件对象自带的 clientX——天地图 marker 事件对象实测可能不带
   document.addEventListener('mousemove', function (ev) {
     RT.mouse = { x: ev.clientX, y: ev.clientY };
-    // 防闪烁兜底：光标在卡片上就取消关闭。卡片随 fitCardInMap 挪位时
-    // mouseenter/mouseleave 来回误报（挪前挪后各报一次），边界事件驱动
-    // 的开关就成了「一直闪烁」；以光标是否真的落在卡片矩形内实时判定。
-    if (RT.openMk && RT.timer) {
-      var r = visibleCardRect();
-      if (r && ev.clientX >= r.left && ev.clientX <= r.right
-             && ev.clientY >= r.top && ev.clientY <= r.bottom) { hoverStay(); }
-    }
+    hoverTick();
   });
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
   }
-  function hoverClose() {
-    hoverStay();
-    var m = RT.openMk;
-    if (!m) { return; }
-    RT.timer = setTimeout(function () {
-      try { m.closeInfoWindow(); } catch (e) {}
-      if (RT.openMk === m) { RT.openMk = null; }
-      selMk(m, false);   // 卡片关了，图标回落小圆点
-    }, 350);
+  // 光标是否压在卡片矩形内
+  function cursorOnCard(p) {
+    var r = visibleCardRect();
+    return !!(r && p.x >= r.left && p.x <= r.right
+                && p.y >= r.top && p.y <= r.bottom);
   }
+  // 光标是否压在任一可见图标上（±6px 余量；压住才算，30px 邻近不算，
+  // 否则卡片粘着不放）
+  function cursorOnPin(p) {
+    try {
+      var scope = map && map.getContainer ? map.getContainer()
+                                          : document.getElementById('route-map');
+      if (!scope || !scope.querySelectorAll) { return false; }
+      var els = scope.querySelectorAll('.tdt-marker-icon');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) { continue; }   // 隐藏图层
+        var r = els[i].getBoundingClientRect();
+        if (r.width < 4) { continue; }
+        if (p.x >= r.left - 6 && p.x <= r.right + 6
+            && p.y >= r.top - 6 && p.y <= r.bottom + 6) { return true; }
+      }
+    } catch (e) {}
+    return false;
+  }
+  // 关卡唯一裁判：光标既不在卡片上、也不压着任何图钉，才延时 350ms 关。
+  // 只由 mousemove 驱动，与 DOM 边界事件完全无关——静止光标不会产生
+  // mousemove，也就绝不会误关，闪烁死循环从机制上不存在。
+  // 卡片内联 RThover.stay/leave 保留：leave 后下一次 mousemove 会自然接手
+  function hoverTick() {
+    if (!RT.openMk) { return; }
+    var p = RT.mouse;
+    if (!p) { return; }
+    if (cursorOnCard(p) || cursorOnPin(p)) { hoverStay(); return; }
+    if (!RT.timer) {
+      RT.timer = setTimeout(function () {
+        RT.timer = null;
+        var q = RT.mouse;
+        if (q && (cursorOnCard(q) || cursorOnPin(q))) { return; }   // 定时期间又移回来了
+        var m = RT.openMk;
+        try { m.closeInfoWindow(); } catch (e) {}
+        if (RT.openMk === m) { RT.openMk = null; }
+        selMk(m, false);   // 卡片关了，图标回落小圆点
+      }, 350);
+    }
+  }
+  function hoverClose() { hoverTick(); }
   window.RThover = { stay: hoverStay, leave: hoverClose };
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
   // 「图片卡」标记：介绍页没搜到、只有搜索来的图，站点名固定为必应图片
