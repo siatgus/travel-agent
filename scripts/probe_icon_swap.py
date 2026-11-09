@@ -69,10 +69,14 @@ window.onload = function(){
           setTimeout(function(){
             var r3 = img1.getBoundingClientRect();   // 动画结束（freeze）
             var snap3 = [r3.top, r3.left, r3.width, r3.height];
+            // naturalWidth>0 才是真渲染出来了——破图（XML 错误）时为 0，
+            // 而 width/height 属性仍在，getBoundingClientRect 骗得过
             document.getElementById('out').textContent = 'INFO=' + JSON.stringify({
               hasSetIcon: typeof mk.setIcon === 'function',
               src_swapped: img1.getAttribute('src') === pinUrl,
               src_has_smil: img1.getAttribute('src').indexOf('animateTransform') > -1,
+              svg_loaded: img1.naturalWidth > 0 && img1.naturalHeight > 0,
+              natural: [img1.naturalWidth, img1.naturalHeight],
               same_img: img1 === img0,
               snap1: snap1, snap2: snap2, snap3: snap3
             });
@@ -114,7 +118,7 @@ s1, s2, s3 = data["snap1"], data["snap2"], data["snap3"]
 stable = all(abs(a - b) <= 1 for a, b in zip(s1, s2)) and \
          all(abs(a - b) <= 1 for a, b in zip(s2, s3))
 ok = (data["hasSetIcon"] and data["src_swapped"] and data["src_has_smil"]
-      and data["same_img"] and stable
+      and data["same_img"] and data["svg_loaded"] and stable
       and s1[2] == 30 and s1[3] == 40)
-print("PASS 图标动画期间零漂移" if ok else "FAIL 动画期间图标位置漂移！")
+print("PASS 图标真实渲染且动画期间零漂移" if ok else "FAIL（破图或漂移）")
 sys.exit(0 if ok else 1)

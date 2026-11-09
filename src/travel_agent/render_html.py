@@ -259,7 +259,8 @@ ROUTE_MAP_JS = """
     // 天地图框架的定位机制（translate3d），CSS keyframes 一动它图标就被
     // 甩到图层面板原点附近——录屏里「图标在其他地方弹出来」的元凶。
     // SMIL 随新 src 加载自动播放，围绕尾尖 (15,38.5) 从 0.45 弹到 1.15 回 1，
-    // 外层 translate 组合实现绕点缩放；fill=freeze 停在原尺寸
+    // 外层 translate 组合实现绕点缩放；fill=freeze 停在原尺寸。
+    // 注意 <g> 必须逐层闭合（img 里 SVG 是严格 XML，少一个 </g> 整张破图）
     var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="40" viewBox="0 0 30 40">'
       + '<g transform="translate(15,38.5)"><g opacity="0.35">'
       + '<animate attributeName="opacity" values="0.35;1;1" keyTimes="0;0.65;1"'
@@ -267,7 +268,7 @@ ROUTE_MAP_JS = """
       + '<g><animateTransform attributeName="transform" type="scale"'
       + ' values="0.45;1.15;1" keyTimes="0;0.65;1" dur="0.22s" fill="freeze"/>'
       + '<g transform="translate(-15,-38.5)">' + body + '</g>'
-      + '</g></g></svg>';
+      + '</g></g></g></svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   }
   // 未选中态小圆点（用户指定样式，同「我的位置」蓝点语言但用当天配色）：

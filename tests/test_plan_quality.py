@@ -546,6 +546,12 @@ def test_route_map_real() -> None:
               and 'fill="freeze"' in h2
               and "@keyframes rt-pop" not in h2
               and "classList.add('rt-pop')" not in h2)
+        # img 里的 SVG 是严格 XML：pin() 模板 <g 与 </g 必须配平
+        # （少一个 </g> 整张图标破图——「图标丢失」事故的根因）
+        _p0 = h2.find("function pin(")
+        _pb = h2[_p0:h2.find("\n  }", _p0)] if _p0 >= 0 else ""
+        check("pin 模板 SVG 标签配平", _pb and _pb.count("<g") == _pb.count("</g")
+              and "<svg" in _pb and "</svg>" in _pb)
         check("换选回落旧钉（不留残钉）", "selMk(RT.openMk, false)" in h2)
         check("关闭卡片图标回落小圆点", "selMk(m, false)" in h2)
         # 防闪烁：关卡唯一裁判是光标坐标，与 DOM 边界事件完全无关——
