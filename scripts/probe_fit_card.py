@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
-"""端到端行为探针：从 render_html.py 逐字提取 fitCardInMap/visibleCardRect，
-在真实天地图 SDK + 贴边场景下验证「挪卡片不动地图」真的生效。"""
+"""端到端行为探针：从 render_html.py 逐字提取 visibleCardRect/fitCardInMap/markerRects，
+在真实天地图 SDK 下验证「挪卡片不动地图」：
+① 贴边图钉开卡，卡片钳进地图可视区；
+② 近旁第二个图钉落在卡片默认位置内，收敛后卡片不得遮挡任何图标；
+③ 再次开卡先复位再重新收敛（不跨次累计漂移）。"""
 import json
 import re
 import subprocess
@@ -19,7 +22,8 @@ def extract(name):
     return m.group(0)
 
 
-funcs = extract("visibleCardRect") + "\n" + extract("fitCardInMap")
+funcs = "\n".join(extract(n) for n in
+                  ("visibleCardRect", "markerRects", "fitCardInMap"))
 
 probe = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -30,7 +34,7 @@ probe = """<!DOCTYPE html>
 <pre id="out">PENDING</pre>
 <script src="https://api.tianditu.gov.cn/api?v=4.0&tk=__KEY__"></script>
 <script>
-var map;   /* visibleCardRect 引用同名变量：真实页面里在 IIFE 闭包，这里须全局声明 */
+var map;   /* 提取的函数引用同名变量：真实页面里在 IIFE 闭包，这里须全局声明 */
 __FUNCS__
 </script>
 <script>
@@ -39,9 +43,12 @@ window.onload = function(){
     try{
       map = new T.Map('route-map');
       map.centerAndZoom(new T.LngLat(104.06,30.67), 12);
-      // 图钉放在地图顶部（贴上边），气泡默认往上开必然被裁
+      // 图钉 A 贴地图顶部：气泡默认往上开必然被裁；
+      // 图钉 B 放在卡片默认位置内（A 右上方），不开卡时验证避让
       var mk = new T.Marker(new T.LngLat(104.06, 30.672));
       map.addOverLay(mk);
+      var mkB = new T.Marker(new T.LngLat(104.083, 30.683));
+      map.addOverLay(mkB);
       var iw = new T.InfoWindow('<div class="rt-card">card</div>',
                                 {offset:new T.Point(0,-38), maxWidth:250});
       function rect(){ var box=document.getElementById('route-map');
@@ -49,29 +56,49 @@ window.onload = function(){
         var m=box.getBoundingClientRect();
         return [Math.round(r.top-m.top), Math.round(r.bottom-m.top),
                 Math.round(r.left-m.left), Math.round(r.right-m.left)]; }
+      function rectAbs(){ var c=document.querySelector('.rt-card');
+        var r=c.getBoundingClientRect();
+        return [r.top, r.bottom, r.left, r.right]; }
+      // 需要避让的图标集合：与真实代码同源——markerRects(mk) 已排除当前 marker
+      function guardRects(){ return markerRects(mk).map(function(r){
+        return [r.top, r.bottom, r.left, r.right]; }); }
+      function iconRects(){ var box=document.getElementById('route-map');
+        var m=box.getBoundingClientRect(); var out=[];
+        box.querySelectorAll('.tdt-marker-icon').forEach(function(e){
+          if(e.offsetParent===null){return;}
+          var r=e.getBoundingClientRect();
+          out.push([Math.round(r.top-m.top),Math.round(r.bottom-m.top),
+                    Math.round(r.left-m.left),Math.round(r.right-m.left)]); });
+        return out; }
       mk.openInfoWindow(iw);
       setTimeout(function(){
         var before = rect();
-        fitCardInMap(iw, 0);
+        var iconsBefore = iconRects();
+        fitCardInMap(iw, mk, 0);
         setTimeout(function(){
           var after = rect();
+          var guardsAfter = guardRects();
           // 第二次开卡：offset 应先复位再重新收敛（不跨次累计漂移）
           setTimeout(function(){
             mk.openInfoWindow(iw);
             setTimeout(function(){
               var before2 = rect();
-              fitCardInMap(iw, 0);
+              fitCardInMap(iw, mk, 0);
               setTimeout(function(){
                 var after2 = rect();
+                var guardsAfter2 = guardRects();
                 document.getElementById('out').textContent = 'INFO=' + JSON.stringify({
                   before: before, after: after,
+                  icons_before: iconsBefore,
+                  guards_after: guardsAfter, card_abs: rectAbs(),
                   reopen_before: before2, reopen_after: after2,
+                  guards_after2: guardRects(), card_abs2: rectAbs(),
                   offset_final: (function(o){return o?[o.x,o.y]:null;})(iw.getOffset())
                 });
-              }, 900);
+              }, 2200);
             }, 700);
           }, 200);
-        }, 900);
+        }, 2300);
       }, 700);
     }catch(e){ document.getElementById('out').textContent = 'ERR=' + e.message; }
   }, 300);
@@ -91,21 +118,42 @@ for cand in (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         edge = cand
         break
 out = subprocess.run(
-    [edge, "--headless", "--disable-gpu", "--dump-dom", "--virtual-time-budget=16000",
+    [edge, "--headless", "--disable-gpu", "--dump-dom", "--virtual-time-budget=20000",
      "--window-size=800,600", "file:///" + str(p).replace("\\", "/")],
-    capture_output=True, text=True, timeout=90).stdout
+    capture_output=True, text=True, timeout=120).stdout
 m = re.search(r"INFO=.*", out, re.S)
 if not m:
     print("NO INFO; dump len =", len(out))
     sys.exit(1)
 data = json.loads(m.group(0)[5:].rsplit("</pre>", 1)[0].strip())
+
+
+def in_map(r):
+    top, bottom, left, right = r
+    return top >= 0 and bottom <= 400 and left >= 0 and right <= 600
+
+
+def overlaps_abs(card, guards):
+    """卡片页面坐标 [top,bottom,left,right] 与任一避让图标（页面坐标）相交。"""
+    ct, cb, cl, cr = card
+    for gt, gb, gl, gr in guards:
+        if min(cb, gb) - max(ct, gt) > 0 and min(cr, gr) - max(cl, gl) > 0:
+            return True
+    return False
+
+
 top, bottom, left, right = data["after"]
-ok1 = top >= 0 and bottom <= 400 and left >= 0 and right <= 600
-t2, b2, l2, r2 = data["reopen_after"]
-ok2 = t2 >= 0 and b2 <= 400 and l2 >= 0 and r2 <= 600
-print("首次开卡  before=%s after=%s  -> %s" % (data["before"], data["after"],
-      "PASS 卡片完整落在地图内" if ok1 else "FAIL 仍被裁"))
-print("再次开卡  before=%s after=%s  -> %s" % (data["reopen_before"], data["reopen_after"],
-      "PASS 复位后重新收敛" if ok2 else "FAIL"))
+ok1 = in_map(data["after"])
+ok2 = not overlaps_abs(data["card_abs"], data["guards_after"])
+ok3 = (in_map(data["reopen_after"])
+       and not overlaps_abs(data["card_abs2"], data["guards_after2"]))
+print("图钉矩形:", data["icons_before"])
+print("首次开卡  before=%s after=%s -> %s / %s" % (
+    data["before"], data["after"],
+    "PASS 卡片在地图内" if ok1 else "FAIL 仍被裁",
+    "PASS 不遮挡图标" if ok2 else "FAIL 遮挡图标"))
+print("再次开卡  before=%s after=%s -> %s" % (
+    data["reopen_before"], data["reopen_after"],
+    "PASS 复位后重新收敛" if ok3 else "FAIL"))
 print("最终 offset =", data["offset_final"])
-sys.exit(0 if ok1 and ok2 else 1)
+sys.exit(0 if ok1 and ok2 and ok3 else 1)

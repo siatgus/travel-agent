@@ -291,12 +291,47 @@ ROUTE_MAP_JS = """
       return best || fallback;
     } catch (e) { return null; }
   }
-  // 校两轮：开卡渲染（20ms）量一次，挪完（620ms）复测一次兜残差。
+  // 可见图钉图标矩形（IMG.tdt-marker-icon，实测 class）：
+  // 隐藏图层（切页签 hide）offsetParent 为 null 自动排除；
+  // 排除离 mk 锚点最近的图标 = 当前 marker 自身（卡片本来就悬在它旁边）。
+  // marker 实例没有 _icon 暴露（实测），但 getLngLat() 存在，
+  // 锚点像素用 map.lngLatToContainerPoint 换算
+  function markerRects(mk) {
+    try {
+      var scope = map && map.getContainer ? map.getContainer()
+                                          : document.getElementById('route-map');
+      if (!scope || !scope.querySelectorAll) { return []; }
+      var near = -1, nd = 1e18, ax = null;
+      if (mk && mk.getLngLat && map && map.lngLatToContainerPoint) {
+        var p = map.lngLatToContainerPoint(mk.getLngLat());
+        var m0 = scope.getBoundingClientRect();
+        ax = { x: m0.left + p.x, y: m0.top + p.y };
+      }
+      var out = [];
+      var els = scope.querySelectorAll('.tdt-marker-icon');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) { continue; }   // 隐藏图层
+        var r = els[i].getBoundingClientRect();
+        if (r.width < 4) { continue; }
+        if (ax) {
+          var d = Math.pow(r.left + r.width / 2 - ax.x, 2)
+                + Math.pow(r.top + r.height / 2 - ax.y, 2);
+          if (d < nd) { nd = d; near = out.length; }
+        }
+        out.push(r);
+      }
+      if (ax && near >= 0) { out.splice(near, 1); }
+      return out;
+    } catch (e) { return []; }
+  }
+  // 三段式位置收敛（挪卡片不动地图）：① 钳进地图可视区；② 避让图钉图标——
+  // 与可见图标矩形重叠时沿重叠较小的轴推离（+2px 余量）；③ 复测兜残差。
+  // 避让可能与钳制打架，靠多轮收敛（最多 3 轮，每轮 620ms）；
   // offset 以 RTbase（首次记录的原始锚点偏移）为基准，每次开卡先复位，
   // 保证换缩放级别后不会跨次累计漂移
-  function fitCardInMap(iw, round) {
+  function fitCardInMap(iw, mk, round) {
     if (!iw || !iw.setOffset || !iw.getOffset) { return; }
-    if (round > 1) { return; }
+    if (round > 2) { return; }
     if (!round) {
       if (!iw.RTbase) {
         try {
@@ -318,12 +353,26 @@ ROUTE_MAP_JS = """
         else if (r.bottom > m.bottom - pad) { sy = -Math.round(r.bottom - (m.bottom - pad)); }
         if (r.left < m.left + pad) { sx = Math.round(m.left + pad - r.left); }
         else if (r.right > m.right - pad) { sx = -Math.round(r.right - (m.right - pad)); }
+        var icons = markerRects(mk);
+        for (var i = 0; i < icons.length; i++) {
+          var q = icons[i];
+          if (r.right <= q.left || r.left >= q.right ||
+              r.bottom <= q.top || r.top >= q.bottom) { continue; }   // 不相交
+          // 分离位移按方向算（对称 overlap 会推不够）：
+          // 水平左推 = 卡片右缘-图标左缘，右推 = 图标右缘-卡片左缘；垂直同理。
+          // 取各轴较小的方向，再选绝对值更小的轴，一次推到完全分离
+          var dx = (r.right - q.left <= q.right - r.left)
+            ? -(r.right - q.left + 2) : (q.right - r.left + 2);
+          var dy = (r.bottom - q.top <= q.bottom - r.top)
+            ? -(r.bottom - q.top + 2) : (q.bottom - r.top + 2);
+          if (Math.abs(dx) <= Math.abs(dy)) { sx += dx; } else { sy += dy; }
+        }
         if (!sx && !sy) { return; }
         var o = iw.getOffset();
         if (!o || typeof o.x !== 'number') { o = iw.RTbase || { x: 0, y: -38 }; }
         iw.setOffset(new T.Point(o.x + sx, o.y + sy));
         iw.update();
-        fitCardInMap(iw, round + 1);
+        fitCardInMap(iw, mk, round + 1);
       } catch (e) {}
     }, round ? 620 : 20);
   }
@@ -342,7 +391,7 @@ ROUTE_MAP_JS = """
       function openCard() {
         hoverStay(); RT.openMk = mk;
         mk.openInfoWindow(iw);
-        fitCardInMap(iw, 0);
+        fitCardInMap(iw, mk, 0);
       }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
       // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关。
