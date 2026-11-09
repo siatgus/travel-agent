@@ -530,6 +530,25 @@ def test_route_map_real() -> None:
               and 'onmouseleave="RThover.leave()"' in h2
               and "window.RThover" in h2)
         check("图钉挂 mouseout 关闭", "addEventListener('mouseout'" in h2)
+        # 两态图标：未选中小圆点，选中展开完整圆章 + 弹入过渡动画
+        check("图钉默认小圆点（未选中态）",
+              "function mDot" in h2 and "mIcon(mDot(color), 22, 22, 11, 11)" in h2)
+        check("选中展开完整圆章（setIcon 两态切换）",
+              "function selMk" in h2 and "typeof mk.setIcon !== 'function'" in h2
+              and "mIcon(url, 30, 40, 15, 38)" in h2)
+        check("展开有弹入过渡动画（rt-pop）",
+              "@keyframes rt-pop" in h2 and "rt-pop .22s ease-out" in h2
+              and 'classList.add(\'rt-pop\')' in h2
+              and "transform-origin:50% 100%" in h2)
+        check("换选回落旧钉（不留残钉）", "selMk(RT.openMk, false)" in h2)
+        check("关闭卡片图标回落小圆点", "selMk(m, false)" in h2)
+        # 防闪烁：光标坐标实时兜底，不信 DOM 边界事件（卡片挪位时它们来回误报）
+        check("悬停防闪烁以光标在卡片矩形内实时判定",
+              "if (RT.openMk && RT.timer)" in h2
+              and "ev.clientX >= r.left && ev.clientX <= r.right" in h2
+              and "ev.clientY >= r.top && ev.clientY <= r.bottom" in h2)
+        check("圆章内类别小图标与序号同轴心（用户指出不匹配）",
+              "translate(10.3,14.2) scale(0.78)" in h2)
         check("地图容器 620px 高（放大版）",
               'id="route-map" style="height:620px' in h2)
         check("地图卡横向突破正文栏宽（rt-mapcard）",

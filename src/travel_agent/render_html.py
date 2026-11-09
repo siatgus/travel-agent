@@ -240,10 +240,12 @@ ROUTE_MAP_JS = """
   function pin(color, kind, txt) {
     var inner;
     if (txt) {
-      // 上半序号 + 下半小图标
-      inner = '<text x="15" y="12.2" font-size="10.5" font-family="Arial,sans-serif"'
+      // 上半序号 + 下半小图标（类别小图标必须与序号同轴心：12px 图标格
+      // 缩放 0.78 后宽 9.36，translate x = 15 - 9.36/2 = 10.3，否则
+      // 数字和类别标志看着不匹配——用户的原话）
+      inner = '<text x="15" y="12.4" font-size="11" font-family="Arial,sans-serif"'
         + ' font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text>'
-        + '<g transform="translate(9.5,13.8) scale(0.72)" opacity="0.95">'
+        + '<g transform="translate(10.3,14.2) scale(0.78)" opacity="0.95">'
         + glyph(kind) + '</g>';
     } else {
       inner = '<g transform="translate(9.3,7.6) scale(0.95)" opacity="0.95">'
@@ -255,6 +257,14 @@ ROUTE_MAP_JS = """
       + inner + '</svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   }
+  // 未选中态小圆点（用户指定样式，同「我的位置」蓝点语言但用当天配色）：
+  // 选中（悬停/点按）才展开成完整圆章图标，展开即 rt-pop 过渡
+  function mDot(color) {
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
+      + '<circle cx="11" cy="11" r="7.5" fill="' + color + '" stroke="#FFFFFF"'
+      + ' stroke-width="2.6"/></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
   // 「我的位置」蓝点：内联 SVG，不引外部图
   function dot() {
     var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
@@ -263,6 +273,17 @@ ROUTE_MAP_JS = """
   }
   var map, all = [], dayRecs = [], homeOv = null, curTab = -1;
   var locMarker = null, locCircle = null;
+  // 选中展开动画样式（注入一次）：天地图 SDK 换图标是瞬时替换，过渡靠 CSS
+  // 补——img 元素经实测 setIcon 后不重建，class 动画可见；transform-origin
+  // 取 50% 100%（图钉锚点在尾尖），从小圆点弹出时围绕锚点放大
+  try {
+    var rtSt = document.createElement('style');
+    rtSt.textContent = '@keyframes rt-pop{0%{transform:scale(.45);opacity:.35}'
+      + '65%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}'
+      + 'img.tdt-marker-icon.rt-pop{animation:rt-pop .22s ease-out;'
+      + 'transform-origin:50% 100%}';
+    document.head.appendChild(rtSt);
+  } catch (e) {}
   function ll(lng, lat) {
     var p = new T.LngLat(lng, lat);
     all.push(p);
@@ -424,12 +445,11 @@ ROUTE_MAP_JS = """
   function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
     try {
-      var icon = new T.Icon({ iconUrl: pin(color, kind, txt),
-                              iconSize: new T.Point(30, 40),
-                              iconAnchor: new T.Point(15, 38) });
-      mk = new T.Marker(pos, { icon: icon });
+      // 未选中态默认小圆点；选中才展开完整圆章（两态 + 过渡，见 selMk）
+      mk = new T.Marker(pos, { icon: mIcon(mDot(color), 22, 22, 11, 11) });
     } catch (e) { mk = new T.Marker(pos); }
     map.addOverLay(mk);
+    mk.RTpin = { color: color, kind: kind, txt: txt };   // 两态图标参数
     try {
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
@@ -437,13 +457,15 @@ ROUTE_MAP_JS = """
         // 同一图钉已开卡就不重开：mouseover 在卡片段落间移动可能再触发，
         // 重开会把 offset 复位重收敛，卡片看得见地跳（用户反馈「乱动」）
         if (RT.openMk === mk) { hoverStay(); return; }
+        if (RT.openMk) { selMk(RT.openMk, false); }   // 换选：旧钉回落小圆点
         hoverStay(); RT.openMk = mk;
+        selMk(mk, true);
         mk.openInfoWindow(iw);
         fitCardInMap(iw, 0);
       }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
-      // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关。
-      // 卡片挪位不动图钉，鼠标始终在图钉上，mouseout 只在用户真移开时触发
+      // 光标坐标实时兜底见文档级 mousemove（不信 DOM 边界事件——卡片挪位
+      // 时它们来回误报，就是「一直闪烁」的根源）。
       mk.addEventListener('mouseover', openCard);
       mk.addEventListener('mouseout', hoverClose);
       if (uncertain) {
@@ -453,12 +475,51 @@ ROUTE_MAP_JS = """
     } catch (e) {}
     return mk;
   }
+  function mIcon(url, w, h, ax, ay) {
+    return new T.Icon({ iconUrl: url, iconSize: new T.Point(w, h),
+                        iconAnchor: new T.Point(ax, ay) });
+  }
+  // 两态图标切换：on=选中（完整圆章+弹入过渡）/未选（回落小圆点）。
+  // setIcon 后按 src 找到对应 img 元素挂 rt-pop class——探针实测 img 不重建、
+  // class 保留；回落不做动画（收起要利落，弹出才要弹性）
+  function selMk(mk, on) {
+    try {
+      var p = mk.RTpin;
+      if (!p || typeof mk.setIcon !== 'function') { return; }
+      if (on) {
+        var url = pin(p.color, p.kind, p.txt);
+        mk.setIcon(mIcon(url, 30, 40, 15, 38));
+        var imgs = document.querySelectorAll('#route-map img.tdt-marker-icon');
+        for (var i = 0; i < imgs.length; i++) {
+          if (imgs[i].getAttribute('src') === url) {
+            imgs[i].classList.remove('rt-pop');
+            void imgs[i].offsetWidth;   // 强制重排：连续换钉也能重放动画
+            imgs[i].classList.add('rt-pop');
+            setTimeout(function (el) {
+              return function () { try { el.classList.remove('rt-pop'); } catch (e) {} };
+            }(imgs[i]), 260);
+            break;
+          }
+        }
+      } else {
+        mk.setIcon(mIcon(mDot(p.color), 22, 22, 11, 11));
+      }
+    } catch (e) {}
+  }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
   var RT = { timer: null, openMk: null, mouse: null };
   // 文档级跟踪光标：悬停图钉前必先移动鼠标，开卡时 RT.mouse 永远新鲜。
   // 不用事件对象自带的 clientX——天地图 marker 事件对象实测可能不带
   document.addEventListener('mousemove', function (ev) {
     RT.mouse = { x: ev.clientX, y: ev.clientY };
+    // 防闪烁兜底：光标在卡片上就取消关闭。卡片随 fitCardInMap 挪位时
+    // mouseenter/mouseleave 来回误报（挪前挪后各报一次），边界事件驱动
+    // 的开关就成了「一直闪烁」；以光标是否真的落在卡片矩形内实时判定。
+    if (RT.openMk && RT.timer) {
+      var r = visibleCardRect();
+      if (r && ev.clientX >= r.left && ev.clientX <= r.right
+             && ev.clientY >= r.top && ev.clientY <= r.bottom) { hoverStay(); }
+    }
   });
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
@@ -470,6 +531,7 @@ ROUTE_MAP_JS = """
     RT.timer = setTimeout(function () {
       try { m.closeInfoWindow(); } catch (e) {}
       if (RT.openMk === m) { RT.openMk = null; }
+      selMk(m, false);   // 卡片关了，图标回落小圆点
     }, 350);
   }
   window.RThover = { stay: hoverStay, leave: hoverClose };
