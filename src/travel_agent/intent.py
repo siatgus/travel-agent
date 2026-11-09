@@ -134,6 +134,37 @@ def is_transport_time_change(text: str) -> bool:
                 and _TRANS_CHANGE_RE.search(t))
 
 
+# 混合指令按标点切成从句逐句判断，切完用中文逗号拼回去
+_CLAUSE_SPLIT_RE = re.compile(r"[，,。；;！？!？\n]+")
+
+
+def split_transport_time_change(text: str) -> tuple[str, str | None]:
+    """把混合指令拆成「交通时刻修改从句」+「其余行程请求」。
+
+    「把出发时间改成10点，去成都玩3天」是两件事——改班次时刻要拒绝，
+    但「去成都玩3天」是正经排行程请求，不能整句连坐（用户实测：整句
+    被拒后还反问"直接说去哪儿玩几天"，可目的地和天数明明都说了）。
+    按标点切从句、逐句过 is_transport_time_change，
+    返回 (剩余文本, 被剔除的从句或 None)；没有标点的整句命中时
+    剩余为空串，调用方按纯拒绝处理。
+    """
+    t = (text or "").strip()
+    if not (_TRANS_SEG_RE.search(t) and _TRANS_TIME_RE.search(t)
+            and _TRANS_CHANGE_RE.search(t)):
+        return t, None          # 快路径：整句都不含时刻修改，原样返回
+    kept: list[str] = []
+    dropped: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(t):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if is_transport_time_change(clause):
+            dropped.append(clause)
+        else:
+            kept.append(clause)
+    return "，".join(kept), ("，".join(dropped) if dropped else None)
+
+
 def parse_clock_anchor(text: str) -> dict | None:
     """从「把 Day 3 午餐排到 15:20 结束后接 90 分钟午休」解析锚点。
 

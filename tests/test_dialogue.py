@@ -255,6 +255,48 @@ def test_transport_time_change_refused() -> None:
           str(s.last_plan["slots"]["must_visit"]))
 
 
+def test_mixed_transport_time_and_trip() -> None:
+    """混合指令只拒绝改班次时刻，剩余的行程请求照常处理。
+
+    之前「把出发时间改成10点，去成都玩3天」整句连坐拒绝，回复还
+    建议"直接说去哪儿玩几天"——可目的地和天数用户明明都说了。
+    """
+    from travel_agent import intent
+    rest, dropped = intent.split_transport_time_change(
+        "把出发时间改成10点，去成都玩3天")
+    check("混合句拆出交通时刻从句",
+          dropped == "把出发时间改成10点" and rest == "去成都玩3天",
+          f"rest={rest!r} dropped={dropped!r}")
+    _r2, _d2 = intent.split_transport_time_change("把去程到达时间改为 09:00")
+    check("纯时刻句剩余为空（走纯拒绝）", _r2 == "" and _d2 is not None,
+          f"rest={_r2!r} dropped={_d2!r}")
+    _r3, _d3 = intent.split_transport_time_change("去成都玩3天")
+    check("普通行程句原样通过", _r3 == "去成都玩3天" and _d3 is None,
+          f"rest={_r3!r} dropped={_d3!r}")
+    _r4, _d4 = intent.split_transport_time_change("到达时间是什么时候")
+    check("班次提问不误拆", _d4 is None and "到达时间是什么时候" in _r4,
+          f"rest={_r4!r} dropped={_d4!r}")
+    s = session()
+    s.turn("11月8号去大理玩4天，2人，预算6000")
+    before = s.last_plan
+    r = s.turn("把出发时间改成10点，去成都玩3天")
+    check("混合指令不再整句拒绝", "这条先没动行程" not in r.render,
+          r.render[:80])
+    check("回复说明时刻部分被拒", "真实班次" in r.render, r.render[:80])
+    check("回复处理了剩余行程请求",
+          "成都" in r.render
+          and (r.mode in ("plan", "clarify") or r.plan is not None),
+          f"mode={r.mode} {r.render[:80]}")
+    check("新方案目的地是成都或正在追问成都",
+          (r.plan or {}).get("slots", {}).get("destination") == "成都"
+          or s.slots.get("destination") == "成都",
+          str((r.plan or {}).get("slots", {}).get("destination")))
+    check("原大理方案未被悄悄改动",
+          before is None or s.last_plan is before
+          or s.last_plan["slots"]["destination"] == "成都",
+          str((s.last_plan or {}).get("slots", {}).get("destination")))
+
+
 # ------------------------------------------------------------------ 预算三档
 
 
@@ -946,6 +988,7 @@ def main() -> int:
                test_explicit_total_is_sticky, test_change_mind,
                test_clock_precise_reschedule_honest,
                test_transport_time_change_refused,
+               test_mixed_transport_time_and_trip,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,
                test_province_asks_city, test_unsupported_destination_never_replaced,
                test_month_only_date, test_solo_traveler, test_hotel_relax_notice,

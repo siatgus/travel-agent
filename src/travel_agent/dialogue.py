@@ -437,8 +437,27 @@ class Session:
 
     # -------------------------------------------------- 主入口
     def turn(self, utterance: str) -> Reply:
+        """混合指令拆分：交通时刻修改从句拒绝，其余行程请求照常处理。
+
+        「把出发时间改成10点，去成都玩3天」是两件事——之前整句连坐
+        拒绝，还反问"直接说去哪儿玩几天"，可目的地和天数用户明明都
+        说了。这里只把时刻从句剔掉，剩余部分原样走主流程。
+        """
+        rest, dropped = intent.split_transport_time_change(utterance)
+        if dropped is None or not rest.strip():
+            return self._turn_impl(utterance)
+        reply = self._turn_impl(rest, history_text=utterance)
+        note = (f"> 「{dropped}」这条没照办：**去程/返程的时刻来自真实"
+                "班次查询，我不能直接改数字**——想换班次就换出发日期或"
+                "出发地，我查到真实班次后再排。下面只处理剩下的行程请求：")
+        reply.render = note + "\n\n" + reply.render
+        return reply
+
+    def _turn_impl(self, utterance: str,
+                   history_text: str | None = None) -> Reply:
         self.turn_no += 1
-        self.history.append({"role": "user", "content": utterance})
+        self.history.append({"role": "user",
+                             "content": history_text or utterance})
 
         # ---- 先判断意图：问天气/景点/班次/闲聊时直接答，不进排行程流水线 ----
         # 之前所有输入都被当成「补槽位」，于是问天气会被回「排行程还差 2 件事」，
