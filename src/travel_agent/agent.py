@@ -581,11 +581,15 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     for pref, keywords in {
         "不吃辣": ("不吃辣", "不能吃辣", "微辣都不行"),
         "忌高海拔": ("恐高", "高反", "心脏"),
-        "需无障碍": ("轮椅", "腿脚不便"),
+        # 婴儿车/推车/少台阶都算无障碍诉求——推车友好本质就是坡道/电梯问题，
+        # 不能只记成"带幼儿"然后哪都不落地（杭州实测：概要标了「需无障碍」，
+        # 行程里却只有一句"以现场为准"，没有确认也没有取舍提示）
+        "需无障碍": ("轮椅", "腿脚不便", "无障碍", "少台阶", "台阶少",
+                     "婴儿车", "推车"),
         "带幼儿": ("孩子", "宝宝", "娃", "小孩", "儿童", "儿子", "女儿",
                    "婴儿车", "推车"),
     }.items():
-        if any(k in text for k in keywords):
+        if any(k in text for k in keywords) and pref not in slots["hard_prefs"]:
             slots["hard_prefs"].append(pref)
 
     # 「每天午休 90 分钟」是显式作息要求，不一定伴随孩子（自己想午休也合法）；
@@ -1188,23 +1192,44 @@ def self_check(result: dict) -> list[dict]:
 
     # 用餐点：抵达/返程日按班次时间判断，其余每天都必须有坐下来吃的时段。
     # 原来无条件豁免最后一天——16 点才发车还整天没饭，质检照样亮绿灯。
-    def _dep_hour() -> int:
+    def _dep_min() -> int | None:
         it = ((result.get("inbound") or {}).get("items") or [{}])[0]
         try:
-            return int(str(it.get("depart") or "18:00").split(":")[0])
+            _hh, _mm = (int(x) for x in str(it.get("depart") or "18:00").split(":")[:2])
+            return _hh * 60 + _mm
         except (ValueError, AttributeError):
-            return 18
+            return 18 * 60
+
+    dep_min = _dep_min()
+    station_buf = composer.STATION_BUFFER_MIN
+
+    def _node_ends(d: dict) -> list[int]:
+        """一天里正经节点（景点/餐）的结束时刻，分钟制。"""
+        ends = []
+        for n in d["nodes"]:
+            if n["type"] not in ("attraction", "restaurant"):
+                continue
+            hh, mm = (int(x) for x in n["time"].split(":"))
+            ends.append(hh * 60 + mm + n["duration_min"])
+        return ends
 
     no_meal = []
     for d in days_plan:
         if any(n["type"] == "restaurant" for n in d["nodes"]):
             continue
-        if d["day"] == len(days_plan) and _dep_hour() < 13:
-            continue          # 中午前就发车，不安排正餐说得通
+        if d["day"] == len(days_plan):
+            if dep_min < 13 * 60:
+                continue          # 中午前就发车，不安排正餐说得通
+            # 返程日真来不及坐下吃（吃完 + 去车站会越过发车）不算违规——
+            # 编排层此时会把午餐如实改成「打包 + 提前动身」
+            ends = _node_ends(d)
+            last_end = max(ends) if ends else None
+            if last_end is not None and last_end + 60 + station_buf > dep_min:
+                continue
         no_meal.append(f"Day{d['day']}")
     checks.append({
         "item": "每天有明确用餐点"
-                + ("" if len(days_plan) < 2 or _dep_hour() >= 13
+                + ("" if len(days_plan) < 2 or dep_min >= 13 * 60
                    else "（返程日在发车前不排正餐）"),
         "result": "pass" if not no_meal else "fail",
         "evidence": f"缺用餐点：{'、'.join(no_meal)}" if no_meal else "",
@@ -1271,21 +1296,40 @@ def self_check(result: dict) -> list[dict]:
                    "result": "pass" if not late else "fail",
                    "evidence": "、".join(late)})
 
-    # 午餐时段：11:26 开始逛 150 分钟等于 14:00 才吃饭
+    # 午餐时段：11:26 开始逛 150 分钟等于 14:00 才吃饭。
+    # 按实际排出的餐点时间判，最后一天不再整体豁免——豁免曾经把
+    # 「17:03 才开始吃午餐」放成绿灯（杭州实测）。返程日发车早，
+    # 午餐窗口放宽到 15:30（吃完还要留去车站的时间）。
     bad_lunch = []
     for d in days_plan:
-        if d["day"] in (1, len(days_plan)):
-            continue          # 抵达日与返程日不要求
+        if d["day"] == 1:
+            continue          # 抵达日不要求
+        limit = (15 * 60 + 30) if d["day"] == len(days_plan) else 14 * 60
         lunches = [n for n in d["nodes"]
                    if n["type"] == "restaurant" and n["time"] < "16:00"]
         if not lunches:
             continue
         hh, mm = (int(x) for x in lunches[0]["time"].split(":"))
-        if not (11 * 60 + 30 <= hh * 60 + mm <= 14 * 60):
+        if not (11 * 60 + 30 <= hh * 60 + mm <= limit):
             bad_lunch.append(f"Day{d['day']} {lunches[0]['name']} {lunches[0]['time']}")
-    checks.append({"item": "午餐落在 11:30–14:00",
+    checks.append({"item": "午餐落在 11:30–14:00（返程日宽限到 15:30）",
                    "result": "pass" if not bad_lunch else "fail",
                    "evidence": "、".join(bad_lunch)})
+
+    # 返程日赶车可行性：最后一个正经节点结束 + 去车站时间必须早于发车。
+    # 之前时间轴能一路排到 18:03 吃完午饭赶 18:00 的车，这一项根本不存在。
+    if len(days_plan) > 1 and dep_min:
+        ends = _node_ends(days_plan[-1])
+        last_end = max(ends) if ends else None
+        ok = last_end is None or last_end + station_buf <= dep_min
+        checks.append({
+            "item": f"返程日 {composer.fmt(dep_min)} 发车前留出去车站时间",
+            "result": "pass" if ok else "fail",
+            "evidence": ("" if ok else
+                         f"最后一个节点 {composer.fmt(last_end)} 结束，"
+                         f"距发车只剩 {dep_min - last_end} 分钟"
+                         f"（去车站至少要 {station_buf} 分钟）"),
+        })
     return checks
 
 

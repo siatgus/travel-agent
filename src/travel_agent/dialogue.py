@@ -825,11 +825,22 @@ class Session:
         # 「别太赶」而节奏本来就在最松的一档：重排出来必然一模一样。
         # 这里**不许**再跑一遍 plan_trip（白等 50 秒），更不许说"这一版只把
         # 时间与动线重排了一遍"——行程和预算一个字都没变，那是在骗人。
-        # 直接回答，并把真能省力的几个手段摊开（删站 / 减天 / 换住宿）。
+        # 但"没得再松"≠"没事可做"：行程真超额（质检口径）时要有实际动作——
+        # 删得动的（非必去点）直接删；全是必去点装不下就如实摊牌让用户取舍。
+        # （杭州实测：质检报"3 个景点 > 上限 2"，点别太赶却回"已经最松"）
         if "pace" in explicit and self.plan_made:
             old_pace, new_pace = prev_slots.get("pace"), slots.get("pace")
             if new_pace == old_pace:
                 self.slots = slots
+                trimmed = self._trim_overcap(new_pace)
+                if trimmed is not None:
+                    note, _removed = trimmed
+                    text = note + agent.render(self.last_plan)
+                    self.history.append({"role": "agent", "content": text})
+                    return Reply(mode="plan", turn_no=self.turn_no,
+                                 ask_rounds=self.ask_rounds,
+                                 slots=dict(self.slots), plan=self.last_plan,
+                                 render=text)
                 text = self._pace_noop_answer(new_pace)
                 self.history.append({"role": "agent", "content": text})
                 return Reply(mode="answer", turn_no=self.turn_no,
@@ -937,6 +948,16 @@ class Session:
             if slots.get("avoid"):
                 assumptions.append("已按你的要求避开：" + "、".join(slots["avoid"]))
 
+        # 无障碍诉求（婴儿车/少台阶/轮椅）：不管有没有点名必去点都要说清——
+        # 库里没有无障碍数据，"已确保安排"这句话对它不成立，必须给出
+        # 取舍通道（杭州实测：概要标了「需无障碍」却没有任何落地说明）
+        if "需无障碍" in (slots.get("hard_prefs") or []):
+            assumptions.append(
+                "无障碍需求（婴儿车/少台阶）我记下了，但景点资料里没有"
+                "无障碍设施数据，**我没法确保每个点都满足**——台阶/坡道"
+                "情况请以现场为准。对台阶特别敏感的话直接点名"
+                "（比如「XX 台阶多，换一个」），我换平缓的景点重排")
+
         tiers = None
         if not slots.get("budget_total"):
             tiers = self._budget_tiers(result)
@@ -1025,16 +1046,83 @@ class Session:
         return intent.spot_answer(city, spot, items, note=note,
                                   client=self.client)
 
-    def _pace_noop_answer(self, pace: str) -> str:
-        """节奏已经在最松一档时的回答：说清"没得再松"，并给出真能生效的选项。
+    def _overcap_days(self, pace: str) -> list[tuple[int, int, list[dict]]]:
+        """按质检口径找超额天：返回 [(天号, 上限, 当天景点节点列表)]。"""
+        cap = composer.PACE_CAP.get(pace, 3)
+        out = []
+        for d in (self.last_plan or {}).get("days_plan") or []:
+            atts = [n for n in d.get("nodes") or [] if n.get("type") == "attraction"]
+            if len(atts) > cap:
+                out.append((d.get("day"), cap, atts))
+        return out
 
-        不能只说"已经最松了"就完事——用户要的是更空的一天，得告诉他哪几步
-        真的会改变结果，而且这些步骤必须是他一句话就能下的指令。
+    def _trim_overcap(self, pace: str) -> tuple[str, list[str]] | None:
+        """节奏没变但行程超额时，「别太赶」的实际动作：删超额站。
+
+        只删用户没有点名必去的景点（从当天最后一个往前删，保住锚点）；
+        删完同步当日预算、门票明细与总额——不能一边删景点一边留虚高的账。
+        超额的全是必去点时返回 None：那是用户的需求装不下，得他本人取舍。
+        """
+        plan = self.last_plan
+        if not plan:
+            return None
+        cap = composer.PACE_CAP.get(pace, 3)
+        must_names = ((plan.get("slots") or self.slots or {}).get("must_visit")
+                      or [])
+        party = (plan.get("slots") or self.slots or {}).get("party_size") or 1
+        removed: list[str] = []
+        ticket_cut = 0.0
+        for d in plan.get("days_plan") or []:
+            atts = [n for n in d.get("nodes") or [] if n.get("type") == "attraction"]
+            excess = len(atts) - cap
+            if excess <= 0:
+                continue
+            removable = [n for n in atts
+                         if not any(composer.name_hit(m, n.get("name") or "")
+                                    for m in must_names)]
+            for n in reversed(removable):
+                if excess <= 0:
+                    break
+                d["nodes"].remove(n)
+                removed.append(f"Day {d.get('day')} {n.get('name')}")
+                ticket_cut += float(n.get("cost") or 0)
+                excess -= 1
+        if not removed:
+            return None
+        if ticket_cut:
+            b = plan.get("budget") or {}
+            for it in b.get("breakdown") or []:
+                if it.get("category") == "ticket":
+                    it["amount"] = round((it.get("amount") or 0)
+                                         - ticket_cut * party, 2)
+            if b.get("total") is not None:
+                b["total"] = round(b["total"] - ticket_cut * party, 2)
+            for d in plan.get("days_plan") or []:
+                cost = sum(n.get("cost") or 0 for n in d["nodes"]
+                           if n.get("type") == "attraction")
+                d["day_budget"] = cost * party + 150 * party
+        pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
+        plan["assumptions"] = (plan.get("assumptions") or []) + [
+            f"按「别太赶」删掉超额景点：{'、'.join(removed)}"
+            f"（{pn}节奏每天最多 {cap} 个景点）"]
+        note = (f"> 已按「别太赶」处理：删掉超额景点 {'、'.join(removed)}"
+                f"——{pn}节奏每天最多 {cap} 个景点。\n\n")
+        return note, removed
+
+    def _pace_noop_answer(self, pace: str) -> str:
+        """节奏没变（通常已是最松档）时的回答。
+
+        两种情况分开说，不能笼统一句"已经最松了"：
+        - 行程真超额（质检口径）且超额的全是用户点名的必去点——如实摊牌
+          "必去点装不下"，给加一天/取消必去的取舍（杭州实测：质检报
+          "3 个景点 > 上限 2"，回复却说"没有继续往下压的空间"）。
+        - 行程本来没超额——说清"没得再松"，并给出真能生效的选项。
         """
         pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
         loosenest = pace == "relaxed"
         plan = self.last_plan or {}
         days_plan = plan.get("days_plan") or []
+        over = self._overcap_days(pace)
         heavy = None
         for d in days_plan:
             k = len([x for x in d.get("nodes") or [] if x.get("type") == "attraction"])
@@ -1042,6 +1130,28 @@ class Session:
                 heavy = (d.get("day"), k, [x.get("name") for x in d.get("nodes") or []
                                           if x.get("type") == "attraction"])
         total_days = len(days_plan) or (plan.get("slots") or {}).get("days")
+
+        lines = []
+        if over:
+            day_no, cap, atts = over[0]
+            must_names = ((plan.get("slots") or {}).get("must_visit")
+                          or (self.slots or {}).get("must_visit") or [])
+            must_in = [n.get("name") for n in atts
+                       if any(composer.name_hit(m, n.get("name") or "")
+                              for m in must_names)]
+            names = "、".join(x.get("name") for x in atts)
+            lines.append(
+                f"现在已经是「{pn}」节奏，可 Day {day_no} 还是排了 {len(atts)} 个景点"
+                f"（{names}），超过每天 {cap} 个的上限——超出的"
+                + (f"（{'、'.join(must_in)}）是你点名的必去点，我不能替你删。"
+                   if must_in else "这轮我没动手，删哪些由你定。"))
+            lines.append("真要把它松下来：")
+            lines.append(f"- 加一天：说「多玩一天」，Day {day_no} 就装得下了")
+            if must_in:
+                lines.append(f"- 取消一个必去点：说「去掉{'、'.join(must_in[:1])}」，我马上删")
+            lines.append("- 换住宿位置：住到景点更集中的片区，每天路上的时间能省一大截")
+            lines.append("选一条告诉我，我按你的选择重排；不选我就保留现在这版。")
+            return "\n".join(lines)
 
         head = (f"现在已经是「{pn}」节奏，是最松的一档（每天最多 2 个景点），"
                 f"景点密度没有继续往下压的空间了。" if loosenest else

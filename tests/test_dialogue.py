@@ -297,6 +297,60 @@ def test_mixed_transport_time_and_trip() -> None:
           str((s.last_plan or {}).get("slots", {}).get("destination")))
 
 
+def test_pace_noop_trims_overcap() -> None:
+    """「别太赶」对超额行程要有实际动作：删掉非必去的超额站并同步预算。
+
+    之前质检报「3 个景点 > 上限 2」，点别太赶却回"已经是最松的一档，
+    没有继续往下压的空间"——只看了节奏档位，没看行程本身（杭州实测）。
+    """
+    s = session()
+    s.turn("11月20号去杭州玩2天，2人，轻松，预算5000")
+    check("前置：已有轻松档方案",
+          s.plan_made and s.slots.get("pace") == "relaxed",
+          str(s.slots.get("pace")))
+    last = s.last_plan["days_plan"][-1]
+    last["nodes"].append({"time": "19:00", "name": "额外塞的景点",
+                          "type": "attraction", "duration_min": 60,
+                          "cost": 60, "transit": "", "tip": ""})
+    before = (s.last_plan.get("budget") or {}).get("total")
+    r = s.turn("行程别太赶，轻松一点")
+    names = [n.get("name") for d in s.last_plan["days_plan"] for n in d["nodes"]]
+    check("超额时别太赶给出新方案而非空话", r.mode == "plan",
+          f"mode={r.mode} {r.render[:60]}")
+    check("超额的非必去景点被删掉", "额外塞的景点" not in names, str(names))
+    check("回复写明删了什么", "已按「别太赶」处理" in r.render, r.render[:80])
+    after = (s.last_plan.get("budget") or {}).get("total")
+    check("预算总额同步扣回门票（60 元 × 2 人）",
+          before is None or abs((after or 0) - (before - 120)) < 0.01,
+          f"{before} -> {after}")
+
+
+def test_pace_noop_must_overcap_honest() -> None:
+    """超额全是用户点名的必去点：如实摊牌取舍，绝不静默删需求。"""
+    s = session()
+    s.turn("11月20号去杭州玩2天，2人，轻松，预算5000")
+    s.slots["pace"] = "relaxed"
+    s.slots["must_visit"] = ["必去甲", "必去乙", "必去丙"]
+    s.last_plan["slots"] = dict(s.last_plan.get("slots") or {},
+                                must_visit=["必去甲", "必去乙", "必去丙"],
+                                party_size=2)
+    d1 = s.last_plan["days_plan"][0]
+    d1["nodes"] = [n for n in d1["nodes"] if n["type"] != "attraction"]
+    for nm in ("必去甲", "必去乙", "必去丙"):
+        d1["nodes"].append({"time": "10:00", "name": nm, "type": "attraction",
+                            "duration_min": 90, "cost": 0, "transit": "",
+                            "tip": ""})
+    r = s.turn("行程别太赶，轻松一点")
+    after = [n["name"] for d in s.last_plan["days_plan"] for n in d["nodes"]]
+    check("必去点超额时如实回答不重排", r.mode == "answer", f"mode={r.mode}")
+    check("三个必去点都还在行程里",
+          all(nm in after for nm in ("必去甲", "必去乙", "必去丙")), str(after))
+    check("回复点名超额事实与必去点身份",
+          "个景点" in r.render and "必去点" in r.render, r.render[:120])
+    check("给出加一天/取消必去的取舍", "多玩一天" in r.render and "去掉" in r.render,
+          r.render[:200])
+
+
 # ------------------------------------------------------------------ 预算三档
 
 
@@ -989,6 +1043,8 @@ def main() -> int:
                test_clock_precise_reschedule_honest,
                test_transport_time_change_refused,
                test_mixed_transport_time_and_trip,
+               test_pace_noop_trims_overcap,
+               test_pace_noop_must_overcap_honest,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,
                test_province_asks_city, test_unsupported_destination_never_replaced,
                test_month_only_date, test_solo_traveler, test_hotel_relax_notice,

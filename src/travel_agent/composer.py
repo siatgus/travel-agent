@@ -45,6 +45,10 @@ DAY_MOVE_BUDGET_MIN = 150  # 单日市内移动上限 2.5h
 # 景点最晚结束时刻。没有这条约束时会排出"21:05 逛完古城、21:28 吃晚饭"的行程——
 # 营业时间上它合法（古城全天开放），但真实体验不成立。
 DAY_END_LATEST = 20 * 60
+# 返程日：发车前必须留出「去车站 + 取票安检」的时间。车站远近未知，按
+# 90 分钟保守估——18:00 的车，最晚 16:30 收尾。没有这条线时会排出
+# "17:03 逛完灵隐寺、18:03 才吃完午饭赶 18:00 的车"的时间表（杭州实测）。
+STATION_BUFFER_MIN = 90
 
 # 兴趣词的同义扩展，**分两档**：
 #
@@ -492,6 +496,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
         # 抵达日：容量由到站时刻决定；离开日：不留新景点
         start_min = 9 * 60
+        dep_min = ret_deadline = None
         if i == 0:
             hh, mm = (int(x) for x in outbound_arrive.split(":"))
             arrive = hh * 60 + mm
@@ -505,6 +510,9 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             hh, mm = (int(x) for x in outbound_depart_last.split(":"))
             day_cap = 1 if hh >= 15 else 0
             start_min = 10 * 60
+            dep_min = hh * 60 + mm
+            # 返程日当天所有活动都要赶在这之前收尾
+            ret_deadline = dep_min - STATION_BUFFER_MIN
         else:
             day_cap = cap
 
@@ -585,11 +593,19 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 clock -= tmin + (0 if not nodes else 0)
                 move_total -= tmin
                 continue
-            if clock + p["duration_min"] > DAY_END_LATEST:
-                # 营业时间允许、但会把一天拖到深夜 → 同样顺延
+            day_latest = ret_deadline if ret_deadline is not None else DAY_END_LATEST
+            if clock + p["duration_min"] > day_latest:
+                # 营业时间允许、但会把一天拖到深夜/赶不上返程 → 同样顺延
+                if i == days - 1:
+                    why = (f"{fmt(clock)} 才开始，结束将晚于 {fmt(day_latest)}，"
+                           f"赶不上 {outbound_depart_last} 的返程班次"
+                           f"（发车前要留 {STATION_BUFFER_MIN} 分钟去车站）；"
+                           f"一定要去的话加一天，或换更晚的返程班次")
+                else:
+                    why = (f"{fmt(clock)} 才开始，结束将晚于 {fmt(DAY_END_LATEST)}，"
+                           f"移到次日更合理")
                 dropped.append({"day": i + 1, "poi": p["name"],
-                                "why": f"{fmt(clock)} 才开始，结束将晚于 {fmt(DAY_END_LATEST)}，"
-                                       f"移到次日更合理"})
+                                "why": why})
                 clock -= tmin
                 move_total -= tmin
                 continue
@@ -599,6 +615,10 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 tip += "　位置为估算（未收录），可能是市郊/跨城，出发前确认交通"
             if with_kid:
                 tip += f"　{_kid_tip(name)}"
+            # 无障碍诉求（婴儿车/少台阶/轮椅）：库里没有各景点的无障碍数据，
+            # 排进来不等于"已确保满足"——每个点都要把"未核实"写明
+            if "需无障碍" in (slots.get("hard_prefs") or []):
+                tip += "　无障碍设施未核实（台阶/坡道以现场为准）"
             # 兴趣标记先挂在节点上，备注前缀等整份行程排完再统一生成——
             # 弱命中（喝茶→公园）如果每天各标一个，会变成两个公园都写"近似匹配"。
             ints = []
@@ -662,12 +682,15 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         # 返程日：下午/傍晚才发车的话，中午也得坐下来吃一顿再走。
         # 原来只在非返程日补餐，16 点的班次配着"早市 + 一个景点"就是饿着肚子赶车，
         # 质检还因为"最后一天豁免"假装通过。
+        # 但饭必须真的吃得完：17:03 才吃完景点还硬塞 60 分钟午餐，
+        # 排出 18:03 吃完饭赶 18:00 的车（杭州实测）。装不下就如实改成
+        # 「打包 + 提前动身」，不排假时间表。
         if i == days - 1 and not any(n["type"] == "restaurant" for n in nodes):
             try:
                 dep_h = int(str(outbound_depart_last).split(":")[0])
             except (ValueError, AttributeError):
                 dep_h = 18
-            if dep_h >= 13:
+            if dep_h >= 13 and ret_deadline is not None:
                 clock = max(clock, 12 * 60)
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
                                            ("晚餐", prev_geo, 6.0)],
@@ -675,13 +698,24 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "下午才发车，吃饱再走")
-                    clock += lmin
-                    nodes.append(meal)
-                    used_food.add(lunch["poi_id"])
-                    clock += lunch["duration_min"]
+                    ltotal = lmin + lunch["duration_min"]
                 else:
-                    nodes.append(_meal_fallback(clock, "午餐", spicy_free))
-                    clock += 60
+                    ltotal = 60
+                if clock + ltotal <= ret_deadline:
+                    if lunch:
+                        clock += lmin
+                        nodes.append(meal)
+                        used_food.add(lunch["poi_id"])
+                        clock += lunch["duration_min"]
+                    else:
+                        nodes.append(_meal_fallback(clock, "午餐", spicy_free))
+                        clock += 60
+                else:
+                    nodes.append(_node(
+                        fmt(clock), "打包简餐，提前出发去车站", "transit",
+                        max(dep_min - clock, 30), "—",
+                        f"{outbound_depart_last} 发车，坐下来吃再赶车时间不够——"
+                        "候车时或车上解决，别为了吃饭误车"))
 
         # 晚餐：定位到当日最后一个点位附近
         remaining = [x for x in remaining if x not in used_pois]

@@ -1036,6 +1036,92 @@ def test_poi_info_cards() -> None:
     check("图片卡来源行显示「图片来源」", "图片来源：" in h3)
 
 
+# ------------------------------------------------------------------ 杭州实测三连
+
+
+# 杭州 2 天场景（2026-11-09 端到端实测）：2 大 1 小、轻松、18:00 返程，
+# 必去西湖 + 灵隐寺。西湖 4 小时、灵隐寺 2.5 小时，返程日装不下第二个。
+HANGZHOU = [
+    _poi("h1", "西湖", [30.24, 120.15], appeal=5, dur=240, hours="全天"),
+    _poi("h2", "灵隐寺", [30.24, 120.10], appeal=4, dur=150, cost=45,
+         hours="07:00-18:00"),
+    _poi("hf1", "楼外楼", [30.25, 120.15], cat="restaurant", dur=60, cost=90,
+         hours="10:30-20:00", tags=["food"]),
+]
+SLOTS_HZ = {
+    "destination": "杭州", "origin": "上海",
+    "date_range": {"start": "2026-11-20", "end": "2026-11-21"},
+    "days": 2, "party_size": 3, "pace": "relaxed", "budget_total": 6000,
+    "must_visit": ["西湖", "灵隐寺"], "soft_prefs": [],
+    "avoid": [], "hard_prefs": ["带幼儿"], "diet": [],
+    "stay_pref": "", "lodge": "",
+}
+
+
+def test_return_day_station_buffer() -> None:
+    """返程日收尾必须早于发车前 90 分钟（实测：18:03 吃完饭赶 18:00 的车）。"""
+    plan, log = composer.compose(SLOTS_HZ, {"items": HANGZHOU}, WEATHER,
+                                 "15:30", "18:00", [30.25, 120.15])
+    last = plan[-1]
+    ends = [(_minutes(n["time"]) + n["duration_min"], n["name"])
+            for n in last["nodes"] if n["type"] in ("attraction", "restaurant")]
+    check("返程日全部节点在发车前 90 分钟收尾",
+          all(e <= 17 * 60 + 30 for e, _ in ends), str(ends))
+    check("装不下的必去点被如实顺延并写明赶车原因",
+          any("返程班次" in d.get("why", "") for d in log.get("deferred", [])),
+          str(log.get("deferred")))
+    lunches = [n for n in last["nodes"]
+               if n["type"] == "restaurant" and _minutes(n["time"]) < 16 * 60]
+    check("返程日仍有午餐且不晚于 15:30 开始",
+          lunches and _minutes(lunches[0]["time"]) <= 15 * 60 + 30,
+          str([(n["time"], n["name"]) for n in last["nodes"]]))
+    res = _fake_result(days_plan=plan, slots=dict(SLOTS_HZ))
+    res["inbound"] = {"items": [{"depart": "18:00", "code": "G7310"}]}
+    chk = agent.self_check(res)
+    dep = next(c for c in chk if "发车前" in c["item"])
+    check("质检新增：返程日发车前留出车站时间 → pass", dep["result"] == "pass",
+          str(dep))
+    lun = next(c for c in chk if c["item"].startswith("午餐"))
+    check("质检：午餐窗口按实际排出的时间判 → pass", lun["result"] == "pass",
+          str(lun))
+
+
+def test_return_day_pack_and_go() -> None:
+    """返程日午饭真来不及坐下吃：如实改「打包+提前动身」，不排假时间表。"""
+    slots = dict(SLOTS_HZ, must_visit=["西湖"])
+    short = [_poi("h3", "断桥残雪", [30.26, 120.15], dur=60, hours="全天")]
+    plan, _ = composer.compose(slots, {"items": HANGZHOU + short}, WEATHER,
+                               "15:30", "14:00", [30.25, 120.15])
+    last = plan[-1]
+    pack = [n for n in last["nodes"] if "打包" in n["name"]]
+    check("14:00 发车赶不上午餐 → 打包+提前动身", bool(pack),
+          str([(n["time"], n["name"]) for n in last["nodes"]]))
+    if pack:
+        check("打包节点写明发车时间与缘由",
+              "14:00" in pack[0]["tip"] and "误车" in pack[0]["tip"],
+              pack[0]["tip"])
+    ends = [(_minutes(n["time"]) + n["duration_min"], n["name"])
+            for n in last["nodes"] if n["type"] in ("attraction", "restaurant")]
+    check("返程日节点仍全部在截止前收尾",
+          all(e <= 14 * 60 - composer.STATION_BUFFER_MIN for e, _ in ends),
+          str(ends))
+
+
+def test_accessibility_pref_lands() -> None:
+    """无障碍诉求（婴儿车友好/少台阶）要落进备注与假设，不能只躺在概要里。"""
+    slots_acc = dict(SLOTS_HZ, hard_prefs=["需无障碍", "带幼儿"])
+    plan, _ = composer.compose(slots_acc, {"items": HANGZHOU}, WEATHER,
+                               "15:30", "18:00", [30.25, 120.15])
+    tips = [n.get("tip", "") for d in plan for n in d["nodes"]
+            if n["type"] == "attraction"]
+    check("无障碍未核实写进景点备注",
+          any("无障碍设施未核实" in t for t in tips), str(tips[:2]))
+    s = agent.extract_slots("上海往返杭州玩2天，2大1小（3岁），轻松，婴儿车友好/少台阶")
+    check("婴儿车友好/少台阶识别为需无障碍",
+          "需无障碍" in s["hard_prefs"], str(s["hard_prefs"]))
+    check("同时识别为带幼儿", "带幼儿" in s["hard_prefs"], str(s["hard_prefs"]))
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -1045,6 +1131,9 @@ def main() -> int:
                test_spot_day_phrase_is_not_trip_days,
                test_fallback_meal_consumes_time,
                test_return_day_lunch_and_honest_check,
+               test_return_day_station_buffer,
+               test_return_day_pack_and_go,
+               test_accessibility_pref_lands,
                test_uncertain_ticket_assumption,
                test_kid_party_and_schedule,
                test_map_marks_uncertain_points, test_route_map_real,
