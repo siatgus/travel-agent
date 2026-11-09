@@ -365,6 +365,13 @@ def extract_slots(text: str, today: date | None = None,
 def extract_slots_rules(text: str, today: date | None = None) -> dict:
     """规则版槽位抽取器，对应 prompts/04 子提示词 A 的输出结构。"""
     today = today or date.today()
+    # 交通时刻修改从句先剥掉：「把去程到达时间改为 09:00」的「到达时间
+    # 改为」会被目的地兜底正则（去|到|玩…)吃成城市「达时间改为」，污染
+    # 必去景点、假设和行前准备（用户实测）。剥完照常抽取其余槽位。
+    text = re.sub(r"[^，。；,;]{0,8}(?:去程|返程|回程|出发|到达|抵达|发车|班次|车次|航班)"
+                  r"[^，。；,;]{0,6}(?:时间|时刻)[^，。；,;]{0,10}"
+                  r"(?:改为|改成|改到|换到|换成|改一下|修改|调整|提前|推迟|定在)"
+                  r"[^，。；\s]{0,8}", "，", text)
     slots: dict = {
         "destination": None, "origin": None, "date_range": None, "days": None,
         "party_size": 1, "budget_total": None, "budget_per_person": None,
@@ -390,7 +397,9 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     # (?<![不别])(?<!不想)(?<!不用)：'不想去豫园'里'去'的前一个字是'想'，
     # 单字环视挡不住，必须再看一位——否则'豫园'会被当成目的地，
     # 还连带把'豫园'从排除清单里过滤掉（frag==destination 被丢弃）。
-    _m_go = re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|往|飞)([\u4e00-\u9fa5]{2,4})", text)
+    # 「去掉苍山」的「去」是否定/删除动词的一部分——(?!掉|除) 挡住，
+    # 否则会截出「掉苍山」当地点/景点，还写进 KB 造成数据污染（实测闭环）。
+    _m_go = re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|往|飞)(?!掉|除)([\u4e00-\u9fa5]{2,4})", text)
     _go_city = next((c for c in known
                      if _m_go and _in_text(c, _m_go.group(1))), None)
     dest = dest_r or _go_city or next((c for c in known if _in_text(c, text)), None)
@@ -398,7 +407,7 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         # 「安排去迪士尼的行程」「去迪士尼的行程」：旧正则只认「去X玩/去X吧」，
         # 撞上"…的行程"整句一个目的地都抽不出来，于是被当成"用户没说去哪儿"，
         # 追问一句"想去哪儿"——用户明明刚说了要去迪士尼。
-        if m := re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|玩|安排去)"
+        if m := re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|玩|安排去)(?!掉|除)"
                           r"([\u4e00-\u9fa5]{2,6}?)(?:的)?"
                           r"(?:行程|旅游|旅行|路线|计划|安排|玩|逛|吧|呀|啊|呢|哦|嘛|"
                           r"，|,|。|$|\s)", text):
@@ -406,7 +415,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     if dest:
         # 兜底剥离句尾语气词（非贪婪正则可能拿不到边界时）
         dest = re.sub(r"[吧呀啊呢哦嘛了]+$", "", dest)
+        # 兜底正则的第二道闸：时刻/班次类词混进来的碎片绝不是城市
+        # （「达时间改为」「车次改成」这类，防线一剥漏时在这兜住）
         if len(dest) >= 2 and dest not in _NON_CITY_WORDS \
+                and not re.search(r"时间|时刻|改为|改成|改到|提前|推迟|班次|车次|航班|高铁", dest) \
                 and not re.match(r"^[几多少什么哪]", dest):
             slots["destination"] = dest
 

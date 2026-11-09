@@ -461,6 +461,25 @@ class Session:
                              ask_rounds=self.ask_rounds, slots=dict(self.slots),
                              render=text)
 
+        # 「把去程到达时间改为 09:00」——交通时刻修改请求：班次时刻来自
+        # 真实查询，不能凭空改数字；这类指令必须拦在槽位抽取之前，否则
+        # 目的地兜底正则会把「达时间改为」吃成城市/景点，污染整份方案
+        # （用户实测：进了必去景点、假设和行前准备）。有无方案都拦。
+        if intent.is_transport_time_change(utterance):
+            text = (
+                "这条先没动行程：**去程/返程的时刻来自真实班次查询，"
+                "我不能直接改数字**——改了就不是真实存在的班次了。\n\n"
+                "想赶更早或更晚的班次，可以：\n"
+                "1. 直接问班次（如「上海到成都的高铁班次」），我看到合适的"
+                "真实班次后按它重排行程；\n"
+                "2. 告诉我换出发日期或出发地，我重新查班次再排。\n\n"
+                "如果你其实是想排行程或改行程，直接说需求（去哪儿、玩几天），"
+                "班次时刻我来查。")
+            self.history.append({"role": "agent", "content": text})
+            return Reply(mode="answer", turn_no=self.turn_no,
+                         ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                         render=text)
+
         # 「把 Day 3 午餐排到 15:20 结束」——分钟级锚点改排：整体平移目标日
         # 时间轴（composer.apply_anchor），不动景点时长与交通。放在意图直答
         # 之后：天气/交通/景点问答里出现时刻不归这管。解析不出具体锚点

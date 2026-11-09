@@ -222,6 +222,39 @@ def test_clock_precise_reschedule_honest() -> None:
           s.turn("去掉苍山").mode == "plan" and before)
 
 
+def test_transport_time_change_refused() -> None:
+    """「把去程到达时间改为 09:00」必须拦在抽取之前，绝不污染方案。
+
+    之前这句话被目的地兜底正则吃成城市「达时间改为」，进了必去景点、
+    假设和行前准备（用户实测）。
+    """
+    from travel_agent import agent, intent
+    check("交通时刻修改被识别",
+          intent.is_transport_time_change("把去程到达时间改为 09:00"))
+    check("到达时间陈述/提问不误拦",
+          not intent.is_transport_time_change("我们9点到成都")
+          and not intent.is_transport_time_change("到达时间是什么时候"))
+    check("目的地抽取不再吃到时刻碎片",
+          agent.extract_slots("把去程到达时间改为 09:00")["destination"] is None)
+    check("混合句里正常目的地照抽",
+          agent.extract_slots("把出发时间改成10点，去成都玩3天")["destination"] == "成都")
+    _r = agent.extract_slots("去掉苍山")
+    check("「去掉X」不再被截成地点「掉X」（曾闭环污染 KB）",
+          _r["destination"] is None and _r["avoid"] == ["苍山"]
+          and not _r["must_visit"], str(_r["destination"]))
+    s = session()
+    s.turn("11月8号去大理玩4天，2人，预算6000")
+    before = s.last_plan
+    r = s.turn("把去程到达时间改为 09:00")
+    check("交通时刻修改返回明确拒绝",
+          r.mode == "answer" and "真实班次" in r.render, r.render[:60])
+    check("方案未被改动",
+          s.last_plan is before
+          and s.last_plan["slots"]["destination"] == "大理")
+    check("必去景点未被污染", not s.last_plan["slots"]["must_visit"],
+          str(s.last_plan["slots"]["must_visit"]))
+
+
 # ------------------------------------------------------------------ 预算三档
 
 
@@ -912,6 +945,7 @@ def main() -> int:
                test_slots_not_clobbered, test_per_person_tracks_party_size,
                test_explicit_total_is_sticky, test_change_mind,
                test_clock_precise_reschedule_honest,
+               test_transport_time_change_refused,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,
                test_province_asks_city, test_unsupported_destination_never_replaced,
                test_month_only_date, test_solo_traveler, test_hotel_relax_notice,
