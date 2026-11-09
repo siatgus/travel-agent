@@ -157,6 +157,10 @@ def route_map_data(result: dict) -> dict:
 
     景点带 poi_links 里的介绍卡片（搜索来的介绍页+缩略图），
     url/snippet 在这里统一做 HTML 属性转义，前端直接拼 innerHTML。
+    img 例外：它不走 innerHTML，而是进 CSS background-image:url(...)
+    ——CSS 不做 HTML 反转义，esc 会把 & 变 &amp; 打坏查询参数（图片就没了）。
+    改为剥危险字符 < > " ' ( )（防注入目的不变），& 与参数保留；
+    前端 imgCss 还会再剥一遍括号/引号/空白，双保险。
     """
     links = result.get("poi_links") or {}
     days = []
@@ -176,7 +180,7 @@ def route_map_data(result: dict) -> dict:
                         "url": esc(str(info["url"])),
                         "site": esc(str(info.get("site") or "")),
                         "snippet": esc(str(info.get("snippet") or "")),
-                        "img": esc(str(info.get("img") or "")),
+                        "img": re.sub(r'[<>"\'()]', "", str(info.get("img") or "")),
                     }
             nodes.append(node)
         days.append({"day": d["day"], "nodes": nodes})

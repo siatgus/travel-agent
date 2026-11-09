@@ -831,6 +831,21 @@ def test_poi_info_cards() -> None:
           all(not n.get("link") for d in md["days"] for n in d["nodes"]
               if n["name"] != "宽窄巷子"))
 
+    # img 走 CSS url() 不做 HTML 转义：& 必须原样保留（转义会打坏查询参数
+    # 导致图片加载不出来），但注入危险字符要被剥掉
+    res3 = _fake_result(days_plan=plan)
+    res3["poi_links"] = {"宽窄巷子": {
+        "url": "https://x.com/", "site": "x.com", "snippet": "", "img": "",
+        }}
+    res3["poi_links"]["宽窄巷子"]["img"] = \
+        "https://ts3.mm.bing.net/th?id=OIP.abc&pid=15.1&w=480&h=320" + \
+        '"><img onerror=x>'
+    imgv = [n["link"]["img"] for d in render_html.route_map_data(res3)["days"]
+            for n in d["nodes"] if n.get("link")][0]
+    check("img 保留 & 查询参数、剥除注入字符",
+          "&pid=15.1&w=480" in imgv and "<" not in imgv and '"' not in imgv,
+          imgv)
+
     # 图片卡（site=必应图片）：来源行与按钮换成图片文案
     res3 = _fake_result(days_plan=plan)
     res3["poi_links"] = {"宽窄巷子": {
