@@ -346,6 +346,14 @@ def extract_slots(text: str, today: date | None = None,
                 merged.update(slots[key])
                 slots[key] = merged
         slots["_source"] = "llm"
+        # 人数总数必须与构成自洽：模型常照字面把「1个人」回成 party_size=1，
+        # 而「1 大 1 小」构成（婴儿车→1 小）来自规则补齐——总数以构成之和
+        # 为准，否则概要「1 大 1 小，共 1 人」、预算按 1 人算（亲子实测）
+        if (slots.get("adults") is not None
+                and slots.get("children") is not None
+                and slots.get("party_size") !=
+                    slots["adults"] + slots["children"]):
+            slots["party_size"] = slots["adults"] + slots["children"]
         return slots
 
     slots = extract_slots_rules(text, today)
@@ -1024,10 +1032,8 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             assumptions.append(
                 "儿童门票按半价估算（多数景区 6 岁以下/1.2m 以下免票，"
                 "以各景区现场口径为准）")
-        # 大交通口径在 items 组装完统一写（见下方），这里只交代儿童票折算
-        assumptions.append(
-            "儿童票（高铁 6 岁下免费、机票 2~11 岁约半价）未单独折算，"
-            "以各渠道现场口径为准")
+        # 高铁/机票儿童票折算说明挪到大交通判定处（见下方）——票价未查到
+        # 时大交通根本不在预算里，再写"未单独折算"会让人以为已经算过
     items = []
     if has_origin:
         # 班次没查到（价格 0）就不要往预算里塞一行「¥0 交通（数据缺失）」：
@@ -1055,8 +1061,9 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         assumptions.append("往返大交通未计入预算（班次票价未查到或未提供出发地），"
                            "出发前请自行查票价确认")
     elif _kids:
-        assumptions.append("往返大交通按查到的班次票价×全部人数计入预算，"
-                           "儿童票未单独折算，实际通常比这里低")
+        assumptions.append(
+            "往返大交通按查到的班次票价×全部人数计入预算，儿童票未单独折算"
+            "（高铁 6 岁下免费、机票 2~11 岁约半价），实际通常比这里低")
     _phase("正在核算预算与校验行程可行性…")
     budget = dispatch("calc_budget", {"items": items, "party_size": n,
                                       "budget_target": slots["budget_total"],

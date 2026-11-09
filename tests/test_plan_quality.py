@@ -803,17 +803,48 @@ def test_kid_party_and_schedule() -> None:
     nodes_too_late = []
     c2 = composer._insert_kid_nap(nodes_too_late, 16 * 60 + 10, 1, 4, True)
     check("16 点后不再后移午休", not nodes_too_late and c2 == 16 * 60 + 10)
+    # 端到端：上午拖堂 → 午餐 15:31 结束（旧截止 15:00 会砍）仍插午休
+    items_late = [dict(p) for p in CHENGDU]
+    for p in items_late:
+        if p["name"] == "都江堰":
+            p["duration_min"] = 330
+    plan_late, _ = composer.compose(kid_slots, {"items": items_late}, WEATHER,
+                                    "12:00", "18:00", [30.66, 104.06])
+    nap_late = [n for d in plan_late if d["day"] == 2
+                for n in d["nodes"] if "午休" in n["name"]]
+    check("午餐 15:31 结束仍插午休（端到端）",
+          len(nap_late) == 1 and nap_late[0]["time"] == "15:31",
+          str([(n["time"], n["name"]) for n in nap_late]))
     # LLM 兜底路径：模型只回 party_detail 漏 party_size 时，总数按构成之和
     from travel_agent import llm as _llm
     _cs = _llm.coerce_slots({"party_detail": "1 大 1 小"})[0]
     check("LLM 路径 party_size 按构成之和重算（防「1 大 1 小，共 1 人」）",
           _cs["party_size"] == 2, str(_cs.get("party_size")))
+    # LLM 主路径：模型照字面把「1个人」回成 party_size=1，构成（婴儿车→
+    # 1 大 1 小）来自规则补齐——合并后总数必须与构成自洽
+    _orig_extract = _llm.extract_slots_llm
+    try:
+        _llm.extract_slots_llm = lambda *a, **k: (
+            {"destination": "成都", "days": 4, "party_size": 1,
+             "hard_prefs": [], "soft_prefs": [], "must_visit": [],
+             "avoid": [], "pace": "relaxed", "uncertain_fields": []}, None)
+        _s = agent.extract_slots("12月5号去成都玩4天，1个人，婴儿车友好、少台阶",
+                                 client=object())
+    finally:
+        _llm.extract_slots_llm = _orig_extract
+    check("LLM 主路径总数与构成自洽（1大1小→共 2 人）",
+          _s["party_size"] == 2 and _s["children"] == 1,
+          str({k: _s.get(k) for k in ("party_size", "adults", "children")}))
     # 大交通假设与预算标题必须同口径：票价未查到时不得再写「按全价估算」
     import inspect as _insp
     _ag = _insp.getsource(agent)
     check("大交通未查到时假设写「未计入」（与预算标题一致）",
           "往返大交通未计入预算（班次票价未查到或未提供出发地）" in _ag
           and "按全价×全部人数估算" not in _ag)
+    check("票价未计入时不出现高铁/机票儿童票折算说明（景区门票口径保留）",
+          "儿童票（高铁 6 岁下免费、机票 2~11 岁约半价）未单独折算" not in _ag
+          and "儿童门票按半价估算" in _ag
+          and _ag.count("儿童票未单独折算") == 1)
     # 质检口径与节奏承诺一致：只数景点、按 PACE_CAP 判，不把餐/午休算进去
     check("质检按节奏上限只数景点数",
           "单日景点数不超节奏上限" in _ag
