@@ -499,7 +499,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     if _mk and _adults is None and _kids is None:
         _adults, _kids = 2, (cn_to_int(_mk.group(1)) or 3) - 2
     _child_age = None
-    if re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿", text) or _fm or _mc:
+    # 「婴儿车友好」「租个推车」没提孩子，但推车本身就意味着带幼儿——
+    # 亲子慢游实测里用户只写了"婴儿车友好、少台阶"，孩子数被漏算
+    if (re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿|婴儿车|推车", text)
+            or _fm or _mc):
         _ma2 = re.search(r"(\d{1,2}|[一二两三四五六七八九十]{1,2})\s*岁", text)
         if _ma2:
             _a = cn_to_int(_ma2.group(1))
@@ -509,8 +512,8 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     if _adults is None and re.search(r"我和(?:老婆|老公|爱人|对象)|夫妻"
                                      r"|(?:我们|我)(?:俩|两)", text):
         _adults = 2
-    if _kids is None and (re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿", text)
-                          or _child_age is not None):
+    if _kids is None and (re.search(r"孩子|娃|宝宝|小孩|儿童|儿子|女儿|婴儿车|推车",
+                                    text) or _child_age is not None):
         _kids = 1
     # 「N个人」显式总数：有构成信息时用来推大人数量，没有时直接当总人数
     _n_total = None
@@ -559,10 +562,16 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         "不吃辣": ("不吃辣", "不能吃辣", "微辣都不行"),
         "忌高海拔": ("恐高", "高反", "心脏"),
         "需无障碍": ("轮椅", "腿脚不便"),
-        "带幼儿": ("孩子", "宝宝", "娃", "小孩", "儿童", "儿子", "女儿"),
+        "带幼儿": ("孩子", "宝宝", "娃", "小孩", "儿童", "儿子", "女儿",
+                   "婴儿车", "推车"),
     }.items():
         if any(k in text for k in keywords):
             slots["hard_prefs"].append(pref)
+
+    # 「每天午休 90 分钟」是显式作息要求，不一定伴随孩子（自己想午休也合法）；
+    # 作曲层见到「需午休」同样插 90 分钟午休节点
+    if re.search(r"午休|午睡|小睡|睡个午觉", text) and "需午休" not in slots["hard_prefs"]:
+        slots["hard_prefs"].append("需午休")
 
     # 「2大1小」这种句式一个关键词都不含，但带娃的事实已从人数构成里确认——
     # 不能让孩子只影响预算、不影响行程强度与作息

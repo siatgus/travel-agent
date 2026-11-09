@@ -433,7 +433,7 @@ PAGE = """<!DOCTYPE html>
           <select id="pf-cur" style="width:80px;flex:none"><option>CNY ¥</option></select>
         </div></div>
       <div class="f"><label>同行人数<span class="opt">可选</span></label>
-        <input id="pf-party" inputmode="numeric" placeholder="比如 2 人"></div>
+        <input id="pf-party" placeholder="比如 2，或 2大1小（3岁）"></div>
       <div class="f"><label>旅行节奏<span class="opt">可选</span></label>
         <select id="pf-pace"><option>刚刚好</option><option>紧凑打卡</option><option>轻松慢逛</option></select></div>
       <div class="f"><label>兴趣偏好<span class="opt">可选</span></label>
@@ -980,8 +980,14 @@ function submitPlanner(){
   const origin=document.getElementById('pf-origin').value.trim();
   parts.push((origin?'从'+origin+'出发，':'')
     +(sd.getMonth()+1)+'月'+sd.getDate()+'号去'+dest+(days?'玩'+days+'天':''));
-  const party=parseInt(document.getElementById('pf-party').value,10);
-  if(party>0)parts.push(party+'个人');
+  const partyRaw=document.getElementById('pf-party').value.trim();
+  if(partyRaw){
+    // 「2大1小（3岁）」必须原样交给对话层拆——之前 parseInt 只抠出 2 再拼
+    // 「2个人」，「1小（3岁）」整段丢掉：孩子从人数、预算、午休、家庭房里
+    // 全部消失（亲子慢游实测反馈）。纯数字才走「N个人」句式。
+    if(/^\d{1,3}$/.test(partyRaw))parts.push(partyRaw+'个人');
+    else parts.push(partyRaw);
+  }
   const budget=parseFloat(document.getElementById('pf-budget').value);
   if(budget>0)parts.push('预算总共'+Math.round(budget));
   const pace=document.getElementById('pf-pace').value;

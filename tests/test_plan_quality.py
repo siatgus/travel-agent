@@ -767,6 +767,34 @@ def test_kid_party_and_schedule() -> None:
           and not merged["party_detail"],
           str({k: merged.get(k) for k in ("party_size", "children", "party_detail")}))
 
+    # 表单入口：同行人数必须原样透传——parseInt 会把「2大1小（3岁）」抠成
+    # 「2个人」，孩子从人数/预算/午休/家庭房里全部消失（亲子慢游实测）
+    import inspect
+    from travel_agent import server as _srv
+    srv_src = inspect.getsource(_srv)
+    check("表单人数非纯数字时原样透传",
+          "/^\\d{1,3}$/.test(partyRaw)" in srv_src and "parts.push(partyRaw)" in srv_src,
+          "submitPlanner 仍在 parseInt 人数栏")
+    check("表单不再 parseInt 人数栏",
+          "parseInt(document.getElementById('pf-party')" not in srv_src)
+    # 「婴儿车友好」「每天午休90分钟」不提孩子也要进带娃/午休链路
+    s4 = agent.extract_slots_rules("去扬州玩3天，婴儿车友好，每天午休90分钟")
+    check("婴儿车句式按 1 大 1 小算",
+          s4["party_size"] == 2 and s4["children"] == 1,
+          str({k: s4.get(k) for k in ("party_size", "children")}))
+    check("婴儿车命中带幼儿偏好", "带幼儿" in s4["hard_prefs"])
+    check("点名午休识别为需午休", "需午休" in s4["hard_prefs"])
+    # 纯大人点名午睡：也插午休，措辞不提幼儿
+    adult_nap = dict(SLOTS, hard_prefs=["需午休"])
+    plan_nap, _ = composer.compose(adult_nap, {"items": CHENGDU}, WEATHER,
+                                   "12:00", "18:00", [30.66, 104.06])
+    nap_only = [n for d in plan_nap for n in d["nodes"] if "午休" in n["name"]]
+    check("纯大人点名午休也有 90 分钟节点",
+          bool(nap_only) and all(n["duration_min"] == 90 for n in nap_only),
+          str([n["name"] for n in nap_only][:2]))
+    check("非幼儿午休措辞不提幼儿",
+          bool(nap_only) and all("幼儿" not in n["name"] for n in nap_only))
+
 
 def test_poi_info_cards() -> None:
     """景点介绍卡片：必应解析（离线样本）、来源优先级、断网降级、注入渲染与转义。"""

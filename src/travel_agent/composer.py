@@ -288,17 +288,22 @@ def _kid_tip(name: str) -> str:
 
 
 def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
-                    with_kid: bool) -> int:
-    """带幼儿：午饭后写死 90 分钟午休，返回新 clock（没插就原样返回）。
+                    with_kid: bool, label: str | None = None) -> int:
+    """带幼儿或用户点名午休：午饭后写死 90 分钟午休，返回新 clock。
 
     "带幼儿"不能只是概要里的一个标签——幼儿下午没有这一觉，晚饭前必崩。
-    抵达/返程日行程本来就轻，不插。
+    用户明确说"每天午休 90 分钟"（需午休）即使没带孩子也照插，只是措辞
+    不提幼儿。抵达/返程日行程本来就轻，不插。
     """
     if not with_kid or day_idx in (0, days - 1) or clock >= 15 * 60:
         return clock
-    nodes.append(_node(fmt(clock), "午休（带幼儿，回酒店小睡）", "rest", 90, "—",
+    nodes.append(_node(fmt(clock), label or "午休（带幼儿，回酒店小睡）", "rest",
+                       90, "—",
                        "幼儿作息排进时间轴：午饭后睡 90 分钟再出发，"
-                       "下午的安排已整体顺延；离酒店远就改车里睡/找母婴室歇脚"))
+                       "下午的安排已整体顺延；离酒店远就改车里睡/找母婴室歇脚"
+                       if label is None else
+                       "按你的要求排进时间轴：午饭后歇 90 分钟再出发，"
+                       "下午的安排已整体顺延"))
     return clock + 90
 
 
@@ -321,6 +326,10 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                          + (slots.get("avoid") or []))
     spicy_free = "辣" in _restrict
     with_kid = _with_kid(slots)
+    # 午休触发面：带幼儿，或用户显式要午休（需午休）；后者措辞不提幼儿
+    _nap_asked = "需午休" in (slots.get("hard_prefs") or [])
+    want_nap = with_kid or _nap_asked
+    _nap_label = None if with_kid else "午休（回酒店小睡）"
     days = slots["days"]
     cap = PACE_CAP[slots["pace"]]
     start = date.fromisoformat(slots["date_range"]["start"])
@@ -484,7 +493,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                     clock += 60      # 同上：兜底餐占 60 分钟，时间轴照常往后推
                 lunch_done = True
-                clock = _insert_kid_nap(nodes, clock, i, days, with_kid)
+                clock = _insert_kid_nap(nodes, clock, i, days, want_nap,
+                                        _nap_label)
 
         # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
         # 库里没有餐厅也得留出这段时间——"每天有明确用餐点"不是有数据才成立的承诺。
