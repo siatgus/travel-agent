@@ -40,6 +40,26 @@ _PREFERRED = ("zhihu.com", "baike.baidu.com", "mafengwo.cn", "you.ctrip.com",
               "you.ctrip", "piao.qunar.com", "goto.ly.com", "tuniu.com",
               "dianping.com", "sina.com.cn", "sohu.com", "163.com")
 
+# 块内缩略图可信来源：百科/OTA 景点页的必应缩略图就是实体照片；
+# 知乎/门户的块内图是「文章头图」，与景点经常无关（景山公园卡片
+# 配动漫图的事故就是知乎文章头图）——这些来源的图必须换专用图片搜索
+_TRUST_IMG = ("baike.baidu.com", "mafengwo.cn", "you.ctrip.com",
+              "piao.qunar.com", "goto.ly.com", "tuniu.com", "dianping.com",
+              "gov.cn")
+
+
+def _site_is(site: str, pref: str) -> bool:
+    """域名后缀严格匹配（不是子串）：pref 是 registrable 域名，
+    site 必须等于它或是它的子域。子串匹配会把 xzhihu.com 之类仿冒域
+    也算成知乎。"""
+    s = (site or "").lower().split("/")[0].split(":")[0].strip(".")
+    p = (pref or "").lower()
+    return s == p or s.endswith("." + p)
+
+
+def _img_trusted(site: str) -> bool:
+    return any(_site_is(site, h) for h in _TRUST_IMG)
+
 _BLOCK = websearch._BING_BLOCK
 _URL = websearch._BING_URL
 _SNIPPET = websearch._BING_SNIPPET
@@ -102,7 +122,7 @@ def _pick(results: list[dict], name: str) -> dict | None:
         return None
     for host in _PREFERRED:
         for r in named:
-            if host in (r.get("site") or ""):
+            if _site_is(r.get("site") or "", host):
                 return r
     return named[0]
 
@@ -183,12 +203,19 @@ def fetch_one(name: str, city: str, timeout: int = _TIMEOUT) -> dict | None:
         info = _search_one(name, city, timeout)
     except Exception:
         info = None
-    if info is not None and not info.get("img"):
-        # 介绍页有了但没缩略图（知乎等来源常见）：单独搜一张景点图补上
-        try:
-            info["img"] = _search_image(name, timeout)
-        except Exception:
-            pass
+    if info is not None:
+        # 图片来源把关：无图、或来源不属于「块内缩略图可信」名单（知乎/
+        # 门户的块内图是文章头图，经常与景点无关——景山公园卡片配动漫图
+        # 的事故），一律换专用图片搜索「<景点> 风景」：图片搜索按查询
+        # 相关性排序，出来的就是景点本尊。专用搜索失败时保留块内图
+        # （多数还是对的），总比没图强。
+        if not info.get("img") or not _img_trusted(info.get("site") or ""):
+            try:
+                img2 = _search_image(name, timeout)
+            except Exception:
+                img2 = ""
+            if img2:
+                info["img"] = img2
     elif info is None:
         # 介绍页宁缺毋滥没搜到，但图片可以独立给：出「图片卡」，
         # 点击跳必应图片搜索结果页（比没卡片直观）

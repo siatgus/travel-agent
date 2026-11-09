@@ -793,6 +793,19 @@ def test_poi_info_cards() -> None:
           poi_links._pick([{"title": "完全无关", "url": "https://a.com/x",
                             "snippet": "别的", "site": "a.com"}], "宽窄巷子") is None)
     check("非 http 链接被丢弃", all(r["url"].startswith("http") for r in rs))
+    # 来源匹配必须是域后缀严格匹配，子串仿冒域不算（张冠李戴比没有卡片严重）
+    check("来源匹配用域后缀（子串仿冒不算）",
+          poi_links._site_is("zhuanlan.zhihu.com", "zhihu.com")
+          and poi_links._site_is("zhihu.com", "zhihu.com")
+          and not poi_links._site_is("xzhihu.com", "zhihu.com")
+          and not poi_links._site_is("zhihu.com.evil.cn", "zhihu.com"))
+    # 块内缩略图可信名单：百科/OTA 的必应缩略图就是实体照片；
+    # 知乎/门户的块内图是文章头图，与景点经常无关
+    check("块内缩略图可信名单判定",
+          poi_links._img_trusted("baike.baidu.com")
+          and poi_links._img_trusted("you.ctrip.com")
+          and not poi_links._img_trusted("zhihu.com")
+          and not poi_links._img_trusted("www.sohu.com"))
 
     # 图片搜索兜底：介绍页无缩略图 → 必应图片搜索补图
     img_page = ('<html><body>'
@@ -830,6 +843,32 @@ def test_poi_info_cards() -> None:
         check("介绍页缺失时出图片卡", bool(info3) and info3.get("site") == "必应图片"
               and info3.get("img", "").startswith("https://ts"),
               str(info3 and info3.get("site")))
+        # 来源不可信（知乎）：块内缩略图是文章头图、可能完全无关
+        # （景山公园卡片配动漫图的事故），必须换成专用图片搜索结果
+        zhihu_img = ('<html><body><li class="b_algo"><h2>'
+                     '<a href="https://www.zhihu.com/question/888">景山公园攻略</a></h2>'
+                     '<p>景山公园俯瞰故宫全景…</p>'
+                     '<img class="rms_img" src="//th.bing.com/th?id=ANIME"></li></body></html>')
+        poi_links._cache.pop("北京|景山公园", None)
+        poi_links.websearch._fetch = lambda url, timeout=8: (
+            img_page if "/images/search" in url else zhihu_img)
+        info4 = poi_links.fetch_one("景山公园", "北京")
+        check("知乎来源块内图换成图片搜索结果",
+              bool(info4) and info4.get("img", "").startswith("https://ts")
+              and "ANIME" not in info4.get("img", ""),
+              str(info4 and info4.get("img"))[:80])
+        # 可信来源（百科）：块内缩略图就是实体照片，直接保留、不多发请求
+        baike_img = ('<html><body><li class="b_algo"><h2>'
+                     '<a href="https://baike.baidu.com/item/北海公园">北海公园</a></h2>'
+                     '<p>北海公园位于北京市西城区…</p>'
+                     '<img class="rms_img" src="//th.bing.com/th?id=BAIKE"></li></body></html>')
+        poi_links._cache.pop("北京|北海公园", None)
+        poi_links.websearch._fetch = lambda url, timeout=8: (
+            img_page if "/images/search" in url else baike_img)
+        info5 = poi_links.fetch_one("北海公园", "北京")
+        check("百科来源保留块内图（可信不多发请求）",
+              bool(info5) and "BAIKE" in info5.get("img", ""),
+              str(info5 and info5.get("img"))[:80])
         poi_links._cache.pop("成都|都江堰", None)
         poi_links.websearch._fetch = lambda url, timeout=8: (_ for _ in ()).throw(
             IOError("断网"))
