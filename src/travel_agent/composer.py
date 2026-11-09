@@ -748,10 +748,20 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
         nodes.sort(key=lambda x: x["time"])
         cost = sum(n["cost"] for n in nodes if n["type"] == "attraction")
+        # 主题必须与当天实际角色一致：旧写法 [抵达适应,核心景区,人文深度,
+        # 返程收尾][min(i,3)] 会让 5 天行程的 Day4、Day5 都标「返程收尾」，
+        # 可 Day4 还排着景点和晚餐（用户实测）。只有真正发车的最后一天
+        # 才是返程日；单天行程是「一日往返」。
+        if days == 1:
+            theme = "一日往返"
+        elif i == days - 1:
+            theme = "返程收尾"
+        else:
+            theme = ["抵达适应", "核心景区", "人文深度"][min(i, 2)]
         plan.append({
             "day": i + 1,
             "date": d.isoformat(),
-            "theme": ["抵达适应", "核心景区", "人文深度", "返程收尾"][min(i, 3)],
+            "theme": theme,
             "intensity": "high" if cost >= 200 else ("low" if cost == 0 else "medium"),
             "nodes": nodes,
             "move_min": move_total,

@@ -170,6 +170,67 @@ def _in_text(city: str, text: str) -> bool:
     return False
 
 
+# 多城连写的连接成分：「成都、重庆」「成都和重庆」「先成都后重庆」。
+# 必须非空——「南京中山陵」里南京和中山（市）紧贴，是城市+景点不是多城；
+# 「的」也不算连接词，「南京的中山陵」不是多城。
+_MULTI_JOIN_RE = re.compile(r"^[、，,\s和与跟及先还后]+$")
+
+
+def split_multi_city(text: str, known: list[str] | None = None) -> list[str]:
+    """按出现顺序找出文本里"连写"的多个已知城市。
+
+    「去成都、重庆玩」→ [成都, 重庆]；「先成都后重庆」→ [成都, 重庆]。
+    两个城市之间隔着正常语句（「从上海出发…去成都」）不算——出发地
+    由调用方预先从文本里剥掉。单城或找不到返回空列表。
+    """
+    t = text or ""
+    known = known or _known_cities()
+    occ: list[tuple[int, int, str]] = []
+    for c in known:
+        start = 0
+        while (i := t.find(c, start)) != -1:
+            occ.append((i, i + len(c), c))
+            start = i + 1
+    if len(occ) < 2:
+        return []
+    occ.sort()
+    groups: list[list] = []       # [end_pos, [cities]]
+    for s, e, c in occ:
+        if groups and s >= groups[-1][0] and _MULTI_JOIN_RE.match(t[groups[-1][0]:s]) \
+                and c not in groups[-1][1]:
+            groups[-1][1].append(c)
+            groups[-1][0] = e
+        else:
+            groups.append([e, [c]])
+    best = max(groups, key=lambda g: len(g[1]))
+    return best[1] if len(best[1]) >= 2 else []
+
+
+def normalize_multi_dest(slots: dict, text: str) -> None:
+    """目的地槽位混进多个城市时剥出来（就地修改）。
+
+    「去成都、重庆玩5天」当前架构一次只能排一个城市：城市串绝不能
+    当 destination（会被追问"在哪个城市"再被挂成景点），也不能混进
+    must_visit。拆成 multi_cities 交给对话层明确说明并追问先排哪个。
+    """
+    known = _known_cities()
+    t = text or ""
+    # 剥掉出发地出现的位置：「从上海出发…成都、重庆」里上海是出发地
+    for m in re.finditer(r"从([\u4e00-\u9fa5]{2,4}?)(?:出发|走|去|到|飞|动身|坐|搭)", t):
+        t = t[:m.start(1)] + "\x00" * len(m.group(1)) + t[m.end(1):]
+    dest = slots.get("destination")
+    cands = split_multi_city(dest, known) if dest else []
+    if len(cands) < 2:
+        cands = split_multi_city(t, known)
+        # 目的地已抽出单城时，文本里拆出的城市组必须包含它才算多城请求，
+        # 否则无关场合提到的城市组合会误伤正常单城请求
+        if dest and cands and dest not in cands:
+            cands = []
+    if len(cands) >= 2:
+        slots["multi_cities"] = cands
+        slots["destination"] = None
+
+
 def is_city(name: str | None) -> bool:
     """这个名字是不是一座"能排行程"的城市，而不是景点/商圈/写错的地名。
 
@@ -354,6 +415,10 @@ def extract_slots(text: str, today: date | None = None,
                 and slots.get("party_size") !=
                     slots["adults"] + slots["children"]):
             slots["party_size"] = slots["adults"] + slots["children"]
+        # 模型会把「去成都、重庆玩」整串回给 destination（提示词只说"城市名"）：
+        # 城市串进下游会被追问"在哪个城市"、还会被挂成位置估算景点（实测）。
+        # 多城请求剥成 multi_cities，与规则路径行为一致。
+        normalize_multi_dest(slots, text)
         return slots
 
     slots = extract_slots_rules(text, today)
@@ -645,6 +710,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         # 「想去大理玩」的大理是目的地，不是景点；但「一定要去喜洲古镇」
         # 的喜洲古镇只是恰好被当成了目的地（不在已知城市表），必去标记要保留——
         # 用户接下来补了城市，这个点名还生效。
+        # 顿号/逗号连接的片段是城市串（「成都、重庆」实测被当景点排进
+        # 行程），景点名里不会有标点，直接拒绝。
+        if re.search(r"[、，,]", frag):
+            return False
         if frag == slots.get("destination") and frag in known_set:
             return False
         return (len(frag) >= 2 and frag not in known_set
@@ -704,6 +773,9 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
 
     # 两个清单都出现同一景点时，排除赢（veto 先于必去占位，保持一致）
     slots["must_visit"] = [m for m in slots["must_visit"] if m not in slots["avoid"]]
+
+    # 多城请求剥出来：「去成都、重庆玩5天」的城市串绝不能当目的地或景点
+    normalize_multi_dest(slots, text)
 
     slots["uncertain_fields"] = uncertain
     return slots

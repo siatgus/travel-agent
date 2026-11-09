@@ -532,7 +532,7 @@ def coerce_ranking(raw, allowed: list[str]):
 SLOT_SYSTEM = """你是行程需求抽取器。只输出一个 JSON 对象，不要任何解释、不要代码围栏。
 
 字段定义：
-- destination / origin: 城市名，字符串或 null
+- destination / origin: 城市名，字符串或 null。**只填一个城市名**；用户想多城连玩（「成都、重庆」「先成都后重庆」）时填 null，不要把城市串塞进来
 - date_range: {"start":"YYYY-MM-DD"} 或 {"month":"YYYY-MM"} 或 {"day":N}（只说了"20号"这类裸日子时），无法确定填 null
 - days: 整数 1-30，出发日与返程日算在同一天数内
 - party_size: 整数 1-20，含本人，**孩子也算人**（「2大1小」→ 3）

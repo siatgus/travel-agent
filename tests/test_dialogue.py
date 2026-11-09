@@ -255,6 +255,57 @@ def test_transport_time_change_refused() -> None:
           str(s.last_plan["slots"]["must_visit"]))
 
 
+def test_multi_city_request_not_poi() -> None:
+    """「去成都、重庆玩5天」是多城请求：明确说明单城限制，绝不当景点。
+
+    实测：LLM 把「成都、重庆」整串回给 destination → 被追问"在哪个
+    城市"→ 用户补「先成都后重庆」→ 城市串被挂成位置估算景点排进
+    Day2，最后变成重庆 5 天、没有成都行程。
+    """
+    from travel_agent import agent
+    s1 = agent.extract_slots("从上海出发，11月24号去成都、重庆玩5天")
+    check("多城请求拆出城市列表",
+          s1.get("multi_cities") == ["成都", "重庆"]
+          and s1.get("destination") is None,
+          f"multi={s1.get('multi_cities')} dest={s1.get('destination')}")
+    check("多城请求天数日期照抽",
+          s1.get("days") == 5 and "11-24" in str((s1.get("date_range") or {}).get("start")),
+          f"days={s1.get('days')} date={s1.get('date_range')}")
+    check("城市串不进必去景点",
+          all("、" not in m for m in (s1.get("must_visit") or [])),
+          str(s1.get("must_visit")))
+    s2 = agent.extract_slots("先成都后重庆")
+    check("「先X后Y」也识别为多城",
+          s2.get("multi_cities") == ["成都", "重庆"], str(s2.get("multi_cities")))
+    s3 = agent.extract_slots("去南京的中山陵玩")
+    check("城市+景点不被误判为多城",
+          s3.get("destination") == "南京" and not s3.get("multi_cities"),
+          f"dest={s3.get('destination')} multi={s3.get('multi_cities')}")
+    s4 = agent.extract_slots("去成都玩5天")
+    check("单城请求不受影响",
+          s4.get("destination") == "成都" and not s4.get("multi_cities"),
+          f"dest={s4.get('destination')}")
+    # ---- 端到端：说明能力边界 → 追问 → 选定后清空 ----
+    sess = session()
+    r1 = sess.turn("从上海出发，11月24号去成都、重庆玩5天")
+    check("多城请求明确说明一次只排一个城市",
+          r1.mode == "clarify" and "一个城市" in r1.render, r1.render[:80])
+    check("多城请求不追问在哪个城市", "在哪个城市" not in r1.render, r1.render[:80])
+    check("多城请求不出方案", r1.plan is None and not sess.plan_made)
+    r2 = sess.turn("先成都后重庆")
+    check("再次表达多城仍说明并追问",
+          r2.mode == "clarify" and "一个城市" in r2.render, r2.render[:80])
+    sess.turn("成都")
+    check("选定单城后目的地生效、多城清单清空",
+          sess.slots.get("destination") == "成都"
+          and not sess.slots.get("multi_cities"),
+          f"dest={sess.slots.get('destination')} "
+          f"multi={sess.slots.get('multi_cities')}")
+    check("必去景点里没有城市串",
+          all("、" not in m for m in (sess.slots.get("must_visit") or [])),
+          str(sess.slots.get("must_visit")))
+
+
 def test_mixed_transport_time_and_trip() -> None:
     """混合指令只拒绝改班次时刻，剩余的行程请求照常处理。
 
@@ -1042,6 +1093,7 @@ def main() -> int:
                test_explicit_total_is_sticky, test_change_mind,
                test_clock_precise_reschedule_honest,
                test_transport_time_change_refused,
+               test_multi_city_request_not_poi,
                test_mixed_transport_time_and_trip,
                test_pace_noop_trims_overcap,
                test_pace_noop_must_overcap_honest,

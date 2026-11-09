@@ -1094,6 +1094,32 @@ def test_return_day_station_buffer() -> None:
           vio["evidence"])
 
 
+def test_day_theme_matches_role() -> None:
+    """每日主题必须与当天实际角色一致：只有真正发车那天才叫「返程收尾」。
+
+    实测 5 天行程 Day4、Day5 都标「返程收尾」，可 Day4 还排着景点和
+    晚餐——日期角色与内容自相矛盾。
+    """
+    slots5 = dict(SLOTS_HZ, days=5,
+                  date_range={"start": "2026-11-20", "end": "2026-11-24"})
+    plan, _ = composer.compose(slots5, {"items": HANGZHOU}, WEATHER,
+                               "15:30", "18:00", [30.25, 120.15])
+    check("5 天行程排满 5 天", len(plan) == 5, str(len(plan)))
+    themes = {d["day"]: d["theme"] for d in plan}
+    check("只有最后一天标「返程收尾」",
+          themes.get(5) == "返程收尾"
+          and all(t != "返程收尾" for k, t in themes.items() if k != 5),
+          str(themes))
+    check("首日是「抵达适应」", themes.get(1) == "抵达适应", str(themes))
+    plan2, _ = composer.compose(dict(SLOTS_HZ, days=1,
+                                     date_range={"start": "2026-11-20",
+                                                 "end": "2026-11-20"}),
+                                {"items": HANGZHOU}, WEATHER,
+                                "09:00", "18:00", [30.25, 120.15])
+    check("单天行程标「一日往返」", plan2[0]["theme"] == "一日往返",
+          plan2[0]["theme"])
+
+
 def test_return_day_pack_and_go() -> None:
     """返程日午饭真来不及坐下吃：如实改「打包+提前动身」，不排假时间表。"""
     slots = dict(SLOTS_HZ, must_visit=["西湖"])
@@ -1141,6 +1167,7 @@ def main() -> int:
                test_return_day_lunch_and_honest_check,
                test_return_day_station_buffer,
                test_return_day_pack_and_go,
+               test_day_theme_matches_role,
                test_accessibility_pref_lands,
                test_uncertain_ticket_assumption,
                test_kid_party_and_schedule,

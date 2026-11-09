@@ -567,13 +567,17 @@ class Session:
         # 少了这一步，"迪士尼在哪个城市？"→"上海" 会把迪士尼本身弄丢，
         # 用户看到的是一份跟迪士尼毫无关系的上海行程。
         if self.pending_spot and "destination" in explicit:
-            delta = dict(delta)
-            delta["must_visit"] = sorted(set(
-                (delta.get("must_visit") or []) + [self.pending_spot]))
-            explicit.add("must_visit")
-            self.pending_must.append(self.pending_spot)
-            lead_notes.append(f"把「{self.pending_spot}」加进{delta.get('destination')}的行程")
-            self.pending_spot = None
+            # 含分隔符的串是城市组合不是景点（多城请求），绝不能挂成必去点
+            if re.search(r"[、，,]", self.pending_spot):
+                self.pending_spot = None
+            else:
+                delta = dict(delta)
+                delta["must_visit"] = sorted(set(
+                    (delta.get("must_visit") or []) + [self.pending_spot]))
+                explicit.add("must_visit")
+                self.pending_must.append(self.pending_spot)
+                lead_notes.append(f"把「{self.pending_spot}」加进{delta.get('destination')}的行程")
+                self.pending_spot = None
 
         # ---- 景点被当成了城市：「安排去迪士尼的行程」 ----
         # 抽取器会把「去迪士尼」里的迪士尼写进 destination。可迪士尼不是城市，
@@ -669,6 +673,11 @@ class Session:
         if self.memory is not None:
             self.slots = self.memory.apply_to(self.slots)
 
+        # 用户选定了单个城市 → 多城待选清单完成使命（「成都、重庆」→「成都」）
+        if self.slots.get("destination") and "destination" in explicit:
+            self.slots.pop("multi_cities", None)
+            self.pending_spot = None
+
         # 人数：用户明说才算"有了"。party_size 默认 1，不看这句话会把
         # "没说几个人" 当成 "说了 1 个人"，直接出一份单人预算的行程。
         if "party_size" in explicit or (self.slots.get("party_size") or 1) != 1:
@@ -741,7 +750,18 @@ class Session:
         # 时间/天数是一次只问一件：问过没答就换个说法再问，问满 2 次仍空着
         # 就按常见情况假设并出方案——绝不因为"问过了"就当"答过了"。
         question = asked = None
-        if not dest:
+        # 多城连玩请求（「去成都、重庆玩5天」「先成都后重庆」）：当前一次
+        # 只能排一个城市的详细行程。绝不能把城市串追问成"在哪个城市"、
+        # 更不能挂成景点硬排（实测变成重庆 5 天+「成都、重庆」假景点）——
+        # 明确说明能力边界，让用户挑先排哪个，这才对得起他的输入。
+        _mc = [c for c in (self.slots.get("multi_cities") or []) if c]
+        if len(_mc) >= 2 and not dest:
+            asked = ["destination"]
+            question = (f"{'、'.join(_mc)}——多城市连线暂时排不了，"
+                        f"我一次只能出**一个城市**的详细行程。\n"
+                        f"先排哪个？说城市名我就开始（另一个想玩的时候，"
+                        f"再说一句「去XX玩N天」就行）。")
+        elif not dest:
             asked = ["destination"]
             if self.last_city:
                 question = (f"你是想排「{self.last_city}」的行程吗？确认一下我就开始。"
