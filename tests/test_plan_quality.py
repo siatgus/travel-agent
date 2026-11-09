@@ -810,12 +810,18 @@ def test_poi_info_cards() -> None:
               and "getBoundingClientRect" in h and "panBy" not in h)
         check("只认可见卡片矩形（防隐藏旧节点误判）",
               "function visibleCardRect" in h and "querySelectorAll('.rt-card')" in h)
-        check("只避让选中图标：anchorRect 按锚点构造矩形（不查 DOM）",
-              "function anchorRect" in h and "getLngLat" in h
-              and "lngLatToContainerPoint" in h
+        check("只避让选中图标：iconRectAt 按开卡光标位置识别（锚点换算/最近匹配都会选错）",
+              "function iconRectAt" in h and "RT.mouse" in h
+              and "anchorRect" not in h and "lngLatToContainerPoint" not in h
               and "markerRects" not in h)
+        check("一次算好一次挪：钳制与避让合并单次 setOffset（多轮分步跳动=乱动）",
+              "cx + ax" in h and "o.y + cy + ay" in h)
+        check("复测轮沿用首轮守卫矩形（防鼠标移走换目标二次挪动）",
+              "iw.RTguard" in h)
+        check("同图钉已开卡不重开（防 offset 复位重收敛跳动）",
+              "RT.openMk === mk" in h)
         check("避让位移按方向算分离量（对称 overlap 会推不够）",
-              "q.right - r.left" in h and "r.right - q.left" in h)
+              "q.right - t.left" in h and "t.right - q.left" in h)
         check("挪卡不动图：旧平移兜底机制已清干净",
               "RT.panned" not in h and "watchCard" not in h
               and "mousemove" not in h.split('poiCard')[0].split('function addMarker')[-1])

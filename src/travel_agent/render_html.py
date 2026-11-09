@@ -291,30 +291,38 @@ ROUTE_MAP_JS = """
       return best || fallback;
     } catch (e) { return null; }
   }
-  // 当前选中图钉的图标矩形：不查 DOM——「离锚点最近的图标」判定在图钉密集时
-  // 会选错（邻钉可能比自己的图标离锚点更近，实测踩过）。图钉图标规格固定
-  // iconSize(30,40)/iconAnchor(15,38)，锚点像素 = lngLatToContainerPoint 换算，
-  // 直接按锚点构造矩形（实测渲染 25x41，各放宽 2px 余量）
-  function anchorRect(mk) {
+  // 选中图钉的图标矩形：用开卡那一刻的光标位置识别——鼠标正悬在图标上，
+  // 这是最可靠的「选中」判定（按锚点换算有系统偏差、按最近图标匹配在
+  // 图钉密集时会选错，两种实测都踩过坑）。取光标 30px 内最近的可见图标
+  function iconRectAt(mx, my) {
     try {
-      if (!mk || !mk.getLngLat || !map || !map.lngLatToContainerPoint) { return null; }
-      var scope = map.getContainer ? map.getContainer()
-                                   : document.getElementById('route-map');
-      if (!scope) { return null; }
-      var m0 = scope.getBoundingClientRect();
-      var p = map.lngLatToContainerPoint(mk.getLngLat());
-      var ax = m0.left + p.x, ay = m0.top + p.y;
-      return { left: ax - 16, right: ax + 16, top: ay - 40, bottom: ay + 4 };
+      var scope = map && map.getContainer ? map.getContainer()
+                                          : document.getElementById('route-map');
+      if (!scope || !scope.querySelectorAll) { return null; }
+      var els = scope.querySelectorAll('.tdt-marker-icon');
+      var best = null, nd = 1e18;
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) { continue; }   // 隐藏图层
+        var r = els[i].getBoundingClientRect();
+        if (r.width < 4) { continue; }
+        var dx = Math.max(r.left - mx, mx - r.right, 0);
+        var dy = Math.max(r.top - my, my - r.bottom, 0);
+        var d = dx * dx + dy * dy;
+        if (d < nd) { nd = d; best = r; }
+      }
+      return (best && nd <= 900) ? best : null;          // 30px 内才算选中
     } catch (e) { return null; }
   }
-  // 三段式位置收敛（挪卡片不动地图）：① 钳进地图可视区；② 避让选中图标——
-  // 与当前图钉图标矩形重叠时沿分离所需方向推离；③ 复测兜残差。
-  // 避让可能与钳制打架，靠多轮收敛（最多 3 轮，每轮 620ms）；
+  // 卡片位置收敛（挪卡片不动地图），一次算好一次挪：
+  // ① 钳进地图可视区；② 若钳完仍压着选中的图标，在四向分离向量里挑
+  // 「不压图标 > 尽量不出地图 > 位移最小」的最优解，与钳制合并成一次
+  // setOffset——多轮分步挪会看得见卡片连跳几下（用户反馈「乱动」）。
+  // 620ms 后静默复测一轮兜残差，残差为零就不动。
   // offset 以 RTbase（首次记录的原始锚点偏移）为基准，每次开卡先复位，
   // 保证换缩放级别后不会跨次累计漂移
-  function fitCardInMap(iw, mk, round) {
+  function fitCardInMap(iw, round) {
     if (!iw || !iw.setOffset || !iw.getOffset) { return; }
-    if (round > 2) { return; }
+    if (round > 1) { return; }
     if (!round) {
       if (!iw.RTbase) {
         try {
@@ -331,42 +339,58 @@ ROUTE_MAP_JS = """
         var box = document.getElementById('route-map');
         if (!r || !box) { return; }
         var m = box.getBoundingClientRect();
-        var pad = 8, sx = 0, sy = 0;
-        if (r.top < m.top + pad) { sy = Math.round(m.top + pad - r.top); }
-        else if (r.bottom > m.bottom - pad) { sy = -Math.round(r.bottom - (m.bottom - pad)); }
-        if (r.left < m.left + pad) { sx = Math.round(m.left + pad - r.left); }
-        else if (r.right > m.right - pad) { sx = -Math.round(r.right - (m.right - pad)); }
-        var q = anchorRect(mk);
-        if (q && r.right > q.left && r.left < q.right &&
-            r.bottom > q.top && r.top < q.bottom) {
-          // 分离位移按方向算（对称 overlap 会推不够）：左推=卡片右缘-图标左缘…
-          // 方向与轴的选择都要考虑边界可行性，否则贴边图钉会「避让↔钳制」振荡：
-          // 每轴先挑「推完仍留在地图内」的方向（两向可行取小），可行轴优先
-          var dxL = -(r.right - q.left + 2), dxR = q.right - r.left + 2;
-          var dyU = -(r.bottom - q.top + 2), dyD = q.bottom - r.top + 2;
-          var lOK = r.left + dxL >= m.left + pad;
-          var rOK = r.right + dxR <= m.right - pad;
-          var uOK = r.top + dyU >= m.top + pad;
-          var dOK = r.bottom + dyD <= m.bottom - pad;
-          var dx = (lOK && rOK) ? (Math.abs(dxL) <= Math.abs(dxR) ? dxL : dxR)
-                : lOK ? dxL : (rOK ? dxR
-                : (Math.abs(dxL) <= Math.abs(dxR) ? dxL : dxR));
-          var dy = (uOK && dOK) ? (Math.abs(dyU) <= Math.abs(dyD) ? dyU : dyD)
-                : uOK ? dyU : (dOK ? dyD
-                : (Math.abs(dyU) <= Math.abs(dyD) ? dyU : dyD));
-          var xOK = (lOK || rOK);
-          var yOK = (uOK || dOK);
-          if (xOK && (!yOK || Math.abs(dx) <= Math.abs(dy))) { sx += dx; }
-          else { sy += dy; }
+        var pad = 8, cx = 0, cy = 0;
+        if (r.top < m.top + pad) { cy = Math.round(m.top + pad - r.top); }
+        else if (r.bottom > m.bottom - pad) { cy = -Math.round(r.bottom - (m.bottom - pad)); }
+        if (r.left < m.left + pad) { cx = Math.round(m.left + pad - r.left); }
+        else if (r.right > m.right - pad) { cx = -Math.round(r.right - (m.right - pad)); }
+        // 钳制后的位置若压着选中的图标，四向分离里挑最优。
+        // 守卫矩形在首轮记到 iw.RTguard，复测轮沿用同一个——复测时鼠标
+        // 可能已移到别的图标上，实时识别会换来换去造成二次挪动
+        if (round === 0) { iw.RTguard = RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null; }
+        var q = iw.RTguard;
+        var ax = 0, ay = 0;
+        if (q) {
+          var t = { top: r.top + cy, bottom: r.bottom + cy,
+                    left: r.left + cx, right: r.right + cx };
+          if (t.right > q.left && t.left < q.right &&
+              t.bottom > q.top && t.top < q.bottom) {
+            // 分离位移按方向算（左推 = 卡片右缘-图标左缘），对称 overlap 推不够
+            var cands = [
+              { dx: 0, dy: -(t.bottom - q.top + 2) },
+              { dx: 0, dy: q.bottom - t.top + 2 },
+              { dx: -(t.right - q.left + 2), dy: 0 },
+              { dx: q.right - t.left + 2, dy: 0 }
+            ];
+            var best = null;
+            for (var i = 0; i < cands.length; i++) {
+              var a = { top: t.top + cands[i].dy, bottom: t.bottom + cands[i].dy,
+                        left: t.left + cands[i].dx, right: t.right + cands[i].dx };
+              var hit = (a.right > q.left && a.left < q.right &&
+                         a.bottom > q.top && a.top < q.bottom) ? 1 : 0;
+              // 出界量：只惩罚真实超出，压线（pad 内）不算
+              var out = Math.max(0, m.top + pad - a.top)
+                      + Math.max(0, a.bottom - (m.bottom - pad))
+                      + Math.max(0, m.left + pad - a.left)
+                      + Math.max(0, a.right - (m.right - pad));
+              var dist = Math.abs(cands[i].dx) + Math.abs(cands[i].dy);
+              if (best === null || hit < best.hit ||
+                  (hit === best.hit && (out < best.out - 4 ||
+                   (Math.abs(out - best.out) <= 4 && dist < best.dist)))) {
+                best = { hit: hit, out: out, dist: dist, dx: cands[i].dx, dy: cands[i].dy };
+              }
+            }
+            if (best) { ax = best.dx; ay = best.dy; }
+          }
         }
-        if (!sx && !sy) { return; }
+        if (!cx && !cy && !ax && !ay) { return; }
         var o = iw.getOffset();
         if (!o || typeof o.x !== 'number') { o = iw.RTbase || { x: 0, y: -38 }; }
-        iw.setOffset(new T.Point(o.x + sx, o.y + sy));
+        iw.setOffset(new T.Point(o.x + cx + ax, o.y + cy + ay));
         iw.update();
-        fitCardInMap(iw, mk, round + 1);
+        fitCardInMap(iw, round + 1);
       } catch (e) {}
-    }, round ? 620 : 20);
+    }, round ? 620 : 60);
   }
   function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
@@ -380,10 +404,16 @@ ROUTE_MAP_JS = """
     try {
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
-      function openCard() {
+      function openCard(ev) {
+        // 同一图钉已开卡就不重开：mouseover 在卡片段落间移动可能再触发，
+        // 重开会把 offset 复位重收敛，卡片看得见地跳（用户反馈「乱动」）
+        if (RT.openMk === mk) { hoverStay(); return; }
+        if (ev && typeof ev.clientX === 'number') {
+          RT.mouse = { x: ev.clientX, y: ev.clientY };   // 识别选中图标用
+        }
         hoverStay(); RT.openMk = mk;
         mk.openInfoWindow(iw);
-        fitCardInMap(iw, mk, 0);
+        fitCardInMap(iw, 0);
       }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
       // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关。
@@ -398,7 +428,7 @@ ROUTE_MAP_JS = """
     return mk;
   }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
-  var RT = { timer: null, openMk: null };
+  var RT = { timer: null, openMk: null, mouse: null };
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
   }
