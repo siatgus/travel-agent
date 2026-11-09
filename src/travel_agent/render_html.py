@@ -251,10 +251,23 @@ ROUTE_MAP_JS = """
       inner = '<g transform="translate(9.3,7.6) scale(0.95)" opacity="0.95">'
         + glyph(kind) + '</g>';
     }
+    var body = '<path d="M10 23.5L15 38.5l5-15z" fill="' + color + '"/>'
+      + '<circle cx="15" cy="13.5" r="12.2" fill="' + color + '" stroke="#FFFFFF"'
+      + ' stroke-width="1.8"/>'
+      + inner;
+    // 弹入动画必须放在 SVG 内部（SMIL）：img 元素上的 CSS transform 是
+    // 天地图框架的定位机制（translate3d），CSS keyframes 一动它图标就被
+    // 甩到图层面板原点附近——录屏里「图标在其他地方弹出来」的元凶。
+    // SMIL 随新 src 加载自动播放，围绕尾尖 (15,38.5) 从 0.45 弹到 1.15 回 1，
+    // 外层 translate 组合实现绕点缩放；fill=freeze 停在原尺寸
     var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="40" viewBox="0 0 30 40">'
-      + '<path d="M10 23.5L15 38.5l5-15z" fill="' + color + '"/>'
-      + '<circle cx="15" cy="13.5" r="12.2" fill="' + color + '" stroke="#FFFFFF" stroke-width="1.8"/>'
-      + inner + '</svg>';
+      + '<g transform="translate(15,38.5)"><g opacity="0.35">'
+      + '<animate attributeName="opacity" values="0.35;1;1" keyTimes="0;0.65;1"'
+      + ' dur="0.22s" fill="freeze"/>'
+      + '<g><animateTransform attributeName="transform" type="scale"'
+      + ' values="0.45;1.15;1" keyTimes="0;0.65;1" dur="0.22s" fill="freeze"/>'
+      + '<g transform="translate(-15,-38.5)">' + body + '</g>'
+      + '</g></g></svg>';
     return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   }
   // 未选中态小圆点（用户指定样式，同「我的位置」蓝点语言但用当天配色）：
@@ -273,17 +286,6 @@ ROUTE_MAP_JS = """
   }
   var map, all = [], dayRecs = [], homeOv = null, curTab = -1;
   var locMarker = null, locCircle = null;
-  // 选中展开动画样式（注入一次）：天地图 SDK 换图标是瞬时替换，过渡靠 CSS
-  // 补——img 元素经实测 setIcon 后不重建，class 动画可见；transform-origin
-  // 取 50% 100%（图钉锚点在尾尖），从小圆点弹出时围绕锚点放大
-  try {
-    var rtSt = document.createElement('style');
-    rtSt.textContent = '@keyframes rt-pop{0%{transform:scale(.45);opacity:.35}'
-      + '65%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}'
-      + 'img.tdt-marker-icon.rt-pop{animation:rt-pop .22s ease-out;'
-      + 'transform-origin:50% 100%}';
-    document.head.appendChild(rtSt);
-  } catch (e) {}
   function ll(lng, lat) {
     var p = new T.LngLat(lng, lat);
     all.push(p);
@@ -489,30 +491,14 @@ ROUTE_MAP_JS = """
                         iconAnchor: new T.Point(ax, ay) });
   }
   // 两态图标切换：on=选中（完整圆章+弹入过渡）/未选（回落小圆点）。
-  // setIcon 后按 src 找到对应 img 元素挂 rt-pop class——探针实测 img 不重建、
-  // class 保留；回落不做动画（收起要利落，弹出才要弹性）
+  // 弹入动画在 SVG 内部（SMIL）随新 src 加载自动播放；img 元素的
+  // transform 是框架定位，绝不能碰（CSS keyframes 动它=图标飞到别处）
   function selMk(mk, on) {
     try {
       var p = mk.RTpin;
       if (!p || typeof mk.setIcon !== 'function') { return; }
-      if (on) {
-        var url = pin(p.color, p.kind, p.txt);
-        mk.setIcon(mIcon(url, 30, 40, 15, 38));
-        var imgs = document.querySelectorAll('#route-map img.tdt-marker-icon');
-        for (var i = 0; i < imgs.length; i++) {
-          if (imgs[i].getAttribute('src') === url) {
-            imgs[i].classList.remove('rt-pop');
-            void imgs[i].offsetWidth;   // 强制重排：连续换钉也能重放动画
-            imgs[i].classList.add('rt-pop');
-            setTimeout(function (el) {
-              return function () { try { el.classList.remove('rt-pop'); } catch (e) {} };
-            }(imgs[i]), 260);
-            break;
-          }
-        }
-      } else {
-        mk.setIcon(mIcon(mDot(p.color), 22, 22, 11, 11));
-      }
+      mk.setIcon(on ? mIcon(pin(p.color, p.kind, p.txt), 30, 40, 15, 38)
+                    : mIcon(mDot(p.color), 22, 22, 11, 11));
     } catch (e) {}
   }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）

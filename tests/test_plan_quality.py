@@ -537,11 +537,15 @@ def test_route_map_real() -> None:
               "function mDot" in h2 and "mIcon(mDot(color), 22, 22, 11, 11)" in h2)
         check("选中展开完整圆章（setIcon 两态切换）",
               "function selMk" in h2 and "typeof mk.setIcon !== 'function'" in h2
-              and "mIcon(url, 30, 40, 15, 38)" in h2)
-        check("展开有弹入过渡动画（rt-pop）",
-              "@keyframes rt-pop" in h2 and "rt-pop .22s ease-out" in h2
-              and 'classList.add(\'rt-pop\')' in h2
-              and "transform-origin:50% 100%" in h2)
+              and "mIcon(pin(p.color, p.kind, p.txt), 30, 40, 15, 38)" in h2
+              and "mIcon(mDot(p.color), 22, 22, 11, 11)" in h2)
+        # 弹入动画必须在 SVG 内部（SMIL）：img 元素的 CSS transform 是天地图
+        # 框架定位机制，CSS keyframes 一动它图标就被甩到别处（用户录屏实锤）
+        check("弹入动画在 SVG 内部（SMIL），不碰框架定位 transform",
+              "animateTransform" in h2 and 'values="0.45;1.15;1"' in h2
+              and 'fill="freeze"' in h2
+              and "@keyframes rt-pop" not in h2
+              and "classList.add('rt-pop')" not in h2)
         check("换选回落旧钉（不留残钉）", "selMk(RT.openMk, false)" in h2)
         check("关闭卡片图标回落小圆点", "selMk(m, false)" in h2)
         # 防闪烁：关卡唯一裁判是光标坐标，与 DOM 边界事件完全无关——
