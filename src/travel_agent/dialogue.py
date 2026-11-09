@@ -461,21 +461,35 @@ class Session:
                              ask_rounds=self.ask_rounds, slots=dict(self.slots),
                              render=text)
 
-        # 「把 Day 3 午餐排到 15:20 结束」——分钟级精确排程能力还不存在，
-        # 静默重排一份常规时间轴只会让人以为指令没生效（亲子测试实测）。
-        # 放在意图直答之后：天气/交通/景点问答里出现时刻不归这管
+        # 「把 Day 3 午餐排到 15:20 结束」——分钟级锚点改排：整体平移目标日
+        # 时间轴（composer.apply_anchor），不动景点时长与交通。放在意图直答
+        # 之后：天气/交通/景点问答里出现时刻不归这管。解析不出具体锚点
+        # （有时刻没目标节点）仍走诚实提示，绝不静默重排装没听见。
         if self.plan_made and intent.wants_clock_schedule(utterance):
-            text = (
-                "这条先没动行程：**暂时做不到按具体时刻（比如 15:20）精确排程**——"
-                "时间轴由景点时长、交通耗时和用餐时段自动推算，接了也只会重排出"
-                "一份常规时间轴，看着就像没生效。\n\n"
-                "我能做的调整：换/删/加景点（「去掉锦里」「Day 2 加上熊猫基地」）、"
-                "改天数（「多住一天」）、节奏与预算。\n\n"
-                "顺带说明：带幼儿或点名午休的行程，编排器会保证中间日午餐后"
-                "插入 90 分钟午休（最晚 16 点前开始），不需要手动指定时刻。")
+            anchor = intent.parse_clock_anchor(utterance)
+            if not anchor:
+                text = (
+                    "想按具体时刻（比如 15:20）改时间轴，得说清楚是**哪一餐/午休**：\n\n"
+                    "可以这样说：「Day 3 午餐排到 15:20 结束」「每天晚餐 7 点开始」"
+                    "「把午休改成 2 小时」。")
+            else:
+                changed, detail, new_days = composer.apply_anchor(
+                    (self.last_plan or {}).get("days_plan") or [], anchor)
+                if not changed:
+                    text = f"这条没动时间轴：{detail}。"
+                else:
+                    # 写回 last_plan：渲染、存档、页面刷新都走既有链路；
+                    # 之后换/加景点会重新编排，锚点是即时的，需要再说一次
+                    self.last_plan = dict(self.last_plan, days_plan=new_days)
+                    text = (f"> 已按你的时刻要求调整：{detail}。\n\n"
+                            "> 注意：之后再换/删/加景点或改天数会重新编排时间轴，"
+                            "这条时刻要求如还需生效请再说一次。\n\n"
+                            + agent.render(self.last_plan))
             self.history.append({"role": "agent", "content": text})
-            return Reply(mode="answer", turn_no=self.turn_no,
+            mode = "plan" if (anchor and changed) else "answer"
+            return Reply(mode=mode, turn_no=self.turn_no,
                          ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                         plan=self.last_plan if mode == "plan" else None,
                          render=text)
 
         delta = agent.extract_slots(utterance, today=self.today, client=self.client)

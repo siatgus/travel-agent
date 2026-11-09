@@ -310,6 +310,146 @@ def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
     return clock + 90
 
 
+# ------------------------------------------------------------------ 分钟级锚点改排
+
+# 平移边界：出发再早不早于 07:30（赶不上开馆还打乱早餐），最晚收摊 23:00
+_ANCHOR_START_EARLIEST = 7 * 60 + 30
+_ANCHOR_END_LATEST = 23 * 60
+
+
+def _find_meal_node(nodes: list[dict], target: str) -> dict | None:
+    """按 type+时段窗口找餐节点——餐节点的 name 是餐厅名不是「午餐」。
+
+    午休节点名以「午休」开头（rest 类型），直接按名字找。
+    """
+    if target == "午休":
+        for n in nodes:
+            if n["name"].startswith("午休"):
+                return n
+        return None
+    lo, hi = {"早餐": (0, 10 * 60 + 30), "午餐": (11 * 60, 15 * 60 + 30),
+              "晚餐": (16 * 60 + 30, 24 * 60)}[target]
+    for n in nodes:
+        if n["type"] == "restaurant" and lo <= _tmin(n["time"]) < hi:
+            return n
+    return None
+
+
+def _tmin(s: str) -> int:
+    hh, mm = s.split(":")
+    return int(hh) * 60 + int(mm)
+
+
+def apply_anchor(days_plan: list[dict], anchor: dict) -> tuple[bool, str, list]:
+    """把分钟级锚点要求落到已生成的 days_plan 上。
+
+    做法：**整体平移目标日的时间轴**，让目标节点达到要求的时刻——
+    平移不动任何景点时长与交通耗时，相邻关系原样保留，是改动最小、
+    最不容易出鬼的改法；目标日的「抵达 + 入住」绑定真实班次时刻，
+    只平移它之后的节点（等于压缩了入住后的休整，如实说明）。
+
+    返回 (changed, 说明, new_days_plan)；changed=False 时说明里给原因，
+    days_plan 原样返回（内部是深拷贝，绝不改调用方的数据）。
+    """
+    new_days = [dict(d, nodes=[dict(n) for n in d["nodes"]]) for d in days_plan]
+    days = len(new_days)
+    target = anchor["target"]
+    want = anchor["minute"]
+    mode = anchor["mode"]
+    nap_min = anchor.get("nap_min")
+
+    # 落在哪几天：点名天数 → 那一天；「每天」→ 中间日（抵达/返程日
+    # 的时刻绑着真实班次，不接「每天」）；都没说 → 第一个含目标的中间日
+    if anchor.get("day") is not None:
+        idxs = [anchor["day"] - 1]
+        if not (1 <= anchor["day"] <= days):
+            return False, f"行程只有 {days} 天，没有第 {anchor['day']} 天", new_days
+    elif anchor.get("every_day"):
+        idxs = list(range(1, days - 1)) if days >= 3 else [days - 1]
+        if not idxs:
+            return False, "单天行程的时刻绑定班次，暂不支持按时刻平移", new_days
+    else:
+        idxs = [i for i in range(1, days - 1)
+                if _find_meal_node(new_days[i]["nodes"], target)]
+        if not idxs:
+            idxs = [i for i in range(days) if _find_meal_node(new_days[i]["nodes"], target)]
+        if not idxs:
+            return False, f"行程里没有找到可调的{target}时段", new_days
+
+    details: list[str] = []
+    changed_any = False
+    for i in idxs:
+        nodes = new_days[i]["nodes"]
+        node = _find_meal_node(nodes, target)
+        if node is None:
+            details.append(f"Day {i + 1} 没有{target}节点"
+                           + ("（午休只在带幼儿或点名午休时插入）"
+                              if target == "午休" else ""))
+            continue
+        nap_node = next((n for n in nodes if n["name"].startswith("午休")), None)
+        nap_change = bool(nap_min and nap_node
+                          and nap_node["duration_min"] != nap_min)
+        # 平移起点：抵达日跳过「抵达 + 入住」（班次时刻不可动）
+        frm = 0
+        if i == 0 and nodes and nodes[0]["name"].startswith("抵达"):
+            frm = 1
+        delta = 0
+        clamped = False
+        if want is not None:
+            cur = _tmin(node["time"]) + (node["duration_min"] if mode == "end" else 0)
+            delta = want - cur
+            # 边界钳制：出发不早于 07:30、收摊不晚于 23:00
+            if frm < len(nodes):
+                lo = _ANCHOR_START_EARLIEST - _tmin(nodes[frm]["time"])
+                end_last = _tmin(nodes[-1]["time"]) + nodes[-1]["duration_min"]
+                hi = _ANCHOR_END_LATEST - end_last
+                clamped = delta != max(lo, min(delta, hi))
+                delta = max(lo, min(delta, hi))
+            if abs(delta) <= 2 and not nap_change:
+                details.append(f"Day {i + 1} {target}已经是 "
+                               f"{fmt(want)}{'前结束' if mode == 'end' else '开始'}，"
+                               "时间轴没动")
+                continue
+        elif not nap_change:
+            details.append(f"Day {i + 1} 午休已经是 "
+                           f"{(nap_node or {}).get('duration_min')} 分钟，时间轴没动")
+            continue
+        # 落地：纯平移——节点之间还有交通耗时形成的空隙（transit 不是节点，
+        # 顺序重推会把空隙压没），所以每个节点原时刻 + delta，空隙原样保留；
+        # 午休时长调整作为第二段平移，只影响它之后的节点
+        if want is not None and abs(delta) > 2:
+            for n in nodes[frm:]:
+                n["time"] = fmt(_tmin(n["time"]) + delta)
+        line_nap = ""
+        if nap_change:
+            extra = nap_min - nap_node["duration_min"]
+            nap_node["duration_min"] = nap_min
+            _nap_t = _tmin(nap_node["time"])
+            for n in nodes:
+                if _tmin(n["time"]) > _nap_t:
+                    n["time"] = fmt(_tmin(n["time"]) + extra)
+            line_nap = f"；午休改为 {nap_min} 分钟"
+        changed_any = True
+        if want is not None:
+            cur = _tmin(node["time"]) - delta + (node["duration_min"] if mode == "end" else 0)
+            got = cur + delta
+            line = (f"Day {i + 1} {target}{ '结束' if mode == 'end' else '开始' }调到 "
+                    f"{fmt(got)}（原 {fmt(cur)}，全天时间轴"
+                    f"{'顺延' if delta > 0 else '提前'} {abs(delta)} 分钟）")
+            if clamped:
+                line += (f"——要求超出 {fmt(_ANCHOR_START_EARLIEST)}~"
+                         f"{fmt(_ANCHOR_END_LATEST)} 的可行范围，已取最近可行时刻")
+        else:
+            line = f"Day {i + 1} 午休时长已改为 {nap_min} 分钟"
+            line_nap = ""   # 时长变化已在本句说明，别再拼一遍
+        # 平移把当天拖得太晚要明说，别让人到跟前才发现晚饭快九点
+        end_last = _tmin(nodes[-1]["time"]) + nodes[-1]["duration_min"]
+        if end_last > 21 * 60 + 30:
+            line += f"；注意：当天最晚一个安排将到 {fmt(end_last)} 结束，偏晚"
+        details.append(line + line_nap)
+    return changed_any, "；".join(details), new_days
+
+
 def compose(slots: dict, pois_res: dict, weather_res: dict,
             outbound_arrive: str, outbound_depart_last: str = "18:00",
             hotel_geo: list[float] | None = None,

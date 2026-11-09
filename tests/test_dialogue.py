@@ -168,20 +168,56 @@ def test_change_mind() -> None:
 
 
 def test_clock_precise_reschedule_honest() -> None:
-    """分钟级精确改排（把午餐排到 15:20 结束）：如实说做不到，不静默重排。"""
+    """分钟级锚点改排：能落地的真平移时间轴，落不了的如实说明。"""
     from travel_agent import intent
+    from travel_agent.composer import _tmin
     check("分钟时刻+改排动词被识别",
           intent.wants_clock_schedule("把 Day 3 午餐排到 15:20 结束后接 90 分钟午休"))
+    check("餐目标+时刻无需规划动词",
+          intent.wants_clock_schedule("每天晚餐7点开始"))
     check("整点说法不误伤",
           not intent.wants_clock_schedule("下午3点出发去大理"))
+    check("班次时刻不误入", not intent.wants_clock_schedule("15:20 的高铁"))
+    check("只改午休时长也被识别",
+          intent.wants_clock_schedule("把午休改成2小时"))
+    # 解析：时刻归一化
+    a = intent.parse_clock_anchor("把 Day 3 午餐排到 15:20 结束后接 90 分钟午休")
+    check("锚点解析出天/目标/时刻/时长",
+          a and a["day"] == 3 and a["target"] == "午餐" and a["mode"] == "end"
+          and a["minute"] == 15 * 60 + 20 and a["nap_min"] == 90, str(a))
+    a2 = intent.parse_clock_anchor("每天晚餐7点开始")
+    check("晚餐整点按晚上归一（7点=19:00）",
+          a2 and a2["every_day"] and a2["minute"] == 19 * 60, str(a2))
+    check("无目标节点不硬猜", intent.parse_clock_anchor("15:20 的高铁") is None)
+
     s = session()
     s.turn("11月8号去大理玩4天，2人，预算6000")
     before = s.plan_made and s.last_plan is not None
-    r = s.turn("把 Day 3 午餐排到 15:20 结束后接 90 分钟午休")
-    check("分钟级改排请求返回诚实说明而不是新方案",
-          r.mode == "answer" and "具体时刻" in r.render,
-          f"mode={r.mode}")
-    check("说明里给出可用的改排方式", "景点" in r.render and "多住一天" in r.render)
+    orig_day3 = [_tmin(n["time"]) for n in s.last_plan["days_plan"][2]["nodes"]]
+    r = s.turn("把 Day 3 午餐排到 15:20 结束")
+    check("锚点改排返回新方案",
+          r.mode == "plan" and "已按你的时刻要求调整" in r.render, f"mode={r.mode}")
+    day3 = s.last_plan["days_plan"][2]["nodes"]
+    lunch = next(n for n in day3 if n["type"] == "restaurant"
+                 and 11 * 60 <= _tmin(n["time"]) < 15 * 60 + 30)
+    check("午餐结束精确落在 15:20",
+          _tmin(lunch["time"]) + lunch["duration_min"] == 15 * 60 + 20,
+          f"{lunch['time']}+{lunch['duration_min']}")
+    new_day3 = [_tmin(n["time"]) for n in day3]
+    check("平移保持相邻间隙（交通耗时不丢）",
+          all(b - a_ == d - c for a_, b, c, d
+              in zip(orig_day3, orig_day3[1:], new_day3, new_day3[1:])))
+    day2 = [_tmin(n["time"]) for n in s.last_plan["days_plan"][1]["nodes"]]
+    check("Day 2 时间轴不受影响（未被整体平移）", day2 != new_day3)
+    r2 = s.turn("把 Day 3 午餐排到 15:20 结束")
+    check("重复要求如实说已满足",
+          r2.mode == "answer" and "时间轴没动" in r2.render, r2.render[:60])
+    r3 = s.turn("把第 9 天午餐排到 12 点结束")
+    check("越界天数如实拒绝",
+          r3.mode == "answer" and "没有第 9 天" in r3.render, r3.render[:60])
+    r4 = s.turn("按 15:20 精确调整一下行程")
+    check("解析不出目标仍走诚实提示",
+          r4.mode == "answer" and "哪一餐" in r4.render, r4.render[:60])
     check("普通改排不受影响",
           s.turn("去掉苍山").mode == "plan" and before)
 

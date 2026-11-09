@@ -57,19 +57,129 @@ _PLAN_VERB_RE = re.compile(r"排|规划|安排|做.{0,3}攻略|做.{0,3}行程|�
 # 分钟级精确时刻：15:20 / 15点20(分) / 3点半。只有带分钟的才算——
 # 「下午3点出发」这种整点常是班次/到站信息，交给对应问答处理
 _CLOCK_PRECISE_RE = re.compile(
-    r"[01]?\d\s*[:：]\s*[0-5]\d|[01]?\d\s*点\s*[0-5]\d\s*分?|[01]?\d\s*点半")
+    r"[01]?\d\s*[:：]\s*[0-5]\d|[01]?\d\s*点\s*[0-5]\d\s*分?|[01]?\d\s*点半"
+    r"|[01]?\d\s*点(?!\s*[0-5]?\d|半)")
 
 
 def wants_clock_schedule(text: str) -> bool:
     """想按某个具体时刻（如 15:20）精确改排时间轴吗。
 
-    页面的改排能力是换/删/加景点和改天数，时间轴由景点时长+交通自动
-    推算——分钟级锚点（把午餐排到 15:20 结束）做不到。接了也只会静默
-    重排一份常规时间轴，看起来就像指令没生效（亲子测试实测）。
-    调用方应如实告知能力边界，而不是假装听懂。
+    页面支持分钟级锚点改排：整体平移目标日的时间轴（见
+    composer.apply_anchor）。三条触发路：规划动词 + 精确时刻
+    （「排到 15:20 结束」）、餐食/午休目标词 + 精确时刻（「每天
+    晚餐7点开始」——没有规划动词但语义毫不含糊）、只改午休时长
+    （「午休改成2小时」）。班次句子里不会出现「午餐」这类词，
+    「15:20 的高铁」仍不会误入。真正的解析在 parse_clock_anchor，
+    解析不出目标时调用方走诚实提示。
     """
     t = text or ""
-    return bool(_CLOCK_PRECISE_RE.search(t) and _PLAN_VERB_RE.search(t))
+    if not _CLOCK_PRECISE_RE.search(t):
+        # 没有时刻也可能在改排：只动午休时长（「午休改成2小时」）
+        return bool(re.search(r"午[休睡][^，。；]{0,8}"
+                              r"[一二两三四五六七八九十\d]{1,2}\s*(?:个)?(?:小时|钟头)", t))
+    return bool(_PLAN_VERB_RE.search(t)
+                or re.search(r"调整|改到|挪到|重排|改排", t)
+                or any(k in t for _, kws in _ANCHOR_TARGETS for k in kws))
+
+
+# ------------------------------------------------------------------ 锚点解析
+
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _cn_int(s: str | None) -> int | None:
+    """「3」「三」「十」「二十三」→ int；认不出返回 None。"""
+    if not s:
+        return None
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    if s == "十":
+        return 10
+    if "十" in s:
+        a, _, b = s.partition("十")
+        return ((_CN_NUM.get(a, 1) if a else 1) * 10
+                + (_CN_NUM.get(b, 0) if b else 0))
+    return _CN_NUM.get(s)
+
+
+# 锚点目标词表：编排器真实拥有时间轴的节点才可作锚点
+_ANCHOR_TARGETS = (("早餐", ("早餐", "早饭")), ("午餐", ("午餐", "午饭")),
+                   ("晚餐", ("晚餐", "晚饭")), ("午休", ("午休", "午睡")))
+
+
+def parse_clock_anchor(text: str) -> dict | None:
+    """从「把 Day 3 午餐排到 15:20 结束后接 90 分钟午休」解析锚点。
+
+    返回 {"day": int|None, "every_day": bool, "target": str,
+          "mode": "start"|"end", "minute": int|None, "nap_min": int|None}；
+    minute 为 None 表示只改午休时长（「午休改成2小时」）；
+    解析不出目标节点、或目标/时刻/时长一样都落不了地就返回 None
+    （调用方走诚实提示兜底）。
+
+    只接餐食/午休——编排器只对这几类节点拥有时间轴主权；抵达/返程
+    时刻绑定真实班次，「出发」「到达」类说法不接（平移等于改班次，
+    必须如实拒绝）。整点说法（「下午3点出发」「15:20 的高铁」）多为
+    班次信息，wants_clock_schedule 的规划动词闸门 + 目标词表双重过滤。
+    """
+    t = (text or "").strip()
+    m = _CLOCK_PRECISE_RE.search(t)
+    target = None
+    for name, kws in _ANCHOR_TARGETS:
+        if any(k in t for k in kws):
+            target = name
+            break
+    if target is None:
+        return None
+    mode = "end" if re.search(r"结束|吃完|离[开店]|之后|以后", t) else "start"
+    # 时刻 → 当天分钟数。带「下午/晚上/傍晚」前缀按 12 小时制 +12；
+    # 没前缀时按目标推：晚餐必在晚上（「晚餐7点」=19:00），
+    # 午餐/午休的 1~2 点是下午（「午餐1点」=13:00）。
+    hour = minute = None
+    if m:
+        s = m.group(0)
+        hm = re.match(r"([01]?\d)\s*[:：]\s*([0-5]\d)", s)
+        if hm:
+            hour, minute = int(hm.group(1)), int(hm.group(2))
+        else:
+            hm2 = re.match(r"([01]?\d)\s*点\s*(?:([0-5]\d)\s*分?|(半))?", s)
+            hour = int(hm2.group(1))
+            minute = 30 if hm2.group(3) else int(hm2.group(2) or 0)
+        if re.search(r"下午|傍晚|晚上", t) and hour < 12:
+            hour += 12
+        elif target == "晚餐" and hour <= 11:
+            hour += 12
+        elif target in ("午餐", "午休") and hour <= 2:
+            hour += 12
+    # 第几天：不写天数时由编排层决定落在哪天（every_day 或含目标的首日）
+    day = None
+    dm = re.search(r"第\s*([一二两三四五六七八九十\d]{1,3})\s*天", t) \
+        or re.search(r"day\s*([一二两三四五六七八九十\d]{1,3})", t, re.I)
+    if dm:
+        day = _cn_int(dm.group(1))
+    every_day = day is None and bool(re.search(r"每天|每日|天天", t))
+    # 「接 90 分钟午休」「午休改成 2 小时」：给目标日的午休节点改时长
+    nap_min = None
+    nm = re.search(r"([一二两三四五六七八九十\d]{1,3})\s*分钟\s*的?\s*午[休睡]"
+                   r"|午[休睡]\s*([一二两三四五六七八九十\d]{1,3})\s*分钟", t)
+    if nm:
+        nap_min = _cn_int(nm.group(1) or nm.group(2))
+    else:
+        nm2 = re.search(r"午[休睡][^，。；]{0,8}?([一二两三四五六七八九十\d]{1,2})"
+                        r"\s*(?:个)?(?:小时|钟头)", t)
+        if nm2:
+            _h = _cn_int(nm2.group(1))
+            if _h:
+                nap_min = _h * 60
+    # 「午休改成 2 小时」这类只改时长的锚点：没有时刻也成立，
+    # 但目标 + 时刻 + 时长至少要有一样能落地的
+    if hour is None and nap_min is None:
+        return None
+    return {"day": day, "every_day": every_day, "target": target,
+            "mode": mode,
+            "minute": hour * 60 + minute if hour is not None else None,
+            "nap_min": nap_min}
 # 疑问句式：问句 + 没有规划动词 ≈ 在问问题，不是要出行程
 # （「去日本旅游需要办签证吗」之前被"旅游"关键词劫去重排行程）
 _INTERROG_RE = re.compile(
