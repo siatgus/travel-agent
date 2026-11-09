@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""端到端行为探针：从 render_html.py 逐字提取 visibleCardRect/iconRectAt/fitCardInMap，
-在真实天地图 SDK 下验证「挪卡片不动地图 + 只避让选中的图标 + 不乱动」：
-① 贴边图钉开卡：卡片钳进地图且不遮挡选中图标（鼠标光标位置识别）；
+"""端到端行为探针：从 render_html.py 逐字提取可见性/避让相关函数，
+在真实天地图 SDK 下验证「挪卡片不动地图 + 不遮挡选中的图标 + 不乱动」：
+① 贴边图钉开卡（光标在该图钉图标上）：卡片钳进地图且不遮挡选中图标；
 ② 再次开卡先复位再重新收敛（不跨次累计漂移）；
-③ 图钉居中、默认位置本就不遮图标：offset 保持 base 不乱动；
-④ 收敛后位置稳定：1500ms 与 2500ms 两次测量一致（无振荡/二次挪动）。"""
+③ 图钉居中、默认位置本就不遮选中图标：offset 保持 base 不乱动；
+④ 收敛后位置稳定：两轮复测位置一致（无振荡/二次挪动）。"""
 import json
 import re
 import subprocess
@@ -24,7 +24,8 @@ def extract(name):
 
 
 funcs = "\n".join(extract(n) for n in
-                  ("visibleCardRect", "iconRectAt", "fitCardInMap"))
+                  ("visibleCardRect", "iconRectAt", "overlapArea",
+                   "clearShift", "fitCardInMap"))
 
 probe = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -38,14 +39,11 @@ probe = """<!DOCTYPE html>
 window.onerror = function(msg, src, line, col){
   document.getElementById('err').textContent += ' | JSERR: ' + msg + ' @' + line + ':' + col;
 };
-document.addEventListener('DOMContentLoaded', function(){
-  document.getElementById('err').textContent += ' | DOMContentLoaded';
-});
 </script>
 <script src="https://api.tianditu.gov.cn/api?v=4.0&tk=__KEY__"></script>
 <script>
-var map;        /* 提取的函数引用同名变量：真实页面里在 IIFE 闭包，这里须全局声明 */
-var RT = { mouse: null };   /* 同上：真实页面里由 openCard 事件写入，探针里手工模拟 */
+var map;   /* 提取的函数引用同名变量：真实页面里在 IIFE 闭包，这里须全局声明 */
+var RT = { mouse: null };   /* 真实页面由文档级 mousemove 写入，探针里模拟光标 */
 __FUNCS__
 </script>
 <script>
@@ -54,8 +52,8 @@ window.onload = function(){
     try{
       map = new T.Map('route-map');
       map.centerAndZoom(new T.LngLat(104.06,30.67), 12);
-      // 图钉 A 贴地图顶部：气泡默认往上开必然被裁；图钉 B 放在卡片默认位置
-      // 附近（A 右上方）但不是选中目标——卡片允许盖住 B，只保证不盖住 A
+      // 图钉 A 贴地图顶部（气泡默认往上开必然被裁）；图钉 B 放在卡片默认
+      // 位置内——只避让选中的图标，卡片盖住 B 是允许的
       var mk = new T.Marker(new T.LngLat(104.06, 30.672));
       map.addOverLay(mk);
       var mkB = new T.Marker(new T.LngLat(104.083, 30.683));
@@ -70,38 +68,45 @@ window.onload = function(){
       function rectAbs(){ var c=document.querySelector('.rt-card');
         var r=c.getBoundingClientRect();
         return [r.top, r.bottom, r.left, r.right]; }
-      function iconRect(el){ var box=document.getElementById('route-map');
-        var m=box.getBoundingClientRect(); var r=el.getBoundingClientRect();
-        return [r.top, r.bottom, r.left, r.right]; }
-      function setMouseAt(clientX, clientY){ RT.mouse = {x:clientX, y:clientY}; }
-      // —— 场景 A：图钉 A 贴顶，光标在 A 图标中心 ——
+      function iconRects(){ var box=document.getElementById('route-map');
+        var m=box.getBoundingClientRect(); var out=[];
+        box.querySelectorAll('.tdt-marker-icon').forEach(function(e){
+          if(e.offsetParent===null){return;}
+          var r=e.getBoundingClientRect();
+          out.push([r.top, r.bottom, r.left, r.right]); });
+        return out; }
+      function iconElAt(x, y){ var best=null, nd=1e18;
+        document.getElementById('route-map').querySelectorAll('.tdt-marker-icon')
+          .forEach(function(e){ if(e.offsetParent===null){return;}
+            var r=e.getBoundingClientRect();
+            var dx=Math.max(r.left-x,x-r.right,0), dy=Math.max(r.top-y,y-r.bottom,0);
+            var d=dx*dx+dy*dy; if(d<nd){nd=d; best=e;} });
+        return best; }
+      // —— 场景 A：图钉 A 贴顶，光标在 A 图标中心，开卡收敛 ——
       mk.openInfoWindow(iw);
       setTimeout(function(){
         var before = rect();
-        var iconEls = document.getElementById('route-map')
-          .querySelectorAll('.tdt-marker-icon');
-        var aIcon = iconRect(iconEls[0]);   // A 的图标 DOM（按坐标找最近的）
-        // 光标放在 A 图标中心（页面上 A 的图标矩形中点）
-        var ax=(aIcon[2]+aIcon[3])/2, ay=(aIcon[0]+aIcon[1])/2;
-        setMouseAt(ax, ay);
+        var icons = iconRects();
+        var aEl = iconElAt((icons[0][2]+icons[0][3])/2, (icons[0][0]+icons[0][1])/2);
+        var aAbs = (function(r){ return [r.top, r.bottom, r.left, r.right]; })
+                   (aEl.getBoundingClientRect());
+        RT.mouse = { x:(aAbs[2]+aAbs[3])/2, y:(aAbs[0]+aAbs[1])/2 };
         fitCardInMap(iw, 0);
         setTimeout(function(){
           var after = rect();
           var cardAfter = rectAbs();
-          var guardsAfter = [aIcon];
           var stable1 = rect();
           // —— 场景 B：再次开卡（应复位重收敛，无累计漂移）——
           setTimeout(function(){
             mk.openInfoWindow(iw);
             setTimeout(function(){
               var before2 = rect();
-              setMouseAt(ax, ay);
               fitCardInMap(iw, 0);
               setTimeout(function(){
                 var after2 = rect();
                 var cardAfter2 = rectAbs();
                 var stable2 = rect();
-                // —— 场景 C：图钉居中，默认位置本就不遮图标 → 不乱动 ——
+                // —— 场景 C：图钉居中，默认位置本就不遮选中图标 → 不乱动 ——
                 var mkC = new T.Marker(new T.LngLat(104.075, 30.615));
                 map.addOverLay(mkC);
                 var iwC = new T.InfoWindow('<div class="rt-card">card</div>',
@@ -110,30 +115,24 @@ window.onload = function(){
                   mk.closeInfoWindow();
                   mkC.openInfoWindow(iwC);
                   setTimeout(function(){
-                    var iconEls2 = document.getElementById('route-map')
-                      .querySelectorAll('.tdt-marker-icon');
-                    var cIcon = null;
-                    iconEls2.forEach(function(e){ var r=e.getBoundingClientRect();
-                      var llC = map.lngLatToContainerPoint(new T.LngLat(104.075,30.615));
-                      var box=document.getElementById('route-map').getBoundingClientRect();
-                      if (Math.abs((r.left+r.right)/2-(box.left+llC.x))<20 &&
-                          Math.abs((r.top+r.bottom)/2-(box.top+llC.y))<30){ cIcon=e; } });
-                    var cAbs = cIcon ? iconRect(cIcon) : null;
                     var cBefore = rect();
-                    if (cAbs) { setMouseAt((cAbs[2]+cAbs[3])/2, (cAbs[0]+cAbs[1])/2); }
+                    var cEl = iconElAt.apply(null, (function(){
+                      var box=document.getElementById('route-map').getBoundingClientRect();
+                      var llC = map.lngLatToContainerPoint(new T.LngLat(104.075,30.615));
+                      return [box.left+llC.x, box.top+llC.y]; })());
+                    var cAbs = cEl ? (function(r){ return [r.top, r.bottom, r.left, r.right]; })
+                                   (cEl.getBoundingClientRect()) : null;
+                    if (cAbs) { RT.mouse = { x:(cAbs[2]+cAbs[3])/2, y:(cAbs[0]+cAbs[1])/2 }; }
                     fitCardInMap(iwC, 0);
                     setTimeout(function(){
-                      var cAfter = rect();
-                      var cGuards = cAbs ? [cAbs] : [];
                       document.getElementById('out').textContent = 'INFO=' + JSON.stringify({
                         before: before, after: after,
-                        a_icon: aIcon,
-                        guards_after: guardsAfter, card_abs: cardAfter,
-                        stable1: stable1,
+                        icons: icons, a_icon: aAbs,
+                        card_abs: cardAfter, stable1: stable1,
                         reopen_before: before2, reopen_after: after2,
                         card_abs2: cardAfter2, stable2: stable2,
-                        c_before: cBefore, c_after: cAfter,
-                        c_guards: cGuards, c_card: rectAbs(),
+                        c_before: cBefore, c_after: rect(),
+                        c_icon: cAbs,
                         c_offset: (function(o){return o?[o.x,o.y]:null;})(iwC.getOffset()),
                         c_base: iwC.RTbase ? [iwC.RTbase.x, iwC.RTbase.y] : null,
                         offset_final: (function(o){return o?[o.x,o.y]:null;})(iw.getOffset())
@@ -182,23 +181,23 @@ def in_map(r):
     return top >= 0 and bottom <= 400 and left >= 0 and right <= 600
 
 
-def overlaps_abs(card, guards):
-    """卡片页面坐标 [top,bottom,left,right] 与任一避让图标（页面坐标）相交。"""
+def overlaps_abs(card, icons):
+    """卡片页面坐标 [top,bottom,left,right] 与任一图标（页面坐标）相交。"""
     ct, cb, cl, cr = card
-    for gt, gb, gl, gr in guards:
+    for gt, gb, gl, gr in icons:
         if min(cb, gb) - max(ct, gt) > 0 and min(cr, gr) - max(cl, gl) > 0:
             return True
     return False
 
 
+guards = [data["a_icon"]]
 ok1 = (in_map(data["after"])
-       and not overlaps_abs(data["card_abs"], data["guards_after"]))
+       and not overlaps_abs(data["card_abs"], guards))
 ok2 = (in_map(data["reopen_after"])
-       and not overlaps_abs(data["card_abs2"], data["guards_after"]))
-ok3 = (not overlaps_abs(data["c_card"], data["c_guards"])
-       and data["c_offset"] == data["c_base"])
+       and not overlaps_abs(data["card_abs2"], guards))
+ok3 = data["c_offset"] == data["c_base"] and data["c_after"] == data["c_before"]
 ok4 = (data["stable1"] == data["after"] and data["stable2"] == data["reopen_after"])
-print("A 图标矩形:", data["a_icon"])
+print("图标矩形:", data["icons"], "选中:", data["a_icon"])
 print("首次开卡  before=%s after=%s -> %s" % (
     data["before"], data["after"],
     "PASS 在地图内且不遮选中图标" if ok1 else "FAIL"))

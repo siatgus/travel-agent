@@ -547,8 +547,15 @@ def test_route_map_real() -> None:
         check("点击页签只看某天（show/hide 逻辑）",
               "setTab" in h2 and "o.show()" in h2 and "o.hide()" in h2)
         check("按天分色实线动线", "new T.Polyline(chain" in h2 or "new T.Polyline(" in h2)
-        check("用天地图路径规划服务画真实道路",
-              "new T.DrivingRoute(" in h2 and "getPlan(0).getPath()" in h2)
+        check("路径规划走服务端代理（SDK DrivingRoute 走 HTTPS 会挂死不回调）",
+              "/api/tianditu/drive" in h2 and "new T.DrivingRoute(" not in h2)
+        from travel_agent import server as _srv
+        _s = _TA_PATH(_srv.__file__).read_text(encoding="utf-8")
+        check("代理上游必须走 HTTP（HTTPS /drive 实测挂死）",
+              "http://api.tianditu.gov.cn/drive" in _s
+              and "https://api.tianditu.gov.cn/drive" not in _s)
+        check("代理解析 routelatlon 并缓存", "routelatlon" in _s
+              and "_DRIVE_CACHE" in _s)
         check("规划结果按天替换直线占位", "replaceGhost" in h2 and "lineStyle: 'dashed'" in h2)
         check("路径规划失败也退回直线（不会白屏）",
               "规划失败已退回直线" in h2)
@@ -810,21 +817,19 @@ def test_poi_info_cards() -> None:
               and "getBoundingClientRect" in h and "panBy" not in h)
         check("只认可见卡片矩形（防隐藏旧节点误判）",
               "function visibleCardRect" in h and "querySelectorAll('.rt-card')" in h)
-        check("只避让选中图标：iconRectAt 按开卡光标位置识别（锚点换算/最近匹配都会选错）",
+        check("只避让选中图标：文档级 mousemove 跟踪光标识别（事件对象可能无 clientX）",
               "function iconRectAt" in h and "RT.mouse" in h
-              and "anchorRect" not in h and "lngLatToContainerPoint" not in h
-              and "markerRects" not in h)
+              and "addEventListener('mousemove'" in h
+              and "guardRects" not in h and "anchorRect" not in h
+              and "lngLatToContainerPoint" not in h and "markerRects" not in h)
         check("一次算好一次挪：钳制与避让合并单次 setOffset（多轮分步跳动=乱动）",
               "cx + ax" in h and "o.y + cy + ay" in h)
-        check("复测轮沿用首轮守卫矩形（防鼠标移走换目标二次挪动）",
-              "iw.RTguard" in h)
-        check("同图钉已开卡不重开（防 offset 复位重收敛跳动）",
-              "RT.openMk === mk" in h)
+        check("多图标避让迭代收敛（推开一层可能压到更远的图标）",
+              "function clearShift" in h and "overlapArea" in h)
         check("避让位移按方向算分离量（对称 overlap 会推不够）",
-              "q.right - t.left" in h and "t.right - q.left" in h)
+              "guards[i].right - a.left" in h and "a.right - guards[i].left" in h)
         check("挪卡不动图：旧平移兜底机制已清干净",
-              "RT.panned" not in h and "watchCard" not in h
-              and "mousemove" not in h.split('poiCard')[0].split('function addMarker')[-1])
+              "RT.panned" not in h and "watchCard" not in h)
     finally:
         poi_links.fetch_one = orig_fo
 

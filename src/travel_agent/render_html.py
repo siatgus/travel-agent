@@ -291,9 +291,10 @@ ROUTE_MAP_JS = """
       return best || fallback;
     } catch (e) { return null; }
   }
-  // 选中图钉的图标矩形：用开卡那一刻的光标位置识别——鼠标正悬在图标上，
-  // 这是最可靠的「选中」判定（按锚点换算有系统偏差、按最近图标匹配在
-  // 图钉密集时会选错，两种实测都踩过坑）。取光标 30px 内最近的可见图标
+  // 选中图钉的图标矩形：用光标位置识别（文档级 mousemove 全程跟踪 RT.mouse，
+  // 悬停图钉前必先移动鼠标，坐标永远新鲜——不依赖天地图事件对象自带 clientX，
+  // 实测它可能没有；锚点换算/最近图标匹配两种方案也都实测选错过）。
+  // 取光标 30px 内最近的可见图标
   function iconRectAt(mx, my) {
     try {
       var scope = map && map.getContainer ? map.getContainer()
@@ -313,10 +314,50 @@ ROUTE_MAP_JS = """
       return (best && nd <= 900) ? best : null;          // 30px 内才算选中
     } catch (e) { return null; }
   }
+  function overlapArea(a, q) {
+    var oy = Math.min(a.bottom, q.bottom) - Math.max(a.top, q.top);
+    var ox = Math.min(a.right, q.right) - Math.max(a.left, q.left);
+    return (oy > 0 && ox > 0) ? oy * ox : 0;
+  }
+  // 沿 axis('x'/'y') sign(+1/-1) 方向推 t，直到不与任何 guard 相交。
+  // 迭代收敛：推开一层后可能又压到更远的图标（最多 6 轮）。
+  // 返回 {d, out}：位移量与出界量；d=0 表示本来就不相交
+  function clearShift(t, guards, axis, sign, m, pad) {
+    var d = 0;
+    for (var it = 0; it < 6; it++) {
+      var need = 0;
+      for (var i = 0; i < guards.length; i++) {
+        var a = { top: t.top + (axis === 'y' ? sign * d : 0),
+                  bottom: t.bottom + (axis === 'y' ? sign * d : 0),
+                  left: t.left + (axis === 'x' ? sign * d : 0),
+                  right: t.right + (axis === 'x' ? sign * d : 0) };
+        if (overlapArea(a, guards[i]) <= 0) { continue; }
+        // 分离位移按方向算（对称 overlap 推不够）：
+        // 上推 = t 底缘-图标顶缘，下推 = 图标底缘-t 顶缘，水平同理
+        var sep = (axis === 'y')
+          ? (sign < 0 ? a.bottom - guards[i].top : guards[i].bottom - a.top)
+          : (sign < 0 ? a.right - guards[i].left : guards[i].right - a.left);
+        if (sep > need) { need = sep; }
+      }
+      if (!need) { break; }
+      d += need + 2;   // +2px 余量
+    }
+    var a0 = { top: t.top + (axis === 'y' ? sign * d : 0),
+               bottom: t.bottom + (axis === 'y' ? sign * d : 0),
+               left: t.left + (axis === 'x' ? sign * d : 0),
+               right: t.right + (axis === 'x' ? sign * d : 0) };
+    var out = Math.max(0, m.top + pad - a0.top)
+            + Math.max(0, a0.bottom - (m.bottom - pad))
+            + Math.max(0, m.left + pad - a0.left)
+            + Math.max(0, a0.right - (m.right - pad));
+    var hit = 0;
+    for (var j = 0; j < guards.length; j++) { hit += overlapArea(a0, guards[j]); }
+    return { d: Math.round(d), out: Math.round(out), hit: hit };
+  }
   // 卡片位置收敛（挪卡片不动地图），一次算好一次挪：
-  // ① 钳进地图可视区；② 若钳完仍压着选中的图标，在四向分离向量里挑
-  // 「不压图标 > 尽量不出地图 > 位移最小」的最优解，与钳制合并成一次
-  // setOffset——多轮分步挪会看得见卡片连跳几下（用户反馈「乱动」）。
+  // ① 钳进地图可视区；② 避让选中的图标——四向「推开相交图标」的最小位移里
+  // 按「不压图标 > 尽量不出地图 > 位移最小」挑最优，与钳制合并成一次
+  // setOffset（多轮分步挪用户看得见跳动 =「乱动」）；
   // 620ms 后静默复测一轮兜残差，残差为零就不动。
   // offset 以 RTbase（首次记录的原始锚点偏移）为基准，每次开卡先复位，
   // 保证换缩放级别后不会跨次累计漂移
@@ -339,48 +380,36 @@ ROUTE_MAP_JS = """
         var box = document.getElementById('route-map');
         if (!r || !box) { return; }
         var m = box.getBoundingClientRect();
+        // 守卫矩形只认「选中的图标」（光标所在），首轮记到 iw.RTguard，
+        // 复测轮沿用同一个——复测时鼠标可能已移开，实时识别会换来换去
+        if (round === 0) {
+          iw.RTguard = RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null;
+        }
+        var guards = iw.RTguard ? [iw.RTguard] : [];
         var pad = 8, cx = 0, cy = 0;
         if (r.top < m.top + pad) { cy = Math.round(m.top + pad - r.top); }
         else if (r.bottom > m.bottom - pad) { cy = -Math.round(r.bottom - (m.bottom - pad)); }
         if (r.left < m.left + pad) { cx = Math.round(m.left + pad - r.left); }
         else if (r.right > m.right - pad) { cx = -Math.round(r.right - (m.right - pad)); }
-        // 钳制后的位置若压着选中的图标，四向分离里挑最优。
-        // 守卫矩形在首轮记到 iw.RTguard，复测轮沿用同一个——复测时鼠标
-        // 可能已移到别的图标上，实时识别会换来换去造成二次挪动
-        if (round === 0) { iw.RTguard = RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null; }
-        var q = iw.RTguard;
+        var t = { top: r.top + cy, bottom: r.bottom + cy,
+                  left: r.left + cx, right: r.right + cx };
         var ax = 0, ay = 0;
-        if (q) {
-          var t = { top: r.top + cy, bottom: r.bottom + cy,
-                    left: r.left + cx, right: r.right + cx };
-          if (t.right > q.left && t.left < q.right &&
-              t.bottom > q.top && t.top < q.bottom) {
-            // 分离位移按方向算（左推 = 卡片右缘-图标左缘），对称 overlap 推不够
-            var cands = [
-              { dx: 0, dy: -(t.bottom - q.top + 2) },
-              { dx: 0, dy: q.bottom - t.top + 2 },
-              { dx: -(t.right - q.left + 2), dy: 0 },
-              { dx: q.right - t.left + 2, dy: 0 }
-            ];
-            var best = null;
-            for (var i = 0; i < cands.length; i++) {
-              var a = { top: t.top + cands[i].dy, bottom: t.bottom + cands[i].dy,
-                        left: t.left + cands[i].dx, right: t.right + cands[i].dx };
-              var hit = (a.right > q.left && a.left < q.right &&
-                         a.bottom > q.top && a.top < q.bottom) ? 1 : 0;
-              // 出界量：只惩罚真实超出，压线（pad 内）不算
-              var out = Math.max(0, m.top + pad - a.top)
-                      + Math.max(0, a.bottom - (m.bottom - pad))
-                      + Math.max(0, m.left + pad - a.left)
-                      + Math.max(0, a.right - (m.right - pad));
-              var dist = Math.abs(cands[i].dx) + Math.abs(cands[i].dy);
-              if (best === null || hit < best.hit ||
-                  (hit === best.hit && (out < best.out - 4 ||
-                   (Math.abs(out - best.out) <= 4 && dist < best.dist)))) {
-                best = { hit: hit, out: out, dist: dist, dx: cands[i].dx, dy: cands[i].dy };
-              }
+        if (guards.length) {
+          var dirs = [
+            { axis: 'y', sign: -1 }, { axis: 'y', sign: 1 },
+            { axis: 'x', sign: -1 }, { axis: 'x', sign: 1 }
+          ];
+          var best = null;
+          for (var i = 0; i < dirs.length; i++) {
+            var c = clearShift(t, guards, dirs[i].axis, dirs[i].sign, m, pad);
+            if (best === null || c.hit < best.hit ||
+                (c.hit === best.hit && (c.out < best.out - 4 ||
+                 (Math.abs(c.out - best.out) <= 4 && c.d < best.d)))) {
+              best = { hit: c.hit, out: c.out, d: c.d, axis: dirs[i].axis, sign: dirs[i].sign };
             }
-            if (best) { ax = best.dx; ay = best.dy; }
+          }
+          if (best && best.d > 0) {
+            if (best.axis === 'x') { ax = best.sign * best.d; } else { ay = best.sign * best.d; }
           }
         }
         if (!cx && !cy && !ax && !ay) { return; }
@@ -404,13 +433,10 @@ ROUTE_MAP_JS = """
     try {
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
-      function openCard(ev) {
+      function openCard() {
         // 同一图钉已开卡就不重开：mouseover 在卡片段落间移动可能再触发，
         // 重开会把 offset 复位重收敛，卡片看得见地跳（用户反馈「乱动」）
         if (RT.openMk === mk) { hoverStay(); return; }
-        if (ev && typeof ev.clientX === 'number') {
-          RT.mouse = { x: ev.clientX, y: ev.clientY };   // 识别选中图标用
-        }
         hoverStay(); RT.openMk = mk;
         mk.openInfoWindow(iw);
         fitCardInMap(iw, 0);
@@ -429,6 +455,11 @@ ROUTE_MAP_JS = """
   }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
   var RT = { timer: null, openMk: null, mouse: null };
+  // 文档级跟踪光标：悬停图钉前必先移动鼠标，开卡时 RT.mouse 永远新鲜。
+  // 不用事件对象自带的 clientX——天地图 marker 事件对象实测可能不带
+  document.addEventListener('mousemove', function (ev) {
+    RT.mouse = { x: ev.clientX, y: ev.clientY };
+  });
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
   }
@@ -528,60 +559,37 @@ ROUTE_MAP_JS = """
   }
 
   // ---------- 沿道路画路径（天地图路径规划服务） ----------
-  // T.DrivingRoute 正常是「传 map 就自动画」，但我们自己按天配色画线，
-  // 所以先用不挂地图（或 4x4 隐藏地图）的实例只取点位，再自己画 Polyline。
-  var router = null, routerMode = null, ghostMap = null;
-  function ghostMapOf() {
-    if (ghostMap) return ghostMap;
-    var d = document.createElement('div');
-    d.id = 'rt-ghost-map';
-    d.style.cssText = 'position:absolute;left:-9999px;top:0;width:4px;height:4px;overflow:hidden;';
-    document.body.appendChild(d);
-    try { ghostMap = new T.Map('rt-ghost-map'); } catch (e) { ghostMap = null; }
-    return ghostMap;
-  }
-  function routerOf(mode) {
-    if (router && routerMode === mode) return router;
-    router = null;
-    try {
-      if (mode === 'bare') {
-        router = new T.DrivingRoute(null, { policy: 0 });
-      } else {
-        var gm = ghostMapOf();
-        if (!gm) return null;
-        router = new T.DrivingRoute(gm, { policy: 0 });
-      }
-    } catch (e) { router = null; }
-    routerMode = router ? mode : null;
-    return router;
-  }
-  // 从规划结果里取沿道路的点串（不同小版本字段有差异，三条路都试一遍）
-  function extractPath(res) {
-    var pts = [], k;
-    try {
-      var path = res.getPlan(0).getPath() || [];
-      for (k = 0; k < path.length; k++) { if (path[k]) pts.push(path[k]); }
-    } catch (e) {}
-    if (pts.length < 2) {
-      pts = [];
-      try {
-        var raw = res.result && res.result.result && res.result.result.routelatlon;
-        var arr = raw ? String(raw).split(';') : [];
-        var swap = false;
-        if (arr.length) {
-          var f = arr[0].split(',');
-          if (f.length === 2 && Math.abs(parseFloat(f[0])) > 90) { swap = true; }
-        }
-        for (k = 0; k < arr.length; k++) {
-          var xy = arr[k].split(',');
-          if (xy.length !== 2) { continue; }
-          var a = parseFloat(xy[0]), b = parseFloat(xy[1]);
-          if (isNaN(a) || isNaN(b)) { continue; }
-          pts.push(swap ? new T.LngLat(b, a) : new T.LngLat(a, b));
-        }
-      } catch (e) {}
+  // 不用 SDK 的 T.DrivingRoute：实测它走 HTTPS，而天地图 HTTPS /drive 挂死
+  // 不响应（HTTP 正常），回调永远不触发 → 永远回落直线。改走本服务端代理
+  // /api/tianditu/drive（HTTP 上游 + XML 解析成 JSON），前端 fetch 自己的接口。
+  // 坐标同为 CGCS2000，直接可用，无需转换。
+  function planSeg(a, b, cb) {
+    var finished = false;
+    function done(path) {
+      if (finished) return;
+      finished = true;
+      cb(path);
     }
-    return pts.length > 1 ? pts : null;
+    var timer = setTimeout(function () { done(null); }, 7000);
+    try {
+      var q = 'orig=' + encodeURIComponent(a.lng + ',' + a.lat)
+            + '&dest=' + encodeURIComponent(b.lng + ',' + b.lat);
+      fetch('/api/tianditu/drive?' + q).then(function (resp) { return resp.json(); })
+        .then(function (d) {
+          if (finished) return;
+          clearTimeout(timer);
+          if (d && d.ok && d.pts && d.pts.length > 1) {
+            var pts = [];
+            for (var i = 0; i < d.pts.length; i++) {
+              if (d.pts[i] && d.pts[i].length === 2) {
+                pts.push(new T.LngLat(d.pts[i][0], d.pts[i][1]));
+              }
+            }
+            done(pts.length > 1 ? pts : null);
+          } else { done(null); }
+        })
+        .catch(function () { if (!finished) { clearTimeout(timer); done(null); } });
+    } catch (e) { clearTimeout(timer); done(null); }
   }
   function thin(pts, maxPts) {
     if (pts.length <= maxPts) return pts;
@@ -589,42 +597,6 @@ ROUTE_MAP_JS = """
     for (i = 0; i < pts.length; i += step) { out.push(pts[i]); }
     if (out[out.length - 1] !== pts[pts.length - 1]) { out.push(pts[pts.length - 1]); }
     return out;
-  }
-  function planSeg(a, b, cb) {
-    var finished = false, tried = {}, seq = 0, timers = [];
-    function done(path) {
-      if (finished) return;
-      finished = true;
-      for (var i = 0; i < timers.length; i++) { clearTimeout(timers[i]); }
-      cb(path);
-    }
-    // 先试「不挂地图」的实例；拿不到点位就换 4x4 隐藏地图实例再试一次
-    function attempt(mode) {
-      if (finished || tried[mode]) return;
-      tried[mode] = true;
-      var r = routerOf(mode);
-      if (!r) return;
-      var token = ++seq;
-      timers.push(setTimeout(function () {
-        if (finished || token !== seq) return;
-        if (mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); return; }
-        done(null);
-      }, 7000));
-      try {
-        if (r.setSearchCompleteCallback) {
-          r.setSearchCompleteCallback(function (res) {
-            if (finished || token !== seq) return;
-            var p = extractPath(res);
-            if (!p && mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); return; }
-            done(p);
-          });
-        }
-        r.search(a, b);
-      } catch (e) {
-        if (mode !== 'ghost' && !tried['ghost']) { attempt('ghost'); } else { done(null); }
-      }
-    }
-    attempt('bare');
   }
   // 全局串行队列：天地图路径服务有 QPS 限制，同城多段一次打出去容易被限流
   var jobQueue = [], jobRunning = false;

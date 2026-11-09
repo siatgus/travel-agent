@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import urllib.parse
@@ -55,13 +56,14 @@ from . import llm as llm_layer
 from . import paths
 from . import progress
 from .dialogue import Session, PreferenceMemory
-from .render_html import build_html
+from .render_html import build_html, get_tdt_key
 
 HOST = "127.0.0.1"
 
 _LOCK = threading.Lock()
 _SESSIONS: dict[str, Session] = {}
 _LAST_PLAN: dict[str, tuple[dict, str]] = {}   # sid -> (plan result, utterance)
+_DRIVE_CACHE: dict[str, dict] = {}             # "orig|dest" -> 规划结果（路径基本不变）
 _MEM: PreferenceMemory | None = None
 _LLM = "unset"                                  # 延迟初始化的 LLM 客户端（或 None）
 _LLM_SIG = None                                 # 设置文件指纹 (mtime_ns, size)，变更即重建客户端
@@ -1227,8 +1229,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "not found"}, 404)
                 return
             self._json({"ok": True, **conv})
+        elif path == "/api/tianditu/drive":
+            self._tianditu_drive()
         else:
             self._json({"ok": False, "error": "not found"}, 404)
+
+    def _tianditu_drive(self):
+        """代理天地图驾车路径规划，解析 XML routelatlon → JSON 点串。
+
+        必须走服务端：SDK 的 T.DrivingRoute 走 HTTPS，而天地图 HTTPS /drive
+        挂死不响应（HTTP 正常，实测），前端直调 HTTP 会被 CORS 拦。
+        页面是 CGCS2000 坐标，天地图路径服务同为 CGCS2000，直接可用。"""
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        orig = (q.get("orig") or [""])[0]
+        dest = (q.get("dest") or [""])[0]
+
+        def ok_pt(s):
+            parts = s.split(",")
+            if len(parts) != 2:
+                return None
+            try:
+                lon, lat = float(parts[0]), float(parts[1])
+            except ValueError:
+                return None
+            if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                return None
+            return "%s,%s" % (round(lon, 6), round(lat, 6))
+
+        o, d = ok_pt(orig), ok_pt(dest)
+        if not o or not d:
+            self._json({"ok": False, "error": "bad coords"}, 400)
+            return
+        cache_key = o + "|" + d
+        hit = _DRIVE_CACHE.get(cache_key)
+        if hit is not None:
+            self._json(hit)
+            return
+        key = get_tdt_key()
+        if not key:
+            self._json({"ok": False, "error": "no tdt key"}, 503)
+            return
+        post = json.dumps({"orig": o, "dest": d, "style": "0"},
+                          separators=(",", ":"))
+        url = ("http://api.tianditu.gov.cn/drive?postStr="
+               + urllib.parse.quote(post, safe="")
+               + "&type=search&tk=" + urllib.parse.quote(key))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode("utf-8", "replace")
+        except Exception as e:
+            self._json({"ok": False, "error": "upstream %s" % e}, 502)
+            return
+        pts = []
+        m = re.search(r"<routelatlon>([^<]*)</routelatlon>", body)
+        if m:
+            for pair in m.group(1).split(";"):
+                p = ok_pt(pair.strip())
+                if p:
+                    a, b = p.split(",")
+                    pts.append([float(a), float(b)])
+        if len(pts) < 2:
+            self._json({"ok": False, "error": "no route"}, 502)
+            return
+        if len(_DRIVE_CACHE) > 500:
+            _DRIVE_CACHE.clear()
+        out = {"ok": True, "pts": pts}
+        _DRIVE_CACHE[cache_key] = out
+        self._json(out)
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
