@@ -264,10 +264,11 @@ ROUTE_MAP_JS = """
     all.push(p);
     return p;
   }
-  // 天地图 T.Map 没有 setCenter；panBy(Point) 是动画（正 y = 内容上移），
-  // 方向语义反直觉，所以这里一律「先量再挪」：
-  // 开卡后拿卡片与地图容器的真实矩形比，超出多少像素就 panBy 多少，最多校两轮。
-  // （度数换算那套不可靠：不同缩放级别/窗口尺寸下卡片高度与视口比例并不固定）
+  // 卡片贴地图边缘被裁的解法：不动地图，挪卡片自己。
+  // 天地图 T.InfoWindow 有官方 setOffset(Point)/getOffset()/update()
+  // （真实 SDK 实测确认），偏移语义即屏幕像素方向：x 正=右移、y 正=下移。
+  // 开卡后拿卡片与地图容器的真实矩形比，超出多少像素就把 offset 补多少。
+  // 注意不要改 .tdt-infowindow 的 CSS——它的定位由框架 transform 管理，改了会打架。
   // 取「当前可见」的卡片矩形：天地图关闭 InfoWindow 后可能留下 display:none 的旧节点，
   // 隐藏节点量出来是 0 尺寸，会把贴边判定带偏
   function visibleCardRect() {
@@ -286,26 +287,39 @@ ROUTE_MAP_JS = """
       return best || fallback;
     } catch (e) { return null; }
   }
-  function fitCardInMap(mk, round) {
+  // 校两轮：开卡渲染（20ms）量一次，挪完（620ms）复测一次兜残差。
+  // offset 以 RTbase（首次记录的原始锚点偏移）为基准，每次开卡先复位，
+  // 保证换缩放级别后不会跨次累计漂移
+  function fitCardInMap(iw, round) {
+    if (!iw || !iw.setOffset || !iw.getOffset) { return; }
     if (round > 1) { return; }
+    if (!round) {
+      if (!iw.RTbase) {
+        try {
+          var o0 = iw.getOffset();
+          iw.RTbase = (o0 && typeof o0.x === 'number') ? { x: o0.x, y: o0.y }
+                                                      : { x: 0, y: -38 };
+        } catch (e) { iw.RTbase = { x: 0, y: -38 }; }
+      }
+      try { iw.setOffset(new T.Point(iw.RTbase.x, iw.RTbase.y)); iw.update(); } catch (e) {}
+    }
     setTimeout(function () {
       try {
         var r = visibleCardRect();
         var box = document.getElementById('route-map');
         if (!r || !box) { return; }
         var m = box.getBoundingClientRect();
-        var pad = 8, dx = 0, dy = 0;
-        if (r.top < m.top + pad) { dy = -Math.round(m.top + pad - r.top); }
-        else if (r.bottom > m.bottom - pad) { dy = Math.round(r.bottom - (m.bottom - pad)); }
-        if (r.left < m.left + pad) { dx = -Math.round(m.left + pad - r.left); }
-        else if (r.right > m.right - pad) { dx = Math.round(r.right - (m.right - pad)); }
-        if (!dx && !dy) { return; }
-        map.panBy(new T.Point(dx, dy));
-        // 平移会把图钉挪出鼠标下方（浏览器随即派发 mouseout）：
-        // 取消自动关计时，改由 watch 模式按卡片矩形判定
-        hoverStay(); RT.panned = mk;
-        fitCardInMap(mk, round + 1);
-        setTimeout(watchCard, 700);       // 等平移动画结束再接管关闭
+        var pad = 8, sx = 0, sy = 0;
+        if (r.top < m.top + pad) { sy = Math.round(m.top + pad - r.top); }
+        else if (r.bottom > m.bottom - pad) { sy = -Math.round(r.bottom - (m.bottom - pad)); }
+        if (r.left < m.left + pad) { sx = Math.round(m.left + pad - r.left); }
+        else if (r.right > m.right - pad) { sx = -Math.round(r.right - (m.right - pad)); }
+        if (!sx && !sy) { return; }
+        var o = iw.getOffset();
+        if (!o || typeof o.x !== 'number') { o = iw.RTbase || { x: 0, y: -38 }; }
+        iw.setOffset(new T.Point(o.x + sx, o.y + sy));
+        iw.update();
+        fitCardInMap(iw, round + 1);
       } catch (e) {}
     }, round ? 620 : 20);
   }
@@ -322,21 +336,15 @@ ROUTE_MAP_JS = """
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
       function openCard() {
-        hoverStay(); RT.openMk = mk; RT.panned = null;
+        hoverStay(); RT.openMk = mk;
         mk.openInfoWindow(iw);
-        fitCardInMap(mk, 0);
+        fitCardInMap(iw, 0);
       }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
-      // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关
+      // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关。
+      // 卡片挪位不动图钉，鼠标始终在图钉上，mouseout 只在用户真移开时触发
       mk.addEventListener('mouseover', openCard);
-      mk.addEventListener('mouseout', function () {
-        if (RT.panned === mk) {
-          // 卡片是靠平移腾出空间的，图钉已被挪出鼠标下方，
-          // 这次的 mouseout 不是用户主动移开：改由 watchCard 接管关闭
-          RT.panned = null; watchCard(); return;
-        }
-        hoverClose();
-      });
+      mk.addEventListener('mouseout', hoverClose);
       if (uncertain) {
         // 只有估算点用 click 打开（它没有 hover 卡片，保留点按习惯）
         mk.addEventListener('click', openCard);
@@ -345,12 +353,11 @@ ROUTE_MAP_JS = """
     return mk;
   }
   // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
-  var RT = { timer: null, openMk: null, panned: null, watch: null };
+  var RT = { timer: null, openMk: null };
   function hoverStay() {
     if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
   }
   function hoverClose() {
-    stopWatch();
     hoverStay();
     var m = RT.openMk;
     if (!m) { return; }
@@ -358,24 +365,6 @@ ROUTE_MAP_JS = """
       try { m.closeInfoWindow(); } catch (e) {}
       if (RT.openMk === m) { RT.openMk = null; }
     }, 350);
-  }
-  // 平移开卡后鼠标已不在图钉上（不会再触发 mouseout）：
-  // 文档级 mousemove 监听，鼠标移出卡片矩形就关；气泡卡没有 .rt-card，
-  // 任意移动即关
-  function stopWatch() {
-    if (RT.watch) { document.removeEventListener('mousemove', RT.watch); RT.watch = null; }
-  }
-  function watchCard() {
-    stopWatch();
-    RT.watch = function (ev) {
-      var r = visibleCardRect();
-      if (!r) { stopWatch(); hoverClose(); return; }
-      if (ev.clientX < r.left - 8 || ev.clientX > r.right + 8 ||
-          ev.clientY < r.top - 8 || ev.clientY > r.bottom + 8) {
-        stopWatch(); hoverClose();
-      }
-    };
-    document.addEventListener('mousemove', RT.watch);
   }
   window.RThover = { stay: hoverStay, leave: hoverClose };
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转

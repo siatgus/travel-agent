@@ -805,14 +805,14 @@ def test_poi_info_cards() -> None:
         check("缩略图 URL 注入", "th.bing.com/x.jpg" in h)
         check("卡片带来源与摘要", "介绍来源" in h and "逛吃指南" in h)
         check("悬停打开卡片（mouseover）", "mouseover" in h)
-        check("贴边按像素挪视野给卡片腾位（fitCardInMap）",
-              "function fitCardInMap" in h and "panBy" in h
-              and "getBoundingClientRect" in h)
+        check("贴边挪卡片自身腾位（fitCardInMap 用官方 setOffset）",
+              "function fitCardInMap" in h and "setOffset" in h and "update()" in h
+              and "getBoundingClientRect" in h and "panBy" not in h)
         check("只认可见卡片矩形（防隐藏旧节点误判）",
               "function visibleCardRect" in h and "querySelectorAll('.rt-card')" in h)
-        check("平移后图钉挪出鼠标下方改走 watch 模式",
-              "watchCard" in h and "RT.panned" in h
-              and "removeEventListener" in h)
+        check("挪卡不动图：旧平移兜底机制已清干净",
+              "RT.panned" not in h and "watchCard" not in h
+              and "mousemove" not in h.split('poiCard')[0].split('function addMarker')[-1])
     finally:
         poi_links.fetch_one = orig_fo
 
