@@ -264,31 +264,50 @@ ROUTE_MAP_JS = """
     all.push(p);
     return p;
   }
-  // 图钉贴近视口边缘时，先把视野往里挪一截给卡片腾位置（Google Maps 同款体验）；
-  // 返回是否发生了平移——平移会把图钉挪出鼠标下方，mouseout 要改走 watch 模式
-  function panForCard(p) {
-    var moved = false;
+  // 天地图 T.Map 没有 setCenter；panBy(Point) 是动画（正 y = 内容上移），
+  // 方向语义反直觉，所以这里一律「先量再挪」：
+  // 开卡后拿卡片与地图容器的真实矩形比，超出多少像素就 panBy 多少，最多校两轮。
+  // （度数换算那套不可靠：不同缩放级别/窗口尺寸下卡片高度与视口比例并不固定）
+  // 取「当前可见」的卡片矩形：天地图关闭 InfoWindow 后可能留下 display:none 的旧节点，
+  // 隐藏节点量出来是 0 尺寸，会把贴边判定带偏
+  function visibleCardRect() {
     try {
-      var b = map.getBounds();
-      if (b && b.getSouthWest) {
-        var sw = b.getSouthWest(), ne = b.getNorthEast();
-        var span = ne.getLat() - sw.getLat(), spanLng = ne.getLng() - sw.getLng();
-        var c = map.getCenter(), dLat = 0, dLng = 0;
-        if (span > 0 && p.getLat() > ne.getLat() - span * 0.30) {
-          dLat = span * 0.28;               // 顶边：视野上移，图钉下移
-        }
-        if (spanLng > 0 && p.getLng() < sw.getLng() + spanLng * 0.15) {
-          dLng = -spanLng * 0.15;           // 左边：视野左移，图钉右移
-        } else if (spanLng > 0 && p.getLng() > ne.getLng() - spanLng * 0.15) {
-          dLng = spanLng * 0.15;            // 右边：视野右移，图钉左移
-        }
-        if (dLat || dLng) {
-          map.setCenter(new T.LngLat(c.getLng() + dLng, c.getLat() + dLat));
-          moved = true;
+      var scope = map && map.getContainer ? (map.getContainer() || null) : null;
+      if (!scope) { scope = document.getElementById('route-map'); }
+      if (!scope || !scope.querySelectorAll) { return null; }
+      var els = scope.querySelectorAll('.rt-card'), best = null, fallback = null;
+      for (var i = 0; i < els.length; i++) {
+        var r = els[i].getBoundingClientRect();
+        if (r.width > 80 && r.height > 80) {
+          fallback = r;
+          if (els[i].offsetParent !== null) { best = r; }   // 真正渲染中的优先
         }
       }
-    } catch (e) {}
-    return moved;
+      return best || fallback;
+    } catch (e) { return null; }
+  }
+  function fitCardInMap(mk, round) {
+    if (round > 1) { return; }
+    setTimeout(function () {
+      try {
+        var r = visibleCardRect();
+        var box = document.getElementById('route-map');
+        if (!r || !box) { return; }
+        var m = box.getBoundingClientRect();
+        var pad = 8, dx = 0, dy = 0;
+        if (r.top < m.top + pad) { dy = -Math.round(m.top + pad - r.top); }
+        else if (r.bottom > m.bottom - pad) { dy = Math.round(r.bottom - (m.bottom - pad)); }
+        if (r.left < m.left + pad) { dx = -Math.round(m.left + pad - r.left); }
+        else if (r.right > m.right - pad) { dx = Math.round(r.right - (m.right - pad)); }
+        if (!dx && !dy) { return; }
+        map.panBy(new T.Point(dx, dy));
+        // 平移会把图钉挪出鼠标下方（浏览器随即派发 mouseout）：
+        // 取消自动关计时，改由 watch 模式按卡片矩形判定
+        hoverStay(); RT.panned = mk;
+        fitCardInMap(mk, round + 1);
+        setTimeout(watchCard, 700);       // 等平移动画结束再接管关闭
+      } catch (e) {}
+    }, round ? 620 : 20);
   }
   function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
     var mk;
@@ -303,9 +322,9 @@ ROUTE_MAP_JS = """
       var iw = new T.InfoWindow(infoHtml, { offset: new T.Point(0, -38),
                                             maxWidth: 250 });
       function openCard() {
-        hoverStay(); RT.openMk = mk;
-        RT.panned = panForCard(pos) ? mk : null;
+        hoverStay(); RT.openMk = mk; RT.panned = null;
         mk.openInfoWindow(iw);
+        fitCardInMap(mk, 0);
       }
       // hover 开、移出关：延时 350ms 给鼠标留出从图钉移进卡片的空隙；
       // 移入卡片（RThover.stay）取消关闭，离开卡片（RThover.leave）再关
@@ -349,8 +368,7 @@ ROUTE_MAP_JS = """
   function watchCard() {
     stopWatch();
     RT.watch = function (ev) {
-      var el = document.querySelector('.rt-card');
-      var r = el ? el.getBoundingClientRect() : null;
+      var r = visibleCardRect();
       if (!r) { stopWatch(); hoverClose(); return; }
       if (ev.clientX < r.left - 8 || ev.clientX > r.right + 8 ||
           ev.clientY < r.top - 8 || ev.clientY > r.bottom + 8) {
