@@ -345,8 +345,8 @@ def test_meal_fallback_is_honest() -> None:
     check("兜底餐如实写「就近自选」",
           all("就近自选" in n["name"] for _, n in meals),
           str([n["name"] for _, n in meals]))
-    check("兜底餐说明资料库没有餐厅数据",
-          all("资料库暂无当地餐厅" in n["tip"] for _, n in meals),
+    check("兜底餐说明候选缺口（不笼统说全城没餐厅）",
+          all("附近暂无合适的餐厅候选" in n["tip"] for _, n in meals),
           str([n["tip"] for _, n in meals]))
     # 返程日不排正餐（早市/伴手礼后直接返程），抵达日与中间日都该有
     days_with_meal = {d for d, _ in meals}
@@ -794,6 +794,30 @@ def test_kid_party_and_schedule() -> None:
           str([n["name"] for n in nap_only][:2]))
     check("非幼儿午休措辞不提幼儿",
           bool(nap_only) and all("幼儿" not in n["name"] for n in nap_only))
+    # 午休截止放宽到 16:00：午餐晚收尾（景点拖堂）也要落实硬偏好，
+    # 只有 16 点后不再后移——亲子实测 Day3 午餐过 15 点午休被自由活动顶替
+    nodes_late = []
+    c = composer._insert_kid_nap(nodes_late, 15 * 60 + 20, 1, 4, True)
+    check("午餐 15:20 结束仍插午休",
+          len(nodes_late) == 1 and c == 15 * 60 + 20 + 90, str(c))
+    nodes_too_late = []
+    c2 = composer._insert_kid_nap(nodes_too_late, 16 * 60 + 10, 1, 4, True)
+    check("16 点后不再后移午休", not nodes_too_late and c2 == 16 * 60 + 10)
+    # LLM 兜底路径：模型只回 party_detail 漏 party_size 时，总数按构成之和
+    from travel_agent import llm as _llm
+    _cs = _llm.coerce_slots({"party_detail": "1 大 1 小"})[0]
+    check("LLM 路径 party_size 按构成之和重算（防「1 大 1 小，共 1 人」）",
+          _cs["party_size"] == 2, str(_cs.get("party_size")))
+    # 大交通假设与预算标题必须同口径：票价未查到时不得再写「按全价估算」
+    import inspect as _insp
+    _ag = _insp.getsource(agent)
+    check("大交通未查到时假设写「未计入」（与预算标题一致）",
+          "往返大交通未计入预算（班次票价未查到或未提供出发地）" in _ag
+          and "按全价×全部人数估算" not in _ag)
+    # 质检口径与节奏承诺一致：只数景点、按 PACE_CAP 判，不把餐/午休算进去
+    check("质检按节奏上限只数景点数",
+          "单日景点数不超节奏上限" in _ag
+          and "composer.PACE_CAP.get" in _ag)
 
 
 def test_poi_info_cards() -> None:

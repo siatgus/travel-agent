@@ -1024,10 +1024,10 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             assumptions.append(
                 "儿童门票按半价估算（多数景区 6 岁以下/1.2m 以下免票，"
                 "以各景区现场口径为准）")
-        # 大交通：高铁 6 岁以下免费不占座、机票 2~11 岁约半价，这里没单独折算
+        # 大交通口径在 items 组装完统一写（见下方），这里只交代儿童票折算
         assumptions.append(
-            "往返大交通按全价×全部人数估算，儿童票（高铁 6 岁下免费、"
-            "机票 2~11 岁约半价）未单独折算，实际通常比这里低")
+            "儿童票（高铁 6 岁下免费、机票 2~11 岁约半价）未单独折算，"
+            "以各渠道现场口径为准")
     items = []
     if has_origin:
         # 班次没查到（价格 0）就不要往预算里塞一行「¥0 交通（数据缺失）」：
@@ -1047,6 +1047,16 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         {"category": "local_transit", "label": f"市内交通 {days}天×{n}人（人均 60/天估算）",
          "amount": 60 * days * n},
     ]
+    # 大交通口径必须与预算标题一致（亲子实测反馈：标题写「不含大交通」，
+    # 假设却写「已按全价计入」，用户会误以为已经算进总额）。
+    # 判定就看明细里有没有真的交通费——票价没查到时明细里不会有 0 元行。
+    # 未计入必写；已计入且带娃才补儿童票折算说明（信息齐备时不多话）
+    if not any(i["category"] == "transport" for i in items):
+        assumptions.append("往返大交通未计入预算（班次票价未查到或未提供出发地），"
+                           "出发前请自行查票价确认")
+    elif _kids:
+        assumptions.append("往返大交通按查到的班次票价×全部人数计入预算，"
+                           "儿童票未单独折算，实际通常比这里低")
     _phase("正在核算预算与校验行程可行性…")
     budget = dispatch("calc_budget", {"items": items, "party_size": n,
                                       "budget_target": slots["budget_total"],
@@ -1180,8 +1190,16 @@ def self_check(result: dict) -> list[dict]:
         "result": "pass" if not no_meal else "fail",
         "evidence": f"缺用餐点：{'、'.join(no_meal)}" if no_meal else "",
     })
-    over = [d["day"] for d in days_plan if len(d["nodes"]) > 5]
-    checks.append({"item": "单日节点数不超额", "result": "pass" if not over else "fail",
+    # 口径与节奏承诺一致（亲子实测反馈：午餐/午休/自由活动都算节点，
+    # 两处景点的轻松日被误报超额）——只数景点，上限取 PACE_CAP
+    _cap = composer.PACE_CAP.get((result.get("slots") or {}).get("pace"), 3)
+    over = []
+    for d in days_plan:
+        _na = sum(1 for n in d["nodes"] if n["type"] == "attraction")
+        if _na > _cap:
+            over.append(f"Day{d['day']}（{_na} 个景点 > 上限 {_cap}）")
+    checks.append({"item": f"单日景点数不超节奏上限（每天最多 {_cap} 个）",
+                   "result": "pass" if not over else "fail",
                    "evidence": f"超额天数：{over}" if over else ""})
     within = budget.get("within_budget")
     checks.append({

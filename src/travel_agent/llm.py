@@ -347,6 +347,11 @@ def coerce_slots(raw: dict, today: date | None = None):
                         r"(?:小|小孩|儿童|孩子|娃)", slots["party_detail"])
         if _fm:
             slots["adults"], slots["children"] = int(_fm.group(1)), int(_fm.group(2))
+    # 大人/孩子齐了就以之和为准——模型常只回 party_detail 漏 party_size，
+    # 默认值 1 会把「1 大 1 小」写成「共 1 人」，餐饮/交通全按 1 人算
+    # （亲子实测反馈：构成写 1 大 1 小、总数却是 1）
+    if slots.get("adults") is not None and slots.get("children") is not None:
+        slots["party_size"] = slots["adults"] + slots["children"]
 
     for key in ("destination", "origin"):
         v = raw.get(key)

@@ -293,9 +293,12 @@ def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
 
     "带幼儿"不能只是概要里的一个标签——幼儿下午没有这一觉，晚饭前必崩。
     用户明确说"每天午休 90 分钟"（需午休）即使没带孩子也照插，只是措辞
-    不提幼儿。抵达/返程日行程本来就轻，不插。
+    不提幼儿。截止 16:00：午餐晚收尾（景点拖堂）也照插，只有 16 点后
+    才不再后移——再晚 90 分钟睡醒就撞晚饭，硬偏好不能变成摆设
+    （亲子实测：Day3 午餐结束过 15 点，午休被自由活动顶替）。
+    抵达/返程日行程本来就轻，不插。
     """
-    if not with_kid or day_idx in (0, days - 1) or clock >= 15 * 60:
+    if not with_kid or day_idx in (0, days - 1) or clock >= 16 * 60:
         return clock
     nodes.append(_node(fmt(clock), label or "午休（带幼儿，回酒店小睡）", "rest",
                        90, "—",
@@ -743,7 +746,8 @@ def _pick_meal(foods: list[dict], attempts: list[tuple[str, list[float] | None, 
 
 def _meal_fallback(clock: int, label: str, spicy_free: bool) -> dict:
     """资料库没有餐厅也要照常留用餐时段：如实写"就近自选"，不冒充具体店。"""
-    tip = "资料库暂无当地餐厅，建议在上一站周边就近用餐，出发前看点评确认营业情况"
+    tip = ("当前行程点位附近暂无合适的餐厅候选，建议在上一站周边就近用餐，"
+           "出发前看点评确认营业情况")
     if spicy_free:
         tip += "；不吃辣的话点单时说明要清汤/不辣"
     return _node(fmt(clock), f"{label} · 就近自选", "restaurant", 60,
