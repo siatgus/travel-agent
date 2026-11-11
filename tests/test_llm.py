@@ -278,6 +278,32 @@ def test_lookup_poi_coerce() -> None:
     check("坐标越界的输出被丢弃", row3 is None, f"{row3}")
 
 
+def test_unknown_spot_reply() -> None:
+    """查不到的点名：模型兜底把话说得像人，输出含数字（脑补票价）整句弃用。"""
+    good = ("这个名字我这边没查到可靠资料，不乱说票价。"
+            "它听起来像个本地市集类的地方，你可以换个具体景点，"
+            "或者说「我想去XX」我按名字排进行程。")
+    out = llm.unknown_spot_reply(llm.ScriptedClient([good]), "邯郸", "某市集")
+    check("unknown_spot_reply：干净输出原样返回",
+          out is not None and "不乱说" in out, f"{out}")
+
+    out2 = llm.unknown_spot_reply(
+        llm.ScriptedClient(["门票大概80元，营业时间9点到17点"]), "邯郸", "某景点")
+    check("unknown_spot_reply：输出含数字（脑补票价）→ 弃用回模板",
+          out2 is None, f"{out2}")
+
+    out3 = llm.unknown_spot_reply(
+        llm.ScriptedClient(["这地方免费开放的，直接去就行"]), "邯郸", "某景点")
+    check("unknown_spot_reply：断言「免费」也是编造 → 弃用", out3 is None, f"{out3}")
+
+    check("unknown_spot_reply：无模型 → None",
+          llm.unknown_spot_reply(None, "邯郸", "某景点") is None)
+
+    bad = llm.ScriptedClient([llm.LLMError("网络错误")])
+    check("unknown_spot_reply：模型异常 → None",
+          llm.unknown_spot_reply(bad, "邯郸", "某景点") is None)
+
+
 # ------------------------------------------------------------------ 汇总
 
 def main() -> int:
@@ -292,7 +318,7 @@ def main() -> int:
                test_rerank_hallucination_filtered, test_rerank_all_invalid,
                test_rerank_end_to_end_survives_failure,
                test_rerank_bonus_does_not_break_geometry,
-               test_lookup_poi_coerce):
+               test_lookup_poi_coerce, test_unknown_spot_reply):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

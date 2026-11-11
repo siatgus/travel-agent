@@ -1140,8 +1140,55 @@ class Session:
             return self.party_stated
         return bool(self.slots.get(f))
 
+    # -------------------------------------------------- 行程内节点问答
+    @staticmethod
+    def _is_filler_node(n: dict) -> bool:
+        """系统补的衔接/填充项：不是具体景点，没有门票或介绍可查。
+
+        早市/伴手礼、自由活动、就近自选是编排器补的占位安排，
+        transit/rest/hotel 本来就不是景点——它们在库里永远查不到，
+        走完联网补全再甩"换个城市"是最伤人的一路（用户实测）。
+        """
+        nm = n.get("name") or ""
+        return (nm.startswith("早市") or nm.startswith("自由活动")
+                or "就近自选" in nm
+                or n.get("type") in ("transit", "rest", "hotel"))
+
+    def _plan_node(self, spot: str) -> dict | None:
+        """在当前方案里找用户点名的节点（填充项与真实景点都算）。"""
+        if not (self.plan_made and self.last_plan) or not spot:
+            return None
+        for d in (self.last_plan or {}).get("days_plan") or []:
+            for n in d.get("nodes") or []:
+                nm = n.get("name") or ""
+                if nm and (name_hit(spot, nm) or spot in nm):
+                    return n
+        return None
+
+    def _filler_node_answer(self, node: dict) -> str:
+        """用户问行程里的填充项：按它本来的身份答，而不是当景点查库。"""
+        nm = node.get("name") or "这一项"
+        if nm.startswith("早市"):
+            return (f"「{nm}」不是收费景点，是我在返程日上午留的自由安排："
+                    "早市本身不要门票，逛多久自己定，买特产也比景区包装款便宜。"
+                    "想换成具体的地方（早市街、特产店都行），直接说名字，"
+                    "我查到了就帮你排进去。")
+        if nm.startswith("自由活动"):
+            return (f"「{nm}」是行程里留的机动时间，不是具体景点，没有门票。"
+                    "想把它换成某个景点或体验，说个名字就行。")
+        if "就近自选" in nm:
+            return (f"「{nm}」是附近没查到靠谱餐厅时留的用餐时段，不是具体店，"
+                    "所以没有人均可查。说个你想吃的店名，我查到就帮你排进去。")
+        tip = node.get("tip") or ""
+        return (f"「{nm}」是行程里的衔接安排（{tip}），不是景点，没有门票可查。")
+
     def _spot_qa(self, city: str, spot: str) -> str:
         """回答「XX景点怎么样/门票多少钱」：库里查，查不到就在线补，再答不了如实说。"""
+        # 点名的是行程里的填充项（早市/伴手礼等）：它在库里永远查不到，
+        # 没必要联网补全，直接按节点本身回答。
+        node = self._plan_node(spot)
+        if node is not None and self._is_filler_node(node):
+            return self._filler_node_answer(node)
         r = agent.dispatch("search_poi", {"city": city, "keyword": spot, "limit": 3})
         items = (r.get("items") or []) if r.get("ok") else []
         note = ""
@@ -1157,7 +1204,14 @@ class Session:
                         f"不敢编门票和位置。\n要排进行程的话可以直接说"
                         f"「我想去{spot}」，我按你说的名字安排，细节你再确认。")
             else:
-                # disabled / no_kb / unresolved / not_found：一律不装作有数据
+                # disabled / no_kb / unresolved / not_found：一律不装作有数据。
+                # 先让模型把话说得像人（带上当前行程的上下文），模型不在或
+                # 输出不可信再回模板——模板是底线，不该是唯一的面孔。
+                smart = llm.unknown_spot_reply(
+                    self.client, city, spot,
+                    has_plan=bool(self.plan_made and self.last_plan))
+                if smart:
+                    return smart
                 return (f"「{spot}」暂时查不到——{city}的景点数据我这边也没有"
                         f"联网检索通道，不想编。\n可以说个我收录的城市，比如"
                         f"{intent._SERVICEABLE_HINT}。")

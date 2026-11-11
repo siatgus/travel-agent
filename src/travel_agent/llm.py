@@ -903,6 +903,35 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     return text
 
 
+def unknown_spot_reply(client: Client | None, city: str, spot: str,
+                       has_plan: bool = False) -> str | None:
+    """库里和在线都查不到的点名：让模型把「查不到」说得像人话。
+
+    不是补事实——事实没有。是让拒绝带上上下文和出路（这个名字通常是
+    什么地方、接下来可以怎么说），而不是甩一句"换个我收录的城市"。
+    提示词硬性禁止编造价格/时间等数字；输出里出现数字就整句弃用回模板
+    ——查不到的地点还报数字，只可能是脑补。QuotaError 不捕获（拒绝服务≠降级）。
+    """
+    if client is None:
+        return None
+    sys_p = ("你是旅行规划助手。用户问的地点在资料库和联网检索里都查不到可靠资料。"
+             "要求：如实承认查不到它的门票等具体信息，绝不编造价格、距离、营业时间等数字；"
+             "可以凭常识说明这个名字通常指什么；结合上下文给一句有用的下一步建议"
+             "（比如换个具体景点，或者说「我想去XX」强行排进行程）。"
+             "中文口语，不超过4句，不要用列表和标题格式。")
+    parts = [f"用户在问：「{spot}」", f"城市：{city or '未提及'}"]
+    if has_plan:
+        parts.append("用户当前已有一份这个城市的行程，问题很可能与行程里的安排有关。")
+    try:
+        text = _clean_reply(client.chat(sys_p, "\n".join(parts)))
+    except LLMError:
+        return None
+    text = (text or "").strip()
+    if not text or re.search(r"\d", text) or "免费" in text:
+        return None
+    return text
+
+
 def rewrite_query(client: Client | None, question: str) -> str | None:
     """把用户的自然语言问题改写成搜索引擎关键词（空格分隔）。
 

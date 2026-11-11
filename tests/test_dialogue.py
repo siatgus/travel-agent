@@ -1345,6 +1345,36 @@ def test_general_question_fallback() -> None:
         ws.search = orig
 
 
+def test_filler_node_qa() -> None:
+    """问行程里的填充项（早市/伴手礼）→ 按节点身份回答，不甩"查不到换个城市"。
+
+    填充项在库里永远查不到，之前的路径是联网补全失败后回一句
+    "邯郸的景点数据我这边也没有联网检索通道"——用户点的是自己行程
+    里的安排，得到的却像是从没听过这座城市（实测反馈）。
+    """
+    s = session()
+    r1 = s.turn("11月8号去大理玩4天，2人，预算6000")
+    filler = next((n for d in r1.plan["days_plan"] for n in d["nodes"]
+                   if n.get("name", "").startswith("早市")), None)
+    check("多日行程返程日有早市/伴手礼填充项", filler is not None,
+          f"nodes={[n.get('name') for d in r1.plan['days_plan'] for n in d['nodes']]}")
+    if filler is None:
+        return
+    ans = s._spot_qa("大理", "早市 / 伴手礼")
+    ok = ("查不到" not in ans and "早市" in ans
+          and ("门票" in ans or "自由安排" in ans))
+    check("点名填充项 → 按自由安排作答（不出现「查不到」）", ok, ans[:120])
+    check("填充项回答给出下一步（换具体地方）", "说" in ans and "排" in ans,
+          ans[:120])
+
+    # 非填充节点不受影响：真实景点问答照旧查库（这里查不到走模型/模板，
+    # 但不能被填充项分支误接）
+    check("填充项识别只认系统补的占位安排",
+          not Session._is_filler_node({"name": "崇圣寺三塔", "type": "attraction"})
+          and Session._is_filler_node({"name": "午餐 · 就近自选", "type": "restaurant"})
+          and Session._is_filler_node({"name": "前往车站候车", "type": "transit"}))
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1392,6 +1422,7 @@ def main() -> int:
                test_spot_not_treated_as_city, test_spot_added_to_existing_plan,
                test_replan_remembers_plan, test_unknown_spot_asks_city_then_keeps_spot,
                test_province_not_matched_as_spot,
+               test_filler_node_qa,
                test_bare_day_answered_once, test_month_then_day_merges,
                test_day_then_month_not_overridden):
         fn()

@@ -874,13 +874,21 @@ let boardPlan=null,boardSlots=null,boardTab='all';
 const TYPE_ICONS={attraction:'\\u{1F3DE}',restaurant:'\\u{1F35C}',hotel:'\\u{1F3E8}',
                   transport:'\\u{1F684}',other:'\\u{1F4CD}'};
 function jsq(s){return String(s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'");}
-function nodeMenu(ev,name){
+function nodeMenu(ev,name,ntype){
   ev.stopPropagation();
   bmenu.innerHTML='';
   const mk=(label,msg)=>{const b=document.createElement('button');b.textContent=label;
     b.onclick=()=>{bmenu.style.display='none';send(msg);};bmenu.appendChild(b);};
-  mk('\\u274C 不想去这里，换个类似的','不想去'+name);
-  mk('\\u{1F4D6} 看看介绍和门票',name+'怎么样？门票多少钱');
+  // 菜单跟节点类型走：交通/休息/住宿和系统填充项（早市/伴手礼、自由活动、
+  // 就近自选）不是景点，没有门票和介绍可看，弹「看看介绍和门票」只会
+  // 换来一句"查不到"。只有真实景点/餐厅才给操作项；餐厅问人均不问门票。
+  const filler=/^(早市|自由活动)/.test(name)||name.indexOf('就近自选')>=0;
+  if(!filler&&(ntype==='attraction'||ntype==='restaurant')){
+    mk('\\u274C 不想去这里，换个类似的','不想去'+name);
+    if(ntype==='restaurant')mk('\\u{1F4D6} 看看介绍和人均',name+'怎么样？人均多少钱');
+    else mk('\\u{1F4D6} 看看介绍和门票',name+'怎么样？门票多少钱');
+  }
+  if(!bmenu.children.length)return;
   bmenu.style.display='block';
   const rect=ev.currentTarget.getBoundingClientRect();
   const bw=240,bh=92;
@@ -911,7 +919,7 @@ function dayCard(d,idx){
         +(s?'#EAF3F1':'#F6F1E4')+';color:'+(s?'#2F6F6B':'#8A6A2F')+'">'
         +(s?'兴趣·':'近似·')+esc(it.word||'')+'</span>';
     });
-    h+='<div class="bnode" onclick="nodeMenu(event,\\''+jsq(n.name)+'\\')">'
+    h+='<div class="bnode" onclick="nodeMenu(event,\\''+jsq(n.name)+'\\',\\''+(n.type||'other')+'\\')">'
       +'<span class="tm">'+esc(String(n.time||'').slice(0,5))+'</span>'
       +'<span class="ic">'+(TYPE_ICONS[n.type]||TYPE_ICONS.other)+'</span>'
       +'<span class="nm">'+esc(n.name)+itag+(uncer?' <span style="color:#B4693F;font-size:11px">位置待确认</span>':'')+'</span>'
