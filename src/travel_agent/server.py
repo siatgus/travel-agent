@@ -39,6 +39,7 @@ import json
 import re
 import sys
 import threading
+import time
 import urllib.parse
 import uuid
 import webbrowser
@@ -64,9 +65,101 @@ _LOCK = threading.Lock()
 _SESSIONS: dict[str, Session] = {}
 _LAST_PLAN: dict[str, tuple[dict, str]] = {}   # sid -> (plan result, utterance)
 _DRIVE_CACHE: dict[str, dict] = {}             # "orig|dest" -> 规划结果（路径基本不变）
+_PREFETCHED: set[str] = set()                  # 已启动过预热的 sid，防重复
 _MEM: PreferenceMemory | None = None
 _LLM = "unset"                                  # 延迟初始化的 LLM 客户端（或 None）
 _LLM_SIG = None                                 # 设置文件指纹 (mtime_ns, size)，变更即重建客户端
+
+
+def _ok_pt(s: str) -> str | None:
+    """坐标串 → 舍入到 6 位的 "lon,lat"，非法/越界返回 None。"""
+    parts = str(s).split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        lon, lat = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        return None
+    return "%s,%s" % (round(lon, 6), round(lat, 6))
+
+
+def drive_fetch(o: str, d: str) -> dict:
+    """天地图驾车规划：缓存命中直接返回，否则打 HTTP 上游并解析点串。
+
+    供 /api/tianditu/drive 与预热线程共用——预热让浏览器 fetch 时毫秒级
+    命中缓存，不再受用户浏览器网络时序摆布（实测：无预热时真实浏览器
+    每段 fetch 4~10s，7s 超时一碰就全线回落直线，用户看到的就是直线）。
+    """
+    cache_key = o + "|" + d
+    hit = _DRIVE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    key = get_tdt_key()
+    if not key:
+        return {"ok": False, "error": "no tdt key"}
+    post = json.dumps({"orig": o, "dest": d, "style": "0"},
+                      separators=(",", ":"))
+    url = ("http://api.tianditu.gov.cn/drive?postStr="
+           + urllib.parse.quote(post, safe="")
+           + "&type=search&tk=" + urllib.parse.quote(key))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", "replace")
+    except Exception as e:
+        return {"ok": False, "error": "upstream %s" % e}
+    pts = []
+    m = re.search(r"<routelatlon>([^<]*)</routelatlon>", body)
+    if m:
+        for pair in m.group(1).split(";"):
+            p = _ok_pt(pair.strip())
+            if p:
+                a, b = p.split(",")
+                pts.append([float(a), float(b)])
+    if len(pts) < 2:
+        return {"ok": False, "error": "no route"}
+    if len(_DRIVE_CACHE) > 500:
+        _DRIVE_CACHE.clear()
+    out = {"ok": True, "pts": pts}
+    _DRIVE_CACHE[cache_key] = out
+    return out
+
+
+def _drive_pairs(result: dict) -> list[tuple[str, str]]:
+    """一份方案要预热的路段：每天取有坐标且非位置估算的节点相邻成对，
+    与前端 rec.chain 构建规则一致（不一致缓存键就对不上，预热白做）。"""
+    pairs: list[tuple[str, str]] = []
+    for d in result.get("days_plan") or []:
+        chain = [n["geo"] for n in (d.get("nodes") or [])
+                 if n.get("geo") and not n.get("geo_uncertain")]
+        for a, b in zip(chain, chain[1:]):
+            oa, ob = _ok_pt(f"{a[1]},{a[0]}"), _ok_pt(f"{b[1]},{b[0]}")
+            if oa and ob:
+                pairs.append((oa, ob))
+    return pairs
+
+
+def prefetch_drive_routes(sid: str, result: dict) -> None:
+    """后台预热一份方案的所有动线路段，让前端 fetch 全部命中缓存。
+
+    串行 + 0.15s 间隔防天地图 QPS 限制。daemon 线程，失败只留空缓存，
+    前端按原逻辑回落直线——预热只加速，不改变任何绘制行为。
+    """
+    if sid in _PREFETCHED:
+        return
+    _PREFETCHED.add(sid)
+    if len(_PREFETCHED) > 300:
+        _PREFETCHED.clear()
+    pairs = [p for p in _drive_pairs(result) if (p[0] + "|" + p[1]) not in _DRIVE_CACHE]
+
+    def _run():
+        for oa, ob in pairs:
+            drive_fetch(oa, ob)
+            time.sleep(0.15)
+
+    threading.Thread(target=_run, daemon=True, name="drive-prefetch").start()
 
 
 def _get_llm():
@@ -1223,6 +1316,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(build_html(result, utterance))
             except Exception as e:   # 行程页失败不影响对话
                 self._html(f"<h1>渲染失败</h1><pre>{e}</pre>", 500)
+            finally:
+                # 页面已回给用户，后台同步把动线路段预热进缓存——
+                # 前端 fetch 毫秒级命中，不再赌用户浏览器的网络时序
+                prefetch_drive_routes(sid, result)
         elif path.startswith("/api/conversations/"):
             user = self._auth_user()
             if user is None:
@@ -1247,62 +1344,12 @@ class Handler(BaseHTTPRequestHandler):
         挂死不响应（HTTP 正常，实测），前端直调 HTTP 会被 CORS 拦。
         页面是 CGCS2000 坐标，天地图路径服务同为 CGCS2000，直接可用。"""
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        orig = (q.get("orig") or [""])[0]
-        dest = (q.get("dest") or [""])[0]
-
-        def ok_pt(s):
-            parts = s.split(",")
-            if len(parts) != 2:
-                return None
-            try:
-                lon, lat = float(parts[0]), float(parts[1])
-            except ValueError:
-                return None
-            if not (-180 <= lon <= 180 and -90 <= lat <= 90):
-                return None
-            return "%s,%s" % (round(lon, 6), round(lat, 6))
-
-        o, d = ok_pt(orig), ok_pt(dest)
+        o = _ok_pt((q.get("orig") or [""])[0])
+        d = _ok_pt((q.get("dest") or [""])[0])
         if not o or not d:
             self._json({"ok": False, "error": "bad coords"}, 400)
             return
-        cache_key = o + "|" + d
-        hit = _DRIVE_CACHE.get(cache_key)
-        if hit is not None:
-            self._json(hit)
-            return
-        key = get_tdt_key()
-        if not key:
-            self._json({"ok": False, "error": "no tdt key"}, 503)
-            return
-        post = json.dumps({"orig": o, "dest": d, "style": "0"},
-                          separators=(",", ":"))
-        url = ("http://api.tianditu.gov.cn/drive?postStr="
-               + urllib.parse.quote(post, safe="")
-               + "&type=search&tk=" + urllib.parse.quote(key))
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                body = resp.read().decode("utf-8", "replace")
-        except Exception as e:
-            self._json({"ok": False, "error": "upstream %s" % e}, 502)
-            return
-        pts = []
-        m = re.search(r"<routelatlon>([^<]*)</routelatlon>", body)
-        if m:
-            for pair in m.group(1).split(";"):
-                p = ok_pt(pair.strip())
-                if p:
-                    a, b = p.split(",")
-                    pts.append([float(a), float(b)])
-        if len(pts) < 2:
-            self._json({"ok": False, "error": "no route"}, 502)
-            return
-        if len(_DRIVE_CACHE) > 500:
-            _DRIVE_CACHE.clear()
-        out = {"ok": True, "pts": pts}
-        _DRIVE_CACHE[cache_key] = out
-        self._json(out)
+        self._json(drive_fetch(o, d))
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")

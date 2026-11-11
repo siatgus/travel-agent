@@ -343,6 +343,37 @@ def test_bad_request(base: str, token: str) -> None:
     check("空消息返回 400", status == 400, f"status={status}")
 
 
+def test_drive_prefetch() -> None:
+    """动线预热：路段提取与前端 chain 规则一致、坏坐标不进、uncertain 不进。
+
+    真实浏览器 fetch 每段 4~10s 时会全线超时回落直线（用户实拍南京方案
+    全直线）——预热把天地图上游调用挪到服务端后台，前端 fetch 毫秒级命中。
+    """
+    from travel_agent.server import _drive_pairs, _ok_pt
+    check("_ok_pt 舍入到 6 位", _ok_pt("118.8405123,32.055123") == "118.840512,32.055123",
+          str(_ok_pt("118.8405123,32.055123")))
+    check("_ok_pt 拒绝坏值", _ok_pt("bad") is None and _ok_pt("999,999") is None, "")
+    result = {"days_plan": [
+        {"day": 1, "nodes": [
+            {"name": "A", "geo": [32.05, 118.84], "type": "attraction"},
+            {"name": "午休", "geo": [32.051, 118.841], "type": "rest"},
+            {"name": "B", "geo": [32.06, 118.85], "type": "attraction"},
+            {"name": "估算点", "geo": [32.07, 118.86], "type": "attraction",
+             "geo_uncertain": True},
+        ]},
+        {"day": 2, "nodes": [
+            {"name": "C", "geo": [32.08, 118.87], "type": "attraction"},
+            {"name": "无坐标", "type": "attraction"},
+            {"name": "D", "geo": [32.09, 118.88], "type": "attraction"},
+        ]},
+    ]}
+    pairs = _drive_pairs(result)
+    check("每天相邻可靠点成对（跨 uncertain/无坐标不连）",
+          pairs == [("118.84,32.05", "118.841,32.051"),
+                    ("118.841,32.051", "118.85,32.06"),
+                    ("118.87,32.08", "118.88,32.09")], str(pairs))
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="travel_server_test_"))
     os.environ["TRAVEL_APP_DB"] = str(tmp / "app.db")   # 测试账号库隔离
@@ -365,6 +396,7 @@ def main() -> int:
     test_clarify_flow(base, token)
     test_plan_flow(base, token)
     test_plan_page(base)
+    test_drive_prefetch()
     test_conversations_endpoints(base, token)
     test_reset(base, token)
     test_bad_request(base, token)

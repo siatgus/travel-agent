@@ -664,7 +664,7 @@ ROUTE_MAP_JS = """
       finished = true;
       cb(path);
     }
-    var timer = setTimeout(function () { done(null); }, 7000);
+    var timer = setTimeout(function () { done(null); }, 12000);
     try {
       var q = 'orig=' + encodeURIComponent(a.lng + ',' + a.lat)
             + '&dest=' + encodeURIComponent(b.lng + ',' + b.lat);
