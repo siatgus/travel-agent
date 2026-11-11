@@ -277,6 +277,26 @@ def test_nearby_answer_template() -> None:
     check("没数据时如实说，不编", "不敢瞎推荐" in empty or "不够" in empty)
 
 
+def test_trim_optional_intent() -> None:
+    """「把可去可不去的删掉」要识别成泛指删点，而不是当景点名抽取（冒烟实测）。"""
+    yes = ("还是有点赶，把可去可不去的删掉", "删掉一些景点",
+           "把可有可无的去掉", "少排几个点", "非必去的就删了吧")
+    no = ("去掉灵隐寺", "不想去雷峰塔", "杭州玩2天，加上灵隐寺",
+          "西湖怎么样", "成都到杭州的高铁班次")
+    for t in yes:
+        check(f"泛指删点命中：{t}", intent.wants_trim_optional(t))
+    for t in no:
+        check(f"点名/无关句不命中：{t}", not intent.wants_trim_optional(t))
+    # 抽取层不再产出脏槽位：泛指词组进不了 destination / must_visit / avoid
+    from travel_agent import agent as _agent
+    s = _agent.extract_slots_rules("还是有点赶，把可去可不去的删掉")
+    check("指令碎片不进 destination", not s.get("destination"),
+          str(s.get("destination")))
+    s2 = _agent.extract_slots_rules("删掉一些景点")
+    check("裸数量词不进 avoid", not s2.get("avoid"), str(s2.get("avoid")))
+    check("指令碎片不进 must_visit", not s2.get("must_visit"), str(s2.get("must_visit")))
+
+
 def main() -> int:
     for fn in (test_classify, test_city_parsing, test_weather_answer_format,
                test_weather_never_becomes_plan, test_weather_then_plan_switch,
@@ -284,7 +304,8 @@ def main() -> int:
                test_spot_answer_template, test_poi_answer_autofetch,
                test_smalltalk, test_question_shape,
                test_nearby_answer_template,
-               test_no_destination_no_plan):
+               test_no_destination_no_plan,
+               test_trim_optional_intent):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

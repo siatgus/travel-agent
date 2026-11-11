@@ -385,7 +385,8 @@ def test_bad_spot_name_never_stored() -> None:
     命中它——全新成都方案把它排成 Day2 的 09:00 景点，还带预约和门票说明。
     """
     before = len(autofetch.kb.get_kb().list_pois(CITY) or [])
-    for name in ("达时间改为", "成都、重庆", "云南", "班次"):
+    for name in ("达时间改为", "成都、重庆", "云南", "班次",
+                 "可不去的删掉", "一些景点"):
         r = autofetch.ensure_spot(CITY, name)
         check(f"脏名字「{name}」被拒绝入库", r["status"] == "rejected", str(r))
     after = len(autofetch.kb.get_kb().list_pois(CITY) or [])

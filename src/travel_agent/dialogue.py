@@ -541,6 +541,42 @@ class Session:
                          plan=self.last_plan if mode == "plan" else None,
                          render=text)
 
+        # 「把可去可不去的删掉」「删掉一些景点」——泛指删非必去点，不是加
+        # 新景点/排除新地点：句子里的「一些/可去可不去的」不是地名，放过去
+        # 会被抽成景点名污染方案还落库（实测「可不去的删掉」进了必去点）。
+        # 拦在抽取之前，按节奏就地删超额站；句里带赶/挤字眼（「还是有点赶…」）
+        # 视为同时要放松节奏，按轻松档处理。
+        if self.plan_made and intent.wants_trim_optional(utterance) \
+                and not re.search(r"加上|增加|添上|加一天|多玩一天|多住|延长"
+                                  r"|换成|改[成到]|再加|再逛|再去|必去",
+                                  utterance):
+            _pre = agent.extract_slots_rules(utterance, today=self.today)
+            if not any(_pre.get(k) for k in ("destination", "date_range",
+                                             "days", "must_visit", "avoid",
+                                             "origin")):
+                old_pace = ((self.last_plan or {}).get("slots") or {}).get("pace") \
+                    or (self.slots or {}).get("pace") or "moderate"
+                pace = "relaxed" if re.search(r"[赶挤紧]|太满|太累", utterance) \
+                    else old_pace
+                if pace != old_pace:
+                    self._sync_plan_pace(pace)
+                    self.slots = dict(self.slots or {}, pace=pace)
+                trimmed = self._trim_overcap(
+                    pace, label="删掉可去可不去的景点")
+                if trimmed is not None:
+                    note, _removed = trimmed
+                    text = note + agent.render(self.last_plan)
+                    mode = "plan"
+                else:
+                    text = self._pace_noop_answer(pace, just_loosened=False)
+                    mode = "answer"
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode=mode, turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds,
+                             slots=dict(self.slots),
+                             plan=self.last_plan if mode == "plan" else None,
+                             render=text)
+
         delta = agent.extract_slots(utterance, today=self.today, client=self.client)
         explicit = _explicit_fields(utterance, delta)
         lead_notes: list[str] = []
@@ -1148,7 +1184,7 @@ class Session:
                 out.append((d.get("day"), cap, atts))
         return out
 
-    def _trim_overcap(self, pace: str) -> tuple[str, list[str]] | None:
+    def _trim_overcap(self, pace: str, label: str = "别太赶") -> tuple[str, list[str]] | None:
         """按新节奏就地删超额站（「别太赶」的实际动作，节奏没变或刚放松都走这里）。
 
         只删用户没有点名必去的景点（从当天最后一个往前删，保住锚点）；
@@ -1197,9 +1233,9 @@ class Session:
                 d["day_budget"] = cost * party + 150 * party
         pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
         plan["assumptions"] = (plan.get("assumptions") or []) + [
-            f"按「别太赶」删掉超额景点：{'、'.join(removed)}"
+            f"按「{label}」删掉超额景点：{'、'.join(removed)}"
             f"（{pn}节奏每天最多 {cap} 个景点，删掉的不再挪到别的天）"]
-        note = (f"> 已按「别太赶」处理：删掉超额景点 {'、'.join(removed)}"
+        note = (f"> 已按「{label}」处理：删掉超额景点 {'、'.join(removed)}"
                 f"——{pn}节奏每天最多 {cap} 个景点，删掉的不再挪到别的天。\n\n")
         return note, removed
 

@@ -420,6 +420,44 @@ def test_pace_loosen_deletes_instead_of_relocating() -> None:
           f"{budget_before} -> {budget_after}")
 
 
+def test_trim_optional_phrase_routes_to_trim() -> None:
+    """「把可去可不去的删掉」是泛指删点，不是新景点名（2026-11-11 冒烟实测）。
+
+    之前 LLM 把「可不去的删掉」抽成必去景点，经 autofetch 落库污染 KB，
+    真必去点反而"未能排入"。现在拦在抽取之前按节奏就地删超额站。
+    """
+    s = session()
+    s.turn("11月20号去杭州玩3天，2人，轻松，预算5000")
+    check("前置：已有方案", s.plan_made, f"plan_made={s.plan_made}")
+    s.last_plan["days_plan"][1]["nodes"].append(
+        {"time": "19:00", "name": "额外塞的景点", "type": "attraction",
+         "duration_min": 60, "cost": 60, "transit": "", "tip": ""})
+    before = _attractions(s.last_plan)
+    r = s.turn("还是有点赶，把可去可不去的删掉")
+    after = _attractions(s.last_plan)
+    check("泛指删点给出新方案而非重排空转", r.mode == "plan",
+          f"mode={r.mode} {r.render[:60]}")
+    check("超额的非必去点被删掉",
+          "额外塞的景点" not in after and len(after) == len(before) - 1,
+          f"{before} -> {after}")
+    check("指令碎片没被当成景点混进行程",
+          "可不去的删掉" not in after and "一些" not in after and "一些景点" not in after,
+          str(after))
+    check("回复写明删除动作", "删掉可去可不去的景点" in r.render, r.render[:80])
+
+
+def test_trim_optional_within_cap_is_noop() -> None:
+    """行程本来就在节奏上限内时，泛指删点不动行程，给真能生效的选项。"""
+    s = session()
+    s.turn("11月20号去杭州玩3天，2人，轻松，预算5000")
+    before = _attractions(s.last_plan)
+    r = s.turn("删掉一些景点")
+    check("上限内泛指删点不再重排", r.mode == "answer", f"mode={r.mode}")
+    check("行程一个点没动", _attractions(s.last_plan) == before, str(before))
+    check("回复给出可执行的下一步", "去掉" in r.render or "删掉一站" in r.render,
+          r.render[:120])
+
+
 def test_pace_loosen_without_excess_says_switched() -> None:
     """放松节奏但行程本来就在上限内：明说切了档、没删点、没重排。
 

@@ -342,7 +342,16 @@ def looks_like_spot(name: str | None) -> bool:
 # 景点名里不可能出现的词：时刻/班次改动词。这类碎片来自误解析
 # （「把去程到达时间改为 09:00」曾截出「达时间改为」），一旦入库
 # 会被当成位置估算景点反复排进新行程——用户实测污染了全新的成都方案。
-_BAD_POI_RE = re.compile(r"时间|时刻|改为|改成|改到|班次|车次|航班|高铁|去程|返程|回程")
+_BAD_POI_RE = re.compile(r"时间|时刻|改为|改成|改到|班次|车次|航班|高铁|去程|返程|回程"
+                         # 删除/排除类动词混进名字 = 指令碎片不是景点（实测
+                         # 「把可去可不去的删掉」被抽成必去景点「可不去的删掉」，
+                         # 还经 autofetch 用户点名路径落库污染 KB）
+                         r"|删掉|删了|删去|去掉|去除|拿掉|排除|避开"
+                         r"|可去可不去|不想去|不必去|可有可无"
+                         # 裸数量/泛指词（「删掉一些景点」抽出「一些景点」）
+                         r"|一些|某些|几处|部分")
+# 整串就是数量/泛指代词：它们指代"一批景点"，自己不是景点
+_QUANT_RE = re.compile(r"一些|某些|部分|几个|几处|别的地方|其他地方|其它地方")
 
 
 def valid_poi_name(name: str | None) -> bool:
@@ -357,7 +366,9 @@ def valid_poi_name(name: str | None) -> bool:
         return False
     if re.search(r"[、，,。；;！!？?\s]", n):        # 景点名没有标点
         return False
-    if _BAD_POI_RE.search(n):                        # 时刻/班次碎片
+    if _BAD_POI_RE.search(n):                        # 时刻/班次/删除指令碎片
+        return False
+    if _QUANT_RE.fullmatch(n):                       # 裸数量代词（一些/几个…）
         return False
     if n in _NON_CITY_WORDS or is_region(n) or is_city(n):
         return False
@@ -499,6 +510,11 @@ def extract_slots(text: str, today: date | None = None,
         # 城市串进下游会被追问"在哪个城市"、还会被挂成位置估算景点（实测）。
         # 多城请求剥成 multi_cities，与规则路径行为一致。
         normalize_multi_dest(slots, text)
+        # 目的地也过脏碎片闸：删除/时刻类指令片段绝不是城市（实测 LLM 把
+        # 「可不去的删掉」回成目的地，随后走"用户点名陌生景点"污染方案与 KB）
+        _d = slots.get("destination")
+        if _d and (_BAD_POI_RE.search(_d) or _QUANT_RE.fullmatch(_d)):
+            slots["destination"] = None
         # 模型给的必去/排除同样要过景点名校验：城市串、时刻碎片、省份名
         # 一旦留下来，autofetch 会把它当"未收录景点"落库并长期污染
         for key in ("must_visit", "avoid"):
@@ -566,8 +582,13 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         # 兜底剥离句尾语气词（非贪婪正则可能拿不到边界时）
         dest = re.sub(r"[吧呀啊呢哦嘛了]+$", "", dest)
         # 兜底正则的第二道闸：时刻/班次类词混进来的碎片绝不是城市
-        # （「达时间改为」「车次改成」这类，防线一剥漏时在这兜住）
+        # （「达时间改为」「车次改成」这类，防线一剥漏时在这兜住）；
+        # 删除指令碎片同理——「把可去可不去的删掉」的「去」被兜底正则
+        # 吃成目的地「可不去的删掉」（实测），它随后会变成"用户点名的
+        # 陌生景点"排进行程、经 autofetch 落库污染 KB。
         if len(dest) >= 2 and dest not in _NON_CITY_WORDS \
+                and not _BAD_POI_RE.search(dest) \
+                and not _QUANT_RE.fullmatch(dest) \
                 and not re.search(r"时间|时刻|改为|改成|改到|提前|推迟|班次|车次|航班|高铁", dest) \
                 and not re.match(r"^[几多少什么哪]", dest):
             slots["destination"] = dest
