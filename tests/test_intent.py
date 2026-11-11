@@ -211,6 +211,35 @@ def test_spot_mention() -> None:
     check("具体景点点名与泛问题的区分", not bad, f"不符={bad}")
 
 
+def test_reco_routing() -> None:
+    """「推荐几家X」是问答不是规划：归 poi，套话剥出实体；规划词优先。"""
+    check("推荐句归 poi 问答",
+          intent.classify("推荐几家驴肉火烧") == "poi"
+          and intent.classify("哪家火锅好吃") == "poi",
+          f"{intent.classify('推荐几家驴肉火烧')}")
+    check("含规划词的推荐句仍归 plan",
+          intent.classify("帮我推荐个行程") == "plan",
+          f"{intent.classify('帮我推荐个行程')}")
+    cases = [
+        ("推荐几家驴肉火烧", "驴肉火烧"),
+        ("推荐一家的火锅店", "火锅店"),
+        ("推荐个玩法", "玩法"),
+        ("有哪些景点必去", None),   # 泛问走 poi_answer，不是推荐某类实体
+        ("帮我推荐个行程", None),
+    ]
+    bad = [(t, w, intent.reco_keyword(t, "邯郸")) for t, w in cases
+           if intent.reco_keyword(t, "邯郸") != w]
+    check("推荐句剥套话取实体", not bad, f"不符={bad}")
+    out = intent.recommend_answer("邯郸", "驴肉火烧",
+                                  [{"name": "老驴头驴肉火烧", "area": "丛台区",
+                                    "category": "restaurant", "cost": 25,
+                                    "open_hours": "06:30-19:30",
+                                    "note": "趁热吃"}])
+    check("推荐回答列出店名与人均", "老驴头驴肉火烧" in out and "25" in out, out[:100])
+    empty = intent.recommend_answer("邯郸", "驴肉火烧", [])
+    check("库里没收录如实说", "没收录" in empty, empty[:80])
+
+
 def test_spot_answer_template() -> None:
     out = intent.spot_answer("上海", "迪士尼",
                              [{"name": "上海迪士尼乐园", "area": "浦东",
@@ -316,6 +345,7 @@ def main() -> int:
     for fn in (test_classify, test_city_parsing, test_weather_answer_format,
                test_weather_never_becomes_plan, test_weather_then_plan_switch,
                test_poi_answer_no_invent, test_spot_mention,
+               test_reco_routing,
                test_spot_answer_template, test_poi_answer_autofetch,
                test_smalltalk, test_question_shape,
                test_nearby_answer_template,

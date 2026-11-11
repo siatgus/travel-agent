@@ -34,6 +34,12 @@ POI_KW = ("有什么好玩", "有啥好玩", "好玩的地方", "好玩吗", "�
           "门票", "开放时间", "营业时间", "闭馆",
           # 「天安门广场周边有什么」「外滩附近有什么」这类点名+泛问，也归景点问答
           "周边", "附近", "周围", "介绍一下", "介绍下")
+# 推荐句式：「推荐几家驴肉火烧」曾被分成 other 落进排行程流水线——
+# 已有方案时直接被当成"改行程"整单重排（用户体感：聊两句它又自顾自排行程）。
+# 推荐是问答不是规划；「推荐个行程/安排一下」这类含规划词的仍归 plan
+# （classify 里 has_plan 检查在本规则之前）。
+_RECO_RE = re.compile(r"(?:推荐|介绍|找找|找|想想|列)(?:几|一|些)?(?:家|个|些)"
+                      r"|有哪些|哪家|多来几家")
 TRANSPORT_KW = ("高铁", "动车", "火车", "机票", "航班", "班次", "车次", "票价",
                 "怎么去", "怎么走", "多久到", "怎么到")
 PLAN_KW = ("行程", "安排", "规划", "计划", "排一下", "排个", "帮我排", "玩几天",
@@ -307,7 +313,7 @@ def classify(text: str) -> str:
             return "plan"
     if any(k in t for k in WEATHER_KW):
         return "weather"
-    if any(k in t for k in POI_KW):
+    if any(k in t for k in POI_KW) or _RECO_RE.search(t):
         return "poi"
     if any(k in t for k in TRANSPORT_KW):
         return "transport"
@@ -684,6 +690,70 @@ def spot_answer(city: str, spot: str, pois: list[dict], note: str = "",
     if note:
         lines.append(f"\n{note}")
     lines.append("\n想把它排进行程？说「我想去" + spot + "」我就重排。")
+    return "\n".join(lines)
+
+
+# 「推荐几家X」里的推荐套话：剥掉后剩下的才是要推荐的实体
+_RECO_NOISE = ("推荐", "介绍", "找找", "找", "想想", "列一", "列", "几家", "一家",
+               "几个", "哪些", "什么", "多来", "好吗", "我想", "想", "给我",
+               "帮我", "一下", "当地", "本地", "有没有")
+
+
+def reco_keyword(text: str, city: str | None = None) -> str | None:
+    """「推荐几家驴肉火烧」→「驴肉火烧」；剥不出实体返回 None。
+
+    推荐句不点名具体店（点名走 spot_mention），问的是"这一类里有什么"。
+    """
+    cand = (text or "").strip("？?。！!，, 　~")
+    if city and city in cand:
+        cand = cand.replace(city, "", 1)
+    for w in _RECO_NOISE:
+        cand = cand.replace(w, " ")
+    cand = re.sub(r"\s+", "", cand).strip("的了呀啊呢吧，, ")
+    # 剥掉推荐套话后开头残留的量词（「推荐个玩法」→「个玩法」→「玩法」）
+    cand = re.sub(r"^[个家些]+", "", cand)
+    if len(cand) < 2 or len(cand) > 10:
+        return None
+    if _SPOT_START_RE.match(cand) or any(w in cand for w in _SPOT_GENERIC):
+        return None
+    return cand
+
+
+def recommend_answer(city: str, keyword: str, pois: list[dict],
+                     client=None) -> str:
+    """回答「推荐几家X」：按关键词列出库里的店/景点，事实全部来自库。"""
+    if not pois:
+        return (f"{city}的资料里我还没收录「{keyword}」相关的店，不敢瞎报店名。\n"
+                f"可以说个具体店名，我查到就给你介绍；排行程时选餐厅我也会按"
+                f"你的口味来。")
+    def _poi_fact(p: dict) -> dict:
+        d = {"名称": p.get("name"), "区域": p.get("area"),
+             "开放时间": p.get("open_hours"), "备注": p.get("note")}
+        # cost 缺失就不放这个键——留 None 模型会说成"门票0元"
+        if p.get("cost"):
+            d["人均元" if p.get("category") == "restaurant" else "门票元"] = p["cost"]
+        return d
+
+    facts = {"城市": city, "问的": f"推荐{keyword}",
+             "结果": [_poi_fact(p) for p in pois[:5]]}
+    said = _speak(client, "poi", facts, f"推荐几家{keyword}",
+                  [p.get("name") for p in pois[:2]])
+    if said:
+        return said
+    lines = [f"**{city} · {keyword}**相关的（按库里的资料）："]
+    for p in pois[:5]:
+        extra = []
+        if p.get("area"):
+            extra.append(p["area"])
+        if p.get("cost"):
+            money = "人均" if p.get("category") == "restaurant" else "门票"
+            extra.append(f"{money} {p['cost']} 元")
+        if p.get("open_hours"):
+            extra.append(p["open_hours"])
+        tail = f"（{'，'.join(extra)}）" if extra else ""
+        nt = f" —— {p['note']}" if p.get("note") else ""
+        lines.append(f"- **{p['name']}**{tail}{nt}")
+    lines.append("\n想把哪一家排进行程，直接说「我想去XX」。")
     return "\n".join(lines)
 
 

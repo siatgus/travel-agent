@@ -1405,6 +1405,43 @@ def test_plan_node_where_qa() -> None:
           r3.mode == "plan", f"mode={r3.mode}")
 
 
+def test_reco_restaurant_not_replan() -> None:
+    """「推荐几家驴肉火烧」→ 列店作答，绝不能整单重排（用户实测无脑重排）。"""
+    s = session()
+    r1 = s.turn("11月16号从石家庄去邯郸玩3天，2人，预算2000")
+    check("邯郸方案出成功", r1.mode == "plan", f"mode={r1.mode}")
+    if r1.mode != "plan":
+        return
+    r2 = s.turn("推荐几家驴肉火烧")
+    ok = (r2.mode == "answer" and r2.plan is None
+          and "老驴头驴肉火烧" in r2.render)
+    check("推荐餐厅 → 列店作答（不重排）", ok, r2.render[:120])
+    # 错字容错：记错店名头一个字也能靠去首字重试命中
+    r3 = s.turn("推荐几家老驴肉火烧")
+    check("错字关键词去首字重试", r3.mode == "answer"
+          and "老驴头驴肉火烧" in r3.render, r3.render[:120])
+    # 没收录的品类如实说，不编店名
+    r4 = s.turn("推荐几家螺蛳粉")
+    check("没收录的品类如实说", r4.mode == "answer" and "没收录" in r4.render,
+          r4.render[:120])
+
+
+def test_no_new_slots_no_replan() -> None:
+    """方案后说没有新条件的话（「嗯嗯」「那就这样」）→ 不许再排一遍行程。"""
+    s = session()
+    r1 = s.turn("11月8号去大理玩4天，2人，预算6000")
+    check("首轮出方案", r1.mode == "plan", f"mode={r1.mode}")
+    if r1.mode != "plan":
+        return
+    r2 = s.turn("嗯嗯，那就这样吧")
+    ok = r2.mode == "answer" and r2.plan is None
+    check("无新条件不重排", ok, f"mode={r2.mode} render={r2.render[:80]}")
+    # 明确的修改指令照常重排
+    r3 = s.turn("别太赶")
+    check("明确修改指令仍走行程流程", r3.mode in ("plan", "answer"),
+          f"mode={r3.mode}")
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1453,6 +1490,7 @@ def main() -> int:
                test_replan_remembers_plan, test_unknown_spot_asks_city_then_keeps_spot,
                test_province_not_matched_as_spot,
                test_filler_node_qa, test_plan_node_where_qa,
+               test_reco_restaurant_not_replan, test_no_new_slots_no_replan,
                test_bare_day_answered_once, test_month_then_day_merges,
                test_day_then_month_not_overridden):
         fn()

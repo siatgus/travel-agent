@@ -426,6 +426,22 @@ class Session:
                 if re.search(r"周边|附近|周围", utterance):
                     return self._nearby_qa(city, spot)
                 return self._spot_qa(city, spot)
+            # 「推荐几家驴肉火烧」：问的是这一类里有什么，不是点名单个店。
+            # 之前落到别的分支被当成改行程整单重排（实测）。
+            kw = intent.reco_keyword(utterance, city)
+            if kw:
+                r = agent.dispatch("search_poi",
+                                   {"city": city, "keyword": kw, "limit": 5})
+                items = (r.get("items") or []) if r.get("ok") else []
+                if not items and len(kw) >= 4:
+                    # 用户常记错店名头一个字（「老驴肉火烧」≠「老驴头驴肉火烧」）：
+                    # 掉首字再试一次，别急着说没收录
+                    r2 = agent.dispatch("search_poi",
+                                        {"city": city, "keyword": kw[1:],
+                                         "limit": 5})
+                    items = (r2.get("items") or []) if r2.get("ok") else []
+                return intent.recommend_answer(city, kw, items,
+                                               client=self.client)
             return intent.poi_answer(city, client=self.client)
         if kind == "transport":
             origin, dest = agent._extract_route(utterance)
@@ -915,6 +931,19 @@ class Session:
                 attempt = self.field_asks.get(field, 0) + 1
                 asked = [field]
                 question = self._compose_question(asked, attempt=attempt, backq=backq)
+            elif question is None and self.plan_made and not explicit \
+                    and not replan and not lead_notes:
+                # 无脑重排拦截：方案已出、这句没带来任何新条件、也没说"重新排"
+                # ——再跑一遍 plan_trip 只会原样再出一份（白等几十秒）。实测
+                # 「推荐几家驴肉火烧」就这样被整单重排，用户体感是"聊两句它
+                # 又自顾自排行程"。问一句想改哪里，把改法亮出来。
+                text = ("行程已经在上面了。想改的话直接说：加减景点（「加个XX」"
+                        "「不想去XX」）、改节奏（「别太赶」）、改天数、换城市都行；"
+                        "问景点、问吃的、问天气也随便聊。")
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode="answer", turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds,
+                             slots=dict(self.slots), render=text)
         # 其余情况（城市有了、软信息问满或用户说过"还没定"）→ 带假设出方案
 
         if question is not None:
