@@ -1375,6 +1375,36 @@ def test_filler_node_qa() -> None:
           and Session._is_filler_node({"name": "前往车站候车", "type": "transit"}))
 
 
+def test_plan_node_where_qa() -> None:
+    """「你给我排的X在哪里」→ 答那个点，不回泛推荐。
+
+    邯郸实测：老驴头驴肉火烧在行程里，这句却被抽不出名字 + 意图分类
+    other，最后回一串不相干景点介绍（用户：驴头不对马嘴）。
+    """
+    import re
+    s = session()
+    r1 = s.turn("11月8号去大理玩4天，2人，预算6000")
+    node = next((n for d in r1.plan["days_plan"] for n in d["nodes"]
+                 if n.get("type") == "attraction"
+                 and not Session._is_filler_node(n)
+                 and len(re.sub(r"[（(][^（）()]*[)）]", "",
+                                n.get("name") or "").strip()) >= 4), None)
+    check("方案里有可点名的景点", node is not None,
+          f"nodes={[n.get('name') for d in r1.plan['days_plan'] for n in d['nodes']]}")
+    if node is None:
+        return
+    core = re.sub(r"[（(][^（）()]*[)）]", "", node["name"]).strip()
+    r2 = s.turn(f"你给我排的{core}在哪里")
+    ok = (r2.mode == "answer" and core in r2.render
+          and "查不到" not in r2.render)
+    check("点名行程内景点问位置 → 按该点作答", ok, r2.render[:120])
+
+    # 改行程指令绝不被闸门截胡：不想去 → 照走重排
+    r3 = s.turn(f"我不想去了{core}")
+    check("同名的改行程指令不被问答闸门拦截",
+          r3.mode == "plan", f"mode={r3.mode}")
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1422,7 +1452,7 @@ def main() -> int:
                test_spot_not_treated_as_city, test_spot_added_to_existing_plan,
                test_replan_remembers_plan, test_unknown_spot_asks_city_then_keeps_spot,
                test_province_not_matched_as_spot,
-               test_filler_node_qa,
+               test_filler_node_qa, test_plan_node_where_qa,
                test_bare_day_answered_once, test_month_then_day_merges,
                test_day_then_month_not_overridden):
         fn()

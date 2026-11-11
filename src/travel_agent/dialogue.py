@@ -464,11 +464,53 @@ class Session:
         reply.render = note + "\n\n" + reply.render
         return reply
 
+    def _plan_spot_gate(self, utterance: str) -> str | None:
+        """点名行程里的真实店/景点问细节 → 直接按该 POI 作答，不赌意图分类。
+
+        「你给我排的老驴头驴肉火烧在哪里」带着指代前缀和位置尾巴，规则
+        分类只会给 other、spot_mention 也剥不净——曾被当成泛推荐回一串
+        不相干景点（实测「驴头不对马嘴」）。只要句式是问细节、又不是改
+        行程指令，行程里点到了名就答那个点。
+        """
+        if not (self.plan_made and self.last_plan):
+            return None
+        if not re.search(r"哪里|在哪|地址|位置|怎么样|怎么去|怎么走|多少钱|门票"
+                         r"|好吃|味道|几点|远不远|值得|吗|[？?]", utterance):
+            return None
+        # 改行程的指令绝不拦：「不想去X」「把X换成Y」「X加进必去」……
+        if re.search(r"不想去|换[成掉]|删|去掉|不要|排除|加[进上到]|改成|必去"
+                     r"|排进|重排|加一天|多住|天气|下雨|气温|温度|穿什么", utterance):
+            return None
+        hits: list[str] = []
+        for d in (self.last_plan or {}).get("days_plan") or []:
+            for n in d.get("nodes") or []:
+                if self._is_filler_node(n):
+                    continue
+                nm = n.get("name") or ""
+                core = re.sub(r"[（(][^（）()]*[)）]", "", nm).strip()
+                # 短于 4 字的核心名太泛（「午餐」），不当点名依据
+                if len(core) >= 4 and core in utterance and core not in hits:
+                    hits.append(core)
+        if not hits:
+            return None
+        city = (self.slots.get("destination") or self.trip_dest
+                or self.last_city or "")
+        answers = [self._spot_qa(city, core) for core in hits[:3]]
+        return "\n\n".join(answers)
+
     def _turn_impl(self, utterance: str,
                    history_text: str | None = None) -> Reply:
         self.turn_no += 1
         self.history.append({"role": "user",
                              "content": history_text or utterance})
+
+        # ---- 点名行程里的店/景点问细节：抢在意图分类前接住 ----
+        gated = self._plan_spot_gate(utterance)
+        if gated is not None:
+            self.history.append({"role": "agent", "content": gated})
+            return Reply(mode="answer", turn_no=self.turn_no,
+                         ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                         render=gated)
 
         # ---- 先判断意图：问天气/景点/班次/闲聊时直接答，不进排行程流水线 ----
         # 之前所有输入都被当成「补槽位」，于是问天气会被回「排行程还差 2 件事」，
