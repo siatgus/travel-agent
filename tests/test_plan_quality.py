@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 from datetime import date
 from pathlib import Path as _TA_PATH
@@ -406,10 +407,13 @@ def test_spot_day_phrase_is_not_trip_days() -> None:
     check("「多住一天」记为延长增量而不是天数 1",
           agent.extract_slots("多住一天").get("days_extend") == 1)
     # 对话层：已排 4 天后说「安排一天」，天数必须还是 4
+    # 用大理本地的景点：这条链路会走 autofetch 落库，若拿都江堰（成都景点）
+    # 配大理行程，测试会在真实 KB 里留下一条「大理·都江堰」，
+    # 之后每份大理方案都排出成都景点（实测导致其他测试莫名失败）。
     s = Session(today=date(2026, 11, 6))
     r = s.turn("11月20号从杭州去大理玩4天，2人，预算6000，轻松一点")
     check("前置：4 天方案出来了", r.mode == "plan", r.mode)
-    s.turn("加上都江堰，安排一天")
+    s.turn("加上崇圣寺三塔文化旅游区，安排一天")
     check("对话层兜住：天数保持 4", (s.slots or {}).get("days") == 4,
           str((s.slots or {}).get("days")))
 
@@ -1120,6 +1124,120 @@ def test_day_theme_matches_role() -> None:
           plan2[0]["theme"])
 
 
+def test_multi_spot_list_extracted() -> None:
+    """「想去A、B、C」是三个点名，不是一个景点名（实测三个全丢）。
+
+    顿号不在停止符里，整串被当成一个景点，含标点直接判非法——
+    用户点名三处，方案里一个都没排，还看不出哪里错了。
+    """
+    s = agent.extract_slots_rules("去成都玩5天，想去大熊猫基地、人民公园、都江堰")
+    check("顿号列表抽出全部点名",
+          s.get("must_visit") == ["大熊猫基地", "人民公园", "都江堰"],
+          str(s.get("must_visit")))
+    a = agent.extract_slots_rules("不想去豫园、外滩")
+    check("排除列表同样按顿号拆开", a.get("avoid") == ["豫园", "外滩"],
+          str(a.get("avoid")))
+    check("排除项不混进必去", not a.get("must_visit"), str(a.get("must_visit")))
+
+
+def test_same_spot_not_scheduled_twice() -> None:
+    """同一个点名的权威记录与兜底记录不能各占一天。
+
+    实测成都：库里有「成都大熊猫繁育研究基地」（有坐标），又有一条早先
+    autofetch 落的「大熊猫基地」（位置估算）。两条都被当成必去，于是一个
+    排 Day3、另一个排 Day4——用户看到同一个景点玩了两遍。
+    """
+    pois = CHENGDU + [_poi("p1b", "大熊猫基地", [30.57, 104.07], appeal=5, dur=240,
+                           tags=["用户点名", "位置估算"],
+                           note="用户点名安排；未收录，位置按市区估算")]
+    slots = dict(SLOTS, must_visit=["大熊猫基地"], days=3,
+                 date_range={"start": "2026-11-20", "end": "2026-11-22"})
+    plan, _ = composer.compose(slots, {"items": pois}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    hits = [n["name"] for d in plan for n in d["nodes"]
+            if n["type"] == "attraction" and "熊猫" in n["name"]]
+    check("同名权威记录与兜底记录只排一处", len(hits) == 1, str(hits))
+    check("留下的是有坐标的权威记录", hits == ["成都大熊猫繁育研究基地"], str(hits))
+
+
+def test_uncertain_spot_owns_a_day() -> None:
+    """位置待确认的景点必须单独占一天，不能当「顺路多逛一个」。
+
+    实测成都：人民公园 + 川大博物馆 + 都江堰（240 分钟、位置按市区估算）
+    挤在 Day2，交通时间根本算不出来，晚餐一路拖到 19:48。旧逻辑只在
+    「起手点/必去点本身是估算点」时兜住，补位循环照样把它拉进来。
+    """
+    slots = dict(SLOTS, must_visit=["都江堰", "人民公园"], pace="moderate")
+    plan, _ = composer.compose(slots, {"items": CHENGDU}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    uc_days = [d for d in plan if any(n.get("geo_uncertain") for n in d["nodes"])]
+    check("位置待确认的景点确实排进了行程", bool(uc_days), str(len(plan)))
+    bad = []
+    for d in uc_days:
+        others = [n["name"] for n in d["nodes"]
+                  if n["type"] == "attraction" and n.get("poi_id")
+                  and not n.get("geo_uncertain")]
+        if others:
+            bad.append(f"Day{d['day']}: {'、'.join(others)}")
+    check("它独占当天，不和市区景点混排", not bad, "；".join(bad))
+
+    # 没被点名时，兜底点不该自己跑进候选池——它坐标是城市中心、吸引力又高，
+    # 会挤掉真正的市区景点并独占一天
+    plan2, _ = composer.compose(dict(SLOTS, must_visit=["人民公园"], pace="moderate"),
+                                {"items": CHENGDU}, WEATHER,
+                                "12:00", "18:00", [30.66, 104.06])
+    check("未被点名的兜底点不进候选池",
+          not any(n["name"] == "都江堰" for d in plan2 for n in d["nodes"]),
+          str([[n["name"] for n in d["nodes"]] for d in plan2]))
+
+    item = next(c for c in agent.self_check(_fake_result(days_plan=plan, slots=slots))
+                if "位置待确认的景点单独占一天" in c["item"])
+    check("质检：位置待确认景点单独成天 → pass", item["result"] == "pass", str(item))
+
+    # 反向：混排的日程必须被质检抓出来——生成端与质检端不能各说各话
+    mixed = copy.deepcopy(plan)
+    day = next(d for d in mixed if any(n.get("geo_uncertain") for n in d["nodes"]))
+    day["nodes"].append({"time": "15:00", "name": "武侯祠", "type": "attraction",
+                         "duration_min": 90, "transit": "打车 10分钟（3km）",
+                         "tip": "", "cost": 60, "booking_required": False,
+                         "poi_id": "p2", "geo": [30.65, 104.05], "interests": []})
+    day["nodes"].sort(key=lambda n: n["time"])
+    item2 = next(c for c in agent.self_check(_fake_result(days_plan=mixed, slots=slots))
+                 if "位置待确认的景点单独占一天" in c["item"])
+    check("质检：混排判 fail 且点名到具体景点",
+          item2["result"] == "fail" and "都江堰" in item2["evidence"], str(item2))
+
+
+def test_day_sight_cap() -> None:
+    """单日净游玩时长封顶：景点个数合规，不代表时长合理。
+
+    三个 200 分钟的大点按 intensive（每天 4 个）算是"合规"的，
+    但净玩 10 小时，一天从早逛到天黑——用户实测 09:16 到 19:48。
+    """
+    long_pois = [
+        _poi("L1", "大点甲", [30.66, 104.05], dur=200, hours="全天"),
+        _poi("L2", "大点乙", [30.66, 104.06], dur=200, hours="全天"),
+        _poi("L3", "大点丙", [30.67, 104.07], dur=200, hours="全天"),
+        _poi("Lf", "食堂", [30.66, 104.06], cat="restaurant", dur=60, tags=["food"]),
+    ]
+    slots = dict(SLOTS, must_visit=[], pace="intensive", days=2,
+                 date_range={"start": "2026-11-20", "end": "2026-11-21"})
+    plan, _ = composer.compose(slots, {"items": long_pois}, WEATHER,
+                               "09:00", "18:00", [30.66, 104.06])
+    worst = max(sum(n["duration_min"] for n in d["nodes"] if n["type"] == "attraction")
+                for d in plan)
+    check(f"单日景点净时长 ≤{composer.DAY_SIGHT_CAP_MIN} 分钟",
+          worst <= composer.DAY_SIGHT_CAP_MIN, f"worst={worst}")
+    item = next(c for c in agent.self_check(_fake_result(days_plan=plan, slots=slots))
+                if "景点净时长" in c["item"])
+    check("质检有单日时长项且通过", item["result"] == "pass", str(item))
+    # 晚餐不晚于 19:30 开始
+    late = [f"Day{d['day']} {n['time']}" for d in plan for n in d["nodes"]
+            if n["type"] == "restaurant" and n["time"] >= "16:00"
+            and _minutes(n["time"]) > composer.DINNER_START_LATEST]
+    check("晚餐不晚于 19:30 开始", not late, "、".join(late))
+
+
 def test_return_day_pack_and_go() -> None:
     """返程日午饭真来不及坐下吃：如实改「打包+提前动身」，不排假时间表。"""
     slots = dict(SLOTS_HZ, must_visit=["西湖"])
@@ -1174,7 +1292,9 @@ def main() -> int:
                test_map_marks_uncertain_points, test_route_map_real,
                test_route_map_js_syntax, test_wrap_contains_daily,
                test_poi_info_cards,
-               test_render_budget_and_weather, test_pace_noop_is_honest):
+               test_render_budget_and_weather, test_pace_noop_is_honest,
+               test_uncertain_spot_owns_a_day, test_day_sight_cap,
+               test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

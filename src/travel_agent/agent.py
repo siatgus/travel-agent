@@ -763,7 +763,19 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     # 「顺便去/再去/也去」覆盖顺带点名："去上海顺便去迪士尼"——这类点名
     # 之前静默丢失。再去/也去要再挡"不想再去/别再去"（想/别紧贴动词前）；
     # 顺便类不用挡，"不顺便去"不是人话。
-    _MUST_VB = r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)"
+    _MUST_VB = r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!\s]|$)"
+    # 顿号并列：「想去大熊猫基地、人民公园、都江堰」是三个点名，不是一个。
+    # 旧正则一路吃到标点才停，「大熊猫基地、人民公园、都江堰」被当成一个
+    # 景点名，含「、」直接判非法——三个点名全丢，方案里一个都没排（实测）。
+    for m in re.finditer(
+            r"(?<![不别用])(?<![想])"
+            r"(?:一定要去|必去|必须去|想去|要去|想逛|再去|也去)"
+            r"([\u4e00-\u9fa5]{2,10}?(?:、[\u4e00-\u9fa5]{2,10}?)+)"
+            r"(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
+        for part in re.split(r"[、]", m.group(1)):
+            frag = _poi_frag(part)
+            if _valid_poi(frag) and frag not in slots["must_visit"]:
+                slots["must_visit"].append(frag)
     for m in re.finditer(
             r"(?<![不别用])(?<![想])"
             r"(?:一定要去|必去|必须去|想去|要去|想逛|再去|也去)" + _MUST_VB, text):
@@ -778,9 +790,20 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     # 「给都江堰安排一天 / 安排一天去熊猫基地」：那个点收进必去（天数保持不动）
     if _spot_day and _valid_poi(_spot_day) and _spot_day not in slots["must_visit"]:
         slots["must_visit"].append(_spot_day)
+    # 排除清单同样支持顿号并列：「不想去豫园、外滩」是两处都要避开。
+    # 只认单个片段时整串含「、」被判非法，两处全部漏掉——不想去的点照样排。
+    _AVOID_VB = (r"(?:不想去|不想逛|不去|别去|别逛|别安排|不要安排|不想安排|不安排|"
+                 r"排除|去掉|删掉|避开)")
     for m in re.finditer(
-            r"(?:不想去|不想逛|不去|别去|别逛|别安排|不要安排|不想安排|不安排|排除|去掉|删掉|避开)"
-            r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
+            _AVOID_VB + r"([\u4e00-\u9fa5]{2,10}?(?:、[\u4e00-\u9fa5]{2,10}?)+)"
+            r"(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
+        for part in re.split(r"[、]", m.group(1)):
+            frag = _poi_frag(part)
+            if _valid_poi(frag) and frag not in slots["avoid"]:
+                slots["avoid"].append(frag)
+    for m in re.finditer(
+            _AVOID_VB + r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!\s]|$)",
+            text):
         frag = _poi_frag(m.group(1))
         if _valid_poi(frag) and frag not in slots["avoid"]:
             slots["avoid"].append(frag)
@@ -1442,6 +1465,51 @@ def self_check(result: dict) -> list[dict]:
                          f"距发车只剩 {dep_min - last_end} 分钟"
                          f"（去车站至少要 {station_buf} 分钟）"),
         })
+    # 位置待确认的景点必须单独成天。它的坐标是按城市中心估算的，交通时间
+    # 压根没法算（都江堰与人民公园、川大博物馆挤在 Day2，晚餐拖到 19:48）。
+    # 混排时动线与时长都不可信，质检必须报出来，而不是靠用户自己发现。
+    mixed_geo = []
+    for d in days_plan:
+        atts = [n for n in d["nodes"] if n["type"] == "attraction"]
+        unc = [n for n in atts if n.get("geo_uncertain")]
+        solid = [n for n in atts if not n.get("geo_uncertain") and n.get("poi_id")]
+        if unc and solid:
+            mixed_geo.append(
+                f"Day{d['day']}：{'、'.join(n['name'] for n in unc)}（位置待确认）与 "
+                f"{'、'.join(n['name'] for n in solid)} 排在同一天")
+    checks.append({"item": "位置待确认的景点单独占一天",
+                   "result": "pass" if not mixed_geo else "fail",
+                   "evidence": "；".join(mixed_geo)})
+
+    # 单日总时长：景点净时长与当天收尾时刻双口径。景点数受节奏上限约束，
+    # 但"个数合规、时长爆炸"照样成立——240 分钟远郊点 + 两个市区点
+    # 就是一天逛到天黑，晚餐排到 19:48。
+    overload = []
+    for d in days_plan:
+        sight = sum(n["duration_min"] for n in d["nodes"] if n["type"] == "attraction")
+        ends = _node_ends(d)
+        last = max(ends) if ends else None
+        if sight > composer.DAY_SIGHT_CAP_MIN:
+            overload.append(f"Day{d['day']} 景点净时长 {sight} 分钟 > "
+                            f"{composer.DAY_SIGHT_CAP_MIN} 分钟")
+        if last is not None and last > 21 * 60 + 30:
+            overload.append(f"Day{d['day']} 最后一个安排到 {composer.fmt(last)} 才结束")
+    checks.append({"item": f"单日景点净时长 ≤{composer.DAY_SIGHT_CAP_MIN // 60} 小时且不拖到 21:30",
+                   "result": "pass" if not overload else "fail",
+                   "evidence": "；".join(overload)})
+
+    # 晚餐最晚开始时刻：DAY_END_LATEST 只管景点收尾，不管吃饭。
+    late_dinner = []
+    for d in days_plan:
+        dinners = [n for n in d["nodes"]
+                   if n["type"] == "restaurant" and n["time"] >= "16:00"]
+        for n in dinners:
+            hh, mm = (int(x) for x in n["time"].split(":"))
+            if hh * 60 + mm > composer.DINNER_START_LATEST:
+                late_dinner.append(f"Day{d['day']} {n['name']} {n['time']} 才开始")
+    checks.append({"item": f"晚餐不晚于 {composer.fmt(composer.DINNER_START_LATEST)} 开始",
+                   "result": "pass" if not late_dinner else "fail",
+                   "evidence": "、".join(late_dinner)})
     return checks
 
 

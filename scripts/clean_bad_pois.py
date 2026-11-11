@@ -28,12 +28,48 @@ def main(argv: list[str]) -> int:
         return 1
 
     bad: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+
+    def mark(pid: str, city: str, name: str, why: str) -> None:
+        if pid in seen:
+            return
+        seen.add(pid)
+        bad.append((pid, city, name, why))
+
+    by_name: dict[str, list[tuple[str, dict]]] = {}
     for city in db.cities():
         for p in (db.list_pois(city) or []):
             name = (p.get("name") or "").strip()
             if not agent.valid_poi_name(name):
-                bad.append((p["poi_id"], city, name,
-                            ",".join(p.get("tags") or [])))
+                mark(p["poi_id"], city, name, ",".join(p.get("tags") or []))
+            by_name.setdefault(name, []).append((city, p))
+
+    # 跨城误落库：同一个景点名出现在多个城市，其中至少一条是"用户点名/
+    # 位置估算"兜底记录。实测：大理行程里排出「都江堰」Day2（成都景点），
+    # 门票与位置估算假设全跟着出现，还让「信息齐备零假设」的契约测试挂掉。
+    # 另一城有权威记录 → 兜底那条直接算脏；两边都是兜底 → 列出来人工确认
+    # （都江堰在成都确实存在，只是库里没收录，成都没错、大理错）。
+    def _uncertain(p: dict) -> bool:
+        tags = p.get("tags") or []
+        return ("用户点名" in tags or "位置估算" in tags
+                or "位置按市区估算" in (p.get("note") or ""))
+
+    for name, recs in by_name.items():
+        if len(recs) < 2:
+            continue
+        solid = [c for c, p in recs if not _uncertain(p)]
+        loose = [(c, p) for c, p in recs if _uncertain(p)]
+        if not loose:
+            continue
+        if solid:
+            for c, p in loose:
+                mark(p["poi_id"], c, name,
+                     f"跨城兜底（{'、'.join(sorted(set(solid)))} 已有权威记录）")
+        else:
+            for c, p in loose:
+                if p["poi_id"] not in seen:
+                    print(f"  [待确认] {p['poi_id']} | {c} | {name!r} | "
+                          f"同名记录也在 {'、'.join(sorted({x for x, _ in loose if x != c}))}")
 
     if not bad:
         print("没有发现脏 POI")

@@ -49,6 +49,12 @@ DAY_END_LATEST = 20 * 60
 # 90 分钟保守估——18:00 的车，最晚 16:30 收尾。没有这条线时会排出
 # "17:03 逛完灵隐寺、18:03 才吃完午饭赶 18:00 的车"的时间表（杭州实测）。
 STATION_BUFFER_MIN = 90
+# 单日景点净时长上限（不含交通与用餐）。8 小时是"一天逛到闭园"的真实上限；
+# 没有这条线时 240 分钟的远郊点会和两个市区点凑一天，晚餐排到 19:48（成都实测）。
+DAY_SIGHT_CAP_MIN = 8 * 60
+# 晚餐最晚开始时刻。DAY_END_LATEST 只管景点收尾，不管吃饭：景点 19:48 结束、
+# 晚餐 19:48 开始，实际吃完已过九点。晚于这条线说明当天排太满。
+DINNER_START_LATEST = 19 * 60 + 30
 
 # 兴趣词的同义扩展，**分两档**：
 #
@@ -162,6 +168,16 @@ def interest_hit(interest: str, poi: dict, strong_only: bool = False) -> bool:
     return m[0] == "strong" if strong_only else True
 
 
+def _core_name(name: str) -> str:
+    """去掉通用后缀后的核心词：「成都大熊猫繁育研究基地」→「成都大熊猫繁育研究」。"""
+    n = (name or "").strip()
+    for suf in ("繁育研究基地", "研究基地", "基地", "风景区", "景区", "乐园",
+                "古镇", "古城", "公园", "博物馆", "纪念馆", "寺", "庙"):
+        if n.endswith(suf) and len(n) > len(suf) + 1:
+            return n[:-len(suf)]
+    return n
+
+
 def name_hit(fragment: str, poi_name: str) -> bool:
     """用户点名的景点与 POI 名是否指同一个地方：双向包含。
 
@@ -169,9 +185,24 @@ def name_hit(fragment: str, poi_name: str) -> bool:
     「上海迪士尼乐园」（fragment in name，本来就能中）；用户照抄全名
     「上海迪士尼乐园」而库里叫「迪士尼乐园」（name in fragment，单向会漏）。
     「不想去豫园」这类排除若漏匹配， unwanted 景点照进行程，比漏掉必去更招投诉。
+
+    第三档：去掉「基地/景区/乐园」这类通用后缀后再比核心词。用户说
+    「大熊猫基地」、库里叫「成都大熊猫繁育研究基地」，两者互不为子串，
+    于是命中了库里另一条没有坐标的兜底记录（「大熊猫基地·位置估算」），
+    真实景点被当成位置待确认白占一天。核心词只在长度 ≥3 且**不从前缀**
+    命中时生效：「人民公园」「望江楼公园」不会因为都带「公园」算一处，
+    同一个城市名开头的「测试城海洋馆」「测试城古城」也不会被认成一个点。
     """
     f, n = (fragment or "").strip(), (poi_name or "").strip()
-    return len(f) >= 2 and len(n) >= 2 and (f in n or n in f)
+    if len(f) < 2 or len(n) < 2:
+        return False
+    if f in n or n in f:
+        return True
+    cf, cn = _core_name(f), _core_name(n)
+    if len(cf) < 3 or len(cn) < 3:
+        return False
+    # 前缀相同只说明"同一个城市/品牌下的不同景点"，不算同一处
+    return (cf in cn and not cn.startswith(cf)) or (cn in cf and not cf.startswith(cn))
 
 
 def score_poi(poi: dict, slots: dict, rain_prob: int, last_geo: list[float] | None,
@@ -467,6 +498,15 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     """
     all_pois = pois_res.get("items") or []
     attractions = [p for p in all_pois if p["category"] == "attraction"]
+    # 位置估算的兜底点（用户点名/位置估算）只在**用户真的点名**时才进候选。
+    # 它们本来是 autofetch 为"库里没有的景点"临时造的占位（坐标是城市中心），
+    # 但吸引力给得高、距离又像"就在市中心"，于是每份行程都会被选中、还因为
+    # 「位置待确认」独占一整天——实测成都 5 天里都江堰、大熊猫基地各吃掉一天，
+    # 真正的市区景点反而没位置。
+    _must_terms = [m for m in (slots.get("must_visit") or []) if m]
+    attractions = [p for p in attractions
+                   if not _geo_uncertain(p)
+                   or any(name_hit(m, p["name"]) for m in _must_terms)]
     foods = [p for p in all_pois if p["category"] == "restaurant"]
     # 「不吃辣」这类硬口径：有就驱动餐厅筛选与点单提示，不许只躺在槽位里
     _restrict = " ".join((slots.get("diet") or []) + (slots.get("hard_prefs") or [])
@@ -719,6 +759,13 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
         # 晚餐：定位到当日最后一个点位附近
         remaining = [x for x in remaining if x not in used_pois]
+        # 同一个点名可能对应两条记录：权威记录（有坐标）和早先 autofetch 落的
+        # 兜底记录（位置估算）。权威记录排过之后，兜底那条不能再单独占一天——
+        # 实测成都 5 天里「成都大熊猫繁育研究基地」排 Day3、同名的
+        # 「大熊猫基地」又排 Day4，用户看到同一个景点玩两遍。
+        remaining = [p for p in remaining
+                     if not (_geo_uncertain(p)
+                             and any(name_hit(p["name"], u["name"]) for u in used_pois))]
 
         if i < days - 1:
             dinner = _pick_meal(foods, [("晚餐", prev_geo, 6.0),
@@ -817,31 +864,50 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
     # 只靠 +4.0 加分会被距离成本压掉（远处景点 -5 半径惩罚 + 线性距离惩罚），
     # 结果就是用户说"一定要去喜洲"，系统却因为 18km 而换了个近的。
     must_names = [m for m in (slots.get("must_visit") or []) if m]
-    must = [p for p in pool if any(name_hit(m, p["name"]) for m in must_names)]
+    must = []
+    for m in must_names:
+        hits = [p for p in pool if name_hit(m, p["name"])]
+        if not hits:
+            continue
+        # 同一个点名可能命中多条：库里有权威记录（有坐标），也有一条早先
+        # autofetch 落的兜底记录（无坐标、标位置估算）。两条都收进来会
+        # 触发"位置待确认独占一天"，真实景点反而被当成不确定点。
+        hits.sort(key=lambda p: (_geo_uncertain(p), -p.get("appeal", 0)))
+        if hits[0] not in must:
+            must.append(hits[0])
     if must and log is not None:
         log.setdefault("must_visit", []).extend(
             [{"name": p["name"], "day": d.isoformat()} for p in must])
 
     picked = list(must)
     if not picked:
-        # 起手点 = 分数最高者（含 LLM 偏好加成）。
-        # 闭馆紧迫度只在后面决定"谁先排"，不参与"选谁"——否则用户明说想去的点
-        # 会被一个"关门早"的点顶掉，偏好就失效了。
-        #
-        # 但"分数最高"不够：名额紧张时（4 天里有 1 天给了跨城一日游），
-        # 用户点名的兴趣（大熊猫）会被几个近处的热门点挤出局。
-        # 兴趣点因此优先占锚点位置——这是"用户说了想看"，不是"系统觉得好"。
-        prefs = slots.get("soft_prefs") or []
-        # 先看"名字直接对上"的兴趣（大熊猫 → 大熊猫基地），这类必须优先占位；
-        # 只有同义词命中的（喝茶 → 公园）放在次一档，避免把名额占满。
-        strong = [p for p in pool
-                  if any(interest_hit(w, p, strong_only=True) for w in prefs)]
-        weak = [p for p in pool
-                if p not in strong and any(interest_hit(w, p) for w in prefs)]
-        score_by_id = {p["poi_id"]: s for s, p, _ in scored}
-        cand = strong or weak or [scored[0][1] if scored else None]
-        cand = [p for p in cand if p]
-        picked = [max(cand, key=lambda p: score_by_id.get(p.get("poi_id"), 0))] if cand else []
+        # 位置待确认的点必须有一整天。它在分数竞争里永远输给市区景点
+        # （坐标按城市中心算，看着"不顺路"就出局），成都实测 4 天行程
+        # 根本排不进，只能落进「未能排入」。用户点名了它就给它一天，
+        # 这一天的其余名额由上面的 early return 清空。
+        unc = [p for p in pool if _geo_uncertain(p)]
+        if unc:
+            _by_id = {p["poi_id"]: s for s, p, _ in scored}
+            picked = [max(unc, key=lambda p: _by_id.get(p.get("poi_id"), 0))]
+        else:
+            # 起手点 = 分数最高者（含 LLM 偏好加成）。
+            # 闭馆紧迫度只在后面决定"谁先排"，不参与"选谁"——否则用户明说想去的点
+            # 会被一个"关门早"的点顶掉，偏好就失效了。
+            #
+            # 但"分数最高"不够：名额紧张时（4 天里有 1 天给了跨城一日游），
+            # 用户点名的兴趣（大熊猫）会被几个近处的热门点挤出局。
+            # 兴趣点因此优先占锚点位置——这是"用户说了想看"，不是"系统觉得好"。
+            prefs = slots.get("soft_prefs") or []
+            # 先看"名字直接对上"的兴趣（大熊猫 → 大熊猫基地），这类必须优先占位；
+            # 只有同义词命中的（喝茶 → 公园）放在次一档，避免把名额占满。
+            strong = [p for p in pool
+                      if any(interest_hit(w, p, strong_only=True) for w in prefs)]
+            weak = [p for p in pool
+                    if p not in strong and any(interest_hit(w, p) for w in prefs)]
+            score_by_id = {p["poi_id"]: s for s, p, _ in scored}
+            cand = strong or weak or [scored[0][1] if scored else None]
+            cand = [p for p in cand if p]
+            picked = [max(cand, key=lambda p: score_by_id.get(p.get("poi_id"), 0))] if cand else []
 
     # 位置估算的点单独占一天：交通时间未知，硬跟市区景点凑团只会排出假动线。
     # 它不是"顺路多逛一个"，而是一整段需要用户确认的行程。
@@ -852,10 +918,21 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
     for p in picked[1:]:
         move += transit_estimate(haversine_km(prev, p["geo"]), prev, p["geo"])[1]
         prev = p["geo"]
+    sight_min = sum(p["duration_min"] for p in picked)
     while len(picked) < max(quota, len(must)):
         cand = []
         for s, p, why in scored:
             if p in picked:
+                continue
+            # 位置估算的点**绝不**和市区点凑同一天。上面的 early return 只兜住了
+            # "起手点/必去点本身是估算点"的情况；一旦当天起手是可靠点（如必去
+            # 人民公园），补位循环会把它当顺路点拉进来——成都实测：人民公园 +
+            # 川大博物馆 + 都江堰（240 分钟、位置待确认）挤在 Day2，交通时间还
+            # 没计入，晚餐拖到 19:48。它必须自己占一天。
+            if _geo_uncertain(p):
+                continue
+            # 单日净游玩时长封顶：240 分钟远郊点 + 两个市区点 = 一整天逛到天黑
+            if sight_min + p["duration_min"] > DAY_SIGHT_CAP_MIN:
                 continue
             km = haversine_km(prev, p["geo"])
             if km > MAX_HOP_KM:
@@ -868,6 +945,7 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
         cand.sort(key=lambda x: -x[0])
         _, nxt, km = cand[0]
         picked.append(nxt)
+        sight_min += nxt["duration_min"]
         move += transit_estimate(km, prev, nxt["geo"])[1]
         prev = nxt["geo"]
     return picked

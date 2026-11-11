@@ -285,6 +285,20 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
             return {**base, "status": "exists", "poi": p,
                     "source": p.get("source") or "",
                     "message": f"资料库里已有「{p['name']}」"}
+
+    # 跨城同名：这个名字在别的城市已经有记录（哪怕是"用户点名"的兜底记录），
+    # 说明它更像是那座城市的景点。大理行程里说「加上都江堰」会把都江堰按
+    # 大理市区落库，此后每份大理方案都排出成都的景点（实测，连"信息齐备
+    # 零假设"的契约都被带崩）。宁可如实说"它在成都"，也不新建一条假点。
+    for other in (db.cities() or []):
+        if other == city:
+            continue
+        for p in (db.list_pois(other) or []):
+            if (p.get("name") or "").strip() == name:
+                return {**base, "status": "other_city",
+                        "source": p.get("source") or "",
+                        "message": f"「{name}」资料库里记在{other}，不在{city}；"
+                                   f"如果你要的确实是{city}的那个，告诉我我重新核实"}
     if not ENABLED:
         return {**base, "status": "disabled", "message": "在线补全已关闭"}
     center = center or _resolve_center(city)
