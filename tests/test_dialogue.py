@@ -394,9 +394,13 @@ def test_pace_loosen_deletes_instead_of_relocating() -> None:
           (s.slots.get("pace") or "moderate") == "moderate",
           str(s.slots.get("pace")))
     mid = s.last_plan["days_plan"][1]
-    while len([n for n in mid["nodes"] if n.get("type") == "attraction"]) < 3:
-        mid["nodes"].append({"time": "19:00", "name": "可删景点", "type": "attraction",
-                             "duration_min": 60, "cost": 30, "transit": "", "tip": ""})
+    # 确定性夹具：真实 KB 数据会影响当天排几个点（非密闭测试），先把当天
+    # 景点裁到 2 个、再塞一个 30 元票价的"可删景点"——放松到轻松档（上限 2）
+    # 必然恰好删它，预算必然 -60（30 元 × 2 人），断言不再漂
+    for n in [n for n in mid["nodes"] if n.get("type") == "attraction"][2:]:
+        mid["nodes"].remove(n)
+    mid["nodes"].append({"time": "19:00", "name": "可删景点", "type": "attraction",
+                         "duration_min": 60, "cost": 30, "transit": "", "tip": ""})
     before = _attractions(s.last_plan)
     ret_before = [n.get("name") for n in s.last_plan["days_plan"][-1]["nodes"]]
     budget_before = (s.last_plan.get("budget") or {}).get("total")

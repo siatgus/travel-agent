@@ -403,7 +403,48 @@ def test_bad_spot_name_never_stored() -> None:
           "达时间改为/成都、重庆/云南/还是/几天")
 
 
+def test_llm_coord_refined() -> None:
+    """模型粗坐标（2 位小数）要经天地图地理编码校正（2026-11-11 北京实测：
+    图钉偏约 1km，驾车连线在错误起终点之间找路——"动线不是真实路径"）。"""
+    old_lookup, old_geo = llm.lookup_poi, autofetch.tdt_geocode
+    row = {"name": "测试城科技馆", "lat": 30.05, "lon": 120.05,
+           "category": "attraction", "duration_min": 120, "ticket": 60,
+           "open_hours": "", "note": ""}
+    llm.lookup_poi = lambda client, city, name: (row, None)
+    autofetch.tdt_geocode = lambda *a, **k: (30.0523, 120.0611)
+    restore = _patch_center(CENTER)
+    try:
+        r = autofetch.ensure_spot(CITY, "科技馆", client=object())
+    finally:
+        llm.lookup_poi, autofetch.tdt_geocode = old_lookup, old_geo
+        restore()
+    geo = (r.get("poi") or {}).get("geo") or []
+    check("模型坐标被地理编码校正",
+          r["status"] == "fetched" and len(geo) == 2
+          and abs(geo[0] - 30.0523) < 1e-6 and abs(geo[1] - 120.0611) < 1e-6,
+          f"geo={geo}")
+
+    # 校正点离城心太远（地理编码撞了同名地名）→ 保留模型原坐标
+    row2 = {"name": "测试城天文馆", "lat": 30.05, "lon": 120.05,
+            "category": "attraction", "duration_min": 120, "ticket": 60,
+            "open_hours": "", "note": ""}
+    llm.lookup_poi = lambda client, city, name: (row2, None)
+    autofetch.tdt_geocode = lambda *a, **k: (40.0, 116.0)
+    restore = _patch_center(CENTER)
+    try:
+        r2 = autofetch.ensure_spot(CITY, "天文馆", client=object())
+    finally:
+        llm.lookup_poi, autofetch.tdt_geocode = old_lookup, old_geo
+        restore()
+    geo2 = (r2.get("poi") or {}).get("geo") or []
+    check("校正点离城过远（撞名）→ 保留模型原坐标",
+          len(geo2) == 2 and abs(geo2[0] - 30.05) < 1e-6
+          and abs(geo2[1] - 120.05) < 1e-6, f"geo={geo2}")
+
+
 def main() -> int:
+    # 默认关掉真实地理编码：单测不打外网（专项测试自己临时替换桩）
+    autofetch.tdt_geocode = lambda *a, **k: None
     test_plausible_city()
     test_existing_city_no_fetch()
     test_fetch_and_store()
@@ -418,6 +459,7 @@ def main() -> int:
     test_spot_already_in_kb()
     test_spot_fetch_by_name()
     test_spot_llm_preferred()
+    test_llm_coord_refined()
     test_spot_custom_fallback()
     test_bad_spot_name_never_stored()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

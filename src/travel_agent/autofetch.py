@@ -41,6 +41,129 @@ _CACHE_LOCK = threading.Lock()
 _OSM_DOWN_UNTIL = 0.0
 OSM_DOWN_TTL = 600.0
 
+# 天地图地理编码：把模型给的粗坐标校正成真实位置（2026-11-11 实测：
+# 模型兜底坐标常只有 2 位小数，误差约 1km——故宫的图钉画在错误街区，
+# 驾车连线在错误起终点之间找路，用户看到"动线不是真实路径"）。
+_GEO_CACHE: dict[str, tuple[float, float] | None] = {}
+_GEO_DOWN_UNTIL = 0.0        # 上游异常熔断：10 分钟内不再试
+GEO_DOWN_TTL = 600.0
+
+
+def _tdt_key() -> str:
+    """天地图 Key：环境变量优先，其次设置文件（与 render_html.get_tdt_key 同源；
+    不直接导入 render_html——它引 agent 引回 autofetch，会成环）。"""
+    k = (os.environ.get("TIANDITU_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        from . import llm as llm_layer
+        return str(llm_layer.load_settings().get("tdt_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def tdt_geocode(name: str, city: str, center: list[float] | None = None
+                ) -> tuple[float, float] | None:
+    """查天地图，返回 (lat, lon) 或 None。CGCS2000，与库内点位同系。
+
+    两级策略：先走地名搜索 V2.0（POI 级精度，mapBound 圈定本市）；
+    搜不到再退 geocoder，但**只收精确匹配**——geocoder 会把查不到的
+    POI 名降级到「区县及以上级行政区划」返回区划质心（实测「圆明园
+    遗址公园」被配到 10km 外），这种结果对景点毫无意义，不如不校正。
+    失败/没配 Key/熔断中一律返回 None——调用方保留原坐标（诚实降级）。
+    """
+    if not name or not city:
+        return None
+    ck = city + "|" + name
+    if ck in _GEO_CACHE:
+        return _GEO_CACHE[ck]
+    global _GEO_DOWN_UNTIL
+    key = _tdt_key()
+    if not key or time.time() < _GEO_DOWN_UNTIL:
+        return None
+    out = _tdt_search_poi(name, center)
+    if out is None:
+        out = _tdt_geocoder(name, city)
+    # 两级都没命中不算故障（确实查不到的名字）：按名字缓存 None 防重查；
+    # 熔断只对网络异常生效（见 _tdt_search_poi/_tdt_geocoder）。
+    if len(_GEO_CACHE) > 500:
+        _GEO_CACHE.clear()
+    _GEO_CACHE[ck] = out
+    return out
+
+
+def _tdt_search_poi(name: str, center: list[float] | None
+                    ) -> tuple[float, float] | None:
+    """地名搜索 V2.0 普通搜索：POI 级坐标。返回 None 表示没有可信命中。"""
+    if center is None:
+        return None
+    try:
+        s, w = center[0] - 0.45, center[1] - 0.60
+        n, e = center[0] + 0.45, center[1] + 0.60
+        post = json.dumps({"keyWord": name, "mapBound": f"{w},{s},{e},{n}",
+                           "level": "12", "queryType": "1", "start": "0",
+                           "count": "5"}, separators=(",", ":"))
+        url = ("http://api.tianditu.gov.cn/v2/search?postStr="
+               + urllib.parse.quote(post, safe="")
+               + "&type=query&tk=" + urllib.parse.quote(_tdt_key()))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        hit = exact = None
+        for p in body.get("pois") or []:
+            parts = str(p.get("lonlat") or "").split(",")   # "lon,lat"
+            if len(parts) != 2:
+                continue
+            pt = (float(parts[1]), float(parts[0]))
+            nm = str(p.get("name") or "")
+            if nm == name:
+                exact = pt
+                break
+            if name in nm and hit is None:
+                hit = pt
+        return exact or hit
+    except Exception:
+        global _GEO_DOWN_UNTIL                  # 网络异常才熔断，查不到不算
+        _GEO_DOWN_UNTIL = time.time() + GEO_DOWN_TTL
+        return None
+
+
+def _tdt_geocoder(name: str, city: str) -> tuple[float, float] | None:
+    """geocoder 兜底：只收精确匹配，降级到行政区划的结果一律不要。"""
+    try:
+        ds = json.dumps({"keyWord": f"{city}{name}", "specify": "156"},
+                        separators=(",", ":"))
+        url = ("http://api.tianditu.gov.cn/geocoder?ds="
+               + urllib.parse.quote(ds, safe="")
+               + "&tk=" + urllib.parse.quote(_tdt_key()))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        loc = body.get("location") or {}
+        lat, lon = loc.get("lat"), loc.get("lon")
+        if lat is None or lon is None:
+            return None
+        if "行政区划" in str(loc.get("level") or ""):
+            return None                              # 区划质心 ≠ 景点位置
+        return (float(lat), float(lon))
+    except Exception:
+        global _GEO_DOWN_UNTIL
+        _GEO_DOWN_UNTIL = time.time() + GEO_DOWN_TTL
+        return None
+
+
+def refine_llm_coord(name: str, city: str, lat: float, lon: float,
+                     center: list[float]) -> tuple[float, float]:
+    """模型坐标 → 天地图校正；查不到或落点可疑时保留原坐标。
+
+    校正点必须仍在本市范围（离城心 ≤ LLM_MAX_KM）才采纳——搜索也有
+    撞同名地名的可能，这条是最后一道幻觉闸。
+    """
+    fix = tdt_geocode(name, city, center)
+    if fix and _km(center[0], center[1], fix[0], fix[1]) <= LLM_MAX_KM:
+        return fix
+    return (lat, lon)
+
 # tourism 标签 → (游玩时长分钟, 无 fee 标签时的门票估算)
 _POI_KIND = {
     "museum": (120, 40),
@@ -328,9 +451,14 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
                 raise
             row = None
         if row and _km(center[0], center[1], row["lat"], row["lon"]) <= LLM_MAX_KM:
+            # 模型坐标常只有 2 位小数（误差约 1km）：先按天地图地理编码校正，
+            # 查不到再退回模型原值——图钉与连线都以这个点为准，宁可多花一次
+            # 毫秒级 HTTP，也不能让"故宫"画到错误街区（北京实测）
+            lat, lon = refine_llm_coord(row["name"], city,
+                                        row["lat"], row["lon"], center)
             poi = {
                 "name": row["name"], "category": row["category"],
-                "area": city, "geo": [row["lat"], row["lon"]],
+                "area": city, "geo": [round(lat, 4), round(lon, 4)],
                 "appeal": 4, "duration_min": row["duration_min"],
                 "cost": int(row["ticket"]),
                 "open_hours": row["open_hours"] or "全天",
@@ -437,12 +565,13 @@ def fetch_city_llm(client, city: str, center: list[float]
     for r in rows:
         if _km(center[0], center[1], r["lat"], r["lon"]) > LLM_MAX_KM:
             continue                              # 坐标离城区太远：不是本市或纯属编造
+        lat, lon = refine_llm_coord(r["name"], city, r["lat"], r["lon"], center)
         out.append({
             "name": r["name"],
             "category": "attraction" if r["category"] in ("attraction", "park")
             else "attraction",
             "area": city,
-            "geo": [r["lat"], r["lon"]],
+            "geo": [round(lat, 4), round(lon, 4)],
             "appeal": 3,
             "duration_min": r["duration_min"],
             "cost": int(r["ticket"]),
