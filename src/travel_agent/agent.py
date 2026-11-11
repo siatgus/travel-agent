@@ -1443,6 +1443,24 @@ def self_check(result: dict) -> list[dict]:
         "result": "pass" if not no_meal else "fail",
         "evidence": f"缺用餐点：{'、'.join(no_meal)}" if no_meal else "",
     })
+    # 亲子午休：带幼儿（或点名要午休）的行程，除抵达日外每天都要有午休节点，
+    # 或至少在某个节点里写明"今天在车上/候车时补"。成都 4 天实测：Day2 的午餐
+    # 走"先吃饭再逛"那条分支，午休整段消失，只有 Day3 有——承诺变成了摆设。
+    _hp = (result.get("slots") or {}).get("hard_prefs") or []
+    if "带幼儿" in _hp or "需午休" in _hp:
+        _no_nap = []
+        for d in days_plan:
+            if d["day"] == 1 and len(days_plan) > 1:
+                continue                      # 抵达日到店已傍晚，晚餐后直接睡
+            has = any(n["name"].startswith("午休") for n in d["nodes"])
+            noted = any("午休" in (n.get("tip") or "") for n in d["nodes"])
+            if not has and not noted:
+                _no_nap.append(f"Day{d['day']}")
+        checks.append({
+            "item": "带幼儿每天有午休" + ("（抵达日除外）" if len(days_plan) > 1 else ""),
+            "result": "pass" if not _no_nap else "fail",
+            "evidence": f"缺午休：{'、'.join(_no_nap)}" if _no_nap else "",
+        })
     # 口径与节奏承诺一致（亲子实测反馈：午餐/午休/自由活动都算节点，
     # 两处景点的轻松日被误报超额）——只数景点，上限取 PACE_CAP
     _cap = composer.PACE_CAP.get((result.get("slots") or {}).get("pace"), 3)

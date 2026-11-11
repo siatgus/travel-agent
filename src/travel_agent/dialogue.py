@@ -951,11 +951,42 @@ class Session:
                 exists = [p for p in missed
                           if any(composer.interest_hit(p, it) for it in items)]
                 if exists:
-                    _tight = ("当天往返装不下" if (slots.get("days") or 1) == 1
-                              else "天数/节奏装不下")
-                    assumptions.append(
-                        "你的兴趣「" + "、".join(exists) + "」对应的景点这版没排进去"
-                        f"（{_tight}），加一天或删掉一个别的我就补上")
+                    # 只说"天数/节奏装不下"等于没说：明明是别的点把名额占了，
+                    # 用户既不知道占位的是谁，也不知道说一句就能换（成都实测：
+                    # 「大熊猫基地」落空，方案里却排着杜甫草堂、武侯祠、望江楼公园）。
+                    _days = slots.get("days") or 1
+                    _pn = {"relaxed": "轻松", "moderate": "适中",
+                           "intensive": "紧凑"}.get(slots.get("pace") or "", "")
+                    _cap = composer.PACE_CAP.get(slots.get("pace") or "moderate", 3)
+                    _musts = [m for m in (slots.get("must_visit") or []) if m]
+                    filler: list[str] = []
+                    for d in result["days_plan"]:
+                        for n in d["nodes"]:
+                            if n.get("type") != "attraction":
+                                continue
+                            nm = n.get("name") or ""
+                            # 系统补的填充项（早市/伴手礼）不是用户的选择，
+                            # 拿它当"换掉它"的建议等于让人拿自己的行程换自己
+                            if nm.startswith("早市") or nm.startswith("自由活动"):
+                                continue
+                            if any(composer.name_hit(m, nm) for m in _musts):
+                                continue
+                            if any(composer.name_hit(e, nm) for e in exists):
+                                continue
+                            if nm not in filler:
+                                filler.append(nm)
+                    _why = ("当天往返的时间装不下" if _days == 1
+                            else f"{_pn}节奏每天最多 {_cap} 个景点，名额被先排上的点占了")
+                    _msg = ("你点名的「" + "、".join(exists) + "」这版没排进去——"
+                            + _why
+                            + ("，这几天排的是" + "、".join(filler) if filler else "")
+                            + "。")
+                    if filler:
+                        _msg += (f"想优先它，说一句「把{filler[-1]}换成{exists[0]}」我就换；"
+                                 "或者说「加一天」我重排")
+                    else:
+                        _msg += "加一天，或去掉一个已排的点，我就把它排进去"
+                    assumptions.append(_msg)
                 rest = [p for p in missed if p not in exists]
                 if rest:
                     assumptions.append(

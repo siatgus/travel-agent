@@ -138,6 +138,11 @@ def interest_match(interest: str, poi: dict) -> tuple[str, str] | None:
     for w in INTEREST_BROAD.get(i, ()):
         if w and w in hay:
             return ("weak", w)
+    # 兴趣词本身就是个具体景点时的第三档：两边互不为子串也说得出是同一处。
+    # 「大熊猫基地」 vs 库里的「成都大熊猫繁育研究基地」——子串判断全落空，
+    # 于是这条兴趣被当成"当地没有对应景点"，熊猫基地一个都没排（用户实测）。
+    if level == "strong" and name_hit(i, poi.get("name") or ""):
+        return ("strong", i)
     return None
 
 
@@ -335,7 +340,8 @@ def _kid_tip(name: str) -> str:
 
 
 def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
-                    with_kid: bool, label: str | None = None) -> int:
+                    with_kid: bool, label: str | None = None,
+                    deadline: int | None = None) -> int:
     """带幼儿或用户点名午休：午饭后写死 90 分钟午休，返回新 clock。
 
     "带幼儿"不能只是概要里的一个标签——幼儿下午没有这一觉，晚饭前必崩。
@@ -343,18 +349,34 @@ def _insert_kid_nap(nodes: list[dict], clock: int, day_idx: int, days: int,
     不提幼儿。截止 16:00：午餐晚收尾（景点拖堂）也照插，只有 16 点后
     才不再后移——再晚 90 分钟睡醒就撞晚饭，硬偏好不能变成摆设
     （亲子实测：Day3 午餐结束过 15 点，午休被自由活动顶替）。
-    抵达/返程日行程本来就轻，不插。
+
+    这一天必插，不存在"没排就是没排"：午饭吃得晚就缩到 45 分钟，
+    返程日赶车就在车上/候车时补并写明——成都 4 天实测 Day2 午餐卡在
+    景点之间（先吃饭再逛那条分支），午休整段消失，只有 Day3 有。
     """
-    if not with_kid or day_idx in (0, days - 1) or clock >= 16 * 60:
+    if not with_kid or (day_idx == 0 and days > 1):
+        return clock                # 多日行程的抵达日到店已是傍晚，晚餐后就寝
+    dur = 45 if clock >= 16 * 60 else 90
+    room = None if deadline is None else deadline - clock
+    if room is not None and room < dur + 30:
+        dur = 45 if room >= 45 else 0
+    if dur <= 0:
+        if nodes:
+            prev = nodes[-1]
+            prev["tip"] = ((prev.get("tip") or "").rstrip("；")
+                           + "；今天要赶返程班次，午休改在车上/候车时补")
         return clock
     nodes.append(_node(fmt(clock), label or "午休（带幼儿，回酒店小睡）", "rest",
-                       90, "—",
+                       dur, "—",
                        "幼儿作息排进时间轴：午饭后睡 90 分钟再出发，"
                        "下午的安排已整体顺延；离酒店远就改车里睡/找母婴室歇脚"
                        if label is None else
                        "按你的要求排进时间轴：午饭后歇 90 分钟再出发，"
-                       "下午的安排已整体顺延"))
-    return clock + 90
+                       "下午的安排已整体顺延"
+                       if dur == 90 else
+                       "孩子这觉不能省：午饭吃得晚，缩到 45 分钟，"
+                       "后面的安排跟着顺延"))
+    return clock + dur
 
 
 # ------------------------------------------------------------------ 分钟级锚点改排
@@ -516,9 +538,14 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     # 「位置待确认」独占一整天——实测成都 5 天里都江堰、大熊猫基地各吃掉一天，
     # 真正的市区景点反而没位置。
     _must_terms = [m for m in (slots.get("must_visit") or []) if m]
+    # 兴趣词直接点名某个景点（表单「喜欢大熊猫基地」）也算"点名"：兜底的估算点
+    # 该进池，否则这条兴趣只能靠别的点沾边，用户看到的还是热门拼盘。
+    _spot_terms = [w for w in (slots.get("soft_prefs") or [])
+                   if len(str(w)) >= 2 and w not in GENERIC_INTERESTS]
+    _named = _must_terms + _spot_terms
     attractions = [p for p in attractions
                    if not _geo_uncertain(p)
-                   or any(name_hit(m, p["name"]) for m in _must_terms)]
+                   or any(name_hit(m, p["name"]) for m in _named)]
     foods = [p for p in all_pois if p["category"] == "restaurant"]
     # 「不吃辣」这类硬口径：有就驱动餐厅筛选与点单提示，不许只躺在槽位里
     _restrict = " ".join((slots.get("diet") or []) + (slots.get("hard_prefs") or [])
@@ -652,6 +679,11 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                     clock += 60      # 兜底餐也要吃时间：否则下一站从 12:27+23min=12:50 排，与餐位重叠
                 lunch_done = True
+                # 这条分支（先吃饭再逛）原来漏了午休：吃完直接去下一站，
+                # 于是"带幼儿"的行程里有些天有午休、有些天没有（成都 4 天实测，
+                # Day2 午餐 11:49 吃完立马上武侯祠，全天没有午休节点）。
+                clock = _insert_kid_nap(nodes, clock, i, days, want_nap,
+                                        _nap_label, deadline=ret_deadline)
                 # 吃完再算一次到景点的路程（估算坐标不算）
                 if uncertain or prev_uncertain:
                     tmin = 0
@@ -735,7 +767,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     clock += 60      # 同上：兜底餐占 60 分钟，时间轴照常往后推
                 lunch_done = True
                 clock = _insert_kid_nap(nodes, clock, i, days, want_nap,
-                                        _nap_label)
+                                        _nap_label, deadline=ret_deadline)
 
         # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
         # 库里没有餐厅也得留出这段时间——"每天有明确用餐点"不是有数据才成立的承诺。
@@ -755,7 +787,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                 clock += 60
             lunch_done = True
-            clock = _insert_kid_nap(nodes, clock, i, days, with_kid)
+            clock = _insert_kid_nap(nodes, clock, i, days, with_kid,
+                                    deadline=ret_deadline)
 
         # 返程日：下午/傍晚才发车的话，中午也得坐下来吃一顿再走。
         # 原来只在非返程日补餐，16 点的班次配着"早市 + 一个景点"就是饿着肚子赶车，
@@ -788,6 +821,9 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     else:
                         nodes.append(_meal_fallback(clock, "午餐", spicy_free))
                         clock += 60
+                    # 返程日也照排午休：装得下就睡，装不下就 45 分钟或写明在车上补
+                    clock = _insert_kid_nap(nodes, clock, i, days, want_nap,
+                                            _nap_label, deadline=ret_deadline)
                 else:
                     nodes.append(_node(
                         fmt(clock), "打包简餐，提前出发去车站", "transit",
@@ -831,9 +867,10 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 nodes.append(fb)
                 clock = max(clock, 18 * 60) + 60   # 与午餐兜底一致：兜底餐也占时间
 
-        # 一日往返：时间表不能停在下午三点。写清"剩下怎么过、几点往车站走"，
+        # 发车当天：时间表不能停在午休/午餐。写清"剩下怎么过、几点往车站走"，
         # 否则用户只看到「西湖→午饭」就结束，不知道几点该动身、会不会误车。
-        if days == 1:
+        # 返程日原来没有这段：午休 14:27 结束就没了，18:00 的车靠自己掐点。
+        if ret_deadline is not None and i == days - 1:
             if ret_deadline - clock >= 45:
                 nodes.append(_node(fmt(clock), "自由活动 / 就近休息", "rest",
                                    ret_deadline - clock, "—",
@@ -910,6 +947,14 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
         pool.append(p)
     if blocked and log is not None:
         log.setdefault("vetoed", []).extend(blocked)
+    # 同名兜底副本不进池：权威记录（有确切坐标）已经在池里时，位置估算那条
+    # 会被"位置待确认独占一天"的开场逻辑抓走，结果同一个景点玩两遍——
+    # 成都实测：Day2「大熊猫基地（估算）」独占一天，Day3 又排「成都大熊猫繁育研究基地」。
+    _reliable = [p for p in pool if not _geo_uncertain(p)]
+    if _reliable:
+        pool = [p for p in pool
+                if not (_geo_uncertain(p)
+                        and any(name_hit(p["name"], r["name"]) for r in _reliable))]
     if not pool:
         return []
 
@@ -968,7 +1013,11 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
             score_by_id = {p["poi_id"]: s for s, p, _ in scored}
             cand = strong or weak or [scored[0][1] if scored else None]
             cand = [p for p in cand if p]
-            picked = [max(cand, key=lambda p: score_by_id.get(p.get("poi_id"), 0))] if cand else []
+            # 同一个点名可能命中"权威记录 + 位置估算兜底"两条：先取有确切坐标的，
+            # 否则估算点独占一天、真景点仍然没排进行程（成都大熊猫实测）
+            picked = ([max(cand, key=lambda p: (not _geo_uncertain(p),
+                                                score_by_id.get(p.get("poi_id"), 0)))]
+                      if cand else [])
 
     # 位置估算的点单独占一天：交通时间未知，硬跟市区景点凑团只会排出假动线。
     # 它不是"顺路多逛一个"，而是一整段需要用户确认的行程。

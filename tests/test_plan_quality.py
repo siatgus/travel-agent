@@ -229,6 +229,56 @@ def test_interest_matcher() -> None:
           not composer.interest_hit("喝茶", CHENGDU[4], strong_only=True))
 
 
+def test_spot_interest_gets_placed() -> None:
+    """兴趣栏里写的是景点名（「大熊猫基地」）时，它必须真的排进行程。
+
+    2026-11-11 实测：表单兴趣栏填「大熊猫基地」，方案却排了杜甫草堂、武侯祠、
+    川大博物馆、望江楼公园、锦里，然后说这条兴趣"天数/节奏装不下"。
+    根因是子串匹配：「大熊猫基地」与库里的「成都大熊猫繁育研究基地」互为
+    非子串，interest_match 直接 None，这条兴趣从头到尾没有参与选点。
+    """
+    panda = CHENGDU[0]
+    check("兴趣词点名景点也认得出（大熊猫基地 ↔ 成都大熊猫繁育研究基地）",
+          composer.interest_match("大熊猫基地", panda) == ("strong", "大熊猫基地"),
+          str(composer.interest_match("大熊猫基地", panda)))
+
+    slots = dict(SLOTS, must_visit=[], soft_prefs=["大熊猫基地"], days=4,
+                 party_size=3, adults=2, children=1, child_age=3,
+                 party_detail="2 大 1 小（孩子 3 岁）",
+                 hard_prefs=["不吃辣", "带幼儿"], diet=["不吃辣"])
+    plan, _ = composer.compose(slots, {"items": CHENGDU}, WEATHER,
+                               "18:00", "18:00", [30.66, 104.06])
+    names = [(d["day"], n["name"], [i["word"] for i in (n.get("interests") or [])])
+             for d in plan for n in d["nodes"] if n["type"] == "attraction"]
+    check("点名兴趣的景点排进了行程",
+          any("大熊猫" in nm for _, nm, _ in names), str(names))
+    check("排的是有坐标的权威记录（不是同名估算副本）",
+          [nm for _, nm, _ in names if "大熊猫" in nm] == ["成都大熊猫繁育研究基地"],
+          str(names))
+    check("这一站带兴趣标记",
+          any("大熊猫基地" in words for _, nm, words in names if "大熊猫" in nm),
+          str(names))
+
+    # 亲子午休：抵达日除外，每天都要有——两条午餐路径都得插（成都实测
+    # Day2 走「先吃饭再逛」，午休整段消失，只有 Day3 有）
+    nap_days = [d["day"] for d in plan
+                if any(n["name"].startswith("午休") for n in d["nodes"])]
+    check("多日亲子行程除抵达日外天天有午休",
+          nap_days == list(range(2, len(plan) + 1)), str(nap_days))
+    item = next(c for c in agent.self_check(_fake_result(days_plan=plan, slots=slots))
+                if "带幼儿每天有午休" in c["item"])
+    check("质检：带幼儿每天有午休 → pass", item["result"] == "pass", str(item))
+
+    # 反向：抽掉午休必须被质检抓到，不能让"承诺"只是文案
+    broken = copy.deepcopy(plan)
+    for d in broken:
+        d["nodes"] = [n for n in d["nodes"] if not n["name"].startswith("午休")]
+    item2 = next(c for c in agent.self_check(_fake_result(days_plan=broken, slots=slots))
+                 if "带幼儿每天有午休" in c["item"])
+    check("质检：缺午休判 fail 且点名到具体天",
+          item2["result"] == "fail" and "Day2" in item2["evidence"], str(item2))
+
+
 def test_generic_and_duplicate_interests_cleaned() -> None:
     """泛词兴趣与"必去点同名兴趣"都要清掉。
 
@@ -825,9 +875,14 @@ def test_kid_party_and_schedule() -> None:
     naps = [n for d in plan for n in d["nodes"] if "午休" in n["name"]]
     check("中间日有 90 分钟午休节点",
           bool(naps) and all(n["duration_min"] == 90 for n in naps))
-    check("午休不在抵达/返程日",
-          all(d["day"] not in (1, len(plan)) for d in plan
+    # 抵达日到店已是傍晚，晚餐后就寝；返程日照排（装不下才缩短/写明车上补）
+    check("抵达日不排午休",
+          all(d["day"] != 1 for d in plan
               for n in d["nodes"] if "午休" in n["name"]))
+    check("返程日也落实午休（或写明在车上补）",
+          any("午休" in n["name"] for n in plan[-1]["nodes"])
+          or any("午休" in (n.get("tip") or "") for n in plan[-1]["nodes"]),
+          str([n["name"] for n in plan[-1]["nodes"]]))
     check("景点备注带推车/台阶提示",
           any("带娃提示" in (n.get("tip") or "")
               for d in plan for n in d["nodes"] if n["type"] == "attraction"))
@@ -896,7 +951,26 @@ def test_kid_party_and_schedule() -> None:
           len(nodes_late) == 1 and c == 15 * 60 + 20 + 90, str(c))
     nodes_too_late = []
     c2 = composer._insert_kid_nap(nodes_too_late, 16 * 60 + 10, 1, 4, True)
-    check("16 点后不再后移午休", not nodes_too_late and c2 == 16 * 60 + 10)
+    check("16 点后午休缩到 45 分钟但不再消失",
+          len(nodes_too_late) == 1 and nodes_too_late[0]["duration_min"] == 45
+          and c2 == 16 * 60 + 10 + 45, str(nodes_too_late))
+    # 「先吃饭再逛」这条分支原来漏了午休：成都 4 天实测 Day2 午餐 11:49 吃完
+    # 立马上武侯祠，整天没有午休节点，只有 Day3 有。两条午餐路径必须同口径。
+    two = [
+        _poi("t1", "甲景点", [30.66, 104.06], dur=120, hours="全天"),
+        _poi("t2", "乙景点", [30.665, 104.065], dur=120, hours="全天"),
+        _poi("ff", "测试餐厅", [30.66, 104.06], cat="restaurant", dur=60, cost=50,
+             hours="11:00-21:00", tags=["food"]),
+    ]
+    kid3 = dict(kid_slots, days=3, must_visit=[], soft_prefs=[])
+    plan_pre, _ = composer.compose(kid3, {"items": two}, WEATHER,
+                                   "09:00", "18:00", [30.66, 104.06])
+    d2 = plan_pre[1]["nodes"]
+    kinds = [n["name"] for n in d2]
+    lunch_ix = next((i for i, n in enumerate(d2) if n["type"] == "restaurant"), None)
+    check("先吃饭再逛的当天也排午休",
+          lunch_ix is not None and lunch_ix + 1 < len(d2)
+          and d2[lunch_ix + 1]["name"].startswith("午休"), str(kinds))
     # 端到端：上午拖堂 → 午餐 15:31 结束（旧截止 15:00 会砍）仍插午休
     items_late = [dict(p) for p in CHENGDU]
     for p in items_late:
@@ -1367,7 +1441,8 @@ def test_accessibility_pref_lands() -> None:
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
-               test_interest_matcher, test_generic_and_duplicate_interests_cleaned,
+               test_interest_matcher, test_spot_interest_gets_placed,
+               test_generic_and_duplicate_interests_cleaned,
                test_return_leg_direction,
                test_weather_window_is_per_day,
                test_forecast_window_self_heal, test_transport_card_no_zero_fare,

@@ -505,6 +505,61 @@ def test_day_trip_must_explain_what_does_not_fit() -> None:
         check("三个都排进去了（不必提示装不下）", True)
 
 
+def test_spot_interest_placed_and_nap_daily() -> None:
+    """表单口径：兴趣栏写景点名 + 带 3 岁娃，两件事都要落地。
+
+    2026-11-11 实测（成都 4 天、上海出发、2 大 1 小、轻松、不吃辣）：
+    ① 兴趣栏填「大熊猫基地」，方案却排了杜甫草堂/武侯祠/川大博物馆/望江楼公园/
+       锦里，然后说这条兴趣"天数/节奏装不下"；
+    ② 午休只有 Day3 有，Day2 午餐后直接去武侯祠，只在自由活动里写"累了就早回"。
+    """
+    s = session()
+    # 兴趣词只能由模型抽出（规则层没有开放词表），这里直接把表单结果灌进槽位
+    s.slots = {"origin": "上海", "destination": "成都", "days": 4, "party_size": 3,
+               "adults": 2, "children": 1, "child_age": 3,
+               "party_detail": "2 大 1 小（孩子 3 岁）",
+               "date_range": {"start": "2026-11-20"}, "budget_total": 6000,
+               "pace": "relaxed", "soft_prefs": ["大熊猫基地"], "must_visit": [],
+               "hard_prefs": ["不吃辣", "需无障碍", "带幼儿"], "diet": ["不吃辣"],
+               "stay_pref": "安静，靠近地铁"}
+    r = s.turn("就按这个排吧")
+    plan = s.last_plan or {}
+    days = plan.get("days_plan") or []
+    names = [(d["day"], n.get("name")) for d in days for n in d["nodes"]]
+    panda = [(day, nm) for day, nm in names if "大熊猫" in (nm or "")]
+    check("兴趣点名的熊猫基地排进了行程", bool(panda), str(names))
+    check("同一个景点没有排两遍（权威记录 + 估算副本）", len(panda) == 1, str(panda))
+    check("不再说这条兴趣装不下",
+          not any("大熊猫基地" in a and "没排进去" in a for a in r.assumptions),
+          str([a for a in r.assumptions if "熊猫" in a]))
+
+    nap_days = [d["day"] for d in days
+                if any(n["name"].startswith("午休") for n in d["nodes"])]
+    check("除抵达日外每天都有午休", nap_days == [2, 3, 4], str(nap_days))
+    check("午休写在午餐之后（不是被自由活动顶替）",
+          all(next(i for i, n in enumerate(d["nodes"])
+                   if n["name"].startswith("午休"))
+              > next(i for i, n in enumerate(d["nodes"])
+                     if n["type"] == "restaurant")
+              for d in days if any(n["name"].startswith("午休") for n in d["nodes"])),
+          str([[n["name"] for n in d["nodes"]] for d in days]))
+
+
+def test_interest_missed_explains_swap() -> None:
+    """兴趣真排不进去时，要说清"名额被谁占了"并给一句能直接说的替换。"""
+    s = session()
+    s.slots = {"origin": "上海", "destination": "成都", "days": 1, "party_size": 2,
+               "date_range": {"start": "2026-11-20"}, "budget_total": 6000,
+               "pace": "relaxed", "soft_prefs": ["大熊猫基地"],
+               "must_visit": ["武侯祠", "人民公园", "宽窄巷子"], "hard_prefs": []}
+    r = s.turn("就按这个排吧")
+    joined = " ".join(r.assumptions)
+    check("说清是哪条兴趣没排进去",
+          "大熊猫基地" in joined and "没排进去" in joined, joined[:200])
+    check("给出可直接说的取舍（换点 / 加一天 / 去掉一个）",
+          any(k in joined for k in ("换成", "加一天", "去掉一个")), joined[:200])
+
+
 def test_return_leg_direction_in_plan() -> None:
     """方案里的返程方向必须是 目的地→出发地。
 
@@ -1272,6 +1327,8 @@ def main() -> int:
                test_day_trip_schedules_sights_and_no_hotel,
                test_day_trip_must_explain_what_does_not_fit,
                test_pace_loosen_without_excess_says_switched,
+               test_spot_interest_placed_and_nap_daily,
+               test_interest_missed_explains_swap,
                test_return_leg_direction_in_plan,
                test_pace_word_not_treated_as_interest,
                test_pace_noop_must_overcap_honest,
