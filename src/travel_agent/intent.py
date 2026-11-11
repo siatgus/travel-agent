@@ -603,9 +603,18 @@ def spot_mention(text: str, city: str | None = None) -> str | None:
     cand = (text or "").strip("？?。！!，, 　~")
     if city and city in cand:
         cand = cand.replace(city, "", 1).strip("的了呀啊呢吧去到玩在是，, ")
+    # 括号里的分店/说明是名字的一部分但常拦住库匹配：「圣旨骨酥鱼（滏东店）」
+    # 按核心名查（keyword 子串照样命中库里的全名），长度也按核心名算。
+    # 实测带括号问句超长 + 尾巴剥不净，点名直接落空、被当成泛推荐。
+    cand = re.sub(r"[（(][^（）()]*[)）]", "", cand)
     changed = True
     while changed and cand:
         changed = False
+        # 每轮先剥标点：剥掉「门票多少钱」后尾部会露出「怎么样？」，
+        # 问号不清掉「怎么样」就永远剥不掉（实测广府古城问句残留）。
+        trimmed = cand.strip("？?。！!，, 　~")
+        if trimmed != cand:
+            cand, changed = trimmed, True
         for w in _SPOT_EDGE:
             if len(cand) > len(w):
                 if cand.startswith(w):
@@ -633,7 +642,9 @@ def spot_answer(city: str, spot: str, pois: list[dict], note: str = "",
                 f"可以说说{city}别的地方，或者直接让我排{city}的行程。")
     facts = {"城市": city, "问的景点": spot,
              "结果": [{"名称": p.get("name"), "区域": p.get("area"),
-                       "时长分钟": p.get("duration_min"), "门票元": p.get("cost"),
+                       "时长分钟": p.get("duration_min"),
+                       ("人均元" if p.get("category") == "restaurant" else "门票元"):
+                       p.get("cost"),
                        "开放时间": p.get("open_hours"), "备注": p.get("note")}
                       for p in pois[:3]],
              "补充说明": note}
@@ -649,7 +660,9 @@ def spot_answer(city: str, spot: str, pois: list[dict], note: str = "",
         if p.get("duration_min"):
             extra.append(f"建议留 {p['duration_min']} 分钟")
         if p.get("cost"):
-            extra.append(f"门票 {p['cost']} 元")
+            # 餐厅的 cost 是人均消费口径，说「门票」会让用户愣一下
+            money_word = ("人均" if p.get("category") == "restaurant" else "门票")
+            extra.append(f"{money_word} {p['cost']} 元")
         if p.get("open_hours"):
             extra.append(p["open_hours"])
         tail = f"（{'，'.join(extra)}）" if extra else ""
