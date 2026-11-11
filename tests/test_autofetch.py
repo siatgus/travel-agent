@@ -377,6 +377,31 @@ def test_spot_custom_fallback() -> None:
           f"{p.get('geo')} / {p.get('note')}")
 
 
+def test_bad_spot_name_never_stored() -> None:
+    """脏名字绝不能按"用户点名景点"入库。
+
+    实测事故：「把去程到达时间改为 09:00」误抽出「达时间改为」，autofetch
+    按未收录景点落库（用户点名+位置估算+240 分钟），之后每一份新方案都会
+    命中它——全新成都方案把它排成 Day2 的 09:00 景点，还带预约和门票说明。
+    """
+    before = len(autofetch.kb.get_kb().list_pois(CITY) or [])
+    for name in ("达时间改为", "成都、重庆", "云南", "班次"):
+        r = autofetch.ensure_spot(CITY, name)
+        check(f"脏名字「{name}」被拒绝入库", r["status"] == "rejected", str(r))
+    after = len(autofetch.kb.get_kb().list_pois(CITY) or [])
+    check("被拒绝的名字一条都没写进库", after == before, f"{before} → {after}")
+    # 正常点名不受影响（都江堰曾因"都"字被旧前缀规则误杀）
+    from travel_agent.agent import valid_poi_name
+    check("真实景点名通过校验",
+          all(valid_poi_name(n) for n in
+              ("都江堰", "什刹海", "宽窄巷子", "大熊猫繁育研究基地", "喜洲古镇")),
+          "都江堰/什刹海/宽窄巷子/大熊猫繁育研究基地/喜洲古镇")
+    check("碎片与城市串被校验拦下",
+          not any(valid_poi_name(n) for n in
+                  ("达时间改为", "成都、重庆", "云南", "还是", "几天")),
+          "达时间改为/成都、重庆/云南/还是/几天")
+
+
 def main() -> int:
     test_plausible_city()
     test_existing_city_no_fetch()
@@ -393,6 +418,7 @@ def main() -> int:
     test_spot_fetch_by_name()
     test_spot_llm_preferred()
     test_spot_custom_fallback()
+    test_bad_spot_name_never_stored()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 条自动补全断言通过")
     return 0 if passed == len(RESULTS) else 1

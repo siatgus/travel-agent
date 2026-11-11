@@ -263,12 +263,19 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
       unresolved  城市坐标解析不出来
     """
     from .composer import name_hit
+    from .agent import valid_poi_name
 
     city, name = (city or "").strip(), (name or "").strip()
     base = {"status": "not_found", "city": city, "name": name,
             "poi": None, "source": "", "message": ""}
     if not city or len(name) < 2:
         return {**base, "message": "景点名太短，无法检索"}
+    # 脏名字绝不能入库：误解析碎片（「达时间改为」）、城市串（「成都、重庆」）、
+    # 省份名进来一次就会被反复命中最久——用户实测全新成都方案把
+    # 「达时间改为」排成 Day2 的 240 分钟景点，还带预约与门票说明。
+    if not valid_poi_name(name):
+        return {**base, "status": "rejected",
+                "message": f"「{name}」不像景点名，未入库"}
     db = db or kb.get_kb()
     if db is None:
         return {**base, "status": "no_kb", "message": "知识库不可用"}

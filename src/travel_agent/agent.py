@@ -339,6 +339,42 @@ def looks_like_spot(name: str | None) -> bool:
                        "纪念馆", "寺", "宫", "塔", "岛", "山"))
 
 
+# 景点名里不可能出现的词：时刻/班次改动词。这类碎片来自误解析
+# （「把去程到达时间改为 09:00」曾截出「达时间改为」），一旦入库
+# 会被当成位置估算景点反复排进新行程——用户实测污染了全新的成都方案。
+_BAD_POI_RE = re.compile(r"时间|时刻|改为|改成|改到|班次|车次|航班|高铁|去程|返程|回程")
+
+
+def valid_poi_name(name: str | None) -> bool:
+    """这个名字有没有资格当景点：一句话、没标点、不是城市/省份/虚词。
+
+    规则抽取与 LLM 抽取共用这一道闸，autofetch 落库前也过它——
+    脏名字进来一次，就会在知识库里被反复命中最久（实测「达时间改为」
+    被当成成都景点排进 Day2，还带预约/门票/位置估算说明）。
+    """
+    n = (name or "").strip()
+    if not (2 <= len(n) <= 20):
+        return False
+    if re.search(r"[、，,。；;！!？?\s]", n):        # 景点名没有标点
+        return False
+    if _BAD_POI_RE.search(n):                        # 时刻/班次碎片
+        return False
+    if n in _NON_CITY_WORDS or is_region(n) or is_city(n):
+        return False
+    # 疑问/代词只认整词：「什刹海」是景点，不能因为以"什"开头就被否
+    if re.match(r"^(?:什么|哪儿|哪里|哪个|几个|多少|多久)", n):
+        return False
+    if re.fullmatch(r"[一二两三四五六七八九十\d]+\s*[天人均日个位]", n):
+        return False
+    # 虚词整词否掉；多字虚词才按首尾剥——单字（都/就/也/又）做首尾判断
+    # 会误杀真实景点：「都江堰」曾因此被判成噪音（代码注释里就在用它举例）
+    if n in _STOP_FRAG:
+        return False
+    if any(len(w) >= 2 and (n.startswith(w) or n.endswith(w)) for w in _STOP_FRAG):
+        return False
+    return True
+
+
 def _is_place(name: str | None) -> bool:
     """候选串是不是一个像样的地名。虚词/疑问词必须拦掉：
     「你不问我从哪里出发吗」会被正则抽成出发地「哪里」，编排器随后真的
@@ -419,6 +455,11 @@ def extract_slots(text: str, today: date | None = None,
         # 城市串进下游会被追问"在哪个城市"、还会被挂成位置估算景点（实测）。
         # 多城请求剥成 multi_cities，与规则路径行为一致。
         normalize_multi_dest(slots, text)
+        # 模型给的必去/排除同样要过景点名校验：城市串、时刻碎片、省份名
+        # 一旦留下来，autofetch 会把它当"未收录景点"落库并长期污染
+        for key in ("must_visit", "avoid"):
+            slots[key] = [m for m in (slots.get(key) or [])
+                          if isinstance(m, str) and valid_poi_name(m)]
         return slots
 
     slots = extract_slots_rules(text, today)
@@ -710,21 +751,11 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         # 「想去大理玩」的大理是目的地，不是景点；但「一定要去喜洲古镇」
         # 的喜洲古镇只是恰好被当成了目的地（不在已知城市表），必去标记要保留——
         # 用户接下来补了城市，这个点名还生效。
-        # 顿号/逗号连接的片段是城市串（「成都、重庆」实测被当景点排进
-        # 行程），景点名里不会有标点，直接拒绝。
-        if re.search(r"[、，,]", frag):
-            return False
+        # 具体规则收在 valid_poi_name：标点/时刻班次碎片/城市省份/虚词
+        # 一律不是景点（「成都、重庆」「达时间改为」都在这被拦下）。
         if frag == slots.get("destination") and frag in known_set:
             return False
-        return (len(frag) >= 2 and frag not in known_set
-                and not is_region(frag)      # 「想去云南」的云南是省，不是景点
-                and not re.match(r"^[几哪什多]", frag)
-                # 「增加一天/加上两人」是数量词，不是景点名
-                and not re.fullmatch(r"[一二两三四五六七八九十\d]+\s*[天人均日个位]", frag)
-                # 倒装句里片段前会粘上虚词：「…了，还是加回来吧」会截出「还是」。
-                # 这些词本身永远不是景点名。
-                and not any(frag.startswith(w) or frag.endswith(w)
-                            for w in _STOP_FRAG))
+        return valid_poi_name(frag) and frag not in known_set
 
     # 停止字符集让「想去大理古城逛逛」截成「大理古城」，而不是吞进"逛逛"。
     # (?<![不别用]) 挡住"不想去/别去/不用去"——否则必去与排除会同时命中同一景点。
