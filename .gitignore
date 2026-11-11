@@ -16,3 +16,5 @@ dist/
 # 本地产物
 output/
 .workbuddy/
+scripts/map_probe.png
+scripts/map_crop.png
