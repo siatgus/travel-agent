@@ -376,6 +376,83 @@ def test_pace_noop_trims_overcap() -> None:
           f"{before} -> {after}")
 
 
+def _attractions(plan: dict) -> list[str]:
+    return [n.get("name") for d in plan.get("days_plan") or []
+            for n in d.get("nodes") or [] if n.get("type") == "attraction"]
+
+
+def test_pace_loosen_deletes_instead_of_relocating() -> None:
+    """放松节奏要真删点，不能把装不下的点挪到别的天（2026-11-11 反馈）。
+
+    杭州 3 天、点名西湖和灵隐寺：原 Day 2 排了西湖、灵隐寺、雷峰塔。点「别太赶」
+    后 Day 2 降到两个景点，但雷峰塔被挪到返程日——每天都不超上限了，景点总数
+    和预算却一个没少，等于没删。修法：放松节奏时不再整单重排，就地按新上限删点。
+    """
+    s = session()
+    s.turn("11月20号去杭州玩3天，2人，预算5000")
+    check("前置：初始是适中档",
+          (s.slots.get("pace") or "moderate") == "moderate",
+          str(s.slots.get("pace")))
+    mid = s.last_plan["days_plan"][1]
+    while len([n for n in mid["nodes"] if n.get("type") == "attraction"]) < 3:
+        mid["nodes"].append({"time": "19:00", "name": "可删景点", "type": "attraction",
+                             "duration_min": 60, "cost": 30, "transit": "", "tip": ""})
+    before = _attractions(s.last_plan)
+    ret_before = [n.get("name") for n in s.last_plan["days_plan"][-1]["nodes"]]
+    budget_before = (s.last_plan.get("budget") or {}).get("total")
+
+    r = s.turn("行程别太赶，轻松一点")
+
+    after = _attractions(s.last_plan)
+    check("放松节奏给出新方案", r.mode == "plan", f"mode={r.mode} {r.render[:60]}")
+    check("超额的点被删掉（总数 -1）", len(after) == len(before) - 1,
+          f"{before} -> {after}")
+    check("删掉的点没被挪到别的天", "可删景点" not in after, str(after))
+    check("返程日没有被塞进超额点",
+          [n.get("name") for n in s.last_plan["days_plan"][-1]["nodes"]] == ret_before,
+          str([n.get("name") for n in s.last_plan["days_plan"][-1]["nodes"]]))
+    check("回复写明删了什么", "已按「别太赶」处理" in r.render, r.render[:80])
+    check("摘要把节奏改成轻松",
+          "**节奏**：轻松" in r.render, r.render[:200])
+    budget_after = (s.last_plan.get("budget") or {}).get("total")
+    check("预算跟着门票同步下调",
+          budget_before is None or (budget_after or 0) < budget_before,
+          f"{budget_before} -> {budget_after}")
+
+
+def test_pace_loosen_without_excess_says_switched() -> None:
+    """放松节奏但行程本来就在上限内：明说切了档、没删点、没重排。
+
+    这条防的是另一个方向的谎：用户点了「轻松一点」，系统偷偷重排一遍，
+    行程面目全非却说"只是把节奏放松了"。
+    """
+    s = session()
+    s.turn("11月20号去杭州玩3天，2人，预算5000")
+    # 把每天景点削到 1 个，制造"本来就不超额"的局面
+    for d in s.last_plan["days_plan"]:
+        seen = 0
+        keep = []
+        for n in d["nodes"]:
+            if n.get("type") == "attraction":
+                seen += 1
+                if seen > 1:
+                    continue
+            keep.append(n)
+        d["nodes"] = keep
+    before = [list(d["nodes"]) for d in s.last_plan["days_plan"]]
+
+    r = s.turn("行程别太赶，轻松一点")
+
+    check("没超额时直接回答，不假装重排", r.mode == "answer", f"mode={r.mode}")
+    check("明说已切到轻松", "已把节奏切到「轻松」" in r.render, r.render[:120])
+    check("明说没有删点、没有重排", "没删点、也没重排" in r.render, r.render[:160])
+    check("行程确实一个字没动",
+          [list(d["nodes"]) for d in s.last_plan["days_plan"]] == before)
+    check("方案的节奏已同步为轻松",
+          (s.last_plan.get("slots") or {}).get("pace") == "relaxed",
+          str((s.last_plan.get("slots") or {}).get("pace")))
+
+
 def test_return_leg_direction_in_plan() -> None:
     """方案里的返程方向必须是 目的地→出发地。
 
@@ -1139,6 +1216,8 @@ def main() -> int:
                test_multi_city_request_not_poi,
                test_mixed_transport_time_and_trip,
                test_pace_noop_trims_overcap,
+               test_pace_loosen_deletes_instead_of_relocating,
+               test_pace_loosen_without_excess_says_switched,
                test_return_leg_direction_in_plan,
                test_pace_word_not_treated_as_interest,
                test_pace_noop_must_overcap_honest,

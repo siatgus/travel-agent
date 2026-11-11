@@ -167,6 +167,15 @@ def _restore_intent(text: str) -> bool:
     return bool(_RESTORE_RE.search(text or ""))
 
 
+# 节奏档位：数字越大越紧。用来判断这轮是"放松"还是"收紧"——
+# 放松要就地删点，收紧才该重排（加点）。
+_PACE_RANK = {"relaxed": 0, "moderate": 1, "intensive": 2}
+
+
+def _pace_rank(pace: str | None) -> int:
+    return _PACE_RANK.get(str(pace or ""), 1)
+
+
 def _explicit_fields(text: str, delta: dict) -> set[str]:
     """判断这一轮用户到底"说了什么"，而不是抽取器"默认填了什么"。
 
@@ -857,8 +866,17 @@ class Session:
         # （杭州实测：质检报"3 个景点 > 上限 2"，点别太赶却回"已经最松"）
         if "pace" in explicit and self.plan_made:
             old_pace, new_pace = prev_slots.get("pace"), slots.get("pace")
-            if new_pace == old_pace:
+            # 只放松节奏（这轮没同时改景点/天数/目的地）：就地按新上限删点，不重排。
+            # 重排会把当天装不下的点"挪"到别的天——杭州 3 天实测：点「别太赶」，
+            # Day 2 的雷峰塔被挪到返程日，景点总数与预算一个没少；用户要的是
+            # "少去一个点"，不是"把点藏到别的天"。重排还要白等 50 秒。
+            # 如果同时说了别的（加/去景点、改天数），必须整单重排，不能只删。
+            loosening = (_pace_rank(new_pace) < _pace_rank(old_pace)
+                         and explicit <= {"pace"})
+            if new_pace == old_pace or loosening:
                 self.slots = slots
+                # 概要里的「节奏」跟着改：不重排的话 plan["slots"] 还是旧档
+                self._sync_plan_pace(new_pace)
                 trimmed = self._trim_overcap(new_pace)
                 if trimmed is not None:
                     note, _removed = trimmed
@@ -868,7 +886,7 @@ class Session:
                                  ask_rounds=self.ask_rounds,
                                  slots=dict(self.slots), plan=self.last_plan,
                                  render=text)
-                text = self._pace_noop_answer(new_pace)
+                text = self._pace_noop_answer(new_pace, just_loosened=loosening)
                 self.history.append({"role": "agent", "content": text})
                 return Reply(mode="answer", turn_no=self.turn_no,
                              ask_rounds=self.ask_rounds, slots=dict(self.slots),
@@ -1073,6 +1091,16 @@ class Session:
         return intent.spot_answer(city, spot, items, note=note,
                                   client=self.client)
 
+    def _sync_plan_pace(self, pace: str) -> None:
+        """就地改节奏时，把新档写回已有方案。
+
+        概要的「节奏」、之后每轮的质检与「别太赶」判断都读 plan["slots"]；
+        不写回去，用户点了「轻松一点」，方案抬头还写着「适中」。
+        """
+        ps = (self.last_plan or {}).get("slots")
+        if isinstance(ps, dict) and pace:
+            ps["pace"] = pace
+
     def _overcap_days(self, pace: str) -> list[tuple[int, int, list[dict]]]:
         """按质检口径找超额天：返回 [(天号, 上限, 当天景点节点列表)]。"""
         cap = composer.PACE_CAP.get(pace, 3)
@@ -1084,9 +1112,11 @@ class Session:
         return out
 
     def _trim_overcap(self, pace: str) -> tuple[str, list[str]] | None:
-        """节奏没变但行程超额时，「别太赶」的实际动作：删超额站。
+        """按新节奏就地删超额站（「别太赶」的实际动作，节奏没变或刚放松都走这里）。
 
         只删用户没有点名必去的景点（从当天最后一个往前删，保住锚点）；
+        **删掉就是删掉，不挪到别的天**——把装不下的点塞进返程日，看着每天都不超，
+        实际一个点没少（杭州实测：雷峰塔从 Day 2 挪到返程日）。
         删完同步当日预算、门票明细与总额——不能一边删景点一边留虚高的账。
         超额的全是必去点时返回 None：那是用户的需求装不下，得他本人取舍。
         """
@@ -1131,18 +1161,20 @@ class Session:
         pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
         plan["assumptions"] = (plan.get("assumptions") or []) + [
             f"按「别太赶」删掉超额景点：{'、'.join(removed)}"
-            f"（{pn}节奏每天最多 {cap} 个景点）"]
+            f"（{pn}节奏每天最多 {cap} 个景点，删掉的不再挪到别的天）"]
         note = (f"> 已按「别太赶」处理：删掉超额景点 {'、'.join(removed)}"
-                f"——{pn}节奏每天最多 {cap} 个景点。\n\n")
+                f"——{pn}节奏每天最多 {cap} 个景点，删掉的不再挪到别的天。\n\n")
         return note, removed
 
-    def _pace_noop_answer(self, pace: str) -> str:
-        """节奏没变（通常已是最松档）时的回答。
+    def _pace_noop_answer(self, pace: str, just_loosened: bool = False) -> str:
+        """没有可删的点时的回答。
 
-        两种情况分开说，不能笼统一句"已经最松了"：
+        三种情况分开说，不能笼统一句"已经最松了"：
         - 行程真超额（质检口径）且超额的全是用户点名的必去点——如实摊牌
           "必去点装不下"，给加一天/取消必去的取舍（杭州实测：质检报
           "3 个景点 > 上限 2"，回复却说"没有继续往下压的空间"）。
+        - 这轮刚把节奏放松、但行程本来就在新上限内——说清"切了档、没删点"，
+          别让用户以为我们背着他重排了一遍。
         - 行程本来没超额——说清"没得再松"，并给出真能生效的选项。
         """
         pn = {"relaxed": "轻松", "moderate": "适中", "intensive": "紧凑"}.get(pace, pace)
@@ -1168,7 +1200,8 @@ class Session:
                               for m in must_names)]
             names = "、".join(x.get("name") for x in atts)
             lines.append(
-                f"现在已经是「{pn}」节奏，可 Day {day_no} 还是排了 {len(atts)} 个景点"
+                (f"已切到「{pn}」节奏" if just_loosened else f"现在已经是「{pn}」节奏")
+                + f"，可 Day {day_no} 还是排了 {len(atts)} 个景点"
                 f"（{names}），超过每天 {cap} 个的上限——超出的"
                 + (f"（{'、'.join(must_in)}）是你点名的必去点，我不能替你删。"
                    if must_in else "这轮我没动手，删哪些由你定。"))
@@ -1180,14 +1213,22 @@ class Session:
             lines.append("选一条告诉我，我按你的选择重排；不选我就保留现在这版。")
             return "\n".join(lines)
 
-        head = (f"现在已经是「{pn}」节奏，是最松的一档（每天最多 2 个景点），"
-                f"景点密度没有继续往下压的空间了。" if loosenest else
-                f"这就是「{pn}」节奏下的排法。")
-        lines = [head]
-        if loosenest:
-            lines[0] += "这一轮我没有改行程——改也是同样的结果。"
+        if just_loosened:
+            cap = composer.PACE_CAP.get(pace, 3)
+            k = heavy[1] if heavy else 0
+            head = (f"已把节奏切到「{pn}」（每天最多 {cap} 个景点）。"
+                    f"现在这版每天最多 {k} 个景点，本来就在上限内，"
+                    f"所以这次没删点、也没重排——原来的时间和动线都保留。")
+            lines = [head]
         else:
-            lines[0] += "说「轻松一点」我就把节奏降一档重排。"
+            head = (f"现在已经是「{pn}」节奏，是最松的一档（每天最多 2 个景点），"
+                    f"景点密度没有继续往下压的空间了。" if loosenest else
+                    f"这就是「{pn}」节奏下的排法。")
+            lines = [head]
+            if loosenest:
+                lines[0] += "这一轮我没有改行程——改也是同样的结果。"
+            else:
+                lines[0] += "说「轻松一点」我就把节奏降一档重排。"
 
         moves = []
         if heavy and heavy[1] >= 2:
