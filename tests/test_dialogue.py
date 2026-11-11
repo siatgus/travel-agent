@@ -376,6 +376,25 @@ def test_pace_noop_trims_overcap() -> None:
           f"{before} -> {after}")
 
 
+def test_return_leg_direction_in_plan() -> None:
+    """方案里的返程方向必须是 目的地→出发地。
+
+    2026-11-11 反馈：上海去南京、成都去西安，去程和返程都写成出发方向，
+    用户会照着错的这行去查回程票。这里用内置城市对（上海→大理）跑完整流程，
+    钉住"假设 + 正文交通行"两处文案。
+    """
+    s = session()
+    r = s.turn("11月20号从上海去大理玩3天，2个人")
+    check("前置：出了方案", r.mode == "plan", r.mode)
+    joined = " ".join(r.assumptions)
+    check("假设：去程是 上海→大理", "去程 上海→大理" in joined, joined[:120])
+    check("假设：返程是 大理→上海", "返程 大理→上海" in joined, joined[:120])
+    check("假设：返程没写成出发方向", "返程 上海→大理" not in joined, joined[:120])
+    line = next((l for l in r.render.splitlines() if l.startswith("- 交通")), "")
+    check("正文：往返方向各自正确",
+          "去程 上海→大理" in line and "返程 大理→上海" in line, line)
+
+
 def test_pace_word_not_treated_as_interest() -> None:
     """「轻松休闲一点」不能变成「你的兴趣『休闲』没被满足」。
 
@@ -1120,6 +1139,7 @@ def main() -> int:
                test_multi_city_request_not_poi,
                test_mixed_transport_time_and_trip,
                test_pace_noop_trims_overcap,
+               test_return_leg_direction_in_plan,
                test_pace_word_not_treated_as_interest,
                test_pace_noop_must_overcap_honest,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,

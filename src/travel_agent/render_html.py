@@ -1204,12 +1204,22 @@ def render_checks(result: dict) -> str:
 
 
 def render_transport(result: dict) -> str:
+    # 卡片必须写出方向：去程 origin→dest，返程 dest→origin。
+    # 只写"返程 + 班次号"时，用户拿这张卡去查票很容易查成出发方向
+    # （2026-11-11 实测：上海去南京，返程也写成了上海→南京）。
+    origin = str(result.get("origin") or "")
+    dest = str((result.get("slots") or {}).get("destination") or "")
     parts = []
     for label, res in (("去程", result.get("outbound")), ("返程", result.get("inbound"))):
+        title = label
+        if origin and dest:
+            route = (f"{origin} → {dest}" if label == "去程"
+                     else f"{dest} → {origin}")
+            title = f"{label} {route}"
         if res is None:
             # 没有出发地就不查班次：明说未安排，而不是渲染一张假卡片
             parts.append(
-                f'<div><span style="color:#8A8A82;font-size:12px;">{label}</span><br>'
+                f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
                 f'<span style="font-size:14px;color:#9A9992;">未安排</span>　'
                 f'<span style="font-size:12px;color:#9A9992;">未指定出发地</span></div>')
             continue
@@ -1219,12 +1229,12 @@ def render_transport(result: dict) -> str:
         if not it or not fare:
             # 班次/票价没查到：显示 ¥0 会被当成"免费"，必须明说没查到、没计入
             parts.append(
-                f'<div><span style="color:#8A8A82;font-size:12px;">{label}</span><br>'
+                f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
                 f'<span style="font-size:14px;color:#9A9992;">未查到班次/票价</span><br>'
                 f'<span style="font-size:12px;color:#9A9992;">未计入预算，出发前请自行确认</span></div>')
             continue
         parts.append(
-            f'<div><span style="color:#8A8A82;font-size:12px;">{label}</span><br>'
+            f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
             f'<span style="font-size:14px;">{esc(it.get("code", "—"))}</span>　'
             f'<span style="font-size:13px;color:#5F5E5A;">'
             f'{esc(it.get("depart", ""))} - {esc(it.get("arrive", ""))}　'

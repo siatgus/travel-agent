@@ -164,6 +164,52 @@ def test_interest_is_explainable() -> None:
           str([(n["name"], n.get("interests")) for n in other]))
 
 
+def test_return_leg_direction() -> None:
+    """返程方向必须是 destination→origin。
+
+    2026-11-11 反馈：上海出发去南京、成都出发去西安，方案的假设与预算说明里
+    返程都写成「上海→南京」「成都→西安」——用户照着这行去查回程票会查反。
+    返程方向的正确写法由 leg_route / _no_transport_reason / render 三处共同保证。
+    """
+    r = _fake_result(origin="上海", has_origin=True)
+    r["slots"] = dict(r["slots"], origin="上海", destination="南京")
+    r["outbound"] = {"ok": True, "items": [{"code": "G7001", "depart": "08:00",
+                                            "arrive": "09:30",
+                                            "total_price": 300, "price": 150}]}
+    r["inbound"] = {"ok": True, "items": [{"code": "G7010", "depart": "18:00",
+                                           "arrive": "19:30",
+                                           "total_price": 300, "price": 150}]}
+    line = next((l for l in agent.render(r).splitlines()
+                 if l.startswith("- 交通")), "")
+    check("去程写 origin→dest", "去程 上海→南京" in line, line)
+    check("返程写 dest→origin", "返程 南京→上海" in line, line)
+    check("返程没有被写成出发方向", "返程 上海→南京" not in line, line)
+
+    # 班次查不到时（当前最常见）：假设与预算说明也得按腿给方向
+    miss = _fake_result(origin="上海", has_origin=True)
+    miss["slots"] = dict(miss["slots"], origin="上海", destination="南京")
+    miss["outbound"] = {"ok": False, "items": []}
+    miss["inbound"] = {"ok": False, "items": []}
+    reason = agent._no_transport_reason(miss)
+    check("预算说明：去程方向正确", "去程 上海→南京" in reason, reason)
+    check("预算说明：返程方向正确", "返程 南京→上海" in reason, reason)
+    check("预算说明：返程没写成出发方向", "返程 上海→南京" not in reason, reason)
+    # 只缺一腿时不要连另一条也报成"没查到"
+    half = _fake_result(origin="上海", has_origin=True)
+    half["slots"] = dict(half["slots"], origin="上海", destination="南京")
+    half["outbound"] = dict(r["outbound"])
+    half["inbound"] = {"ok": False, "items": []}
+    reason2 = agent._no_transport_reason(half)
+    check("只缺返程时只报返程", "去程" not in reason2 and "返程 南京→上海" in reason2,
+          reason2)
+
+    # 分组方向函数本身：去程/返程互不串味
+    check("leg_route 去程 = origin→dest",
+          agent.leg_route("去程", "成都", "西安") == "成都→西安")
+    check("leg_route 返程 = dest→origin",
+          agent.leg_route("返程", "成都", "西安") == "西安→成都")
+
+
 def test_interest_matcher() -> None:
     check("「大熊猫」命中大熊猫基地",
           composer.interest_hit("大熊猫", CHENGDU[0]))
@@ -1322,6 +1368,7 @@ def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
                test_interest_matcher, test_generic_and_duplicate_interests_cleaned,
+               test_return_leg_direction,
                test_weather_window_is_per_day,
                test_forecast_window_self_heal, test_transport_card_no_zero_fare,
                test_meal_fallback_is_honest, test_diet_and_tea_land_in_meals,

@@ -1110,10 +1110,13 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             "定了出发地告诉我，我补上班次并更新预算")
     else:
         # 出发地查不到班次（如小城市）：如实标注，而不是静默按 0 元交通算预算
+        # 方向必须按腿算：返程是从目的地回出发地。两腿都写 origin→dest 时，
+        # 用户会照着方案里那行去查「上海→南京」的回程票（实测：上海去南京，
+        # 去程返程都显示「上海-南京」）。
         for leg_name, leg_res in (("去程", outbound), ("返程", inbound)):
-            if not leg_res.get("ok"):
+            if not (leg_res or {}).get("ok"):
                 assumptions.append(
-                    f"{leg_name} {origin}-{dest} 暂无班次数据，"
+                    f"{leg_name} {leg_route(leg_name, origin, dest)} 暂无班次数据，"
                     f"按 18:00 抵/离保守编排，大交通请自行确认")
     hotel_geo = (hotel.get("items") or [{}])[0].get("geo")
     if not hotel_geo:
@@ -1275,6 +1278,17 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             "days_plan": days_plan, "budget": budget, "cut_plans": cut_plans,
             "decision_log": decision_log, "assumptions": assumptions,
             "must_report": must_report}
+
+
+def leg_route(leg_name: str, origin: str, dest: str) -> str:
+    """这一腿的方向：去程 origin→dest，返程 dest→origin。
+
+    只写 origin→dest 的后果是用户按错误方向查票——「上海去南京」的方案里
+    返程也显示「上海→南京」（2026-11-11 实测，班次查不到时尤其明显）。
+    """
+    if (leg_name or "").startswith("返") or leg_name in ("回程", "返"):
+        return f"{dest}→{origin}"
+    return f"{origin}→{dest}"
 
 
 def outbound_label(res: dict | None) -> str:
@@ -1575,7 +1589,23 @@ def _no_transport_reason(result: dict) -> str:
     if not origin:
         return "出发地未指定，没查班次与票价"
     dest = (result.get("slots") or {}).get("destination") or ""
-    return f"{origin}→{dest} 的班次票价没查到"
+
+    def _missing(res) -> bool:
+        """这一腿是不是"没查到可用班次/票价"（空结果与 0 元同罪）。"""
+        items = (res or {}).get("items") or []
+        return not items or not (items[0].get("total_price")
+                                 or items[0].get("price"))
+
+    # 只缺一腿就只报那一腿的方向：两条都说成 origin→dest 会让用户
+    # 拿错误方向去查回程票（2026-11-11 实测：上海→南京，返程也这么写）
+    legs = []
+    if _missing(result.get("outbound")):
+        legs.append(f"去程 {leg_route('去程', origin, dest)}")
+    if _missing(result.get("inbound")):
+        legs.append(f"返程 {leg_route('返程', origin, dest)}")
+    if not legs:
+        return f"往返 {origin}↔{dest} 的班次票价没查到"
+    return "、".join(legs) + " 的班次票价没查到"
 
 
 def summary_lines(result: dict) -> list[str]:
@@ -1700,14 +1730,20 @@ def render(result: dict) -> str:
     _cal = _wx_caliber(result.get("weather") or {})
     if _cal:
         out.append(f"> {_cal}")
+    # 两腿的方向写在班次前面：返程是 destination→origin，不是反过来。
+    # 只写班次号时用户得自己猜这班车往哪儿开，很容易照去程方向查回程票。
+    _org = result.get("origin") or s.get("origin") or ""
+    _dst = s.get("destination") or ""
+    _out_route = (leg_route("去程", _org, _dst) + " ") if (_org and _dst) else ""
+    _inb_route = (leg_route("返程", _org, _dst) + " ") if (_org and _dst) else ""
     out += [
         "### 出行概要",
         *summary_lines(result),
         "",
         "### 行前准备",
         f"- 天气：{_wx_line((result['weather'].get('days') or [{}])[0])}",
-        (f"- 交通：去程 {outbound_label(result['outbound'])}；"
-         f"返程 {outbound_label(result['inbound'])}"
+        (f"- 交通：去程 {_out_route}{outbound_label(result['outbound'])}；"
+         f"返程 {_inb_route}{outbound_label(result['inbound'])}"
          if result.get("outbound") is not None
          else "- 交通：未指定出发地，往返大交通未安排（预算未含）；定了出发地我补上班次"),
         f"- 需提前预约：{'、'.join(n['name'] for d in result['days_plan'] for n in d['nodes'] if n['booking_required']) or '无'}",
