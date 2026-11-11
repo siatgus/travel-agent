@@ -89,6 +89,12 @@ INTEREST_BROAD: dict[str, tuple[str, ...]] = {
     "古镇": ("古村",),
 }
 
+# 只说明"是哪类地方"、不说明"想看什么"的兴趣词。
+# 它们一旦按强命中处理，命中的是所有名字沾边的点，连备注里写着"在人民公园内"
+# 的餐馆都会被标成「兴趣·公园」——用户实测把鹤鸣茶社标成了公园安排。
+# 这类词最多算"近似匹配"，且餐位（只认强命中）不再凑热闹。
+GENERIC_INTERESTS = {"公园", "园林", "广场"}
+
 
 def _poi_hay(poi: dict) -> str:
     """名字/区域/备注/标签拼成的检索串。"""
@@ -118,11 +124,14 @@ def interest_match(interest: str, poi: dict) -> tuple[str, str] | None:
     if len(i) < 2:
         return None
     hay = _poi_hay(poi)
+    # 泛词兴趣（公园/园林/广场）最高只到 weak：命中只能说明"这是个公园"，
+    # 不足以说"这站就是为你的公园兴趣安排的"（鹤鸣茶社被标「兴趣·公园」的由来）
+    level = "weak" if i in GENERIC_INTERESTS else "strong"
     if i in hay:
-        return ("strong", i)
+        return (level, i)
     for w in INTEREST_SYNONYMS.get(i, ()):
         if w and w in hay:
-            return ("strong", w)
+            return (level, w)
     for w in INTEREST_BROAD.get(i, ()):
         if w and w in hay:
             return ("weak", w)

@@ -424,6 +424,35 @@ def strip_pace_prefs(slots: dict) -> dict:
     return slots
 
 
+def strip_spot_interests(slots: dict) -> dict:
+    """兴趣里混进"某个具体景点"要清掉——那是行程，不是偏好。
+
+    两个真实反馈：
+    1. 点名「都江堰」后，模型又把它抽进 soft_prefs，于是排进行程的那一站
+       额外挂一条「兴趣·都江堰」——必去点看起来被重复命中，纯噪音。
+    2. 点名「人民公园」后，兴趣里出现泛词「公园」，它会把望江楼公园、
+       甚至备注写着"人民公园内"的鹤鸣茶社一起标成「兴趣·公园」，让用户
+       以为餐馆是按公园兴趣安排的。
+
+    判定只有一条：兴趣词与某个点名/排除的景点指同一个地方（name_hit 双向，
+    含核心词档）——那就不是兴趣。泛词「公园」命中「人民公园」也走这条，
+    因为它本来就是景点名被截断的产物。
+    """
+    spots = [s for s in (slots.get("must_visit") or []) + (slots.get("avoid") or [])
+             if isinstance(s, str) and s]
+    prefs = slots.get("soft_prefs") or []
+    keep = [p for p in prefs
+            if isinstance(p, str) and not any(name_hit(p, s) for s in spots)]
+    if len(keep) != len(prefs):
+        slots["soft_prefs"] = keep
+    return slots
+
+
+def sanitize_prefs(slots: dict) -> dict:
+    """soft_prefs 的统一出口：先摘节奏词，再摘"其实是景点"的词。"""
+    return strip_spot_interests(strip_pace_prefs(slots))
+
+
 def extract_slots(text: str, today: date | None = None,
                   client: "llm_layer.Client | None" = None,
                   records: list | None = None) -> dict:
@@ -436,7 +465,7 @@ def extract_slots(text: str, today: date | None = None,
     if client is None:
         slots = extract_slots_rules(text, today)
         slots["_source"] = "rules"
-        return strip_pace_prefs(slots)
+        return sanitize_prefs(slots)
 
     slots, rec = llm_layer.extract_slots_llm(client, text, today)
     if records is not None:
@@ -475,12 +504,12 @@ def extract_slots(text: str, today: date | None = None,
         for key in ("must_visit", "avoid"):
             slots[key] = [m for m in (slots.get(key) or [])
                           if isinstance(m, str) and valid_poi_name(m)]
-        return strip_pace_prefs(slots)
+        return sanitize_prefs(slots)
 
     slots = extract_slots_rules(text, today)
     slots["_source"] = "rules"
     slots["_degraded"] = rec.degraded
-    return strip_pace_prefs(slots)
+    return sanitize_prefs(slots)
 
 
 def extract_slots_rules(text: str, today: date | None = None) -> dict:

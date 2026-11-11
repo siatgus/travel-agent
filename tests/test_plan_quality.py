@@ -183,6 +183,50 @@ def test_interest_matcher() -> None:
           not composer.interest_hit("喝茶", CHENGDU[4], strong_only=True))
 
 
+def test_generic_and_duplicate_interests_cleaned() -> None:
+    """泛词兴趣与"必去点同名兴趣"都要清掉。
+
+    2026-11-11 反馈：点名「人民公园」后兴趣被降成泛词「公园」，除人民公园和
+    望江楼公园外，鹤鸣茶社（餐馆，备注写着人民公园内）也被标「兴趣·公园」，
+    像是按公园兴趣安排的餐馆；点名「都江堰」排进行程后又多一条「兴趣·都江堰」，
+    同一个点被重复命中。
+    """
+    # 1) 槽位层：与点名景点指同一处的兴趣、被点名景点截断出的泛词，都该消失
+    slots = {"soft_prefs": ["公园", "都江堰", "大熊猫", "喝茶"],
+             "must_visit": ["人民公园", "都江堰"]}
+    left = agent.sanitize_prefs(dict(slots))["soft_prefs"]
+    check("必去点不当兴趣（都江堰）", "都江堰" not in left, str(left))
+    check("点名景点的泛词截断被清掉（公园）", "公园" not in left, str(left))
+    check("真兴趣照常保留（大熊猫 / 喝茶）",
+          "大熊猫" in left and "喝茶" in left, str(left))
+
+    # 2) 匹配层：泛词就算留在兴趣里，也只能是近似命中，餐馆不凑热闹
+    teahouse = {"name": "鹤鸣茶社", "category": "restaurant",
+                "note": "人民公园内，盖碗茶", "tags": ["茶馆"]}
+    m = composer.interest_match("公园", teahouse)
+    check("泛词兴趣对餐馆最多算近似", bool(m) and m[0] == "weak", str(m))
+    check("餐馆不会被标成公园兴趣",
+          not composer.interest_hit("公园", teahouse, strong_only=True))
+    check("餐位兴趣只认强命中",
+          not composer._meal_interests(teahouse, {"soft_prefs": ["公园"]}))
+
+    # 3) 端到端：点名人民公园 + 都江堰，行程里不出现这两条错误/重复标记
+    s = copy.deepcopy(SLOTS)
+    s["must_visit"] = ["人民公园", "都江堰"]
+    s["soft_prefs"] = ["公园", "都江堰", "喝茶", "大熊猫"]
+    s = agent.sanitize_prefs(s)
+    plan, _ = composer.compose(s, {"items": CHENGDU}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    words = [(n["name"], i["word"]) for d in plan for n in d["nodes"]
+             for i in (n.get("interests") or [])]
+    check("行程里没有「兴趣·都江堰」重复标签",
+          all(w != "都江堰" for _, w in words), str(words))
+    check("行程里没有「兴趣·公园」",
+          all(w != "公园" for _, w in words), str(words))
+    check("真兴趣标记还在（喝茶）",
+          any(w == "喝茶" for _, w in words), str(words))
+
+
 def test_weather_window_is_per_day() -> None:
     """预报窗口必须逐日判断，不能因为最后一天越界就把前几天也说成历史同期。
 
@@ -1277,7 +1321,8 @@ def test_accessibility_pref_lands() -> None:
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
-               test_interest_matcher, test_weather_window_is_per_day,
+               test_interest_matcher, test_generic_and_duplicate_interests_cleaned,
+               test_weather_window_is_per_day,
                test_forecast_window_self_heal, test_transport_card_no_zero_fare,
                test_meal_fallback_is_honest, test_diet_and_tea_land_in_meals,
                test_spot_day_phrase_is_not_trip_days,

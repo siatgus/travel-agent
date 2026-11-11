@@ -678,7 +678,7 @@ class Session:
         # 节奏词不能当兴趣流通：抽取侧（llm.coerce_slots / agent.extract_slots）
         # 已经拦了一道，这里再清一次是为了历史槽位与跨轮继承——否则上一轮留下的
         # 「休闲」会让之后每份方案都带一句"兴趣没被满足"的假警报。
-        agent.strip_pace_prefs(self.slots)
+        agent.sanitize_prefs(self.slots)
 
         # 用户选定了单个城市 → 多城待选清单完成使命（「成都、重庆」→「成都」）
         if self.slots.get("destination") and "destination" in explicit:
