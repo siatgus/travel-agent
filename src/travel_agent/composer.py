@@ -559,7 +559,16 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     days = slots["days"]
     cap = PACE_CAP[slots["pace"]]
     start = date.fromisoformat(slots["date_range"]["start"])
-    home = hotel_geo or [25.693, 100.165]
+    # home 兜底三级：酒店坐标 > 候选景点几何中心 > 大理默认（历史遗留）。
+    # 绝不能直接跳到大理：境外城市（京都）城心查不到时，所有本市候选都吃
+    # 2000km 距离惩罚 + 15km 半径否决，行程一个景点都不剩（实测）。
+    _geos = [p["geo"] for p in attractions
+             if p.get("geo") and len(p["geo"]) == 2 and not _geo_uncertain(p)]
+    if _geos:
+        _center = [round(sum(g[i] for g in _geos) / len(_geos), 4) for i in (0, 1)]
+    else:
+        _center = None
+    home = hotel_geo or _center or [25.693, 100.165]
     log: dict = {"candidates": [], "days": [], "violations": []}
 
     remaining = [p for p in attractions if p.get("geo")]

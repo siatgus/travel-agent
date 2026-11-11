@@ -183,6 +183,21 @@ def _latin_only(name: str) -> bool:
     return bool(name) and all(ord(ch) < 128 for ch in name)
 
 
+def _kb_city_center(city: str) -> list[float] | None:
+    """KB 已收录 POI 的坐标均值（≥1 个即返回）。境外城市（京都等）不在
+    国内城市表里，但 autofetch 抓到的景点坐标就是本市位置，均值即城心。"""
+    try:
+        db = _kb.get_kb()
+        pois = db.list_pois(city) if db else None
+    except Exception:
+        return None
+    geos = [p.get("geo") for p in (pois or [])
+            if p.get("geo") and len(p["geo"]) == 2]
+    if not geos:
+        return None
+    return [round(sum(g[i] for g in geos) / len(geos), 4) for i in (0, 1)]
+
+
 def resolve_geo(city: str) -> list[float] | None:
     """城市 → [纬度, 经度]。本地表（351 城）+ 拉丁输入的地理编码兜底。
 
@@ -201,6 +216,14 @@ def resolve_geo(city: str) -> list[float] | None:
         if name in CITY_GEO:
             _GEO_CACHE[city] = CITY_GEO[name]
             return CITY_GEO[name]
+    # 本地表没有（境外城市、新收录）：用 KB 里该城市已收录 POI 的坐标均值
+    # 当城心。这不是"拿别的城市顶替"——坐标就来自本市景点，均值≈城区中心。
+    # 实测「去京都」：京都 12 个景点全在库、却因城心查不到全部被距离闸否决，
+    # 编排器退回大理默认坐标，行程里一个景点都没有还毫无提示。
+    geo = _kb_city_center(city)
+    if geo:
+        _GEO_CACHE[city] = geo
+        return geo
     if not _latin_only(city):
         _GEO_CACHE[city] = None
         return None

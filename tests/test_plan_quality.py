@@ -1438,6 +1438,73 @@ def test_accessibility_pref_lands() -> None:
     check("同时识别为带幼儿", "带幼儿" in s["hard_prefs"], str(s["hard_prefs"]))
 
 
+def test_foreign_city_center_from_kb() -> None:
+    """境外城市（京都）不在国内城市表：城心用 KB 已收录 POI 均值兜底。
+
+    实测「去京都」：KB 有 12 个景点、城心 resolve_geo 却返回 None，
+    编排器退回大理默认坐标 → 全部候选吃 2000km 距离惩罚 + 15km 半径
+    否决，行程一个景点不剩，假设里还只字未提。
+    """
+    from travel_agent import real_tools
+    saved = dict(real_tools._GEO_CACHE)
+    real_tools._GEO_CACHE.clear()
+    try:
+        real_tools._GEO_CACHE["境测试城"] = None  # 预占，防外部查询
+        real_tools._GEO_CACHE.pop("境测试城")
+        # 打桩 KB：返回该城两个 POI
+        class _FakeKB:
+            def list_pois(self, city):
+                if city == "境测试城":
+                    return [{"name": "甲", "geo": [35.0, 135.7]},
+                            {"name": "乙", "geo": [35.02, 135.8]}]
+                return []
+        class _FakeMod:
+            def get_kb(self):
+                return _FakeKB()
+        real_geo = real_tools._kb
+        real_tools._kb = _FakeMod()
+        try:
+            geo = real_tools.resolve_geo("境测试城")
+        finally:
+            real_tools._kb = real_geo
+            real_tools._GEO_CACHE.pop("境测试城", None)
+        check("KB POI 均值兜底境外城心",
+              geo == [35.01, 135.75], str(geo))
+    finally:
+        real_tools._GEO_CACHE.clear()
+        real_tools._GEO_CACHE.update(saved)
+
+    # compose 在 hotel_geo 缺失时用候选几何中心，绝不能退回大理默认坐标
+    kyoto = [{"poi_id": "K1", "name": "清水寺", "category": "attraction",
+              "area": "京都", "appeal": 5, "intensity": "low",
+              "duration_min": 120, "cost": 0, "tags": ["寺庙"],
+              "open_hours": "06:00-18:00", "need_booking": False,
+              "geo": [34.99, 135.78]},
+             {"poi_id": "K2", "name": "金阁寺", "category": "attraction",
+              "area": "京都", "appeal": 5, "intensity": "low",
+              "duration_min": 90, "cost": 0, "tags": ["寺庙"],
+              "open_hours": "09:00-17:00", "need_booking": False,
+              "geo": [35.04, 135.73]}]
+    slots_k = dict(SLOTS, days=2)
+    plan, _ = composer.compose(slots_k, {"items": kyoto}, WEATHER,
+                               "12:00", "18:00", None)  # hotel_geo=None
+    spots = [n["name"] for d in plan for n in d["nodes"]
+             if n["type"] == "attraction" and n.get("poi_id")]
+    check("境外城无酒店报价时景点照样排进（home 不退大理）",
+          len(spots) >= 2, str(spots))
+
+    # 空壳守卫：候选有景点、结果一个没有 → 假设必须说明
+    note = agent.empty_plan_note("京都", _fake_result(days_plan=[]).get("days_plan") or [],
+                                 kyoto)
+    check("空壳方案给出显式说明", note is not None and "12" not in (note or ""),
+          str(note))
+    ok_plan = _fake_result(days_plan=[{"day": 1, "nodes": [
+        {"type": "attraction", "name": "清水寺"}]}])
+    check("正常排进景点不给空壳说明",
+          agent.empty_plan_note("京都", ok_plan.get("days_plan"), kyoto) is None,
+          "should be None")
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -1454,6 +1521,7 @@ def main() -> int:
                test_return_day_pack_and_go,
                test_day_theme_matches_role,
                test_accessibility_pref_lands,
+               test_foreign_city_center_from_kb,
                test_uncertain_ticket_assumption,
                test_kid_party_and_schedule,
                test_map_marks_uncertain_points, test_route_map_real,

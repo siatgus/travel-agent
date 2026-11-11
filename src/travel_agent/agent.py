@@ -980,6 +980,24 @@ def resolve_date_range(slots: dict, today: date | None = None
 # ------------------------------------------------------------------ 2. 编排
 
 
+def empty_plan_note(dest: str, days_plan: list[dict],
+                    poi_items: list[dict]) -> str | None:
+    """空壳守卫：候选池有景点、编排结果却一个没排进 → 返回必须写明的假设。
+
+    绝不能让用户拿到一份只有兜底餐位、却看似正常的方案（京都实测：城心
+    查不到导致 12 个景点全被距离闸否决，方案里只有午餐晚餐，假设只字未提）。
+    正常排进了景点返回 None。
+    """
+    pool = [p for p in poi_items or [] if p.get("category") == "attraction"]
+    planned = any(n.get("type") == "attraction"
+                  for d in days_plan for n in d.get("nodes") or [])
+    if not pool or planned:
+        return None
+    return (f"注意：{dest} 数据里有 {len(pool)} 个景点，但这一版一个都没排进行程"
+            f"（位置/时间校验未通过），方案只有用餐与中转，请当作无效结果，"
+            f"补充出发地、日期后再试或反馈")
+
+
 def uncertain_ticket_notes(days_plan: list[dict]) -> list[str]:
     """位置估算的点的门票口径，两种都要写明：
 
@@ -1185,6 +1203,13 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
     # 位置估算的点连门票也是估的：¥110 明细里看不出是不是都江堰的票，
     # 必须写明"按多少/人估、未核实"，不然用户会当成查证过的景区票价。
     assumptions.extend(uncertain_ticket_notes(days_plan))
+
+    # 空壳守卫：候选池里有景点、编排结果却一个没排进（全是兜底餐位）时
+    # 必须说明——绝不能让用户拿到一份看似正常的空方案（京都实测：12 个
+    # 景点全被距离闸否决，方案里只有午餐晚餐，假设里只字未提）。
+    _note = empty_plan_note(dest, days_plan, pois.get("items") or [])
+    if _note:
+        assumptions.append(_note)
 
     # 天气主动提醒：查到的天气预报不能只当装饰——雨大的日子、极端温度
     # 要主动说一句，用户才知道该带伞、该挪室内。
