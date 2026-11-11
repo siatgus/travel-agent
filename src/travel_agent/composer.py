@@ -49,6 +49,9 @@ DAY_END_LATEST = 20 * 60
 # 90 分钟保守估——18:00 的车，最晚 16:30 收尾。没有这条线时会排出
 # "17:03 逛完灵隐寺、18:03 才吃完午饭赶 18:00 的车"的时间表（杭州实测）。
 STATION_BUFFER_MIN = 90
+# 当日往返：下车到能开始逛的时间（出站 + 打车到第一站）。没有住宿要入住，
+# 不该沿用抵达日的 90 分钟 check-in；30 分钟是地铁/打车到市区的常见值。
+DAYTRIP_ARRIVE_BUFFER_MIN = 30
 # 单日景点净时长上限（不含交通与用餐）。8 小时是"一天逛到闭园"的真实上限；
 # 没有这条线时 240 分钟的远郊点会和两个市区点凑一天，晚餐排到 19:48（成都实测）。
 DAY_SIGHT_CAP_MIN = 8 * 60
@@ -546,7 +549,23 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         # 抵达日：容量由到站时刻决定；离开日：不留新景点
         start_min = 9 * 60
         dep_min = ret_deadline = None
-        if i == 0:
+        if days == 1:
+            # 当日往返：既不是"抵达日"也不是"返程日"，是一整天。
+            # 按抵达日排会变成「18:00 抵达 + 入住」→ 容量 0 → 一个景点都排不进，
+            # 用户只填了西湖也被告知"天数/节奏装不下"（杭州实测）。
+            hh, mm = (int(x) for x in outbound_arrive.split(":"))
+            arrive = hh * 60 + mm
+            start_min = max(9 * 60, arrive + DAYTRIP_ARRIVE_BUFFER_MIN)
+            if arrive < 15 * 60:
+                nodes.append(_node(outbound_arrive, "抵达 + 出站", "transit",
+                                   DAYTRIP_ARRIVE_BUFFER_MIN, "车站/机场打车",
+                                   "当天往返，行李随身，直接去第一站"))
+            hh, mm = (int(x) for x in outbound_depart_last.split(":"))
+            dep_min = hh * 60 + mm
+            # 一天里的所有活动都要赶在返程发车前收尾（含去车站缓冲）
+            ret_deadline = dep_min - STATION_BUFFER_MIN
+            day_cap = cap if start_min < 13 * 60 else (1 if start_min < 15 * 60 else 0)
+        elif i == 0:
             hh, mm = (int(x) for x in outbound_arrive.split(":"))
             arrive = hh * 60 + mm
             nodes.append(_node(outbound_arrive, "抵达 + 入住", "transit", 90,
@@ -575,6 +594,15 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         picked = _pick_chain(pool_remaining, slots, rain, home, day_cap, d, log, pref_rank)
         # 紧迫度高（闭馆早、耗时长）的先占时段，同等紧迫度保持原有成团顺序
         picked = sorted(picked, key=lambda x: (_must_start(x), picked.index(x)))
+        if days == 1:
+            # 一天就这么长：必去点优先，然后先排最占时间的点。倒过来排会把
+            # 90 分钟的街区排在前面，240 分钟的西湖就再也塞不进返程截止线
+            # （实测：单日只剩「河坊街 + 午餐 + 4 小时自由活动」）。
+            _must = [m for m in (slots.get("must_visit") or []) if m]
+            picked = sorted(
+                picked,
+                key=lambda x: (0 if any(name_hit(m, x["name"]) for m in _must) else 1,
+                               -x["duration_min"]))
 
         # 时间轴装配
         # clock 必须从 start_min 起：返程日 09:00 已排了「早市/伴手礼」（60 分钟），
@@ -607,7 +635,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
             # 进景点前先看会不会跨过饭点：11:26 开始逛 150 分钟，等于 14:00 才吃午饭。
             # 只在已经接近饭点（11:00 后）时才插，避免一早上就吃午饭。
-            if (not lunch_done and i not in (0, days - 1) and clock >= 11 * 60
+            # 单日行程也是"一整天"，午餐照排；只有抵达日/返程日才跳过
+            if (not lunch_done and (days == 1 or i not in (0, days - 1)) and clock >= 11 * 60
                     and clock + p["duration_min"] > 12 * 60 + 30):
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
                                            ("晚餐", prev_geo, 6.0)],
@@ -710,7 +739,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
         # 兜底午餐：景点排完仍没吃上（如上午只有一个景点），在自由活动前就近补一顿。
         # 库里没有餐厅也得留出这段时间——"每天有明确用餐点"不是有数据才成立的承诺。
-        if not lunch_done and i not in (0, days - 1) and used_pois:
+        if not lunch_done and (days == 1 or i not in (0, days - 1)) and used_pois:
             clock = max(clock, 11 * 60 + 30)
             lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
                                        ("晚餐", prev_geo, 6.0)],
@@ -802,6 +831,20 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 nodes.append(fb)
                 clock = max(clock, 18 * 60) + 60   # 与午餐兜底一致：兜底餐也占时间
 
+        # 一日往返：时间表不能停在下午三点。写清"剩下怎么过、几点往车站走"，
+        # 否则用户只看到「西湖→午饭」就结束，不知道几点该动身、会不会误车。
+        if days == 1:
+            if ret_deadline - clock >= 45:
+                nodes.append(_node(fmt(clock), "自由活动 / 就近休息", "rest",
+                                   ret_deadline - clock, "—",
+                                   "返程前不硬塞景点：按体力逛街或在车站附近歇脚"))
+            leave = min(max(clock, ret_deadline), dep_min)
+            nodes.append(_node(fmt(leave), "前往车站候车", "transit",
+                               max(dep_min - leave, 30), "打车/地铁",
+                               f"{outbound_depart_last} 返程，预留 "
+                               f"{STATION_BUFFER_MIN} 分钟取票安检"))
+            clock = dep_min
+
         nodes.sort(key=lambda x: x["time"])
         cost = sum(n["cost"] for n in nodes if n["type"] == "attraction")
         # 主题必须与当天实际角色一致：旧写法 [抵达适应,核心景区,人文深度,
@@ -831,12 +874,21 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         log["days"].append({"day": i + 1, "move_min": move_total,
                             "picked": [p["name"] for p in used_pois]})
 
-    # 顺延后仍未排入的点，才是真正的冲突（而非已修复）
+    # 顺延后仍未排入的点，才是真正的冲突（而非已修复）。
+    # 只有用户点名/点名兴趣的点才算"冲突"：单日行程里候选池剩下的十几个热门点
+    # 排不进去是正常的，全报成冲突会让质检亮一片红灯（杭州一日往返实测：
+    # 用户只提了西湖，质检却因为"雷峰塔未能排入"判失败）。
+    _asked = [m for m in (slots.get("must_visit") or []) if m]
+    _prefs = slots.get("soft_prefs") or []
     deferred_names = {d["poi"] for d in log.get("deferred", [])}
     for p in remaining:
-        if p["name"] in deferred_names:
-            log["violations"].append({"day": 0, "poi": p["name"],
-                                      "why": "全程未能排入，受闭馆时间与动线限制"})
+        if p["name"] not in deferred_names:
+            continue
+        if not (any(name_hit(m, p["name"]) for m in _asked)
+                or any(interest_hit(w, p) for w in _prefs)):
+            continue
+        log["violations"].append({"day": 0, "poi": p["name"],
+                                  "why": "全程未能排入，受闭馆时间与动线限制"})
     finalize_interests(plan, slots, {p["poi_id"]: p for p in attractions})
     return plan, log
 

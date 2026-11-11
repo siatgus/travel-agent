@@ -951,9 +951,11 @@ class Session:
                 exists = [p for p in missed
                           if any(composer.interest_hit(p, it) for it in items)]
                 if exists:
+                    _tight = ("当天往返装不下" if (slots.get("days") or 1) == 1
+                              else "天数/节奏装不下")
                     assumptions.append(
                         "你的兴趣「" + "、".join(exists) + "」对应的景点这版没排进去"
-                        "（天数/节奏装不下），加一天或删掉一个别的我就补上")
+                        f"（{_tight}），加一天或删掉一个别的我就补上")
                 rest = [p for p in missed if p not in exists]
                 if rest:
                     assumptions.append(
@@ -988,8 +990,12 @@ class Session:
                     "没查到 " + "、".join(unknown) + " 的可用资料（资料库和在线源都没有），"
                     "所以没排进行程；写全名或告诉我它所在的城市/区，我再补一次")
             if missed:
-                assumptions.append("点名景点本轮未能排入：" + "、".join(missed)
-                                   + "（受闭馆时间与动线限制，可让我加天数或换日期再试）")
+                if (slots.get("days") or 1) == 1:
+                    _why = ("（一日往返要赶当晚的车，可用时间装不下；"
+                            "换成晚一点的返程班次，或把行程加成两天就能排进去）")
+                else:
+                    _why = "（受闭馆时间与动线限制，可让我加天数或换日期再试）"
+                assumptions.append("点名景点本轮未能排入：" + "、".join(missed) + _why)
             if slots.get("avoid"):
                 assumptions.append("已按你的要求避开：" + "、".join(slots["avoid"]))
 
@@ -1502,13 +1508,22 @@ class Session:
         """提示词第 48 行：缺预算不追问，给三档让用户选。"""
         total = result["budget"]["total"]
         n = result["slots"]["party_size"] or 1
+        # 一日往返没有住宿，"住宿降档"这种说法在这里是假的
+        if (result["slots"].get("days") or 1) == 1:
+            notes = ("打车改地铁公交、少吃一顿正餐",
+                     "当前这版方案，含 10% 机动（当天往返，不含住宿）",
+                     "打车为主、正餐换口碑餐厅、加一个付费景点")
+        else:
+            notes = ("住宿降到经济型、少吃一顿正餐、只保留 1 个付费景点",
+                     "当前这版方案，含 10% 机动",
+                     "住宿升一档、增加包车、正餐换成口碑餐厅")
         return {
             "经济": {"total": round(total * 0.75), "per_person": round(total * 0.75 / n),
-                     "note": "住宿降到经济型、少吃一顿正餐、只保留 1 个付费景点"},
+                     "note": notes[0]},
             "舒适": {"total": round(total), "per_person": round(total / n),
-                     "note": "当前这版方案，含 10% 机动"},
+                     "note": notes[1]},
             "品质": {"total": round(total * 1.35), "per_person": round(total * 1.35 / n),
-                     "note": "住宿升一档、增加包车、正餐换成口碑餐厅"},
+                     "note": notes[2]},
         }
 
     @staticmethod

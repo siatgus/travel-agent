@@ -453,6 +453,58 @@ def test_pace_loosen_without_excess_says_switched() -> None:
           str((s.last_plan.get("slots") or {}).get("pace")))
 
 
+def test_day_trip_schedules_sights_and_no_hotel() -> None:
+    """单日行程要按"一整天"排，且不过夜、不收住宿费。
+
+    2026-11-11 反馈（高优先级）：杭州、日期同一天、轻松节奏，只填西湖也没排进
+    任何景点，还提示"天数/节奏装不下"；同时主题写「一日往返」，概要却写
+    「1 天 1 晚」、预算收 ¥400 住宿、日程里还有 18:00「抵达 + 入住」。
+    根因：编排把单日当成"抵达日"（18:00 抵达 → 容量 0），住宿按 max(days-1,1)
+    算一晚。
+    """
+    s = session()
+    r = s.turn("11月20号从上海去杭州玩1天，2人，想去西湖")
+    check("前置：单日方案", r.mode == "plan" and s.slots.get("days") == 1,
+          f"mode={r.mode} days={s.slots.get('days')}")
+    plan = s.last_plan
+    nodes = [n for d in plan["days_plan"] for n in d["nodes"]]
+    names = [n.get("name") for n in nodes]
+    check("点名的西湖排进了行程", any("西湖" in (x or "") for x in names), str(names))
+    check("主题是「一日往返」", plan["days_plan"][0]["theme"] == "一日往返",
+          plan["days_plan"][0]["theme"])
+    check("没有「抵达 + 入住」", not any("入住" in (x or "") for x in names), str(names))
+    check("收尾写了去车站候车", any("车站候车" in (x or "") for x in names), str(names))
+
+    items = [i for i in (plan.get("budget") or {}).get("breakdown") or []]
+    check("预算里没有住宿行", not any(i.get("category") == "hotel" for i in items),
+          str([(i.get("category"), i.get("amount")) for i in items]))
+    check("摘要写「当日往返」而不是 1 天 1 晚",
+          "当日往返" in r.render and "1 天 1 晚" not in r.render,
+          [l for l in r.render.splitlines() if "行程日期" in l][:1])
+    from travel_agent import agent as _agent
+    bad = [c for c in _agent.self_check(plan) if c.get("result") != "pass"]
+    check("单日方案质检全绿（首日强度/闭馆冲突不再误报）", not bad, str(bad)[:160])
+
+
+def test_day_trip_must_explain_what_does_not_fit() -> None:
+    """一天装不下的必去点要如实说"装不下"，不能说成"符合安排"。"""
+    s = session()
+    r = s.turn("11月20号从上海去杭州玩1天，2人，"
+               "想去西湖、灵隐寺、雷峰塔")
+    placed = [m for m in ("西湖", "灵隐寺", "雷峰塔")
+              if any(m in (n.get("name") or "")
+                     for d in s.last_plan["days_plan"] for n in d["nodes"])]
+    check("至少排进一个必去点", bool(placed), str(placed))
+    joined = " ".join(r.assumptions)
+    missed_lines = [a for a in r.assumptions if "未能排入" in a]
+    if len(placed) < 3:
+        check("排不下的必去点明说是当日往返时间不够",
+              bool(missed_lines) and "一日往返" in missed_lines[0],
+              str(missed_lines)[:160])
+    else:
+        check("三个都排进去了（不必提示装不下）", True)
+
+
 def test_return_leg_direction_in_plan() -> None:
     """方案里的返程方向必须是 目的地→出发地。
 
@@ -1217,6 +1269,8 @@ def main() -> int:
                test_mixed_transport_time_and_trip,
                test_pace_noop_trims_overcap,
                test_pace_loosen_deletes_instead_of_relocating,
+               test_day_trip_schedules_sights_and_no_hotel,
+               test_day_trip_must_explain_what_does_not_fit,
                test_pace_loosen_without_excess_says_switched,
                test_return_leg_direction_in_plan,
                test_pace_word_not_treated_as_interest,

@@ -1054,15 +1054,21 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                                              "to_city": dest, "date": start.isoformat(),
                                              "party_size": n}, 1)
     price_cap = round((slots["budget_total"] or 6000) * 0.08)
-    hotel = call("search_hotel", {"city": dest, "check_in": start.isoformat(),
-                                  "check_out": end.isoformat(), "guests": n,
-                                  "max_price_per_night": price_cap}, 1)
+    # 当日往返不过夜：不查住宿、不收住宿费、也不给选房建议。以前不管天数都查，
+    # 单日行程预算里照收一晚 400（杭州实测：1 天行程写「1 天 1 晚」+ ¥400 住宿）。
+    _nights = max(days - 1, 0)
     hotel_relaxed = False
-    if hotel.get("ok") and not hotel.get("items"):
-        # 条件过严无匹配 → 换参数重试（放宽价格上限），而不是拿空列表往下走
+    if _nights:
         hotel = call("search_hotel", {"city": dest, "check_in": start.isoformat(),
-                                      "check_out": end.isoformat(), "guests": n}, 1)
-        hotel_relaxed = True
+                                      "check_out": end.isoformat(), "guests": n,
+                                      "max_price_per_night": price_cap}, 1)
+        if hotel.get("ok") and not hotel.get("items"):
+            # 条件过严无匹配 → 换参数重试（放宽价格上限），而不是拿空列表往下走
+            hotel = call("search_hotel", {"city": dest, "check_in": start.isoformat(),
+                                          "check_out": end.isoformat(), "guests": n}, 1)
+            hotel_relaxed = True
+    else:
+        hotel = {"ok": True, "items": [], "day_trip": True}
     pois = call("search_poi", {"city": dest, "limit": 20}, 1)
 
     # 点名景点在候选池里找不到 → 定向补一条再重查。
@@ -1101,8 +1107,11 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                                             "to_city": origin,
                                             "date": end.isoformat(), "party_size": n}, 2)
 
-    # 没有出发地：按 18:00 抵/离保守编排，往返大交通不查、不算、如实标注
-    arrival = ((outbound or {}).get("items") or [{"arrive": "18:00"}])[0]["arrive"]
+    # 没有出发地：按保守时刻编排，往返大交通不查、不算、如实标注。
+    # 当日往返不能按 18:00 抵达——那样一天里一个景点都排不进（杭州实测：
+    # 单日行程填了西湖、三个必去点全没安排，还提示"天数/节奏装不下"）。
+    _arr_default = "09:00" if days == 1 else "18:00"
+    arrival = ((outbound or {}).get("items") or [{"arrive": _arr_default}])[0]["arrive"]
     depart_last = ((inbound or {}).get("items") or [{"depart": "18:00"}])[0]["depart"]
     if not has_origin:
         assumptions.append(
@@ -1115,9 +1124,16 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         # 去程返程都显示「上海-南京」）。
         for leg_name, leg_res in (("去程", outbound), ("返程", inbound)):
             if not (leg_res or {}).get("ok"):
+                # 单日行程的真实口径是"上午到、傍晚走"，照抄 18:00 抵/离会让
+                # 用户以为当天只有晚上可用，也解释不了为什么排不进景点
+                if days == 1:
+                    _tail = ("按 09:00 抵达编排" if leg_name == "去程"
+                             else "按 18:00 返程编排")
+                else:
+                    _tail = "按 18:00 抵/离保守编排"
                 assumptions.append(
                     f"{leg_name} {leg_route(leg_name, origin, dest)} 暂无班次数据，"
-                    f"按 18:00 抵/离保守编排，大交通请自行确认")
+                    f"{_tail}，大交通请自行确认")
     hotel_geo = (hotel.get("items") or [{}])[0].get("geo")
     if not hotel_geo:
         # 没有住宿数据时，用目的地中心当"家"。否则编排器退回内置默认坐标（大理），
@@ -1173,14 +1189,20 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
 
     # 预算
     hotel_price = (hotel.get("items") or [{}])[0].get("price", 400) if hotel.get("items") else 400
-    if not hotel.get("items"):
+    nights = _nights
+    rooms, room_label = hotel_rooms(_kids, n)
+    if nights and not hotel.get("items"):
         assumptions.append(
             f"{dest} 暂无住宿报价，住宿按 {hotel_price} 元/晚的常见均价估算，"
             f"订房前以实际房价为准")
     # 住宿偏好要落到可执行的选房建议：按已排景点的几何中心指一个片区，
     # 而不是把「近地铁安静」原样复述一遍。依据是行程数据，不是编的地名。
     _stay_pref = " ".join(filter(None, [slots.get("stay_pref") or "", slots.get("lodge") or ""]))
-    if _stay_pref:
+    if _stay_pref and not nights:
+        assumptions.append(
+            f"你提了住宿偏好（{_stay_pref}），但这版是当日往返、不住宿，"
+            f"所以没排订房；要过夜就说「住一晚」，我按这个偏好挑片区")
+    elif _stay_pref:
         from .tools import haversine_km as _hk
         _spots = [(n["name"], n["geo"]) for d in days_plan for n in d["nodes"]
                   if n["type"] == "attraction" and n.get("geo")
@@ -1202,9 +1224,7 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
         assumptions.append(
             f"预算内（≤{price_cap} 元/晚）没有可用住宿，已放宽到 "
             f"{hotel['items'][0]['price']} 元/晚的{hotel['items'][0]['name']}")
-    nights = max(days - 1, 1)
-    rooms, room_label = hotel_rooms(_kids, n)
-    if rooms == 1 and room_label == "家庭房/加床":
+    if nights and rooms == 1 and room_label == "家庭房/加床":
         assumptions.append(
             "带幼儿出行：按 1 间家庭房/加床估算（报价用城市双人间均价，"
             "家庭房差价未计入），订房时选「家庭房」或可加床房型")
@@ -1233,9 +1253,14 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                 items.append({"category": "transport",
                               "label": f"{_leg} {outbound_label(_res)}",
                               "amount": _amt})
+    if nights:
+        # 当日往返不写住宿行：0 元的「住宿 0晚」既没用又容易被当成漏算
+        items.append(
+            {"category": "hotel",
+             "label": (f"{(hotel.get('items') or [{}])[0].get('name', '住宿（按城市均价估算）')} "
+                       f"{nights}晚×{rooms}{room_label}"),
+             "amount": hotel_price * nights * rooms})
     items += [
-        {"category": "hotel", "label": f"{(hotel.get('items') or [{}])[0].get('name', '住宿（按城市均价估算）')} {nights}晚×{rooms}{room_label}",
-         "amount": hotel_price * nights * rooms},
         {"category": "ticket", "label": "景点门票与索道", "amount": ticket_total},
         {"category": "food", "label": f"餐饮 {days}天×{n}人（人均 180/天估算）",
          "amount": 180 * days * n},
@@ -1331,7 +1356,7 @@ def build_cut_plans(budget: dict, hotel: dict, nights: int, rooms: int,
     plans = []
     cur_price = (hotel.get("items") or [{}])[0].get("price", 0)
     all_prices = [h["price"] for h in (hotel.get("items") or [])]
-    if cur_price and len(all_prices) > 1:
+    if nights and cur_price and len(all_prices) > 1:
         cheap = min(all_prices)
         plans.append({
             "change": f"住宿换到同城 {cheap} 元/晚 的客栈（多走约 10 分钟到古城）",
@@ -1436,9 +1461,15 @@ def self_check(result: dict) -> list[dict]:
         "evidence": (f"合计 {budget.get('total')} / 目标 {budget.get('target')}"
                      if budget.get("target") else f"合计 {budget.get('total')}，用户未设预算上限"),
     })
+    # 一日往返没有"抵达日"这个概念：整天都能用，240 分钟的西湖是正常的，
+    # 不该按"首日只安排轻活动"判失败（杭州单日实测：质检因此误报红灯）
+    _one_day = (result.get("slots") or {}).get("days") == 1 or len(days_plan) == 1
     checks.append({
         "item": "首日不排高强度景点",
-        "result": "pass" if all(n["duration_min"] <= 150 for n in days_plan[0]["nodes"]) else "fail",
+        "result": ("pass" if _one_day or
+                   all(n["duration_min"] <= 150 for n in days_plan[0]["nodes"])
+                   else "fail"),
+        "evidence": ("一日往返按整天排，不受首日强度限制" if _one_day else ""),
     })
 
     # 折返检测：单日内相邻站点直线距离是否超阈值
@@ -1626,7 +1657,9 @@ def summary_lines(result: dict) -> list[str]:
     start = date.fromisoformat(s["date_range"]["start"])
     days = s["days"]
     end = start + timedelta(days=max(days - 1, 0))
-    nights = max(days - 1, 1)
+    # 单日行程没有"一晚"：写「1 天 1 晚」还收住宿费，等于把一日游当两天卖
+    nights = max(days - 1, 0)
+    _stay = f"{days} 天 {nights} 晚" if nights else f"{days} 天，当日往返"
     pace = {"relaxed": "轻松", "intensive": "特种兵"}.get(s.get("pace"), "适中")
     prefs = "、".join(s.get("hard_prefs") or [])
     # 没有出发地就明说「未指定」，并把后果（大交通未含）写出来。
@@ -1652,7 +1685,7 @@ def summary_lines(result: dict) -> list[str]:
     return [
         f"- **出发地 → 目的地**：{origin_disp} → {dest}",
         f"- **行程日期**：{start.isoformat()} 至 {end.isoformat()}"
-        f"（{days} 天 {nights} 晚）",
+        f"（{_stay}）",
         f"- **出行人数**：{_party}　|　**节奏**：{pace}"
         + (f"　|　**硬性偏好**：{prefs}" if prefs else ""),
         budget,

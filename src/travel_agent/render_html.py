@@ -52,6 +52,13 @@ def esc(s) -> str:
     return html.escape(str(s))
 
 
+def stay_text(days) -> str:
+    """天数口径：单日行程是「当日往返」，不能写「1 天 1 晚」。"""
+    d = int(days or 1)
+    n = max(d - 1, 0)
+    return f"{d} 天 {n} 晚" if n else f"{d} 天 · 当日往返"
+
+
 def project(points: list[list[float]], w: int, h: int, pad: int = 28):
     """经纬度 → 画布坐标，带纬度校正与边界扩展。"""
     lats = [p[0] for p in points]
@@ -1298,7 +1305,7 @@ def build_html(result: dict, utterance: str) -> str:
     facts_html = "".join([
         fact("出发地 → 目的地", f"{origin_disp} → {esc(s['destination'])}", origin_note),
         fact("出发日期", f"{start} 至 {end}"),
-        fact("行程天数", f"{s['days']} 天 {max(s['days'] - 1, 1)} 晚"),
+        fact("行程天数", stay_text(s['days'])),
         fact("出行人数", (f"{s['party_size']} 人（{esc(s['party_detail'])}）"
                           if s.get("party_detail") else f"{s['party_size']} 人")),
         fact("预算目标", f"¥{b['target']:,.0f}" if b.get("target") else "未设定"),
@@ -1364,7 +1371,7 @@ def build_html(result: dict, utterance: str) -> str:
   <div style="font-size:12px;color:#8A8A82;letter-spacing:0.08em;margin-bottom:10px;">
     TRAVEL PLAN · 由旅行规划智能体生成
   </div>
-  <h1>{esc(s['destination'])} · {s['days']} 天 {max(s['days']-1,1)} 晚</h1>
+  <h1>{esc(s['destination'])} · {stay_text(s['days'])}</h1>
   <div style="font-size:13px;color:#7A7972;margin-bottom:18px;">
     需求原文：{esc(utterance)}
   </div>
