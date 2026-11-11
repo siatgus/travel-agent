@@ -376,6 +376,30 @@ def test_pace_noop_trims_overcap() -> None:
           f"{before} -> {after}")
 
 
+def test_pace_word_not_treated_as_interest() -> None:
+    """「轻松休闲一点」不能变成「你的兴趣『休闲』没被满足」。
+
+    用户只在表单里勾了「轻松慢逛」（前端拼成"不想太赶，轻松休闲一点"），
+    模型把这句抽成 soft_prefs=["休闲"]，于是每份方案都多一句
+    「你的兴趣『休闲』在成都的资料里没有直接对应的景点」的假警报。
+    这里直接注入脏槽位，验证合并后的每一层（对话/编排）都清得掉。
+    """
+    from travel_agent import agent  # 局部导入：只用于构造底座槽位
+
+    s = session()
+    slots = agent.extract_slots_rules(
+        "11月8号从杭州去大理玩4天，2个人，预算6000", TODAY)
+    slots["soft_prefs"] = ["休闲"]          # 模拟模型误抽
+    slots["pace"] = "relaxed"
+    s.slots = slots
+    r = s.turn("喜欢苍山、古城")
+    check("节奏词不会残留在兴趣槽位里", s.slots.get("soft_prefs") == [],
+          str(s.slots.get("soft_prefs")))
+    check("方案里不再出现「兴趣『休闲』没对应景点」",
+          not any("休闲" in a for a in r.assumptions), str(r.assumptions))
+    check("回复正文同样干净", "休闲" not in r.render, r.render[:80])
+
+
 def test_pace_noop_must_overcap_honest() -> None:
     """超额全是用户点名的必去点：如实摊牌取舍，绝不静默删需求。"""
     s = session()
@@ -1096,6 +1120,7 @@ def main() -> int:
                test_multi_city_request_not_poi,
                test_mixed_transport_time_and_trip,
                test_pace_noop_trims_overcap,
+               test_pace_word_not_treated_as_interest,
                test_pace_noop_must_overcap_honest,
                test_budget_tiers_when_absent, test_no_tiers_when_budget_given,
                test_province_asks_city, test_unsupported_destination_never_replaced,

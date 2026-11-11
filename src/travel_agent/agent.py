@@ -409,6 +409,21 @@ def _extract_route(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def strip_pace_prefs(slots: dict) -> dict:
+    """把混进 soft_prefs 的节奏词清掉（「轻松休闲」≠ 兴趣）。
+
+    LLM 抽取侧已经拦了一道（llm.coerce_slots），这里兜住另外几条路：
+    多轮会话继承下来的旧槽位、调用方手工构造的 slots、以后新增的抽取入口。
+    清空 soft_prefs 只影响"兴趣"的说明与打分，节奏仍由 pace 表达。
+    """
+    prefs = slots.get("soft_prefs") or []
+    keep = [p for p in prefs
+            if isinstance(p, str) and not llm_layer.is_pace_word(p)]
+    if len(keep) != len(prefs):
+        slots["soft_prefs"] = keep
+    return slots
+
+
 def extract_slots(text: str, today: date | None = None,
                   client: "llm_layer.Client | None" = None,
                   records: list | None = None) -> dict:
@@ -421,7 +436,7 @@ def extract_slots(text: str, today: date | None = None,
     if client is None:
         slots = extract_slots_rules(text, today)
         slots["_source"] = "rules"
-        return slots
+        return strip_pace_prefs(slots)
 
     slots, rec = llm_layer.extract_slots_llm(client, text, today)
     if records is not None:
@@ -460,12 +475,12 @@ def extract_slots(text: str, today: date | None = None,
         for key in ("must_visit", "avoid"):
             slots[key] = [m for m in (slots.get(key) or [])
                           if isinstance(m, str) and valid_poi_name(m)]
-        return slots
+        return strip_pace_prefs(slots)
 
     slots = extract_slots_rules(text, today)
     slots["_source"] = "rules"
     slots["_degraded"] = rec.degraded
-    return slots
+    return strip_pace_prefs(slots)
 
 
 def extract_slots_rules(text: str, today: date | None = None) -> dict:

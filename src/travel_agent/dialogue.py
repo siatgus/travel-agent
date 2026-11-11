@@ -196,7 +196,9 @@ def _explicit_fields(text: str, delta: dict) -> set[str]:
         got.add("budget_total")
     if delta.get("hard_prefs"):
         got.add("hard_prefs")
-    if delta.get("soft_prefs"):
+    if any(not llm.is_pace_word(p) for p in (delta.get("soft_prefs") or [])):
+        # 「轻松休闲一点」是节奏，不是"这轮说了兴趣"——标成显式会让
+        # 下游以为兴趣已经答过，兴趣追问就此跳过，而 soft_prefs 其实是空的
         got.add("soft_prefs")
     if delta.get("must_visit"):
         got.add("must_visit")
@@ -672,6 +674,11 @@ class Session:
         # 却从未使用，--memory 参数实际是摆设
         if self.memory is not None:
             self.slots = self.memory.apply_to(self.slots)
+
+        # 节奏词不能当兴趣流通：抽取侧（llm.coerce_slots / agent.extract_slots）
+        # 已经拦了一道，这里再清一次是为了历史槽位与跨轮继承——否则上一轮留下的
+        # 「休闲」会让之后每份方案都带一句"兴趣没被满足"的假警报。
+        agent.strip_pace_prefs(self.slots)
 
         # 用户选定了单个城市 → 多城待选清单完成使命（「成都、重庆」→「成都」）
         if self.slots.get("destination") and "destination" in explicit:

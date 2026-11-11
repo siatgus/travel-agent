@@ -100,6 +100,32 @@ def test_unknown_field_dropped() -> None:
     check("未知字段不污染槽位", ok)
 
 
+def test_pace_word_is_not_interest() -> None:
+    """「轻松休闲」是节奏，不是兴趣。
+
+    表单的「轻松慢逛」拼成「不想太赶，轻松休闲一点」，模型常把「休闲」抽进
+    soft_prefs；任何城市的库里都没有叫"休闲"的景点，于是每份方案都多一句
+    「你的兴趣『休闲』没有直接对应的景点」——用户只勾了节奏，却被通知兴趣没被满足。
+    """
+    client = llm.ScriptedClient([
+        good_slots_json(soft_prefs=["休闲", "轻松休闲", "休闲一点", "摄影"],
+                        pace="relaxed")])
+    slots, rec = llm.extract_slots_llm(client, "不想太赶，轻松休闲一点", TODAY)
+    ok = (rec.ok and slots["soft_prefs"] == ["摄影"]
+          and len([w for w in rec.warnings if "节奏词" in w]) == 3)
+    check("节奏词不进 soft_prefs，真兴趣照常保留", ok,
+          f"soft_prefs={slots and slots['soft_prefs']} warnings={rec.warnings}")
+
+    # 反向：带实体词的照旧当兴趣，别把「轻松徒步」误杀成节奏
+    for w, expect in (("轻松徒步", False), ("摄影游", False),
+                      ("大熊猫", False), ("慢逛", True), ("休闲游", True),
+                      ("特种兵", True), ("", True)):
+        if llm.is_pace_word(w) != expect:
+            check(f"节奏词判定 {w!r}", False, f"got {llm.is_pace_word(w)}")
+            return
+    check("节奏词判定：只吃纯节奏串，不误伤实体兴趣", True)
+
+
 # ------------------------------------------------------------------ 3. 重问
 
 
@@ -258,6 +284,7 @@ def main() -> int:
     for fn in (test_fenced_json, test_numeric_coercion,
                test_avoid_coerced_and_wins_over_must,
                test_unknown_hard_pref_dropped, test_unknown_field_dropped,
+               test_pace_word_is_not_interest,
                test_repair_on_invalid_pace, test_repair_hint_contains_error,
                test_past_date_rejected_then_fixed,
                test_degrade_after_two_bad_outputs, test_degrade_on_timeout,

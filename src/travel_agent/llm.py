@@ -40,6 +40,38 @@ SOFT_PREF_VOCAB = {
     "古建", "夜市", "小吃", "白族", "户外", "博物馆", "温泉", "索道",
 }
 
+# 节奏 / 强度词——它们描述"怎么玩"，不是"想看什么"。
+# 表单的「轻松慢逛」会拼成「不想太赶，轻松休闲一点」，模型很容易把「休闲」
+# 抽进 soft_prefs；编排层在任何一个城市的库里都找不到名叫"休闲"的景点，
+# 于是每份方案都多出一句「你的兴趣『休闲』在成都的资料里没有直接对应的景点」
+# ——用户只勾了个节奏，却被通知"你的兴趣没被满足"（实测反馈）。
+# 归入 pace 就够了，soft_prefs 见到一律丢弃。
+PACE_WORDS = {
+    "轻松", "休闲", "慢逛", "悠闲", "放松", "躺平", "慢节奏", "慢游",
+    "不赶", "别太赶", "不想太赶", "特种兵", "打卡", "深度游", "自由行",
+    "度假",
+}
+
+# 判断时先剥掉的虚词/程度词：「休闲一点」「轻松些」与「休闲」等价
+_PACE_FILLER = re.compile(r"[\s,，、。.~～!！?？一点些更比较的啦啊吧就行]+")
+# 剥掉收尾的泛化字（「休闲游」「度假之旅」）——只要还剩实体词就当兴趣保留
+_PACE_TAIL = re.compile(r"(?:之旅|游玩|游|玩法|想法|需求)+$")
+
+
+def is_pace_word(word: str) -> bool:
+    """整串只由节奏语素构成 → 这是 pace，不是兴趣。
+
+    「轻松休闲」「休闲一点」「休闲游」算；「轻松徒步」「摄影游」不算（有实体词）。
+    """
+    w = _PACE_FILLER.sub("", str(word or ""))
+    if not w:
+        return True
+    rest = w
+    for tok in sorted(PACE_WORDS, key=len, reverse=True):
+        rest = rest.replace(tok, "")
+    rest = _PACE_TAIL.sub("", rest)
+    return not rest
+
 
 # ------------------------------------------------------------------ 记账
 
@@ -425,6 +457,11 @@ def coerce_slots(raw: dict, today: date | None = None):
                 continue
             word = item.strip()
             if not word:
+                continue
+            # 节奏词先摘出去：它属于 pace，「休闲」永远匹配不到景点，
+            # 留在 soft_prefs 只会生成一条"你的兴趣没被满足"的假警报
+            if is_pace_word(word):
+                warnings.append(f"软偏好 {word!r} 是节奏词，已归入 pace，不算兴趣")
                 continue
             # 兴趣是开放词表：用户说「大熊猫 / 喝茶 / 老街」，白名单里没有也不能丢——
             # 丢了就等于"偏好没被听见"，行程里自然一个都不出现。
