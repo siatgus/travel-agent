@@ -580,18 +580,32 @@ PAGE_SRC = """<!DOCTYPE html>
      planner/login 的桌面规则盖掉（实测手机上仍是 4 列溢出） */
   @media(max-width:760px){
        #main{flex-direction:column}
-       #board{width:auto;max-height:46vh;border-left:none;border-top:1px solid var(--line)}
-       header{padding:0 10px;gap:8px}
+       #board{width:auto;max-height:42vh;border-left:none;border-top:1px solid var(--line)}
+       /* 顶栏一行放下：按钮一律不换行、全面收紧；手机号藏起只留积分，
+          否则「历史行程(6)」「＋新对话」会被挤成两行竖排（截图实测） */
+       header{padding:0 8px;gap:6px}
        header .sub{display:none}
-       header h1{font-size:14px}
-       header .logo{width:30px;height:30px;font-size:15px;border-radius:9px}
-       header button{padding:6px 10px;font-size:12px;border-radius:9px}
-       .userbox{padding:4px 9px;font-size:12px}
+       header h1{font-size:13px;white-space:nowrap}
+       header .logo{width:28px;height:28px;font-size:14px;border-radius:8px}
+       header button{padding:5px 8px;font-size:11.5px;border-radius:8px;white-space:nowrap}
+       .userbox{padding:3px 8px;font-size:11px;white-space:nowrap}
+       #ub-phone,#userbox .sep{display:none}
        #btn-qr{display:none}          /* 手机上再显示「手机访问」没有意义 */
-       #chat{padding:14px 12px}
-       .msg{max-width:88%}
-       #bar{padding:10px 12px}
-       #send{padding:0 16px}
+       #chat{padding:12px 10px;gap:12px}
+       .msg{max-width:88%;padding:11px 14px}
+       /* 行程面板收紧：标题/页签/备注间距全面缩小 */
+       #bhead{padding:10px 12px 8px}
+       #btabs{padding:8px 10px;gap:5px}
+       #btabs button{padding:3px 10px;font-size:11.5px}
+       #bbody{padding:10px 12px}
+       .bcard{padding:6px 8px}
+       .bnode{padding:7px 6px;gap:6px}
+       .bnode .tm{width:38px;font-size:11px}
+       .bnode .nm{font-size:12.5px}
+       #bchips{padding:8px 10px}
+       #bchips button{padding:3px 10px;font-size:11.5px}
+       #bar{padding:8px 10px}
+       #send{padding:0 14px}
        #foot{font-size:10px;padding:4px 6px 8px}
        #planner{padding:16px 10px 30px}
        #planner .hero{padding:24px 18px;border-radius:18px}
