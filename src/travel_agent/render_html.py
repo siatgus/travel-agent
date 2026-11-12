@@ -572,7 +572,8 @@ ROUTE_MAP_JS = """
   // 统一给一张迷你卡——名称 + 当日色标签 + 时间，不再是裸 <b>名字</b>。
   // 复用 rt-card 类名让 visibleCardRect 能量到它（防贴边裁切与误关）
   function miniCard(n, color, tag, note) {
-    return '<div class="rt-card rt-mini" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">'
+    return '<div class="rt-card rt-mini" style="border-left-color:' + darken(color, 0.75)
+      + ';" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">'
       + '<div class="rt-mini-name">' + n.name + '</div>'
       + '<div class="rt-mini-meta"><span class="rt-mini-tag" style="background:'
       + darken(color, 0.75) + ';">' + tag + '</span>'
@@ -1038,8 +1039,10 @@ def render_route_map(result: dict) -> str:
         f'#rt-locate-tip:empty{{display:none;}}'
         # 景点介绍卡片（hover 图钉弹出，效仿行程类 App 的大卡）
         f'.rt-card{{width:238px;font-family:inherit;}}'
-        f'.rt-mini{{width:196px;background:#FFFFFF;border-radius:10px;padding:9px 12px 10px;'
-        f'box-shadow:0 6px 18px rgba(29,35,51,.14);}}'
+        f'/* 迷你卡自带白底会跟 InfoWindow 的白色气泡叠成「框外框」，'
+        f'所以卡片只留左侧当日色条，气泡就是唯一的框 */'
+        f'.rt-mini{{width:196px;padding:3px 2px 4px 10px;'
+        f'border-left:3px solid #2b5fe0;}}'
         f'.rt-mini-name{{font-size:13.5px;font-weight:bold;color:#2c3550;line-height:1.4;}}'
         f'.rt-mini-meta{{display:flex;align-items:center;gap:7px;margin-top:6px;'
         f'font-size:11px;color:#7a8299;}}'
