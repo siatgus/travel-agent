@@ -643,6 +643,9 @@ PAGE_SRC = """<!DOCTYPE html>
        #planner .hero h2{font-size:23px}
        #planner .card{padding:18px 14px}
        #planner .grid{grid-template-columns:repeat(2,1fr)}
+       /* 预算格=金额+币种下拉，塞进半列必挤爆，手机上独占一整行 */
+       #planner .fbudget{grid-column:1/-1}
+       #planner .fbudget select{width:72px}
        #planner .go{padding:11px 20px;font-size:13px}
        #login .lg-nav{padding:16px 5vw}
        #login .lg-main{padding:6px 4vw 36px;gap:22px}
@@ -754,13 +757,13 @@ PAGE_SRC = """<!DOCTYPE html>
         <input id="pf-start" type="date"></div>
       <div class="f"><label>返程日期<span class="opt">可选</span></label>
         <input id="pf-end" type="date"></div>
-      <div class="f"><label>预算总额<span class="opt">可选</span></label>
+      <div class="f fbudget"><label>预算总额<span class="opt">可选</span></label>
         <div style="display:flex;gap:6px">
           <input id="pf-budget" inputmode="numeric" placeholder="比如 8000" style="flex:1;min-width:0">
           <select id="pf-cur" style="width:80px;flex:none"><option>CNY ¥</option></select>
         </div></div>
       <div class="f"><label>同行人数<span class="opt">可选</span></label>
-        <input id="pf-party" placeholder="比如 2，或 2大1小（3岁）"></div>
+        <input id="pf-party" placeholder="比如 2 或 2大1小"></div>
       <div class="f"><label>旅行节奏<span class="opt">可选</span></label>
         <select id="pf-pace"><option>刚刚好</option><option>紧凑打卡</option><option>轻松慢逛</option></select></div>
       <div class="f"><label>兴趣偏好<span class="opt">可选</span></label>
