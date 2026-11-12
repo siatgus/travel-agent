@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import threading
@@ -59,7 +60,7 @@ from . import llm as llm_layer
 from . import paths
 from . import progress
 from .dialogue import Session, PreferenceMemory
-from .render_html import build_html, get_tdt_key, map_mode
+from .render_html import build_html, get_amap_key, get_tdt_key, map_mode
 
 HOST = "127.0.0.1"          # 本机自访问地址（探测占用、默认展示）；对外绑定见 main()
 
@@ -202,6 +203,130 @@ def prefetch_drive_routes(sid: str, result: dict) -> None:
             time.sleep(0.15)
 
     threading.Thread(target=_run, daemon=True, name="drive-prefetch").start()
+
+
+# ---- 高德动线（/api/amap/drive 与预热线程共用） ----------------------------
+_AMAP_DRIVE_CACHE: dict[str, dict] = {}        # "o|d"(GCJ-02) -> 规划结果
+_AMAP_PREFETCHED: set[str] = set()
+
+_GCJ_PI = 3.14159265358979323846
+_GCJ_A = 6378245.0
+_GCJ_EE = 0.00669342162296594323
+
+
+def _gcj_out_of_china(lng: float, lat: float) -> bool:
+    return lng < 72.004 or lng > 137.8347 or lat < 0.8293 or lat > 55.8271
+
+
+def wgs2gcj(lng: float, lat: float) -> tuple[float, float]:
+    """WGS-84 → GCJ-02 标准公开算法（与前端 AMAP_ROUTE_JS 同一套）。
+
+    高德 REST 返回 GCJ-02、前端图钉经 wgs2gcj 也是 GCJ-02——预热的缓存键
+    必须用同一坐标系的点串，否则键对不上，预热全部白做。
+    """
+    if _gcj_out_of_china(lng, lat):
+        return (lng, lat)
+    x, y = lng - 105.0, lat - 35.0
+    dlat = (-100.0 + 2.0 * x + 3.0 * y * y + 0.2 * y * y * y
+            + 0.1 * x * y * y + 0.2 * (abs(x) ** 0.5))
+    dlat += (20.0 * math.sin(6.0 * x * _GCJ_PI)
+             + 20.0 * math.sin(2.0 * x * _GCJ_PI)) * 2.0 / 3.0
+    dlat += (20.0 * math.sin(y * _GCJ_PI)
+             + 40.0 * math.sin(y / 3.0 * _GCJ_PI)) * 2.0 / 3.0
+    dlat += (160.0 * math.sin(y / 12.0 * _GCJ_PI)
+             + 320.0 * math.sin(y * _GCJ_PI / 30.0)) * 2.0 / 3.0
+    dlng = (300.0 + x + 2.0 * y * y + 0.1 * x * x + 0.1 * x * y
+            + 0.1 * (abs(x) ** 0.5))
+    dlng += (20.0 * math.sin(6.0 * x * _GCJ_PI)
+             + 20.0 * math.sin(2.0 * x * _GCJ_PI)) * 2.0 / 3.0
+    dlng += (20.0 * math.sin(x * _GCJ_PI)
+             + 40.0 * math.sin(x / 3.0 * _GCJ_PI)) * 2.0 / 3.0
+    dlng += (150.0 * math.sin(x / 12.0 * _GCJ_PI)
+             + 300.0 * math.sin(x / 30.0 * _GCJ_PI)) * 2.0 / 3.0
+    radlat = lat / 180.0 * _GCJ_PI
+    magic = math.sin(radlat)
+    magic = 1 - _GCJ_EE * magic * magic
+    sqrtmagic = (magic ** 0.5)
+    dlat = (dlat * 180.0) / ((_GCJ_A * (1 - _GCJ_EE)) / (magic * sqrtmagic) * _GCJ_PI)
+    dlng = (dlng * 180.0) / (_GCJ_A / sqrtmagic * math.cos(radlat) * _GCJ_PI)
+    return (lng + dlng, lat + dlat)
+
+
+def amap_drive_fetch(o: str, d: str) -> dict:
+    """高德驾车规划（REST v3）：缓存命中直接返回，否则打上游解析点串。
+
+    供 /api/amap/drive 与预热线程共用。走服务端而不是浏览器里的
+    AMap.Driving 插件，因为 2021-12 后申请的 JS Key 必须配安全密钥
+    （securityJsCode），没配的话插件服务全部 INVALID_USER_SCODE——
+    而用户的 Key 实测调 REST 直连成功（Web 服务类型），不依赖安全密钥。
+    前端请求与缓存的键都是 GCJ-02（wgs2gcj 纠偏后），与 REST 返回同系。
+    """
+    cache_key = o + "|" + d
+    hit = _AMAP_DRIVE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    key = get_amap_key()
+    if not key:
+        return {"ok": False, "error": "no amap key"}
+    q = urllib.parse.urlencode({"origin": o, "destination": d,
+                                "key": key, "extensions": "base"})
+    try:
+        req = urllib.request.Request(
+            "https://restapi.amap.com/v3/direction/driving?" + q,
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        return {"ok": False, "error": "upstream %s" % e}
+    if str(body.get("status")) != "1":
+        return {"ok": False, "error": "amap %s" % body.get("info", "unknown")}
+    pts: list[list[float]] = []
+    try:
+        steps = body["route"]["paths"][0]["steps"] or []
+    except (KeyError, IndexError, TypeError):
+        steps = []
+    for st in steps:
+        for pair in str(st.get("polyline") or "").split(";"):
+            p = _ok_pt(pair.strip())
+            if p:
+                a, b = p.split(",")
+                pts.append([float(a), float(b)])
+    if len(pts) < 2:
+        return {"ok": False, "error": "no route"}
+    if len(_AMAP_DRIVE_CACHE) > 500:
+        _AMAP_DRIVE_CACHE.clear()
+    out = {"ok": True, "pts": pts}
+    _AMAP_DRIVE_CACHE[cache_key] = out
+    return out
+
+
+def prefetch_amap_routes(sid: str, result: dict) -> None:
+    """高德模式的后台预热：坐标先 wgs2gcj 对齐前端缓存键，再逐段拉上游。
+
+    高德配额宽松，0.1s 间隔只是礼貌节流；daemon 线程，失败不影响页面。
+    """
+    if sid in _AMAP_PREFETCHED:
+        return
+    _AMAP_PREFETCHED.add(sid)
+    if len(_AMAP_PREFETCHED) > 300:
+        _AMAP_PREFETCHED.clear()
+    pairs = []
+    for oa, ob in _drive_pairs(result):
+        ga = wgs2gcj(float(oa.split(",")[0]), float(oa.split(",")[1]))
+        gb = wgs2gcj(float(ob.split(",")[0]), float(ob.split(",")[1]))
+        # 键规范化到 5 位小数（≈1m，规划精度足够），与前端 toFixed(5)
+        # 及 handler 的 _ok_pt 三方一致——差一位小数预热就白做
+        oa2, ob2 = _ok_pt("%.5f,%.5f" % (ga[0], ga[1])), _ok_pt("%.5f,%.5f" % (gb[0], gb[1]))
+        if oa2 and ob2:
+            pairs.append((oa2, ob2))
+    pairs = [p for p in pairs if (p[0] + "|" + p[1]) not in _AMAP_DRIVE_CACHE]
+
+    def _run():
+        for oa, ob in pairs:
+            amap_drive_fetch(oa, ob)
+            time.sleep(0.1)
+
+    threading.Thread(target=_run, daemon=True, name="amap-drive-prefetch").start()
 
 
 def _get_llm():
@@ -1974,6 +2099,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 只有天地图模式需要预热（高德模式走 AMap.Driving 插件直连）
                 if map_mode() == "tdt":
                     prefetch_drive_routes(sid, result)
+                elif map_mode() == "amap":
+                    prefetch_amap_routes(sid, result)
         elif path.startswith("/api/conversations/"):
             user = self._auth_user()
             if user is None:
@@ -1988,6 +2115,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, **conv})
         elif path == "/api/tianditu/drive":
             self._tianditu_drive()
+        elif path == "/api/amap/drive":
+            self._amap_drive()
         else:
             self._json({"ok": False, "error": "not found"}, 404)
 
@@ -2004,6 +2133,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "bad coords"}, 400)
             return
         self._json(drive_fetch(o, d))
+
+    def _amap_drive(self):
+        """代理高德驾车路径规划：前端传 GCJ-02「lng,lat」对，透传 REST v3。
+
+        走服务端的原因见 amap_drive_fetch——浏览器端 AMap.Driving 插件
+        没配安全密钥会全挂，而 REST 直连用现有 Key 即成功（实测）。"""
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        o = _ok_pt((q.get("o") or [""])[0])
+        d = _ok_pt((q.get("d") or [""])[0])
+        if not o or not d:
+            self._json({"ok": False, "error": "bad coords"}, 400)
+            return
+        self._json(amap_drive_fetch(o, d))
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")

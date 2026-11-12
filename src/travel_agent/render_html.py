@@ -1524,7 +1524,11 @@ AMAP_ROUTE_JS = """
       })(btns[k]);
     }
   }
-  // ---------- 沿道路画路径（AMap.Driving 插件，JS Key 直连，无需服务端代理）。
+  // ---------- 沿道路画路径。
+  // 首选服务端代理 /api/amap/drive（REST v3，Web 服务 Key 直连，不依赖
+  // 安全密钥——2021-12 后的 JS Key 没配 securityJsCode 时 AMap.Driving
+  // 插件全部 INVALID_USER_SCODE，实测）；代理不可用再试 AMap.Driving
+  // 插件（配了安全密钥的环境），最后退回直线。
   // 高德路径服务返回 GCJ-02，与纠偏后的图钉坐标系一致，直接画。
   function planSeg(a, b, cb) {
     var finished = false;
@@ -1534,6 +1538,33 @@ AMAP_ROUTE_JS = """
       cb(path);
     }
     var timer = setTimeout(function () { done(null); }, 12000);
+    // 5 位小数（≈1m）与服务端预热键三方对齐：toFixed(5) → handler _ok_pt
+    var o = a[0].toFixed(5) + ',' + a[1].toFixed(5);
+    var d = b[0].toFixed(5) + ',' + b[1].toFixed(5);
+    fetch('/api/amap/drive?o=' + encodeURIComponent(o)
+          + '&d=' + encodeURIComponent(d))
+      .then(function (resp) { return resp.json(); })
+      .then(function (j) {
+        if (finished) return;
+        if (j && j.ok && j.pts && j.pts.length > 1) {
+          clearTimeout(timer);
+          done(j.pts);
+          return;
+        }
+        drivePlugin(a, b, function (pts) { clearTimeout(timer); done(pts); });
+      })
+      .catch(function () {
+        drivePlugin(a, b, function (pts) { clearTimeout(timer); done(pts); });
+      });
+  }
+  function drivePlugin(a, b, cb) {
+    var finished = false;
+    function done(path) {
+      if (finished) return;
+      finished = true;
+      cb(path);
+    }
+    var timer = setTimeout(function () { done(null); }, 9000);
     try {
       if (!drv) { done(null); return; }
       drv.search(new AMap.LngLat(a[0], a[1]), new AMap.LngLat(b[0], b[1]),

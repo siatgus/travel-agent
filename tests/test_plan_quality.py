@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import urllib.parse
 from datetime import date
@@ -779,7 +780,7 @@ def test_route_map_real() -> None:
               "webapi.amap.com/maps?v=2.0&key=" in h4)
         check("高德优先于天地图",
               "api.tianditu.gov.cn/api?" not in h4)
-        check("高德驱动驾车规划（插件直连，不走天地图代理）",
+        check("高德不走天地图代理，且仍保留 Driving 插件兜底",
               "/api/tianditu/drive" not in h4 and "AMap.Driving" in h4)
         check("安全密钥在 SDK 加载之前注入",
               "window._AMapSecurityConfig" in h4
@@ -816,6 +817,12 @@ def test_route_map_real() -> None:
               all(f"case '{k}'" in h4 for k in ("sight", "restaurant", "transit", "hotel")))
         check("估算点是灰色?图钉", "'#a0a8bd', 'unknown', '?'" in h4)
         check("动线失败退回直线的文案仍在", "规划失败已退回直线" in h4)
+        # 动线首选服务端代理（Web 服务 Key 直连 REST，不依赖安全密钥），
+        # 代理不可用再退 AMap.Driving 插件，最后直线
+        check("高德动线首选 /api/amap/drive 服务端代理",
+              "fetch('/api/amap/drive?o=" in h4 and "function drivePlugin" in h4)
+        check("代理请求键 5 位小数（与服务端预热键对齐）",
+              "toFixed(5)" in h4)
         render_html.get_amap_key = lambda: "zz';alert(1)//"
         h5 = render_html.build_html(res, "成都4天")
         check("高德非法字符的 Key 被过滤", "alert(1)" not in h5)
@@ -845,6 +852,60 @@ def test_route_map_real() -> None:
         else:
             os.environ["TIANDITU_KEY"] = orig_env
 
+    # ---- 高德动线服务端代理（server.py）：wgs2gcj / 无 Key / 上游解析 ----
+    from travel_agent import server as ta_server
+    # 纠偏算法与前端同一套：境内输出在 WGS 附近 0.001~0.01 度偏移内
+    glng, glat = ta_server.wgs2gcj(116.404, 39.915)
+    check("服务端 wgs2gcj 产生合理的 GCJ 偏移",
+          0.001 <= abs(glng - 116.404) <= 0.01
+          and 0.001 <= abs(glat - 39.915) <= 0.01,
+          f"({glng:.6f},{glat:.6f})")
+    check("境外坐标直通不纠偏",
+          ta_server.wgs2gcj(-118.24, 34.05) == (-118.24, 34.05))
+    orig_amap_key = ta_server.get_amap_key
+    orig_urlopen = ta_server.urllib.request.urlopen
+    try:
+        ta_server.get_amap_key = lambda: ""
+        r0 = ta_server.amap_drive_fetch("116.48103,39.98964", "116.43445,39.90816")
+        check("没配高德 Key 时代理报错不抛异常",
+              r0.get("ok") is False and "no amap key" in str(r0.get("error")))
+        # 伪造上游：REST v3 结构，steps[].polyline 为「lng,lat;…」点串
+        fake = {"status": "1", "route": {"paths": [{"steps": [
+            {"polyline": "116.481196,39.989545;116.480939,39.989284"},
+            {"polyline": "116.480886,39.989225;116.480100,39.988000"}]}]}}
+        class _FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(fake).encode()
+        ta_server.get_amap_key = lambda: "fakekey0123456789abcdef0123456789"
+        ta_server._AMAP_DRIVE_CACHE.clear()
+        ta_server.urllib.request.urlopen = lambda req, timeout=8: _FakeResp()
+        r1 = ta_server.amap_drive_fetch("116.48103,39.98964", "116.43445,39.90816")
+        check("代理解析 steps[].polyline 成点串",
+              r1.get("ok") is True and len(r1.get("pts") or []) == 4
+              and r1["pts"][0] == [116.481196, 39.989545],
+              str(r1)[:120])
+        r2 = ta_server.amap_drive_fetch("116.48103,39.98964", "116.43445,39.90816")
+        check("同路段命中缓存（不发第二次上游请求）", r2 == r1)
+        # 上游业务失败（status != 1）
+        bad = {"status": "0", "info": "INVALID_PARAMS"}
+        class _BadResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(bad).encode()
+        ta_server._AMAP_DRIVE_CACHE.clear()
+        ta_server.urllib.request.urlopen = lambda req, timeout=8: _BadResp()
+        r3 = ta_server.amap_drive_fetch("116.48103,39.98964", "116.43445,39.90816")
+        check("上游报错时代理诚实返回失败", r3.get("ok") is False
+              and "INVALID_PARAMS" in str(r3.get("error")))
+    finally:
+        ta_server.get_amap_key = orig_amap_key
+        ta_server.urllib.request.urlopen = orig_urlopen
+        ta_server._AMAP_DRIVE_CACHE.clear()
+    check("高德预热入口存在（server 挂 map_mode 闸）",
+          callable(ta_server.prefetch_amap_routes)
+          and callable(ta_server.prefetch_drive_routes))
+
     # AMAP_KEY 环境变量同理（且 map_mode 判定为高德）
     orig_env2 = os.environ.get("AMAP_KEY")
     orig_env3 = os.environ.get("TIANDITU_KEY")
@@ -855,15 +916,25 @@ def test_route_map_real() -> None:
         check("有高德 Key 时 map_mode 判定为 amap", render_html.map_mode() == "amap")
         os.environ["AMAP_KEY"] = ""
         os.environ["TIANDITU_KEY"] = "envkey0123456789abcdef0123456789"
-        check("只有天地图 Key 时 map_mode 判定为 tdt", render_html.map_mode() == "tdt")
+        # 本机设置文件可能真配了 amap_key/tdt_key（用户已填），把读取函数
+        # 一并桩掉，「只有天地图 Key」的前提才成立
+        _orig_ak2 = render_html.get_amap_key
+        render_html.get_amap_key = lambda: ""
+        try:
+            check("只有天地图 Key 时 map_mode 判定为 tdt", render_html.map_mode() == "tdt")
+        finally:
+            render_html.get_amap_key = _orig_ak2
         os.environ.pop("TIANDITU_KEY", None)
-        # 本机设置文件可能真配了 tdt_key，把读取函数一并桩掉才构成「都没有」
-        _orig_tdt2 = render_html.get_tdt_key
+        # 同理：本机真配了 amap_key 时 svg 分支需要把两个读取函数都桩掉
+        _orig_ak3 = render_html.get_amap_key
+        _orig_tk3 = render_html.get_tdt_key
+        render_html.get_amap_key = lambda: ""
         render_html.get_tdt_key = lambda: ""
         try:
             check("都没有时 map_mode 判定为 svg", render_html.map_mode() == "svg")
         finally:
-            render_html.get_tdt_key = _orig_tdt2
+            render_html.get_amap_key = _orig_ak3
+            render_html.get_tdt_key = _orig_tk3
     finally:
         if orig_env2 is None:
             os.environ.pop("AMAP_KEY", None)
@@ -1268,6 +1339,13 @@ def test_poi_info_cards() -> None:
 
     plan, _ = _compose()
     orig_fo = poi_links.fetch_one
+    # 这组断言钉的是天地图模板的卡片避让实现（InfoWindow 官方 setOffset）；
+    # 高德模板没有 setOffset、用关闭后重开——本机真配了高德 Key 会让
+    # build_html 走高德模板，必须强制天地图模式再构建页面
+    _orig_ak4 = render_html.get_amap_key
+    _orig_tk4 = render_html.get_tdt_key
+    render_html.get_amap_key = lambda: ""
+    render_html.get_tdt_key = lambda: "tdtkey0123456789abcdef0123456789abcd"
     try:
         poi_links.fetch_one = lambda name, city, timeout=6: {
             "url": "https://www.zhihu.com/question/999", "site": "zhihu.com",
@@ -1302,6 +1380,8 @@ def test_poi_info_cards() -> None:
               "RT.panned" not in h and "watchCard" not in h)
     finally:
         poi_links.fetch_one = orig_fo
+        render_html.get_amap_key = _orig_ak4
+        render_html.get_tdt_key = _orig_tk4
 
     # 转义：url/snippet 里的恶意内容不能原样进 HTML
     res2 = _fake_result(days_plan=plan)
