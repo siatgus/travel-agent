@@ -367,6 +367,7 @@ PAGE_SRC = """<!DOCTYPE html>
   #bmenu{position:fixed;z-index:18;background:var(--card);border:1px solid var(--line);
        border-radius:14px;box-shadow:0 14px 40px rgba(29,35,51,.16);padding:6px;display:none;
        min-width:225px}
+  #bmmask{position:fixed;inset:0;background:rgba(29,35,51,.35);display:none;z-index:17}
   #bmenu button{display:block;width:100%;text-align:left;border:none;background:none;
        padding:9px 12px;font-size:13px;border-radius:9px;cursor:pointer;color:var(--ink);
        white-space:nowrap}
@@ -604,6 +605,16 @@ PAGE_SRC = """<!DOCTYPE html>
        .bnode .nm{font-size:12.5px}
        #bchips{padding:8px 10px}
        #bchips button{padding:3px 10px;font-size:11.5px}
+       /* 节点操作菜单 → 底部抽屉：从屏幕底滑出、带遮罩、顶部把手。
+          定位由 JS 分支跳过（inline left/top 会盖掉 CSS），见 nodeMenu */
+       #bmenu.drawer{top:auto;left:0;right:0;bottom:0;width:auto;min-width:0;
+         border-radius:18px 18px 0 0;border-bottom:none;
+         padding:12px 16px calc(14px + env(safe-area-inset-bottom));
+         box-shadow:0 -14px 44px rgba(29,35,51,.22);animation:drawerup .22s ease}
+       #bmenu.drawer::before{content:'';display:block;width:38px;height:4px;
+         border-radius:2px;background:var(--line);margin:0 auto 6px}
+       #bmenu.drawer button{padding:14px 12px;font-size:14.5px;border-radius:11px}
+       @keyframes drawerup{from{transform:translateY(100%)}to{transform:none}}
        #bar{padding:8px 10px}
        #send{padding:0 14px}
        #foot{font-size:10px;padding:4px 6px 8px}
@@ -764,6 +775,7 @@ PAGE_SRC = """<!DOCTYPE html>
   </div>
 </div>
 </div>
+<div id="bmmask"></div>
 <div id="bmenu"></div>
 <div id="bar">
   <div id="row">
@@ -1045,7 +1057,7 @@ document.getElementById('logoutmask').addEventListener('click', function(e){
   if(e.target === this) closeLogout();
 });
 document.addEventListener('keydown', function(e){
-  if(e.key === 'Escape') closeLogout();
+  if(e.key === 'Escape'){ closeLogout(); hideNodeMenu(); closeQr(); }
 });
 
 // ---------------- 手机访问（扫码互通） ----------------
@@ -1102,6 +1114,11 @@ const board=document.getElementById('board');
 const bbody=document.getElementById('bbody');
 const btabs=document.getElementById('btabs');
 const bmenu=document.getElementById('bmenu');
+const bmmask=document.getElementById('bmmask');
+function hideNodeMenu(){
+  bmenu.style.display='none';
+  bmmask.style.display='none';
+}
 let boardPlan=null,boardSlots=null,boardTab='all';
 const TYPE_ICONS={attraction:'\\u{1F3DE}',restaurant:'\\u{1F35C}',hotel:'\\u{1F3E8}',
                   transport:'\\u{1F684}',other:'\\u{1F4CD}'};
@@ -1110,7 +1127,7 @@ function nodeMenu(ev,name,ntype){
   ev.stopPropagation();
   bmenu.innerHTML='';
   const mk=(label,msg)=>{const b=document.createElement('button');b.textContent=label;
-    b.onclick=()=>{bmenu.style.display='none';send(msg);};bmenu.appendChild(b);};
+    b.onclick=()=>{hideNodeMenu();send(msg);};bmenu.appendChild(b);};
   // 菜单跟节点类型走：交通/休息/住宿和系统填充项（早市/伴手礼、自由活动、
   // 就近自选）不是景点，没有门票和介绍可看，弹「看看介绍和门票」只会
   // 换来一句"查不到"。只有真实景点/餐厅才给操作项；餐厅问人均不问门票。
@@ -1121,6 +1138,15 @@ function nodeMenu(ev,name,ntype){
     else mk('\\u{1F4D6} 看看介绍和门票',name+'怎么样？门票多少钱');
   }
   if(!bmenu.children.length)return;
+  // 手机端：底部抽屉（不定位，靠 CSS 贴底），带遮罩；桌面端：跟节点浮动
+  if(window.matchMedia('(max-width:760px)').matches){
+    bmenu.classList.add('drawer');
+    bmenu.style.left='';bmenu.style.top='';
+    bmmask.style.display='block';
+    bmenu.style.display='block';
+    return;
+  }
+  bmenu.classList.remove('drawer');
   bmenu.style.display='block';
   const rect=ev.currentTarget.getBoundingClientRect();
   const bw=240,bh=92;
@@ -1129,7 +1155,7 @@ function nodeMenu(ev,name,ntype){
   if(y+bh>window.innerHeight-10)y=Math.max(8,rect.top-bh-6);
   bmenu.style.left=Math.max(8,x)+'px';bmenu.style.top=y+'px';
 }
-document.addEventListener('click',()=>{bmenu.style.display='none';});
+document.addEventListener('click',hideNodeMenu);
 function dayCard(d,idx){
   const wx=(boardPlan.weather&&boardPlan.weather.days?boardPlan.weather.days[idx]:null);
   let wtxt='';

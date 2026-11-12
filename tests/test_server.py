@@ -202,6 +202,9 @@ def test_lan_and_mobile(base: str) -> None:
           re.search(r'atob\("([A-Za-z0-9+/=]{1000,})"\)', html) is not None)
     check("移动端断点样式存在（≤760px 整体适配、手机上隐藏扫码入口）",
           "@media(max-width:760px)" in html and "#btn-qr{display:none}" in html)
+    check("手机端节点菜单为底部抽屉（带把手、遮罩，JS 按视口分流）",
+          "#bmenu.drawer" in html and 'id="bmmask"' in html
+          and "(max-width:760px)').matches" in html)
 
 
 def test_clarify_flow(base: str, token: str) -> None:
