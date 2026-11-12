@@ -314,7 +314,8 @@ ROUTE_MAP_JS = """
       var els = scope.querySelectorAll('.rt-card'), best = null, fallback = null;
       for (var i = 0; i < els.length; i++) {
         var r = els[i].getBoundingClientRect();
-        if (r.width > 80 && r.height > 80) {
+        // 阈值 40：迷你卡（餐位/车站等）只有 ~55px 高，80 会把它滤掉
+        if (r.width > 80 && r.height > 40) {
           fallback = r;
           if (els[i].offsetParent !== null) { best = r; }   // 真正渲染中的优先
         }
@@ -567,6 +568,19 @@ ROUTE_MAP_JS = """
   }
   function hoverClose() { hoverTick(); }
   window.RThover = { stay: hoverStay, leave: hoverClose };
+  // 无介绍可用的点位（餐位/车站/住宿/没搜到介绍的景点/估算点）：
+  // 统一给一张迷你卡——名称 + 当日色标签 + 时间，不再是裸 <b>名字</b>。
+  // 复用 rt-card 类名让 visibleCardRect 能量到它（防贴边裁切与误关）
+  function miniCard(n, color, tag, note) {
+    return '<div class="rt-card rt-mini" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">'
+      + '<div class="rt-mini-name">' + n.name + '</div>'
+      + '<div class="rt-mini-meta"><span class="rt-mini-tag" style="background:'
+      + darken(color, 0.75) + ';">' + tag + '</span>'
+      + (n.time ? '<span>' + n.time + '</span>' : '')
+      + '</div>'
+      + (note ? '<div class="rt-mini-note">' + note + '</div>' : '')
+      + '</div>';
+  }
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
   // 「图片卡」标记：介绍页没搜到、只有搜索来的图，站点名固定为必应图片
   var IMG_ONLY_TAG = '必应图片';
@@ -856,27 +870,27 @@ ROUTE_MAP_JS = """
         if (n.uncertain) {
           // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
           rec.ov.push(addMarker(pos, '#a0a8bd', 'unknown', '?',
-            '<b>' + n.name + '</b><br><span style="font-size:11px;color:#7a8299;">'
-            + '位置待确认（坐标按市区估算，交通时间未计入）</span>', true));
+            miniCard(n, '#a0a8bd', '位置估算',
+                     '位置待确认 · 坐标按市区估算，交通时间未计入'), true));
           rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
         }
         rec.chain.push(pos);
         if (n.type === 'restaurant') {
           // 餐位也插旗（刀叉图标），但不加名字标签，避免景点名被盖住
-          rec.ov.push(addMarker(pos, color, 'restaurant', '', '<b>' + n.name + '</b>', false));
+          rec.ov.push(addMarker(pos, color, 'restaurant', '', miniCard(n, color, '用餐'), false));
           return;
         }
         if (n.type === 'transit') {
           // 车站/抵达：列车图标
-          rec.ov.push(addMarker(pos, color, 'transit', '', '<b>' + n.name + '</b>', false));
+          rec.ov.push(addMarker(pos, color, 'transit', '', miniCard(n, color, '交通'), false));
           return;
         }
         if (n.type !== 'attraction') { return; }   // 午休/自由活动只进动线不插旗
         seq += 1;
         // hover 弹介绍卡片（图片+来源+摘要+跳转链接）；没搜到就退回名字气泡
         rec.ov.push(addMarker(pos, color, 'sight', String(seq),
-                              n.link ? poiCard(n) : '<b>' + n.name + '</b>', false));
+                              n.link ? poiCard(n) : miniCard(n, color, '景点'), false));
         rec.ov.push(addLabel(n.name, pos, -10));
       });
       if (rec.chain.length >= 2) {
@@ -895,7 +909,8 @@ ROUTE_MAP_JS = """
     });
     if (DATA.home) {
       var hp = ll(DATA.home[1], DATA.home[0]);
-      homeOv = addMarker(hp, '#1d2333', 'hotel', '', '住宿', false);
+      homeOv = addMarker(hp, '#1d2333', 'hotel', '',
+                         miniCard({name: '住宿'}, '#2c3550', '酒店'), false);
       addLabel('住宿', hp, -22);
     }
     if (all.length > 1) {
@@ -1023,6 +1038,14 @@ def render_route_map(result: dict) -> str:
         f'#rt-locate-tip:empty{{display:none;}}'
         # 景点介绍卡片（hover 图钉弹出，效仿行程类 App 的大卡）
         f'.rt-card{{width:238px;font-family:inherit;}}'
+        f'.rt-mini{{width:196px;background:#FFFFFF;border-radius:10px;padding:9px 12px 10px;'
+        f'box-shadow:0 6px 18px rgba(29,35,51,.14);}}'
+        f'.rt-mini-name{{font-size:13.5px;font-weight:bold;color:#2c3550;line-height:1.4;}}'
+        f'.rt-mini-meta{{display:flex;align-items:center;gap:7px;margin-top:6px;'
+        f'font-size:11px;color:#7a8299;}}'
+        f'.rt-mini-tag{{color:#FFFFFF;border-radius:999px;padding:2px 8px;'
+        f'font-size:10.5px;font-weight:600;letter-spacing:.05em;flex:none;}}'
+        f'.rt-mini-note{{font-size:10.5px;color:#a0a8bd;margin-top:5px;line-height:1.5;}}'
         f'.rt-card-img{{height:120px;border-radius:8px 8px 0 0;background:#dfe6f5 center/cover no-repeat;}}'
         f'.rt-card-noimg{{display:flex;align-items:center;justify-content:center;'
         f'background:linear-gradient(135deg,#2b5fe0,#7a5cff);color:#FFFFFF;'

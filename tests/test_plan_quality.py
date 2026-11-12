@@ -755,7 +755,8 @@ def test_route_map_real() -> None:
         check("餐位/车站也插旗（不只景点）",
               "n.type === 'restaurant'" in h2 and "n.type === 'transit'" in h2)
         check("估算点是灰色?图钉", "'#a0a8bd', 'unknown', '?'" in h2)
-        check("住宿用床图标", "'hotel', '', '住宿'" in h2)
+        check("住宿用床图标 + 迷你卡", "'hotel', '', '住宿'" in h2 or
+              ("'hotel'" in h2 and "miniCard({name: '住宿'}" in h2))
         check("页脚有图钉图例", "序号+楼=景点" in h2 and "刀叉=餐饮" in h2)
 
         render_html.get_tdt_key = lambda: "abc';alert(1)//"
