@@ -364,7 +364,7 @@ PAGE_SRC = """<!DOCTYPE html>
   #bchips button{border:1.5px solid var(--line);background:#fff;border-radius:999px;
        padding:4px 13px;font-size:12.5px;color:var(--ink)}
   #bchips button:hover{border-color:var(--blue);color:var(--blue-deep);background:#eef4ff}
-  #bmenu{position:fixed;z-index:18;background:var(--card);border:1px solid var(--line);
+  #bmenu{position:fixed;z-index:25;background:var(--card);border:1px solid var(--line);
        border-radius:14px;box-shadow:0 14px 40px rgba(29,35,51,.16);padding:6px;display:none;
        min-width:225px}
   #bmmask{position:fixed;inset:0;background:rgba(29,35,51,.35);display:none;z-index:17}
@@ -372,6 +372,17 @@ PAGE_SRC = """<!DOCTYPE html>
        padding:9px 12px;font-size:13px;border-radius:9px;cursor:pointer;color:var(--ink);
        white-space:nowrap}
   #bmenu button:hover{background:#eef4ff;color:var(--blue-deep)}
+  /* 行程单抽屉（手机端）：遮罩/悬浮按钮/关闭键桌面端一律隐藏 */
+  #boardmask{position:fixed;inset:0;background:rgba(29,35,51,.35);z-index:19;display:none}
+  #board-fab{display:none;position:fixed;right:14px;bottom:88px;z-index:12;
+       border:none;background:var(--grad);color:#fff;border-radius:999px;
+       padding:10px 18px;font-size:13px;font-weight:600;cursor:pointer;
+       box-shadow:0 10px 26px rgba(122,92,255,.35);align-items:center;gap:6px}
+  #board-fab:active{filter:brightness(1.08)}
+  #bclose{display:none;border:none;background:#f1f4fb;color:var(--dim);
+       width:26px;height:26px;border-radius:8px;font-size:13px;cursor:pointer;
+       flex:none;line-height:1}
+  #bclose:hover{color:var(--ink)}
   @media(max-width:920px){#board{width:380px}}
   /* ---------- 手机访问弹窗（扫码互通） ---------- */
   #qrmask{position:fixed;inset:0;background:rgba(29,35,51,.4);display:none;
@@ -581,7 +592,16 @@ PAGE_SRC = """<!DOCTYPE html>
      planner/login 的桌面规则盖掉（实测手机上仍是 4 列溢出） */
   @media(max-width:760px){
        #main{flex-direction:column}
-       #board{width:auto;max-height:42vh;border-left:none;border-top:1px solid var(--line)}
+       /* 行程详情改抽屉：默认滑出屏外，.on 从底部滑入；
+          常驻占屏 42vh 把对话挤没了（用户截图反馈） */
+       #board{position:fixed;left:0;right:0;bottom:0;top:auto;width:auto;
+            max-height:72vh;border-left:none;border-top:1px solid var(--line);
+            border-radius:18px 18px 0 0;box-shadow:0 -14px 44px rgba(29,35,51,.2);
+            z-index:20;display:flex;transform:translateY(105%);
+            transition:transform .28s ease}
+       #board.on{transform:translateY(0)}
+       #board-fab{display:flex}
+       #bclose{display:flex;align-items:center;justify-content:center}
        /* 顶栏一行放下：按钮一律不换行、全面收紧；手机号藏起只留积分，
           否则「历史行程(6)」「＋新对话」会被挤成两行竖排（截图实测） */
        header{padding:0 8px;gap:6px}
@@ -764,7 +784,8 @@ PAGE_SRC = """<!DOCTYPE html>
 <div id="board">
   <div id="bhead">
     <div id="btitle"><span id="bname">行程面板</span>
-      <span class="bsub" id="bsub"></span></div>
+      <span class="bsub" id="bsub"></span>
+      <button id="bclose" onclick="toggleBoard()" title="收起行程单">&#10005;</button></div>
   </div>
   <div id="btabs"></div>
   <div id="bbody"><div class="bempty">排好行程后，这里会出现可点击的行程单：<br>点任一地点就能修改或查看介绍。</div></div>
@@ -777,6 +798,9 @@ PAGE_SRC = """<!DOCTYPE html>
 </div>
 <div id="bmmask"></div>
 <div id="bmenu"></div>
+<div id="boardmask" onclick="toggleBoard()"></div>
+<button id="board-fab" onclick="toggleBoard()" style="display:none"
+        title="打开行程单">&#128203; 行程单</button>
 <div id="bar">
   <div id="row">
     <textarea id="inp" rows="1" placeholder="说出你的旅行想法，回车发送…"></textarea>
@@ -1228,14 +1252,40 @@ function drawBoard(){
   bbody.innerHTML=h||'<div class="bempty">暂无内容</div>';
   bbody.scrollTop=0;
 }
+// ---------------- 行程单抽屉（手机端 bottom sheet） ----------------
+const boardMask=document.getElementById('boardmask');
+const boardFab=document.getElementById('board-fab');
+const isNarrow=()=>window.matchMedia('(max-width:760px)').matches;
+// open=true：桌面照常展开右侧面板；手机滑入抽屉、隐藏悬浮按钮。
+// open=false：手机回到「亮着行程单按钮、抽屉收起」的待命态。
+function syncBoardOpen(open){
+  if(open){
+    board.classList.add('on');
+    boardMask.style.display=isNarrow()?'block':'none';
+    boardFab.style.display='none';
+  }else{
+    board.classList.remove('on');
+    boardMask.style.display='none';
+    boardFab.style.display=(boardPlan&&isNarrow())?'':'none';
+  }
+}
+function toggleBoard(){
+  syncBoardOpen(!board.classList.contains('on'));
+}
+// 跨过断点时把遮罩收干净（手机开抽屉 → 转成桌面窗口的残留）
+window.addEventListener('resize',()=>{
+  if(!isNarrow())boardMask.style.display='none';
+});
 function hideBoard(){
-  board.classList.remove('on');
   boardPlan=null;boardSlots=null;
+  syncBoardOpen(false);
 }
 function renderBoard(plan,slots){
   boardPlan=plan;boardSlots=slots||null;
   if(!plan||!plan.days_plan||!plan.days_plan.length){hideBoard();return;}
-  board.classList.add('on');
+  // 手机端不自动展开抽屉（常驻面板把对话挤没了），只亮「行程单」按钮；
+  // 桌面端保持原来的自动展开
+  syncBoardOpen(!isNarrow());
   const dest=(slots&&slots.destination)||'';
   document.getElementById('bname').textContent='行程详情';
   document.getElementById('bsub').textContent=dest;
