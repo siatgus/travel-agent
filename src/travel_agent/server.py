@@ -442,10 +442,15 @@ PAGE_SRC = """<!DOCTYPE html>
   #logoutmask .danger{background:var(--coral);border-color:var(--coral);color:#fff}
   #logoutmask .danger:hover{background:#f06540;border-color:#f06540;color:#fff}
   /* ---------- 登录页（整页） ---------- */
+  /* align-items:flex-start 是手机端能否滚动的关键：showLogin 设 display:flex 后
+     .lg-inner 会被默认 stretch 钳在视口高，超出内容被它自己的 overflow:hidden
+     剪掉，#login 看不到溢出就永远滚不动（手机端实测踩过）。flex-start 让内层
+     被内容撑高，短内容时仍有 min-height:100% 兜底铺满。 */
   #login{position:fixed;inset:0;z-index:30;display:none;overflow-y:auto;
+       -webkit-overflow-scrolling:touch;align-items:flex-start;
        background:linear-gradient(180deg,#dcebff 0%,#f3e9ff 55%,#fff2e8 100%)}
-  #login .lg-inner{min-height:100%;display:flex;flex-direction:column;position:relative;
-       overflow:hidden}
+  #login .lg-inner{min-height:100%;width:100%;display:flex;flex-direction:column;
+       position:relative;overflow:hidden}
   #login .cloud{position:absolute;background:rgba(255,255,255,.75);border-radius:999px;
        filter:blur(1px);animation:drift 30s linear infinite;z-index:0}
   #login .cloud::before,#login .cloud::after{content:'';position:absolute;background:inherit;
