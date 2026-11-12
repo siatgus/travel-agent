@@ -1256,6 +1256,15 @@ function drawBoard(){
 const boardMask=document.getElementById('boardmask');
 const boardFab=document.getElementById('board-fab');
 const isNarrow=()=>window.matchMedia('(max-width:760px)').matches;
+// 悬浮按钮要一直贴在输入区上缘：输入框随内容长高、脚注换行都会改变
+// 输入区高度，写死 bottom 会把「发送」压在按钮底下（实测踩过）。
+function placeFab(){
+  if(!isNarrow())return;
+  if(boardFab.style.display==='none')return;
+  const bar=document.getElementById('bar');
+  if(!bar)return;
+  boardFab.style.bottom=(window.innerHeight-bar.getBoundingClientRect().top+12)+'px';
+}
 // open=true：桌面照常展开右侧面板；手机滑入抽屉、隐藏悬浮按钮。
 // open=false：手机回到「亮着行程单按钮、抽屉收起」的待命态。
 function syncBoardOpen(open){
@@ -1267,6 +1276,7 @@ function syncBoardOpen(open){
     board.classList.remove('on');
     boardMask.style.display='none';
     boardFab.style.display=(boardPlan&&isNarrow())?'':'none';
+    placeFab();
   }
 }
 function toggleBoard(){
@@ -1275,6 +1285,7 @@ function toggleBoard(){
 // 跨过断点时把遮罩收干净（手机开抽屉 → 转成桌面窗口的残留）
 window.addEventListener('resize',()=>{
   if(!isNarrow())boardMask.style.display='none';
+  placeFab();
 });
 function hideBoard(){
   boardPlan=null;boardSlots=null;
@@ -1558,7 +1569,7 @@ inp.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}
 });
 inp.addEventListener('input',()=>{inp.style.height='auto';
-  inp.style.height=Math.min(inp.scrollHeight,120)+'px';});
+  inp.style.height=Math.min(inp.scrollHeight,120)+'px';placeFab();});
 
 // 打开网页默认规划表单；但登录态且有存储会话时先全部藏住（不闪表单帧），
 // 等 boot 决定回放对话还是兜底落回表单
