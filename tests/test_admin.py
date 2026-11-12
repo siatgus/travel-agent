@@ -330,6 +330,13 @@ def test_search_ui() -> None:
           'function applyRowAdjust' in p and 'id="radj-delta"' in p)
     check("POI 城市下拉含「全部城市」",
           '<option value="*">全部城市</option>' in p)
+    check("城市四级级联控件齐全（国家/省/城市/区县）",
+          all(k in p for k in ('id="country-sel"', 'id="prov-sel"',
+                               'id="city-sel"', 'id="area-sel"')))
+    check("级联函数已接线（onCountry/onProv/onCity + 签名守卫防递归）",
+          all(k in p for k in ('function onCountry', 'function onProv',
+                               'function onCity', 'function cascadeCities',
+                               'CASCADE_SIG')))
     check("搜索结果计数与空态提示存在",
           '命中 ' in p and '没有符合条件的 POI' in p)
 
@@ -367,6 +374,46 @@ def test_poi_search_http(base: str) -> None:
     check("POI 多条件组合生效",
           status == 200 and all(p["city"] == "上海" and p["category"] == "restaurant"
                                 for p in j.get("items", [])))
+
+    # ---- 城市→省→城市→区县 四级级联 --------------------------------
+    status, j = _get(base, "/api/stats")
+    regions = j.get("regions") or []
+    freshness = j.get("freshness") or []
+    check("stats 下发级联树 regions（国家→省→城市）",
+          status == 200 and bool(regions)
+          and all({"country", "provinces"} <= set(r) for r in regions)
+          and all({"province", "cities"} <= set(pv)
+                  for r in regions for pv in r["provinces"]),
+          str([r.get("country") for r in regions]))
+    tree_cities = {c for r in regions for pv in r["provinces"] for c in pv["cities"]}
+    check("级联树覆盖 freshness 全部城市（不漏城市）",
+          {f["city"] for f in freshness} <= tree_cities,
+          f"缺{ {f['city'] for f in freshness} - tree_cities }")
+    # 选两个城市做省级批量过滤：只返回这两城
+    two = sorted({f["city"] for f in freshness})[:2]
+    status, j = _get(base, "/api/pois?cities=" + urllib.parse.quote(",".join(two)))
+    got = j.get("items", [])
+    check("cities 批量过滤只返回指定城市",
+          status == 200 and bool(got)
+          and {p["city"] for p in got} <= set(two), f"two={two}")
+    # 区县：任取一个有 area 数据的城市
+    city_with_area = next((p["city"] for p in items if p.get("area")), None)
+    if city_with_area:
+        status, j = _get(base, "/api/city-areas?city="
+                         + urllib.parse.quote(city_with_area))
+        areas = j.get("areas") or []
+        check("city-areas 返回区县清单（带 POI 计数）",
+              status == 200 and bool(areas)
+              and all({"area", "pois"} <= set(a) for a in areas),
+              f"{city_with_area}: {len(areas)} 区县")
+        a0 = areas[0]["area"]
+        status, j = _get(base, "/api/pois?city="
+                         + urllib.parse.quote(city_with_area)
+                         + "&area=" + urllib.parse.quote(a0))
+        hit = j.get("items", [])
+        check("area 精确过滤只返回该区县 POI",
+              status == 200 and bool(hit)
+              and all(p["area"] == a0 for p in hit), f"area={a0}")
 
 
 def test_inline_edit_http(base: str) -> None:

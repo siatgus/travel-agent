@@ -200,19 +200,29 @@ class KnowledgeBase:
         return out
 
     def search_pois(self, city: str = "", q: str = "", category: str = "",
-                    source: str = "", limit: int = 500) -> list[dict]:
+                    source: str = "", area: str = "",
+                    cities: list[str] | None = None, limit: int = 500) -> list[dict]:
         """条件检索 POI（管理端用）。返回原始行（含 city/source/tags 字符串）。
 
-        city 为空或 "*" 表示不限城市；q 模糊匹配名称/区域/ID；其余为精确筛选。
+        city 为空或 "*" 表示不限城市；cities 为省/国家级联的批量城市集合
+        （city 优先）；q 模糊匹配名称/区域/ID；其余为精确筛选。
         """
         where, args = [], []
         if city and city != "*":
             where.append("city=?")
             args.append(city)
+        elif cities:
+            cs = [c for c in cities if c]
+            if cs:
+                where.append("city IN (%s)" % ",".join("?" * len(cs)))
+                args.extend(cs)
         if q:
             like = f"%{q}%"
             where.append("(name LIKE ? OR area LIKE ? OR poi_id LIKE ?)")
             args.extend([like, like, like])
+        if area:
+            where.append("area=?")
+            args.append(area)
         if category:
             where.append("category=?")
             args.append(category)
@@ -366,6 +376,13 @@ class KnowledgeBase:
                     " FROM pois GROUP BY city ORDER BY city")
             ],
         }
+
+    def city_areas(self, city: str) -> list[dict]:
+        """某城市的区县清单（POI area 去重 + 计数，管理端级联第 4 级用）。"""
+        rows = self.conn.execute(
+            "SELECT area, COUNT(*) n FROM pois WHERE city=? AND area!=''"
+            " GROUP BY area ORDER BY area", (city,)).fetchall()
+        return [{"area": r["area"], "pois": r["n"]} for r in rows]
 
     def logs(self, limit: int = 50) -> list[dict]:
         rows = self.conn.execute(

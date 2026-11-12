@@ -204,7 +204,14 @@ PAGE = """<!DOCTYPE html>
 <section>
   <h2>POI 管理 <span class="fresh" id="poi-fresh"></span></h2>
   <div class="filters">
-    <select id="city-sel" onchange="loadPois()"></select>
+    <select id="country-sel" onchange="onCountry()" title="国家">
+      <option value="*">全部国家</option></select>
+    <select id="prov-sel" onchange="onProv()" title="省/州">
+      <option value="*">全部省/州</option></select>
+    <select id="city-sel" onchange="onCity()" title="城市">
+      <option value="*">全部城市</option></select>
+    <select id="area-sel" onchange="loadPois()" title="区县">
+      <option value="*">全部区县</option></select>
     <input id="q-poi" placeholder="名称 / 区域 / ID 关键词" size="22" oninput="debouncePoi()">
     <select id="flt-cat" onchange="loadPois()">
       <option value="">全部类型</option>
@@ -393,20 +400,70 @@ async function loadStats(){
   const cards=$('cards');
   if(cards) cards.innerHTML = [['城市',s.cities],['POI',s.pois],['酒店',s.hotels],['班次',s.schedules]]
     .map(c=>'<div class="card"><b>'+c[1]+'</b><span>'+c[0]+'</span></div>').join('');
-  const sel=$('city-sel');
-  if(sel){
-    const cur=sel.value;
-    sel.innerHTML = '<option value="*">全部城市</option>'
-      + (s.freshness||[]).map(f=>'<option>'+esc(f.city)+'</option>').join('');
-    if(cur==='*' || (cur && s.freshness.some(f=>f.city===cur))) sel.value=cur;
-    else sel.value='*';
-  }
+  REGIONS = s.regions || [];
+  rebuildCascade();
   const ft=$('fresh-table');
   if(ft){
     FRESH_ROWS=(s.freshness||[]);
     renderFresh();
   }
   return s;
+}
+
+// ---- 城市→省→城市→区县 四级级联 -------------------------------------
+// REGIONS: [{country, provinces:[{province, cities:[...]}]}]（/api/stats 下发）
+// 每级都有「全部」选项；城市级保留原 #city-sel（新增/同步等逻辑复用）。
+// 选省不选城市时按该省全部城市批量过滤（/api/pois 的 cities 参数）。
+function cascadeCities(){
+  const c=$('country-sel').value||'*', p=$('prov-sel').value||'*';
+  if(c==='*') return null;                       // 不限：不过滤
+  const node=REGIONS.find(r=>r.country===c);
+  const provs=(node&&node.provinces)||[];
+  if(p==='*') return [].concat(...provs.map(x=>x.cities));
+  const pv=provs.find(x=>x.province===p);
+  return pv?pv.cities.slice():[];
+}
+function setSel(sel, opts, keep){
+  const cur=keep?sel.value:null;
+  sel.innerHTML=opts.map(o=>'<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>').join('');
+  if(cur!==null && opts.some(o=>o[0]===cur)) sel.value=cur;
+}
+function rebuildCascade(){
+  if(!$('country-sel')) return;
+  // loadPois 会调 loadStats，loadStats 又触发级联重建回到 loadPois——
+  // 树没变就直接返回，砍断这个环
+  const sig=JSON.stringify(REGIONS);
+  if(sig===CASCADE_SIG) return;
+  CASCADE_SIG=sig;
+  setSel($('country-sel'),
+    [['*','全部国家']].concat(REGIONS.map(r=>[r.country,r.country])), true);
+  onCountry(true);
+}
+function onCountry(keepProv){
+  const c=$('country-sel').value||'*';
+  const node=REGIONS.find(r=>r.country===c);
+  const provs=(node&&node.provinces)||[];
+  setSel($('prov-sel'), [['*','全部省/州']].concat(provs.map(p=>[p.province,p.province])),
+    keepProv===true);
+  onProv(true);
+}
+function onProv(keepCity){
+  const cities=cascadeCities();
+  const all=cities?cities.map(c=>[c,c]):(FRESH_ROWS||[]).map(f=>[f.city,f.city]);
+  setSel($('city-sel'), [['*','全部城市']].concat(all), keepCity===true);
+  if(!keepCity) $('city-sel').value='*';
+  onCity();
+}
+function onCity(){
+  const city=$('city-sel').value||'*';
+  if(city==='*'){ $('area-sel').innerHTML='<option value="*">全部区县</option>'; loadPois(); return; }
+  api('/api/city-areas?city='+encodeURIComponent(city)).then(function(r){
+    const areas=(r&&r.areas)||[];
+    setSel($('area-sel'), [['*','全部区县']]
+      .concat(areas.map(a=>[a.area, a.area+' · '+a.pois+'条'])));
+    $('area-sel').value='*';
+    loadPois();
+  }).catch(function(){ $('area-sel').innerHTML='<option value="*">全部区县</option>'; loadPois(); });
 }
 
 function renderFresh(){
@@ -427,6 +484,8 @@ function renderFresh(){
 const PAGE_SIZES=[10,20,50,100];
 const PAGES={fresh:1,poi:1,log:1,user:1,usage:1};   // 各表当前页码
 let FRESH_ROWS=[];
+let REGIONS=[];                                     // 国家→省→城市级联树（/api/stats）
+let CASCADE_SIG='';                                 // 上次重建时的树签名（防 loadPois↔loadStats 递归环）
 
 function getPageSize(k){
   const v=Number(localStorage.getItem('admin_psize_'+k));
@@ -485,19 +544,28 @@ function num(v){return (v===null||v===undefined)?'-':v;}
 function debouncePoi(){clearTimeout(POI_T);POI_T=setTimeout(loadPois,250);}
 
 async function loadPois(){
-  const s=await loadStats();                       // 城市下拉先就绪
+  const s=await loadStats();                       // 级联下拉先就绪
   const city=$('city-sel').value||'*';
-  const qs='city='+encodeURIComponent(city)
-    +'&q='+encodeURIComponent($('q-poi').value.trim())
+  const area=$('area-sel')?$('area-sel').value:'*';
+  const scope=cascadeCities();                     // 选了国家/省但没选城市 → 批量
+  let qs='';
+  if(city!=='*'){ qs='city='+encodeURIComponent(city); }
+  else if(scope){ qs='cities='+encodeURIComponent(scope.join(',')); }
+  qs+='&q='+encodeURIComponent($('q-poi').value.trim())
     +'&category='+encodeURIComponent($('flt-cat').value)
-    +'&source='+encodeURIComponent($('flt-src').value);
+    +'&source='+encodeURIComponent($('flt-src').value)
+    +(area&&area!=='*'?'&area='+encodeURIComponent(area):'');
   const r=await api('/api/pois?'+qs);
   if(!r.ok){show(false,'加载失败：'+(r.error||'未知错误'));return;}
   POI_CUR=r.items||[];
   POI_ROWS={};
   POI_CUR.forEach(function(p){POI_ROWS[p.poi_id]=p;});
   const fresh=(s.freshness||[]).find(function(f){return f.city===city;});
-  $('poi-fresh').textContent=(city==='*'?'全部城市':'城市 '+city)
+  const label = city!=='*' ? ('城市 '+city)
+    : ($('country-sel').value!=='*'
+        ? ($('prov-sel').value!=='*' ? $('prov-sel').value : $('country-sel').value)
+        : '全部城市');
+  $('poi-fresh').textContent=label
     +(fresh?(' · 共 '+fresh.pois+' 条 · 来源 '+(fresh.sources||'-')+' · 最近更新 '+fresh.last_update):'');
   $('poi-count').textContent='命中 '+POI_CUR.length+' 条';
   POI_EDIT=null;
@@ -1022,6 +1090,32 @@ def _chat_llm_state() -> dict:
                 "error": f"{type(e).__name__}: {str(e)[:60]}"}
 
 
+def _region_tree(freshness: list[dict]) -> dict:
+    """把新鲜度城市按 国家→省 聚合成级联树（/api/stats 的 regions 字段）。
+
+    国内城市查 city_region.CITY_REGION（CITY_GEO 全量映射，民政部口径）；
+    海外查 OVERSEAS_REGION；两边都没有的落「中国/其他」——级联照常可用，
+    不阻塞新城市接入。"""
+    from .city_region import CITY_REGION, OVERSEAS_REGION
+    tree: dict[str, dict[str, list[str]]] = {}
+    for f in freshness:
+        city = str(f.get("city") or "")
+        if not city:
+            continue
+        if city in OVERSEAS_REGION:
+            country, prov = OVERSEAS_REGION[city]
+        else:
+            country, prov = "中国", CITY_REGION.get(city, "其他")
+        tree.setdefault(country, {}).setdefault(prov, []).append(city)
+    regions = []
+    for country, ps in sorted(tree.items(), key=lambda kv: (kv[0] != "中国", kv[0])):
+        provinces = []
+        for prov, cities in sorted(ps.items(), key=lambda kv: (kv[0] == "其他", kv[0])):
+            provinces.append({"province": prov, "cities": sorted(cities)})
+        regions.append({"country": country, "provinces": provinces})
+    return {"regions": regions}
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -1077,7 +1171,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if path == "/api/stats":
-                self._json({"ok": True, **db.stats()})
+                self._json({"ok": True, **db.stats(),
+                            **_region_tree(db.stats().get("freshness") or [])})
             elif path == "/api/pois":
                 import urllib.parse
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1085,8 +1180,15 @@ class Handler(BaseHTTPRequestHandler):
                     city=(qs.get("city") or [""])[0],
                     q=(qs.get("q") or [""])[0].strip(),
                     category=(qs.get("category") or [""])[0].strip(),
-                    source=(qs.get("source") or [""])[0].strip())
+                    source=(qs.get("source") or [""])[0].strip(),
+                    area=(qs.get("area") or [""])[0].strip(),
+                    cities=(qs.get("cities") or [""])[0].split(","))
                 self._json({"ok": True, "items": items, "total": len(items)})
+            elif path == "/api/city-areas":
+                import urllib.parse
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._json({"ok": True,
+                            "areas": db.city_areas((qs.get("city") or [""])[0])})
             elif path == "/api/logs":
                 self._json({"ok": True, "logs": db.logs()})
             else:
