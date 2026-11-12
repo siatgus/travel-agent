@@ -1485,6 +1485,7 @@ async function refreshHistList(){
       if(it.sid===sid){ newChat(); }             // 删的是当前会话 → 切到新会话
       d.remove();
       if(!list.children.length) list.innerHTML='<div class="hempty">还没有历史行程。</div>';
+      refreshHistCount();                        // 顶栏「历史行程(N)」同步减一
     };
     d.onclick=()=>loadConv(it.sid);
     d.appendChild(del);
