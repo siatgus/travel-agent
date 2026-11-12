@@ -570,14 +570,16 @@ PAGE_SRC = """<!DOCTYPE html>
   #planner .chead h3 .no{color:var(--blue-deep);font-size:13px;margin-right:6px;font-weight:700}
   #planner .chead .note{font-size:12px;color:var(--dim)}
   #planner .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 16px}
-  #planner .f{display:flex;flex-direction:column;gap:6px}
-  #planner .f.w2{grid-column:span 2}
+  /* min-width:0 必须加：网格子项默认 min-width:auto，不会收缩到输入框
+     固有最小宽（约 20 字符）以下，窄屏上整格顶破卡片（实测踩过） */
+  #planner .f{display:flex;flex-direction:column;gap:6px;min-width:0}
+  #planner .f.w2{grid-column:span 2;min-width:0}
   #planner label{font-size:12.5px;color:#3c4358;font-weight:600}
   #planner label .opt{color:var(--dim);font-weight:400;margin-left:4px}
   #planner label .req{color:var(--coral);margin-left:2px}
   #planner input,#planner select{border:1.5px solid var(--line);border-radius:12px;
     padding:9px 12px;font-size:13.5px;background:#fbfcff;color:var(--ink);
-    font-family:inherit;outline:none;width:100%}
+    font-family:inherit;outline:none;width:100%;min-width:0}
   #planner input:focus,#planner select:focus{border-color:var(--blue);background:#fff}
   #planner .err{color:#e05c3d;font-size:12.5px;margin-top:10px;display:none}
   #planner .foot{display:flex;justify-content:space-between;align-items:center;margin-top:18px;
