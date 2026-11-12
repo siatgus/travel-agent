@@ -386,6 +386,29 @@ def test_history_scope() -> None:
           f"{inner.histories}")
 
 
+def test_planner_persona() -> None:
+    """资深旅行规划师人设：说话层与闲聊层共用一份，且不许盖掉事实约束。"""
+    check("人设常量存在", "资深旅行规划师" in llm._PERSONA)
+    check("人设不许编造个人经历", "编造个人经历" in llm._PERSONA)
+    check("人设进说话层", llm._REPLY_STYLE.startswith(llm._PERSONA))
+    check("人设进闲聊层", llm._CHAT_SYS.startswith(llm._PERSONA))
+    # 人设在最前面，但事实/数字的硬约束必须还在
+    check("说话层仍锁事实", "只使用【事实】" in llm._REPLY_STYLE)
+    check("闲聊仍不冒充型号", "不要冒充" in llm._CHAT_SYS)
+
+    c = llm.ScriptedClient(["大理古城和洱海值得去，古城慢慢逛半天就够。",
+                            "我在的，先说说你想去哪儿、玩几天。"])
+    llm.compose_reply(c, "poi", {"城市": "大理"}, "大理有什么好玩的")
+    llm.chat_reply(c, "你还在吗")
+    check("两次调用都带同一个人设",
+          len(c.systems) == 2 and all("资深旅行规划师" in s for s in c.systems),
+          f"{[s[:30] for s in c.systems]}")
+    # 闲聊的数字拦截仍生效：编价格要整句弃用
+    c2 = llm.ScriptedClient(["门票 80 元，9 点开门。"])
+    check("人设不放松数字拦截", llm.chat_reply(c2, "洱海门票多少") is None,
+          "闲聊层放过了编造的价格")
+
+
 def main() -> int:
     for fn in (test_fenced_json, test_numeric_coercion,
                test_avoid_coerced_and_wins_over_must,
@@ -399,7 +422,8 @@ def main() -> int:
                test_rerank_end_to_end_survives_failure,
                test_rerank_bonus_does_not_break_geometry,
                test_lookup_poi_coerce, test_unknown_spot_reply,
-               test_plan_intro_guard, test_history_scope):
+               test_plan_intro_guard, test_history_scope,
+               test_planner_persona):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

@@ -279,11 +279,13 @@ class ScriptedClient(Client):
         self._responses = list(responses)
         self._i = 0
         self.prompts: list[str] = []
+        self.systems: list[str] = []            # 每次调用收到的 system（测试断言用）
         self.histories: list[list[dict]] = []   # 每次调用收到的 history（测试断言用）
 
     def chat(self, system: str, user: str, *, temperature: float | None = None,
              history: list[dict] | None = None) -> str:
         self.prompts.append(user)
+        self.systems.append(system)
         self.histories.append(list(history or []))
         if self._i >= len(self._responses):
             raise LLMError("脚本已用尽")
@@ -834,7 +836,23 @@ def poi_names_en(client: Client, city: str, names: list[str]
 # 所以「后台 token 不动」和「说话像机器人」是同一个根因。
 # 这一层把工具查到的事实交给模型组织成人话，模板退成兜底。
 
-_REPLY_STYLE = """你是「旅行规划助手」，一个在本地跑的、说话像真人的助手。
+# 人设：说话层与闲聊层共用一份，避免两套提示词各写一半——一边像规划师、
+# 一边像客服。人设只规定「怎么想、怎么给建议」，不放松任何事实约束：
+# 数字与名称的硬规则压在下面（_REPLY_STYLE 第 2/3 条、chat_reply 的数字拦截）。
+_PERSONA = """你的身份：一位资深旅行规划师（这是产品给你的人设，不用解释设定）。
+
+专业体现在判断上，不在头衔上：
+- 先想「这趟人能不能走下来」：一天几个点、路上要多久、几点必须吃饭休息、
+  带小孩或老人要不要砍点、钱花在哪最值。
+- 给结论也给取舍：该去的直说该去，不值得的直说「这个可以跳过」并说清为什么；
+  拿不准就说「看情况」，说清看哪种情况，不糊弄。
+- 有主张，但话短：别把专业判断铺成讲课，三句话讲完就停。
+- 不摆资历、不自称专家老师，也不编造个人经历（「我带过的客人都…」
+  「我上个月刚去过」这类一律不说）。分量来自判断本身，不是头衔。
+"""
+
+_REPLY_STYLE = _PERSONA + """
+你是「旅行规划助手」，一个在本地跑的、说话像真人的助手。
 
 说话要求：
 1. 像朋友聊天：短句、口语。不要「您好，根据您提供的信息」「以下是为您」这类客服腔。
@@ -991,7 +1009,8 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     return text
 
 
-_CHAT_SYS = """你是「旅行规划助手」，正在跟用户闲聊。规则：
+_CHAT_SYS = _PERSONA + """
+你正在跟用户闲聊。规则：
 1. 用户问你是谁、是什么模型、能做什么：说清你是这个产品里的旅行规划助手，
    背后接的是后台配置的大模型（OpenAI 兼容接口，可以换），不要冒充某个具体
    商业型号（GPT、文心一言等），也不要编造参数量、版本号。
