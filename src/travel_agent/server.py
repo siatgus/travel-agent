@@ -1313,8 +1313,10 @@ async function refreshHistHint(){
   }
   // #login 深链：直达登录页（分享/收藏登录入口用），不影响默认访客首屏
   if(location.hash==='#login') return showLogin();
-  // 刷新恢复：登录态且上次会话已有消息 → 原样回放；否则留在规划表单页
-  if(!token || !sid) return;
+  // 刷新恢复：登录态且上次会话已有消息 → 原样回放；任何走不通的分支都
+  // 落回规划表单页（init 时表单被藏住了，这里负责兜底展示）
+  if(!token){ showPlanner(); return; }
+  if(!sid){ showPlanner(); return; }
   try{
     let r = await fetch('/api/conversations/'+encodeURIComponent(sid),
                         {headers:authHeaders()});
@@ -1322,10 +1324,11 @@ async function refreshHistHint(){
       r = await fetch('/api/conversations/'+encodeURIComponent(sid),
                       {headers:authHeaders()});
     }
-    if(!r.ok) return;
+    if(!r.ok){ showPlanner(); return; }
     const j = await r.json();
     if(j.ok && (j.messages||[]).length) loadConv(sid, j);
-  }catch(e){}
+    else showPlanner();
+  }catch(e){ showPlanner(); }
 })();
 
 inp.addEventListener('keydown',e=>{
@@ -1336,8 +1339,15 @@ inp.addEventListener('input',()=>{inp.style.height='auto';
 document.getElementById('sugs').addEventListener('click',e=>{
   if(e.target.tagName==='BUTTON')send(e.target.textContent);});
 
-// 打开网页先展示规划表单，不直接进对话；提交表单或从历史行程进入后才出现聊天区
-showPlanner();
+// 打开网页默认规划表单；但登录态且有存储会话时先全部藏住（不闪表单帧），
+// 等 boot 决定回放对话还是兜底落回表单
+if(token && store.get('ta_sid')){
+  planner.style.display='none';
+  document.getElementById('main').style.display='none';
+  document.getElementById('bar').style.display='none';
+}else{
+  showPlanner();
+}
 </script>
 </body>
 </html>"""
