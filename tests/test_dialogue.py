@@ -1442,6 +1442,94 @@ def test_no_new_slots_no_replan() -> None:
           f"mode={r3.mode}")
 
 
+def test_comparison_question_not_generic_list() -> None:
+    """「邯郸有没有像迪士尼一样的地方」→ 按类型找同类，不甩本地景点清单。
+
+    实测（2026-11-12）：这句被当成「邯郸有什么好玩的」，回了广府古城、
+    娲皇宫、丛台公园——古城石窟，跟主题乐园半点关系没有。
+    """
+    from travel_agent.llm import ScriptedClient
+    import travel_agent.websearch as ws
+
+    orig = ws.search
+    try:
+        ws.search = lambda q, **k: {"ok": True, "note": "联网检索完成",
+            "results": [{"title": "邯郸有主题乐园吗",
+                         "url": "https://www.example.cn/hd",
+                         "snippet": "邯郸以历史文化景点为主，没有大型主题乐园",
+                         "site": "example.cn"}]}
+        c = ScriptedClient(['{"intent":"poi"}',
+                            "邯郸 主题乐园 类似迪士尼",
+                            "邯郸没有迪士尼那种大型主题乐园，景点以古城和石窟为主。"
+                            "想过山车那套，得看周边大城市，出行前再核实一下。"])
+        s = Session(today=TODAY, client=c)
+        r = s.turn("邯郸有没有像迪士尼一样的地方")
+        check("类比问句走通用问答", r.mode == "answer", f"mode={r.mode}")
+        check("不套本地景点清单", "想待几天" not in r.render, r.render[:120])
+        check("回答点明「没有同类」", "主题乐园" in r.render, r.render[:120])
+    finally:
+        ws.search = orig
+
+
+def test_meta_question_answered() -> None:
+    """问助手本人的话（「你是什么模型」「你是做什么的」）必须答得上，不许回「行程已经在上面了」。
+
+    实测（2026-11-12，网页端）：方案出过之后问这两句，都被「无脑重排拦截」
+    兜住，回了一段「行程已经在上面了。想改的话直接说…」——用户：这些问题
+    都不能回答。根因是闲聊词表只认「你是谁/你能做什么」，而 LLM 兜底分类
+    的标签表里又没有 smalltalk（闲聊被映射成 none），两层都漏。
+    """
+    from travel_agent.llm import ScriptedClient, Client as _StubClient
+
+    # 1) 无模型：纯规则词表也要认得出是闲聊，按身份模板答
+    s = session()
+    r = s.turn("你是什么模型")
+    check("无模型时身份问题照样作答",
+          r.mode == "answer" and "行程已经在上面了" not in r.render
+          and "助手" in r.render, f"mode={r.mode} {r.render[:80]}")
+    r2 = s.turn("你是做什么的")
+    check("「你是做什么的」不被当成改行程",
+          r2.mode == "answer" and "行程已经在上面了" not in r2.render,
+          f"mode={r2.mode} {r2.render[:80]}")
+
+    # 2) 有模型：身份问题交给模型自己说人话（不冒充具体商业型号）
+    c = ScriptedClient(["我是这个产品里的旅行规划助手，背后接的是后台配置的大模型，"
+                        "可以换。天气、班次、景点都能查，也能直接排行程。"])
+    s2 = Session(today=TODAY, client=c)
+    r3 = s2.turn("你是什么模型")
+    check("有模型时身份问题由模型作答",
+          r3.mode == "answer" and "助手" in r3.render, r3.render[:80])
+
+    # 3) 方案已出 + 规则认不出的句子：交给模型闲聊作答，而不是固定话术
+    class _ChatOnly(_StubClient):
+        """模拟"只会闲聊、抽不出槽位"的模型：结构化任务返回空对象，日常对话给固定回复。"""
+
+        def __init__(self, reply: str):
+            super().__init__(api_key="stub")
+            self.reply = reply
+
+        def chat(self, system: str, user: str, **_kw) -> str:
+            return "{}" if ("JSON" in (system or "") or "只输出" in (system or "")) \
+                else self.reply
+
+    s3 = session()
+    r4 = s3.turn("11月8号去大理玩4天，2人，预算6000")
+    check("前置：出过方案", r4.mode == "plan", f"mode={r4.mode}")
+    s3.client = _ChatOnly("我还在学，哪儿答得不好你直接说，我按你的想法改行程。")
+    r5 = s3.turn("你有点笨啊")
+    check("方案后的闲话由模型接住",
+          r5.mode == "answer" and "我还在学" in r5.render,
+          f"mode={r5.mode} {r5.render[:80]}")
+    # 模型不可用（脚本用尽）时回落固定话术，不能崩
+    s4 = session()
+    s4.turn("11月8号去大理玩4天，2人，预算6000")
+    s4.client = ScriptedClient([])
+    r6 = s4.turn("你有点笨啊")
+    check("模型不可用时回落固定话术且不崩",
+          r6.mode == "answer" and "行程已经在上面了" in r6.render,
+          f"mode={r6.mode} {r6.render[:80]}")
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1492,7 +1580,9 @@ def main() -> int:
                test_filler_node_qa, test_plan_node_where_qa,
                test_reco_restaurant_not_replan, test_no_new_slots_no_replan,
                test_bare_day_answered_once, test_month_then_day_merges,
-               test_day_then_month_not_overridden):
+               test_day_then_month_not_overridden,
+               test_meta_question_answered,
+               test_comparison_question_not_generic_list):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

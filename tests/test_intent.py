@@ -278,6 +278,24 @@ def test_smalltalk() -> None:
     check("问身份给出能力说明", r2.mode == "answer" and "行程" in r2.render, r2.render[:50])
 
 
+def test_identity_variants() -> None:
+    """问助手本人的各种说法都要归 smalltalk（实测「你是什么模型」答不上来）。"""
+    for q in ("你是什么模型", "你是做什么的", "你用的哪个模型", "你是干什么的",
+              "你能干嘛", "你是机器人吗"):
+        check(f"「{q}」是闲聊", intent.classify(q) == "smalltalk",
+              intent.classify(q))
+    check("身份判定复用同一张词表", intent.is_identity_question("你是什么模型"))
+    check("问景点不会被当身份问题",
+          not intent.is_identity_question("大理有什么景点")
+          and intent.classify("大理有什么景点") != "smalltalk")
+    # 无模型时模板也要答得上，而不是甩一句改行程的话术
+    s = _session()
+    r = s.turn("你是什么模型")
+    check("无模型时身份问题有答案",
+          r.mode == "answer" and "行程已经在上面了" not in r.render
+          and "助手" in r.render, r.render[:80])
+
+
 def test_no_destination_no_plan() -> None:
     """只说「想出去玩」：引导问城市，不能拿默认城市凑方案。"""
     s = _session()
@@ -306,6 +324,18 @@ def test_question_shape() -> None:
     # 泛问（城市+周边）不剥出假景点
     check("「上海周边有什么」不剥出景点",
           intent.spot_mention("上海周边有什么", "上海") is None)
+
+
+def test_comparison_question() -> None:
+    """「像迪士尼一样的地方」要按类型找同类，不能拿本地景点清单硬答（实测答成古城石窟）。"""
+    yes = ("邯郸有没有像迪士尼一样的地方", "类似西湖这种", "跟丽江差不多的古城",
+           "有没有和环球影城一样的地方", "差不多的景点还有吗")
+    no = ("大理有什么好玩的", "上海迪士尼门票多少钱", "帮我排邯郸2天行程",
+          "推荐几家驴肉火烧")
+    for q in yes:
+        check(f"类比问句命中：{q}", intent.is_comparison_question(q))
+    for q in no:
+        check(f"非类比问句：{q}", not intent.is_comparison_question(q))
 
 
 def test_nearby_answer_template() -> None:
@@ -347,7 +377,8 @@ def main() -> int:
                test_poi_answer_no_invent, test_spot_mention,
                test_reco_routing,
                test_spot_answer_template, test_poi_answer_autofetch,
-               test_smalltalk, test_question_shape,
+               test_smalltalk, test_identity_variants, test_comparison_question,
+               test_question_shape,
                test_nearby_answer_template,
                test_no_destination_no_plan,
                test_trim_optional_intent):

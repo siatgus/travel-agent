@@ -831,8 +831,10 @@ _KIND_TASK = {
     "poi": "用户问有什么好玩的。从事实里挑 3~5 个最值得去的，说清在哪个区、大概玩多久、"
            "门票多少、有什么讲究。不要把所有条目都念一遍。",
     "transport": "用户问交通。用事实里的车次/时刻/价格说清怎么走、哪班更划算或更省时间。",
-    "smalltalk": "用户在打招呼、问你是谁、道谢或告别。简短回应，顺带说清你能做什么："
-                 "查真实天气、真实班次、城市景点，也能直接排行程。",
+    "smalltalk": "用户在打招呼、问你是谁/是什么模型/能做什么、道谢或告别。简短回应："
+                 "问身份就说清你是这个产品里的旅行规划助手，背后接的是后台配置的大模型"
+                 "（OpenAI 兼容接口，可换），不要自称某个具体商业型号（别冒充 GPT、文心等）；"
+                 "再顺带说清你能做什么：查真实天气、真实班次、城市景点，也能直接排行程。",
     "clarify": "用户想排行程但信息不全。只问【要问的】里的那一件事（已经只列了一件，"
                "不要自己再加问题），并附一句具体建议让用户容易回答。"
                "如果【用户刚才的话】是在反问我而不是回答（比如问「你不问我从哪出发吗」），"
@@ -951,6 +953,54 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     return text
 
 
+_CHAT_SYS = """你是「旅行规划助手」，正在跟用户闲聊。规则：
+1. 用户问你是谁、是什么模型、能做什么：说清你是这个产品里的旅行规划助手，
+   背后接的是后台配置的大模型（OpenAI 兼容接口，可以换），不要冒充某个具体
+   商业型号（GPT、文心一言等），也不要编造参数量、版本号。
+2. 只聊助手本身、旅行、以及用户当前这趟行程的轻量话题。不知道的事直说不知道，
+   不编造景点、价格、政策、时刻、开放时间。
+3. 如果用户其实想改行程，用一句话点明怎么说（「加个XX」「不想去XX」「别太赶」
+   「改成 5 天」「换个城市」）。
+4. 2~4 句，口语，不超过 150 字。不要标题、列表、代码块，不要客服腔。"""
+
+
+def chat_reply(client: Client | None, text: str,
+               plan_desc: str = "") -> str | None:
+    """闲聊/问助手身份时的自由作答；模型不可用或输出不可信时返回 None。
+
+    这类问题没有【事实】可以照抄（「你是什么模型」不是查得到的数据），
+    所以不能走 compose_reply 的事实约束模板：给它一套独立的闲聊规则，
+    仍然硬拦"编造数字"——闲聊里出现价格/里程/时刻只可能是脑补。
+    QuotaError 不捕获：额度不足要拒绝服务，不是降级。
+    """
+    if client is None:
+        return None
+    t = (text or "").strip()
+    if not t:
+        return None
+    parts = [f"【用户说的】{t}"]
+    if plan_desc:
+        parts.append(f"【当前行程】{plan_desc}（已经排好了，不用再排一遍）")
+    try:
+        client.task = "reply_chat"
+    except Exception:
+        pass
+    try:
+        raw = client.chat(_CHAT_SYS, "\n".join(parts))
+    except LLMError:
+        return None
+    out = _clean_reply(raw, 200)
+    if not out:
+        return None
+    # 闲聊里冒出价格/时刻/里程只可能是脑补（「门票 80 元」「9 点开门」）；
+    # 但「改成 5 天」这类引导语里的数字是正常的，所以只拦带单位的硬事实。
+    for m in re.findall(r"\d+(?:\.\d+)?\s*(?:元|块|公里|千米|分钟|小时|点|℃|度|米)", out):
+        if m.replace(" ", "") not in (text or "").replace(" ", "") \
+                and m.replace(" ", "") not in (plan_desc or "").replace(" ", ""):
+            return None
+    return out
+
+
 def unknown_spot_reply(client: Client | None, city: str, spot: str,
                        has_plan: bool = False) -> str | None:
     """库里和在线都查不到的点名：让模型把「查不到」说得像人话。
@@ -1006,15 +1056,19 @@ def rewrite_query(client: Client | None, question: str) -> str | None:
 
 # ------------------------------------------------------------------ 意图兜底
 
-_INTENT_LABELS = ("weather", "poi", "transport", "plan_qa", "general", "none")
+_INTENT_LABELS = ("weather", "poi", "transport", "plan_qa", "smalltalk",
+                  "general", "plan", "none")
 
 _INTENT_SYS = (
     "你是旅行助手的意图分类器。判断用户这句话想做什么，只输出 JSON："
     '{"intent":"..."}，不要解释。可选值：\n'
     "weather=问天气；poi=问景点/地方/门票/介绍/周边；transport=问交通班次；\n"
-    "plan_qa=要总结或评价当前行程；general=其他旅行相关问题"
-    "（签证、证件、注意事项、常识等）；\n"
-    "none=都不是——比如在回答追问、报信息、说需求、闲聊。"
+    "plan_qa=要总结或评价当前行程；\n"
+    "plan=想排行程或改行程（说去哪儿玩几天、加/删/换景点、改天数酒店等需求）；\n"
+    "smalltalk=打招呼、问你是谁/是什么模型/能做什么、道谢、告别等关于助手"
+    "本人的对话；\n"
+    "general=其他问题（签证、证件、注意事项、旅行常识等）；\n"
+    "none=都不是——比如在回答追问、报信息。"
 )
 
 

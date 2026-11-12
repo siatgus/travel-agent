@@ -418,6 +418,14 @@ class Session:
             if not city:
                 return intent.poi_answer("")
             self.last_city = city
+            # 「邯郸有没有像迪士尼一样的地方」问的是「按类型找同类」，
+            # 不是「这城市有什么景点」：库里没有类型标签，套本地清单会
+            # 答成古城石窟（实测答非所问）。这类交给模型 + 联网检索，
+            # 检索/模型都不可用才退回本地清单。
+            if intent.is_comparison_question(utterance):
+                said = self._general_answer(utterance)
+                if said:
+                    return said
             # 「上海迪士尼门票多少钱」是问具体景点，不是问「上海有什么好玩的」。
             # 先按名字查库；库里没有就联网/问模型补一条入库再答——而不是把
             # 具体点名当成泛推荐，回一串不相干的热门景点。
@@ -533,12 +541,14 @@ class Session:
         # 问到第三轮还会硬凑出一份别的城市的行程。
         kind = intent.classify(utterance)
         # 规则认不出（other）但句子像个提问时，让模型兜底分类一次。
-        # 「故宫需要预约吗」这类问法词表覆盖不全，靠这一层接住；
-        # 分类失败/说 none 就照旧走排行程流水线。
+        # 问天气/景点/班次/闲聊/助手身份、要排或改行程，全交给它判；
+        # 判成 plan 也不在这里动手——照旧落到下面按规则抽取槽位/改方案，
+        # 确定性的事（真实班次、时长、硬约束）仍只由规则和工具决定。
         if kind == "other" and self.client is not None \
                 and intent.looks_like_question(utterance):
             alt = llm.classify_intent(self.client, utterance)
-            if alt in ("weather", "poi", "transport", "plan_qa", "general"):
+            if alt in ("weather", "poi", "transport", "plan_qa", "smalltalk",
+                       "general"):
                 kind = alt
         if kind in ("weather", "poi", "transport", "smalltalk",
                     "plan_qa", "general"):
@@ -936,10 +946,16 @@ class Session:
                 # 无脑重排拦截：方案已出、这句没带来任何新条件、也没说"重新排"
                 # ——再跑一遍 plan_trip 只会原样再出一份（白等几十秒）。实测
                 # 「推荐几家驴肉火烧」就这样被整单重排，用户体感是"聊两句它
-                # 又自顾自排行程"。问一句想改哪里，把改法亮出来。
-                text = ("行程已经在上面了。想改的话直接说：加减景点（「加个XX」"
-                        "「不想去XX」）、改节奏（「别太赶」）、改天数、换城市都行；"
-                        "问景点、问吃的、问天气也随便聊。")
+                # 又自顾自排行程"。
+                # 这类「规则认不出、又不是改行程」的话（「你是什么模型」
+                # 「你太笨了」）先交给模型自由作答：它有上下文、能说人话；
+                # 模型不可用/答得跑偏才回落到把改法亮出来的固定话术。
+                said = llm.chat_reply(self.client, utterance,
+                                      plan_desc=self.last_plan_desc)
+                text = said or (
+                    "行程已经在上面了。想改的话直接说：加减景点（「加个XX」"
+                    "「不想去XX」）、改节奏（「别太赶」）、改天数、换城市都行；"
+                    "问景点、问吃的、问天气也随便聊。")
                 self.history.append({"role": "agent", "content": text})
                 return Reply(mode="answer", turn_no=self.turn_no,
                              ask_rounds=self.ask_rounds,

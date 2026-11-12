@@ -44,8 +44,29 @@ TRANSPORT_KW = ("高铁", "动车", "火车", "机票", "航班", "班次", "车
                 "怎么去", "怎么走", "多久到", "怎么到")
 PLAN_KW = ("行程", "安排", "规划", "计划", "排一下", "排个", "帮我排", "玩几天",
            "几天", "预算", "出发", "度假", "旅行", "旅游", "走一趟", "待几天")
-SMALLTALK_KW = ("你是谁", "你叫什么", "你能做什么", "你会什么", "你好", "您好",
+# 闲聊词表：只是「没配模型/模型失败」时的兜底——配了模型时规则判 other
+# 的句子会交给 LLM 兜底分类（含 smalltalk 标签），覆盖面由模型补齐。
+SMALLTALK_KW = ("你是谁", "你叫什么", "你叫啥", "你是什么", "你是啥",
+                "什么模型", "哪个模型", "啥模型", "多少亿参数",
+                "你是做什么的", "你是干什么的", "你是干嘛的",
+                "你能做什么", "你能干嘛", "你会什么", "你会做什么", "你会干嘛",
+                "你是机器人", "你是人工智能", "你是ai",
+                "你好", "您好",
                 "谢谢", "谢了", "再见", "拜拜", "在吗", "早上好", "晚上好", "晚安")
+
+# 身份类问法（「你是什么模型」「你是做什么的」实测都答不上来）：场景
+# 判定与模板兜底共用一张表，别再各写一份各漏一半。
+_IDENTITY_KW = ("你是谁", "你叫什么", "你叫啥", "你是什么", "你是啥",
+                "什么模型", "哪个模型", "啥模型", "多少亿参数",
+                "你是做什么的", "你是干什么的", "你是干嘛的",
+                "你能做什么", "你能干嘛", "你会什么", "你会做什么", "你会干嘛",
+                "你是机器人", "你是人工智能", "你是ai")
+
+
+def is_identity_question(text: str) -> bool:
+    """在问助手自己的身份/能力吗（你是谁、什么模型、能做什么……）。"""
+    t = (text or "").lower()
+    return any(k in t for k in _IDENTITY_KW)
 
 # 行程问答：用户要总结/评价当前这份行程，不是要重排。
 # 必须赶在 has_plan 之前判断——「将行程总结成一段话」里的"行程"会撞上 PLAN_KW，
@@ -292,6 +313,21 @@ def looks_like_question(text: str) -> bool:
     if not t or len(t) > 60:
         return False
     return bool(_QUESTION_RE.search(t))
+
+
+# 类比问句：「邯郸有没有像迪士尼一样的地方」「类似西湖这种」「跟丽江差不多的」
+# 这类问题要的不是「这城市有什么景点」，而是「按某种类型找替代」——库里没有
+# 类型标签，硬套本地景点清单会答成古城石窟（实测主题乐园问句回了广府古城）。
+_COMPARE_RE = re.compile(
+    r"像[^，。？?！!]{1,12}(?:一样|那样|那种|似的)"
+    r"|类似[^，。？?！!]{1,10}|类似于"
+    r"|(?:和|跟|同)[^，。？?！!]{1,12}(?:差不多|类似|一样)"
+    r"|差不多的(?:地方|景点)|同款|这种地方|这类地方")
+
+
+def is_comparison_question(text: str) -> bool:
+    """在按「像 X 一样/类似 X」找同类地方吗（不是问这城市有什么）。"""
+    return bool(_COMPARE_RE.search(text or ""))
 
 
 def classify(text: str) -> str:
@@ -820,8 +856,10 @@ def transport_answer(text: str, origin: str | None, dest: str | None,
 
 
 SMALLTALK_REPLIES = {
-    "身份": "我是本地跑的旅行规划助手：真实天气预报、真实路网耗时、在售班次和酒店都在我这儿查。\n"
-            "可以直接问我某地天气，也可以说「下个月去大理玩 4 天，2 人，预算 6000」，我给你排成可执行的行程。",
+    "身份": "我是这个产品里的旅行规划助手，背后接的是后台配置的大模型（OpenAI 兼容接口，"
+            "可以换），不是某个固定品牌。\n"
+            "我能查真实天气预报、真实路网耗时、在售班次和酒店，也能把这些排成可执行的行程。\n"
+            "可以直接问我某地天气，也可以说「下个月去大理玩 4 天，2 人，预算 6000」。",
     "感谢": "不客气～还想问哪座城市的天气，或者要我直接排一版行程？",
     "告别": "随时回来问天气或排行程，我在。",
     "问候": "在的。想了解哪儿的情况？天气、班次、景点都能直接问，也可以让我排行程。",
@@ -831,7 +869,7 @@ SMALLTALK_REPLIES = {
 def smalltalk_answer(text: str, client=None) -> str:
     t = text or ""
     if client is not None:
-        scene = ("身份" if any(k in t for k in ("你是谁", "你叫什么", "你能做什么", "你会什么"))
+        scene = ("身份" if is_identity_question(t)
                  else "感谢" if any(k in t for k in ("谢谢", "谢了"))
                  else "告别" if any(k in t for k in ("再见", "拜拜")) else "问候")
         facts = {"场景": scene,
@@ -841,7 +879,7 @@ def smalltalk_answer(text: str, client=None) -> str:
         said = _speak(client, "smalltalk", facts, t)
         if said:
             return said
-    if any(k in t for k in ("你是谁", "你叫什么", "你能做什么", "你会什么")):
+    if is_identity_question(t):
         return SMALLTALK_REPLIES["身份"]
     if any(k in t for k in ("谢谢", "谢了")):
         return SMALLTALK_REPLIES["感谢"]
