@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模板 B · 夜航 — 深色高级</title>
+<style>
+:root{
+  --bg:#0d1220; --bg2:#111828; --card:rgba(255,255,255,.055); --card-line:rgba(255,255,255,.10);
+  --ink:#e8ecf4; --dim:#8b94a8; --brand:#5aa7e8; --brand2:#7c6cf0;
+  --gold:#e8c574; --gold-dim:#b39850; --ok:#57c79a; --radius:18px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--ink);height:100vh;overflow:hidden}
+button{font-family:inherit;cursor:pointer}
+::selection{background:rgba(90,167,232,.35)}
+/* ===================== 登录页 ===================== */
+#login{height:100vh;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;
+  background:radial-gradient(1200px 600px at 70% -10%,#1b2a4d 0%,transparent 60%),
+             radial-gradient(900px 500px at 10% 110%,#23184a 0%,transparent 55%),var(--bg)}
+.stars{position:absolute;inset:0;background-image:
+  radial-gradient(1.5px 1.5px at 12% 22%,rgba(255,255,255,.7) 50%,transparent 51%),
+  radial-gradient(1px 1px at 32% 68%,rgba(255,255,255,.45) 50%,transparent 51%),
+  radial-gradient(1.5px 1.5px at 55% 14%,rgba(255,255,255,.6) 50%,transparent 51%),
+  radial-gradient(1px 1px at 72% 42%,rgba(255,255,255,.5) 50%,transparent 51%),
+  radial-gradient(2px 2px at 86% 76%,rgba(232,197,116,.7) 50%,transparent 51%),
+  radial-gradient(1px 1px at 44% 88%,rgba(255,255,255,.4) 50%,transparent 51%),
+  radial-gradient(1px 1px at 8% 62%,rgba(255,255,255,.35) 50%,transparent 51%)}
+.mtn{position:absolute;left:0;right:0;bottom:0;height:34%}
+.lg-wrap{position:relative;z-index:2;display:flex;gap:70px;align-items:center;max-width:1060px;width:92%}
+.lg-copy{flex:1}
+.lg-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}
+.lg-logo .logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 8px 30px rgba(90,167,232,.35)}
+.lg-logo b{font-size:20px;letter-spacing:2px}
+.lg-copy h1{font-size:40px;font-weight:800;line-height:1.4}
+.lg-copy h1 em{font-style:normal;background:linear-gradient(100deg,var(--gold),#f4e0a8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lg-copy p{margin-top:18px;color:var(--dim);font-size:15px;line-height:1.9;max-width:26em}
+.lg-stats{margin-top:38px;display:flex;gap:36px}
+.lg-stats .st b{display:block;font-size:22px;color:var(--gold)}
+.lg-stats .st span{font-size:12.5px;color:var(--dim)}
+.glass{flex:none;width:400px;background:var(--card);border:1px solid var(--card-line);border-radius:22px;padding:34px 32px;backdrop-filter:blur(18px);box-shadow:0 30px 80px rgba(0,0,0,.45)}
+.glass h2{font-size:21px;margin-bottom:6px}
+.glass .hint{font-size:13px;color:var(--dim);margin-bottom:26px}
+.f-label{font-size:12.5px;color:var(--dim);margin-bottom:7px}
+.f-row{display:flex;gap:10px;margin-bottom:16px}
+.glass input{width:100%;background:rgba(255,255,255,.06);border:1px solid var(--card-line);border-radius:12px;padding:13px 16px;color:var(--ink);font-size:15px;outline:none;transition:border-color .15s;font-family:inherit}
+.glass input:focus{border-color:var(--brand)}
+.glass input::placeholder{color:#5b6478}
+#lg-send{flex:none;border:1px solid rgba(90,167,232,.5);color:var(--brand);background:rgba(90,167,232,.1);border-radius:12px;padding:0 16px;font-size:13px;white-space:nowrap}
+#lg-btn{width:100%;border:none;border-radius:12px;padding:14px;font-size:15.5px;margin-top:8px;color:#10151f;font-weight:600;
+  background:linear-gradient(100deg,var(--gold),#f0d79a);box-shadow:0 10px 30px rgba(232,197,116,.25)}
+#lg-btn:hover{filter:brightness(1.06)}
+.lg-demo{margin-top:13px;font-size:12.5px;color:var(--gold);background:rgba(232,197,116,.09);border:1px dashed rgba(232,197,116,.4);border-radius:9px;padding:8px 12px;display:none;text-align:center}
+.lg-tip{margin-top:15px;font-size:12px;color:var(--dim);text-align:center;line-height:1.7}
+/* ===================== 首页 ===================== */
+#home{height:100vh;display:none;flex-direction:column}
+.top{height:58px;flex:none;display:flex;align-items:center;gap:14px;padding:0 20px;
+  background:rgba(255,255,255,.04);border-bottom:1px solid var(--card-line);backdrop-filter:blur(10px)}
+.top .logo{width:33px;height:33px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:16px}
+.top b{font-size:15px;letter-spacing:1px}
+.top .sub{font-size:12px;color:var(--dim)}
+.top .sp{flex:1}
+.credits{display:flex;align-items:center;gap:6px;border:1px solid rgba(232,197,116,.45);color:var(--gold);border-radius:999px;padding:5px 14px;font-size:13px;background:rgba(232,197,116,.08)}
+.avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:13px;color:#fff}
+.body{flex:1;display:flex;min-height:0}
+.side{width:238px;flex:none;background:rgba(255,255,255,.03);border-right:1px solid var(--card-line);display:flex;flex-direction:column;padding:14px 10px}
+.newchat{border:none;background:linear-gradient(100deg,var(--brand),var(--brand2));color:#fff;border-radius:12px;padding:11px;font-size:14px;margin-bottom:14px;box-shadow:0 8px 24px rgba(90,167,232,.25)}
+.side h5{font-size:11.5px;color:var(--dim);margin:4px 8px 8px;font-weight:500;letter-spacing:1px}
+.conv{padding:10px 12px;border-radius:11px;font-size:13.5px;cursor:pointer;line-height:1.5;margin-bottom:2px;color:#c7cede}
+.conv small{display:block;color:var(--dim);font-size:11.5px;margin-top:2px}
+.conv:hover{background:rgba(255,255,255,.05)}
+.conv.act{background:rgba(90,167,232,.13);color:#dbe8f5;border:1px solid rgba(90,167,232,.25)}
+.chatcol{flex:1;display:flex;flex-direction:column;min-width:0}
+#chat{flex:1;overflow-y:auto;padding:24px 6%;display:flex;flex-direction:column;gap:16px}
+.welcome{text-align:center;padding:6vh 0 2vh}
+.welcome .big{font-size:30px;font-weight:800}
+.welcome .big em{font-style:normal;background:linear-gradient(100deg,var(--gold),#f4e0a8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.welcome p{color:var(--dim);font-size:14px;margin-top:10px}
+.msg{max-width:78%;border-radius:16px;padding:13px 17px;font-size:14px;line-height:1.75;white-space:pre-wrap;word-break:break-word;animation:fin .3s ease}
+.msg.user{align-self:flex-end;background:linear-gradient(100deg,var(--brand),var(--brand2));color:#fff;border-bottom-right-radius:5px}
+.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--card-line);border-bottom-left-radius:5px;backdrop-filter:blur(8px)}
+.msg.bot h4{font-size:14.5px;color:var(--gold);margin:10px 0 4px}
+.msg.bot h4:first-child{margin-top:0}
+.msg.bot .sec{display:block;color:var(--dim);font-size:12.5px;margin-top:6px}
+.planlink{display:inline-block;margin-top:10px;background:linear-gradient(100deg,var(--gold),#f0d79a);color:#10151f;text-decoration:none;border-radius:9px;padding:7px 16px;font-size:13px;font-weight:600}
+@keyframes fin{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.sugs{display:flex;gap:8px;flex-wrap:wrap;padding:0 6% 12px}
+.sugs button{border:1px solid var(--card-line);background:rgba(255,255,255,.04);border-radius:999px;padding:7px 15px;font-size:13px;color:#c7cede}
+.sugs button:hover{border-color:var(--brand);color:var(--brand)}
+.inputbar{padding:14px 6% 10px;border-top:1px solid var(--card-line);background:rgba(255,255,255,.03)}
+.inputbar .row{display:flex;gap:10px}
+#inp{flex:1;background:rgba(255,255,255,.06);border:1px solid var(--card-line);border-radius:14px;padding:12px 16px;font-size:14px;resize:none;outline:none;font-family:inherit;color:var(--ink)}
+#inp:focus{border-color:var(--brand)}
+#inp::placeholder{color:#5b6478}
+#sendbtn{border:none;background:linear-gradient(100deg,var(--brand),var(--brand2));color:#fff;border-radius:14px;padding:0 26px;font-size:14px}
+.foot{text-align:center;font-size:11px;color:var(--dim);padding:6px 0 8px}
+.board{width:400px;flex:none;border-left:1px solid var(--card-line);background:rgba(255,255,255,.03);display:flex;flex-direction:column}
+.bhead{padding:14px 18px 10px;border-bottom:1px solid var(--card-line)}
+.bhead b{font-size:15px}
+.bhead .bsub{font-size:12px;color:var(--dim);margin-top:3px}
+.bdays{flex:1;overflow-y:auto;padding:14px 18px}
+.day{margin-bottom:16px}
+.day h4{font-size:13.5px;color:var(--gold);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.day h4 .pill{border:1px solid var(--card-line);color:var(--dim);border-radius:999px;font-size:11px;padding:2px 9px;font-weight:400}
+.node{display:flex;gap:10px;padding:8px 10px;border-radius:11px;border:1px solid var(--card-line);background:rgba(255,255,255,.04);margin-bottom:6px;align-items:flex-start}
+.node .tm{font-size:11.5px;color:var(--dim);width:38px;flex:none;padding-top:2px}
+.node .nm{font-size:13.5px;flex:1}
+.node small{display:block;color:var(--dim);font-size:12px}
+.node .mn{font-size:11px;color:var(--dim)}
+.node .book{color:var(--gold);font-size:11px;border:1px solid rgba(232,197,116,.4);border-radius:5px;padding:1px 5px;margin-left:6px}
+.budget{border-top:1px solid var(--card-line);padding:12px 18px;font-size:12.5px;color:var(--dim)}
+.budget b{color:var(--gold)}
+.switch{position:fixed;left:18px;bottom:18px;z-index:9;border:1px dashed #4a5468;background:rgba(13,18,32,.8);color:var(--dim);border-radius:999px;padding:8px 16px;font-size:12.5px}
+@media(max-width:1100px){.board{display:none}}
+@media(max-width:960px){.lg-copy{display:none}}
+@media(max-width:860px){.side{display:none}}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="stars"></div>
+  <svg class="mtn" viewBox="0 0 1200 220" preserveAspectRatio="none">
+    <path d="M0,160 L180,70 L320,150 L480,50 L650,140 L820,60 L1000,150 L1200,80 L1200,220 L0,220 Z" fill="rgba(255,255,255,.04)"/>
+    <path d="M0,190 L220,110 L420,180 L620,100 L840,175 L1050,115 L1200,170 L1200,220 L0,220 Z" fill="rgba(255,255,255,.07)"/>
+  </svg>
+  <div class="lg-wrap">
+    <div class="lg-copy">
+      <div class="lg-logo"><div class="logo">🧭</div><b>行迹 NOCTURNE</b></div>
+      <h1>夜色里的下一段旅程，<br><em>一句对话就能启程</em></h1>
+      <p>真实班次、逐日天气、沿道路的动线、算到 10% 机动费的预算——你负责说想去哪，剩下的交给我们。</p>
+      <div class="lg-stats">
+        <div class="st"><b>351+</b><span>收录城市</span></div>
+        <div class="st"><b>逐日</b><span>天气预报接入</span></div>
+        <div class="st"><b>真实</b><span>班次与道路动线</span></div>
+      </div>
+    </div>
+    <div class="glass">
+      <h2>登录 / 注册</h2>
+      <div class="hint">手机验证码登录 · 首次登录赠送体验积分</div>
+      <div class="f-label">手机号</div>
+      <div class="f-row"><input id="lg-phone" maxlength="11" inputmode="numeric" placeholder="请输入 11 位手机号"></div>
+      <div class="f-label">验证码</div>
+      <div class="f-row">
+        <input id="lg-code" maxlength="6" inputmode="numeric" placeholder="6 位验证码">
+        <button id="lg-send" onclick="sendCode(this)">获取验证码</button>
+      </div>
+      <button id="lg-btn" onclick="doLogin()">开启旅程 ✦</button>
+      <div class="lg-demo" id="lg-demo">演示模式验证码：<b>246810</b>（已自动填入）</div>
+      <div class="lg-tip">登录即同意《用户协议》与《隐私政策》<br>本机对话记录不会删除，重新登录后可继续使用</div>
+    </div>
+  </div>
+</div>
+
+<div id="home">
+  <div class="top">
+    <div class="logo">🧭</div><b>行迹</b><span class="sub">NOCTURNE</span>
+    <span class="sp"></span>
+    <div class="credits">✦ 积分 1,280</div>
+    <div class="avatar">旅</div>
+  </div>
+  <div class="body">
+    <div class="side">
+      <button class="newchat" onclick="fakeSend()">＋ 新的行程对话</button>
+      <h5>最近对话</h5>
+      <div class="conv act">邯郸 3 天 · 2 人 · 预算 2000<small>11-16 出发 · 已出行程</small></div>
+      <div class="conv">大理 4 天 · 不想太赶<small>11-08 出发 · 已出行程</small></div>
+      <div class="conv">成都周末两日 · 带娃<small>聊天中</small></div>
+      <div class="conv">北京 5 天 · 博物馆路线<small>10-28 · 已出行程</small></div>
+    </div>
+    <div class="chatcol">
+      <div id="chat">
+        <div class="welcome">
+          <div class="big">这趟想去哪，<em>说一句就行</em></div>
+          <p>目的地、日期、人数——其余的（班次 / 天气 / 动线 / 预算）我来补齐</p>
+        </div>
+        <div class="msg bot">你好！我是你的行程规划助手 🧭<br>可以说「11月16号从石家庄去邯郸玩3天，2人，预算2000」，先出个能直接用的方案，之后想改哪天、加减哪里，直接说。</div>
+      </div>
+      <div class="sugs">
+        <button onclick="fakeSend()">城市规划：邯郸 3 天</button>
+        <button onclick="fakeSend()">大理 4 天，不想太赶</button>
+        <button onclick="fakeSend()">成都带娃两日游</button>
+      </div>
+      <div class="inputbar">
+        <div class="row">
+          <textarea id="inp" rows="1" placeholder="说说你的计划，或者问点别的…"></textarea>
+          <button id="sendbtn" onclick="fakeSend()">发送</button>
+        </div>
+        <div class="foot">行迹 · 行程数据来自资料库与实时检索 · 出行前请再核对票价与开放时间</div>
+      </div>
+    </div>
+    <div class="board">
+      <div class="bhead">
+        <b>🌴 邯郸 3 天行程</b>
+        <div class="bsub">11-16 ~ 11-18 · 2 人 · 预算内（人均 925 元）</div>
+      </div>
+      <div class="bdays">
+        <div class="day">
+          <h4>Day 1 · 古城与碑刻 <span class="pill">11-16</span></h4>
+          <div class="node"><span class="tm">10:30</span><span class="nm">广府古城<small>城墙可以登，太极宗师故里</small></span><span class="mn">150分</span></div>
+          <div class="node"><span class="tm">15:00</span><span class="nm">邯郸市博物馆<span class="book">需预约</span><small>免费，凭身份证换票</small></span><span class="mn">120分</span></div>
+        </div>
+        <div class="day">
+          <h4>Day 2 · 响堂山石窟 <span class="pill">11-17</span></h4>
+          <div class="node"><span class="tm">09:00</span><span class="nm">响堂山石窟<small>北齐石窟代表作</small></span><span class="mn">180分</span></div>
+          <div class="node"><span class="tm">14:00</span><span class="nm">早市 / 伴手礼<small>自由安排</small></span><span class="mn">60分</span></div>
+        </div>
+        <div class="day">
+          <h4>Day 3 · 市区收尾 <span class="pill">11-18</span></h4>
+          <div class="node"><span class="tm">09:30</span><span class="nm">丛台公园<small>武灵丛台，邯郸地标</small></span><span class="mn">120分</span></div>
+          <div class="node"><span class="tm">16:00</span><span class="nm">返程 · G5678</span><span class="mn">90分</span></div>
+        </div>
+      </div>
+      <div class="budget">合计 <b>¥1,850</b> · 人均 <b>¥925</b> · 含 10% 机动</div>
+    </div>
+  </div>
+</div>
+
+<button class="switch" onclick="toggleView()">⇄ 切换 登录页 / 首页</button>
+
+<script>
+function toggleView(){
+  var l=document.getElementById('login'),h=document.getElementById('home');
+  var onLogin=l.style.display!=='none';
+  l.style.display=onLogin?'none':'flex';
+  h.style.display=onLogin?'flex':'none';
+}
+function sendCode(btn){
+  var p=document.getElementById('lg-phone');
+  if(!/^\d{11}$/.test(p.value)){p.focus();p.style.borderColor='#c0392b';return;}
+  p.style.borderColor='';
+  btn.disabled=true;var left=60;
+  btn.textContent=left+'s 后重发';
+  var t=setInterval(function(){left--;if(left<=0){clearInterval(t);btn.disabled=false;btn.textContent='获取验证码';}else btn.textContent=left+'s 后重发';},1000);
+  document.getElementById('lg-demo').style.display='block';
+  document.getElementById('lg-code').value='246810';
+}
+function doLogin(){toggleView();}
+function fakeSend(){
+  var chat=document.getElementById('chat');
+  var w=chat.querySelector('.welcome');w&&(w.style.display='none');
+  var u=document.createElement('div');u.className='msg user';
+  u.textContent='11月16号从石家庄去邯郸玩3天，2人，预算2000';
+  chat.appendChild(u);
+  var t=document.createElement('div');t.className='msg bot';t.textContent='正在核对目的地资料，准备编排…';
+  chat.appendChild(t);chat.scrollTop=chat.scrollHeight;
+  setTimeout(function(){
+    t.innerHTML='邯郸行程排好了，3 天 2 晚，预算内（人均 925 元）。\n\n'+
+    '<h4>这趟怎么玩</h4>第一天到了先吃顿老驴头驴肉火烧垫底；第二天重头戏，市博物馆加丛台公园；第三天返程前绕广府古城收尾。\n\n'+
+    '<h4>必玩体验</h4>· 邯郸市博物馆：需提前预约——09:00-17:00 开放\n· 广府古城：你点名的必去——城墙可以登\n\n'+
+    '<h4>味蕾印象</h4>· 老驴头驴肉火烧：回住宿方向顺路吃\n· 圣旨骨酥鱼（滏东店）：先吃饭再逛\n\n'+
+    '<span class="sec">🌅 上午 / ☀️ 下午 / 🌙 晚上逐段排好了，每天预算和雨天备案都写在卡片里</span>'+
+    '<a class="planlink" href="javascript:void(0)" onclick="alert(\'此处跳转完整行程页（地图动线 + 每日卡片）\')">查看完整行程 →</a>';
+    chat.scrollTop=chat.scrollHeight;
+  },1400);
+}
+document.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&!e.shiftKey&&document.getElementById('home').style.display!=='none'){
+    var inp=document.getElementById('inp');
+    if(document.activeElement===inp&&inp.value.trim()){inp.value='';fakeSend();}
+  }
+});
+</script>
+</body>
+</html>

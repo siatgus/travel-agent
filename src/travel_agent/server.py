@@ -234,65 +234,79 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>智能旅行规划助手</title>
+<title>晴航 · 智能旅行规划助手</title>
 <style>
-  :root{--bg:#f6f5f1;--card:#fff;--ink:#2b2a26;--dim:#8a8578;--brand:#2f6f6b;
-        --brand-ink:#fff;--line:#e6e2d8;--user:#2f6f6b;}
+  :root{--bg:#f7f9ff;--card:#fff;--ink:#1d2333;--dim:#7a8299;--line:#e6eaf5;
+        --blue:#3d7bff;--blue-deep:#2b5fe0;--coral:#ff7a59;--mint:#2ec4a5;
+        --grad:linear-gradient(105deg,#3d7bff 0%,#7a5cff 60%,#b44df0 100%);
+        --brand:var(--blue);--brand-ink:#fff;--user:#3d7bff;}
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
        background:var(--bg);color:var(--ink);height:100vh;display:flex;flex-direction:column}
+  button{font-family:inherit;cursor:pointer}
+  /* ---------- 顶栏 ---------- */
   header{background:var(--card);border-bottom:1px solid var(--line);
-         padding:14px 20px;display:flex;align-items:center;gap:12px}
-  header .logo{width:34px;height:34px;border-radius:10px;background:var(--brand);
-         color:var(--brand-ink);display:flex;align-items:center;justify-content:center;font-size:18px}
-  header h1{font-size:16px;font-weight:600}
+         padding:0 20px;height:60px;display:flex;align-items:center;gap:12px;flex:none}
+  header .logo{width:34px;height:34px;border-radius:10px;background:var(--grad);
+         color:#fff;display:flex;align-items:center;justify-content:center;font-size:17px;
+         box-shadow:0 6px 16px rgba(122,92,255,.28)}
+  header h1{font-size:15.5px;font-weight:700}
   header .sub{font-size:12px;color:var(--dim)}
-  header button{border:1px solid var(--line);background:var(--card);
-         border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;color:var(--ink);
-         font-family:inherit}
-  header button:hover{border-color:var(--brand);color:var(--brand)}
-  #chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
-  .msg{max-width:76%;border-radius:14px;padding:12px 16px;font-size:14px;line-height:1.7;
+  header button{border:1.5px solid var(--line);background:var(--card);
+         border-radius:10px;padding:7px 14px;font-size:13px;cursor:pointer;color:var(--ink)}
+  header button:hover{border-color:var(--blue);color:var(--blue-deep)}
+  header #btn-new{border:none;background:var(--grad);color:#fff;font-weight:600;
+         box-shadow:0 6px 18px rgba(122,92,255,.28)}
+  header #btn-new:hover{filter:brightness(1.06);color:#fff}
+  /* ---------- 聊天区 ---------- */
+  #chat{flex:1;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:15px}
+  .msg{max-width:76%;border-radius:18px;padding:13px 17px;font-size:14px;line-height:1.75;
        white-space:pre-wrap;word-break:break-word}
-  .msg.user{align-self:flex-end;background:var(--user);color:var(--brand-ink);
-       border-bottom-right-radius:4px}
+  .msg.user{align-self:flex-end;background:var(--grad);color:#fff;
+       border-bottom-right-radius:6px;box-shadow:0 6px 18px rgba(122,92,255,.22)}
   .msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line);
-       border-bottom-left-radius:4px}
-  .msg.bot h3{font-size:15px;margin:2px 0 6px;color:var(--brand)}
-  .msg.bot table{border-collapse:collapse;margin:8px 0;font-size:13px;white-space:normal}
-  .msg.bot th,.msg.bot td{border:1px solid var(--line);padding:4px 10px;text-align:left}
-  .msg.bot th{background:#f0eee7}
-  .msg.bot blockquote{border-left:3px solid var(--brand);padding:2px 10px;margin:6px 0;
-       color:var(--dim);font-size:13px}
-  .msg.bot code{background:#f0eee7;border-radius:4px;padding:1px 5px;font-size:13px}
-  .meta{font-size:12px;color:var(--dim);margin-top:6px}
+       border-bottom-left-radius:6px;box-shadow:0 6px 18px rgba(29,35,51,.05)}
+  .msg.bot h3{font-size:14.5px;margin:8px 0 6px;color:var(--blue-deep);
+       display:flex;align-items:center;gap:7px}
+  .msg.bot h3::before{content:'';width:8px;height:8px;border-radius:50%;
+       background:var(--grad);flex:none}
+  .msg.bot table{border-collapse:collapse;margin:8px 0;font-size:13px;white-space:normal;
+       border-radius:10px;overflow:hidden}
+  .msg.bot th,.msg.bot td{border:1px solid var(--line);padding:5px 11px;text-align:left}
+  .msg.bot th{background:#eef4ff;color:var(--blue-deep)}
+  .msg.bot blockquote{border-left:3px solid var(--blue);padding:4px 12px;margin:6px 0;
+       color:var(--dim);font-size:13px;background:#f2f6ff;border-radius:0 10px 10px 0}
+  .msg.bot code{background:#eef4ff;border-radius:5px;padding:1px 6px;font-size:13px;
+       color:var(--blue-deep)}
+  .meta{font-size:12px;color:var(--dim);margin-top:7px}
   .msg.bot>*{animation:fin .3s ease}
-  @keyframes fin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-  .plan-link{display:inline-block;margin-top:8px;background:var(--brand);color:var(--brand-ink);
-       text-decoration:none;border-radius:8px;padding:6px 14px;font-size:13px}
-  /* ---- 行程面板（右侧交互式行程单）---- */
+  @keyframes fin{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+  .plan-link{display:inline-block;margin-top:9px;background:var(--grad);color:#fff;
+       text-decoration:none;border-radius:10px;padding:8px 18px;font-size:13px;font-weight:600;
+       box-shadow:0 8px 20px rgba(122,92,255,.3)}
+  .plan-link:hover{filter:brightness(1.06)}
+  /* ---------- 行程面板 ---------- */
   #main{flex:1;display:flex;min-height:0;width:100%}
   #board{width:460px;flex:none;border-left:1px solid var(--line);background:var(--card);
        display:none;flex-direction:column;min-height:0}
   #board.on{display:flex}
-  #bhead{padding:12px 16px 8px;border-bottom:1px solid var(--line)}
-  #btitle{font-size:15px;font-weight:600;display:flex;justify-content:space-between;
+  #bhead{padding:14px 18px 10px;border-bottom:1px solid var(--line)}
+  #btitle{font-size:15px;font-weight:700;display:flex;justify-content:space-between;
        align-items:center;gap:8px}
   #btitle .bsub{font-size:12px;color:var(--dim);font-weight:400}
-  #btabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 10px;flex-wrap:wrap}
-  #btabs button{border:1px solid var(--line);background:var(--bg);border-radius:999px;
-       padding:4px 12px;font-size:12.5px;cursor:pointer;color:var(--ink);white-space:nowrap;
-       font-family:inherit}
-  #btabs button.act{background:var(--brand);color:var(--brand-ink);border-color:var(--brand)}
-  #bbody{flex:1;overflow-y:auto;padding:14px 16px}
-  .bday{margin-bottom:14px}
-  .bday h4{font-size:13.5px;color:var(--brand);margin-bottom:6px;display:flex;gap:8px;
+  #btabs{display:flex;gap:6px;overflow-x:auto;padding:10px 18px;flex-wrap:wrap}
+  #btabs button{border:1.5px solid var(--line);background:#fff;border-radius:999px;
+       padding:4px 13px;font-size:12.5px;cursor:pointer;color:var(--ink);white-space:nowrap}
+  #btabs button.act{background:var(--grad);color:#fff;border-color:transparent;font-weight:600}
+  #bbody{flex:1;overflow-y:auto;padding:14px 18px}
+  .bday{margin-bottom:15px}
+  .bday h4{font-size:13.5px;color:var(--blue-deep);margin-bottom:7px;display:flex;gap:8px;
        align-items:baseline;flex-wrap:wrap}
   .bday h4 .wx{font-weight:400;color:var(--dim);font-size:12px}
-  .bcard{border:1px solid var(--line);border-radius:12px;padding:8px 10px;background:var(--bg)}
-  .bnode{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:9px;
+  .bcard{border:1px solid var(--line);border-radius:13px;padding:8px 10px;background:#fbfcff}
+  .bnode{display:flex;align-items:center;gap:8px;padding:8px 9px;border-radius:10px;
        cursor:pointer}
-  .bnode:hover{background:#eef3f0}
+  .bnode:hover{background:#eef4ff}
   .bnode .tm{font-size:12px;color:var(--dim);width:42px;flex:none}
   .bnode .ic{font-size:14px;flex:none}
   .bnode .nm{font-size:13.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
@@ -303,160 +317,212 @@ PAGE = """<!DOCTYPE html>
   .bnote{font-size:12px;color:var(--dim);line-height:1.7}
   .bitem{font-size:13px;line-height:1.9;border-bottom:1px dashed var(--line);padding:5px 2px}
   .bitem:last-child{border-bottom:none}
-  .bempty{color:var(--dim);font-size:12.5px;text-align:center;padding:30px 10px}
-  #bchips{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:6px;flex-wrap:wrap}
-  #bchips button{border:1px solid var(--line);background:var(--bg);border-radius:999px;
-       padding:4px 12px;font-size:12.5px;cursor:pointer;color:var(--ink);font-family:inherit}
-  #bchips button:hover{border-color:var(--brand);color:var(--brand)}
+  .bempty{color:var(--dim);font-size:12.5px;text-align:center;padding:30px 10px;line-height:1.9}
+  #bchips{padding:10px 18px;border-top:1px solid var(--line);display:flex;gap:6px;flex-wrap:wrap}
+  #bchips button{border:1.5px solid var(--line);background:#fff;border-radius:999px;
+       padding:4px 13px;font-size:12.5px;color:var(--ink)}
+  #bchips button:hover{border-color:var(--blue);color:var(--blue-deep);background:#eef4ff}
   #bmenu{position:fixed;z-index:18;background:var(--card);border:1px solid var(--line);
-       border-radius:12px;box-shadow:0 12px 36px rgba(43,42,38,.18);padding:6px;display:none;
+       border-radius:14px;box-shadow:0 14px 40px rgba(29,35,51,.16);padding:6px;display:none;
        min-width:225px}
   #bmenu button{display:block;width:100%;text-align:left;border:none;background:none;
-       padding:9px 12px;font-size:13px;border-radius:8px;cursor:pointer;color:var(--ink);
-       font-family:inherit;white-space:nowrap}
-  #bmenu button:hover{background:var(--bg);color:var(--brand)}
+       padding:9px 12px;font-size:13px;border-radius:9px;cursor:pointer;color:var(--ink);
+       white-space:nowrap}
+  #bmenu button:hover{background:#eef4ff;color:var(--blue-deep)}
   @media(max-width:920px){#board{width:380px}}
   @media(max-width:760px){#main{flex-direction:column}
        #board{width:auto;max-height:44vh;border-left:none;border-top:1px solid var(--line)}}
-  .typing{align-self:flex-start;color:var(--dim);font-size:13px;padding:10px 16px;
-       background:var(--card);border:1px solid var(--line);border-radius:14px;
-       border-bottom-left-radius:4px;display:flex;align-items:center;gap:8px}
-  .tdot{width:6px;height:6px;border-radius:50%;background:var(--dim);
+  /* ---------- 输入区 ---------- */
+  .typing{align-self:flex-start;color:var(--dim);font-size:13px;padding:11px 16px;
+       background:var(--card);border:1px solid var(--line);border-radius:18px;
+       border-bottom-left-radius:6px;display:flex;align-items:center;gap:8px}
+  .tdot{width:6px;height:6px;border-radius:50%;background:var(--blue);
        display:inline-block;animation:tb 1.2s infinite}
   .tdot:nth-child(2){animation-delay:.2s}
   .tdot:nth-child(3){animation-delay:.4s}
   @keyframes tb{0%,80%,100%{opacity:.25}40%{opacity:1}}
   #bar{background:var(--card);border-top:1px solid var(--line);padding:12px 20px}
   #sugs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-  #sugs button{border:1px solid var(--line);background:var(--bg);border-radius:999px;
-       padding:5px 14px;font-size:13px;cursor:pointer;color:var(--ink)}
-  #sugs button:hover{border-color:var(--brand);color:var(--brand)}
+  #sugs button{border:1.5px solid var(--line);background:#fff;border-radius:999px;
+       padding:5px 15px;font-size:13px;cursor:pointer;color:var(--ink)}
+  #sugs button:hover{border-color:var(--blue);color:var(--blue-deep);background:#eef4ff}
   #row{display:flex;gap:10px}
-  #inp{flex:1;border:1px solid var(--line);border-radius:10px;padding:10px 14px;
-       font-size:14px;font-family:inherit;resize:none;outline:none;background:var(--bg)}
-  #inp:focus{border-color:var(--brand)}
-  #send{border:none;background:var(--brand);color:var(--brand-ink);border-radius:10px;
-       padding:0 22px;font-size:14px;cursor:pointer}
+  #inp{flex:1;border:2px solid var(--line);border-radius:16px;padding:11px 15px;
+       font-size:14px;font-family:inherit;resize:none;outline:none;background:#fbfcff}
+  #inp:focus{border-color:var(--blue)}
+  #send{border:none;background:var(--grad);color:#fff;border-radius:16px;
+       padding:0 24px;font-size:14px;font-weight:600;
+       box-shadow:0 6px 18px rgba(122,92,255,.28)}
+  #send:hover{filter:brightness(1.06)}
   #send:disabled{opacity:.5;cursor:default}
   #foot{text-align:center;font-size:11px;color:var(--dim);padding:6px 0 10px}
+  /* ---------- 顶栏账号 ---------- */
   .userwrap{margin-left:auto;display:flex;align-items:center;gap:8px}
-  .userbox{font-size:13px;color:var(--brand);cursor:default;user-select:none;
-       border:1px solid var(--line);border-radius:999px;padding:5px 14px;background:var(--bg);
+  .userbox{font-size:13px;color:var(--blue-deep);cursor:default;user-select:none;
+       border:1.5px solid #d8e3ff;border-radius:999px;padding:5px 14px;background:#eef4ff;
        display:inline-flex;align-items:center;gap:6px}
   .userbox .sep{color:var(--dim)}
-  .userbox .cr{font-weight:600}
-  .quit{border:1px solid var(--line);border-radius:999px;padding:5px 13px;
+  .userbox .cr{font-weight:700}
+  .quit{border:1.5px solid var(--line);border-radius:999px;padding:5px 13px;
        font-size:12.5px;color:var(--dim);cursor:pointer;background:var(--card);
-       font-family:inherit;transition:color .12s,border-color .12s}
-  .quit:hover{border-color:#d3a394;color:#a33a2a}
-  /* 退出确认弹窗 */
-  #logoutmask{position:fixed;inset:0;background:rgba(43,42,38,.45);display:none;
-       align-items:center;justify-content:center;z-index:20}
-  #logoutmask .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
-       padding:22px 24px;width:308px;box-shadow:0 18px 48px rgba(43,42,38,.22)}
+       transition:color .12s,border-color .12s}
+  .quit:hover{border-color:#ffc4b3;color:#e05c3d}
+  #btn-hist{position:relative}
+  /* ---------- 退出确认 ---------- */
+  #logoutmask{position:fixed;inset:0;background:rgba(29,35,51,.4);display:none;
+       align-items:center;justify-content:center;z-index:40}
+  #logoutmask .card{background:var(--card);border-radius:20px;
+       padding:24px 26px;width:320px;box-shadow:0 24px 64px rgba(29,35,51,.24)}
   #logoutmask h2{font-size:16px;margin-bottom:8px}
   #logoutmask .hint{font-size:12.5px;color:var(--dim);line-height:1.7;margin-bottom:18px}
   #logoutmask .btnrow{display:flex;gap:8px;justify-content:flex-end}
-  #logoutmask button{border:1px solid var(--line);background:var(--card);border-radius:9px;
-       padding:8px 16px;font-size:13.5px;cursor:pointer;color:var(--ink);font-family:inherit}
-  #logoutmask button:hover{border-color:var(--brand);color:var(--brand)}
-  #logoutmask .danger{background:#a33a2a;border-color:#a33a2a;color:#fff}
-  #logoutmask .danger:hover{background:#8f3123;border-color:#8f3123;color:#fff}
-  #login{position:fixed;inset:0;background:rgba(43,42,38,.45);display:none;
-       align-items:center;justify-content:center;z-index:10}
-  #login .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
-       padding:26px;width:300px}
-  #login h2{font-size:17px;margin-bottom:4px}
-  #login .hint{font-size:12px;color:var(--dim);margin:4px 0 12px;line-height:1.5}
-  #login input{width:100%;border:1px solid var(--line);border-radius:9px;
-       padding:10px 12px;font-size:14px;margin-bottom:10px;outline:none;
-       background:var(--bg);box-sizing:border-box;font-family:inherit}
-  #login input:focus{border-color:var(--brand)}
-  #login .row2{display:flex;gap:8px;align-items:stretch;margin-bottom:10px}
-  #login .row2 input{flex:1;margin-bottom:0}     /* 去掉 input 下边距，否则按钮被撑高、压到登录按钮 */
-  #login .row2 button{border:1px solid var(--line);background:var(--card);
-       border-radius:9px;padding:0 14px;font-size:13px;cursor:pointer;color:var(--brand);
-       white-space:nowrap;box-sizing:border-box;display:flex;align-items:center;
-       justify-content:center;line-height:1;font-family:inherit;margin:0}
-  #login .row2 button:hover:not(:disabled){border-color:var(--brand)}
-  #login .row2 button:disabled{color:var(--dim);border-color:var(--line);cursor:default}
-  #login .pri{width:100%;border:none;background:var(--brand);color:var(--brand-ink);
-       border-radius:9px;padding:11px 0;font-size:14px;cursor:pointer}
+  #logoutmask button{border:1.5px solid var(--line);background:var(--card);border-radius:11px;
+       padding:8px 16px;font-size:13.5px;cursor:pointer;color:var(--ink)}
+  #logoutmask button:hover{border-color:var(--blue);color:var(--blue-deep)}
+  #logoutmask .danger{background:var(--coral);border-color:var(--coral);color:#fff}
+  #logoutmask .danger:hover{background:#f06540;border-color:#f06540;color:#fff}
+  /* ---------- 登录页（整页） ---------- */
+  #login{position:fixed;inset:0;z-index:30;display:none;overflow-y:auto;
+       background:linear-gradient(180deg,#dcebff 0%,#f3e9ff 55%,#fff2e8 100%)}
+  #login .lg-inner{min-height:100%;display:flex;flex-direction:column;position:relative;
+       overflow:hidden}
+  #login .cloud{position:absolute;background:rgba(255,255,255,.75);border-radius:999px;
+       filter:blur(1px);animation:drift 30s linear infinite;z-index:0}
+  #login .cloud::before,#login .cloud::after{content:'';position:absolute;background:inherit;
+       border-radius:50%}
+  #login .cloud::before{width:60%;height:160%;left:12%;top:-70%}
+  #login .cloud::after{width:42%;height:120%;right:12%;top:-46%}
+  @keyframes drift{from{transform:translateX(-16vw)}to{transform:translateX(110vw)}}
+  #login .lg-nav{display:flex;align-items:center;gap:12px;padding:22px 5vw;z-index:1}
+  #login .lg-nav .logo{width:42px;height:42px;border-radius:13px;background:var(--grad);
+       color:#fff;display:flex;align-items:center;justify-content:center;font-size:21px;
+       box-shadow:0 8px 22px rgba(61,123,255,.35)}
+  #login .lg-nav b{font-size:19px}
+  #login .lg-main{flex:1;display:flex;align-items:center;justify-content:space-between;
+       padding:10px 7vw 50px;gap:40px;position:relative;z-index:1;flex-wrap:wrap}
+  #login .lg-copy{flex:1;min-width:280px}
+  #login .lg-copy .tag{display:inline-block;background:#fff;border:1px solid var(--line);
+       color:var(--blue);border-radius:999px;padding:7px 16px;font-size:13px;font-weight:600;
+       box-shadow:0 4px 14px rgba(61,123,255,.12)}
+  #login .lg-copy h1{font-size:clamp(28px,3.6vw,44px);font-weight:800;line-height:1.35;
+       margin:20px 0 14px}
+  #login .lg-copy h1 .hl{background:var(--grad);-webkit-background-clip:text;
+       background-clip:text;color:transparent}
+  #login .lg-copy p{color:var(--dim);font-size:15px;line-height:1.9;max-width:26em}
+  #login .lg-cards{margin-top:28px;display:flex;gap:13px;flex-wrap:wrap}
+  #login .mini{background:#fff;border:1px solid var(--line);border-radius:16px;
+       padding:13px 17px;box-shadow:0 8px 22px rgba(29,35,51,.07);font-size:13.5px}
+  #login .mini b{display:block;font-size:14.5px;margin-bottom:3px}
+  #login .mini small{color:var(--dim)}
+  #login .lg-panel{flex:none;width:410px;max-width:94vw;background:#fff;border-radius:24px;
+       padding:32px 30px;box-shadow:0 30px 80px rgba(61,123,255,.18)}
+  #login h2{font-size:22px;margin-bottom:6px}
+  #login .hint{font-size:12.5px;color:var(--dim);line-height:1.6}
+  #login .lg-panel>.hint{margin-bottom:22px}
+  #login .f-label{font-size:13px;color:var(--dim);margin-bottom:7px}
+  #login .row2{display:flex;gap:10px;margin-bottom:14px}
+  #login input{width:100%;border:2px solid var(--line);border-radius:14px;
+       padding:12px 15px;font-size:14.5px;outline:none;background:#fbfcff;
+       font-family:inherit;margin-bottom:0;box-sizing:border-box}
+  #login input:focus{border-color:var(--blue)}
+  #login .row2 input{margin-bottom:0}
+  #login .row2 button{flex:none;border:2px solid var(--blue);color:var(--blue);
+       background:#eef4ff;border-radius:14px;padding:0 15px;font-size:13px;cursor:pointer;
+       white-space:nowrap;display:flex;align-items:center;justify-content:center;line-height:1}
+  #login .row2 button:disabled{color:var(--dim);border-color:var(--line);
+       background:var(--card);cursor:default}
+  #login .pri{width:100%;border:none;background:var(--grad);color:#fff;
+       border-radius:14px;padding:14px 0;font-size:15.5px;font-weight:600;cursor:pointer;
+       box-shadow:0 12px 30px rgba(122,92,255,.32)}
+  #login .pri:hover{filter:brightness(1.06)}
   #login .pri:disabled{opacity:.5}
-  #login .ghost{width:100%;margin-top:8px;border:1px solid var(--line);background:transparent;
-       color:var(--dim);border-radius:9px;padding:9px 0;font-size:13px;cursor:pointer;
-       font-family:inherit}
-  #login .ghost:hover{border-color:var(--brand);color:var(--brand)}
-  #guestbar{margin-left:auto;border:1px solid #e2d3c4;background:var(--bg);color:var(--brand);
-       border-radius:999px;padding:5px 14px;font-size:13px;cursor:pointer;font-family:inherit}
-  #guestbar:hover{border-color:var(--brand);background:var(--card)}
-  /* 历史行程抽屉 */
-  #histmask{position:fixed;inset:0;background:rgba(43,42,38,.35);display:none;z-index:14}
+  #login .ghost{width:100%;margin-top:10px;border:1.5px solid var(--line);background:transparent;
+       color:var(--dim);border-radius:14px;padding:10px 0;font-size:13px;cursor:pointer}
+  #login .ghost:hover{border-color:var(--blue);color:var(--blue-deep)}
+  #login #lg-msg{margin-top:12px;color:var(--blue-deep);background:#eef4ff;
+       border-radius:10px;padding:8px 12px;font-size:12.5px;line-height:1.6}
+  #login #lg-msg:empty{display:none}
+  #guestbar{margin-left:auto;border:1.5px solid #d8e3ff;background:#eef4ff;
+       color:var(--blue-deep);border-radius:999px;padding:6px 15px;font-size:13px;
+       cursor:pointer;font-weight:600}
+  #guestbar:hover{border-color:var(--blue)}
+  /* ---------- 历史行程抽屉 ---------- */
+  #histmask{position:fixed;inset:0;background:rgba(29,35,51,.35);display:none;z-index:14}
   #histpanel{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:92vw;
        background:var(--card);border-left:1px solid var(--line);z-index:15;
-       display:none;flex-direction:column;box-shadow:-12px 0 36px rgba(43,42,38,.16)}
+       display:none;flex-direction:column;box-shadow:-12px 0 40px rgba(29,35,51,.14)}
   .hhead{display:flex;align-items:center;justify-content:space-between;
        padding:14px 16px;border-bottom:1px solid var(--line)}
   .hhead h2{font-size:15px}
-  .hhead button{border:1px solid var(--line);background:var(--card);border-radius:8px;
-       padding:5px 13px;font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--ink)}
+  .hhead button{border:1.5px solid var(--line);background:#fff;border-radius:10px;
+       padding:5px 13px;font-size:12.5px;cursor:pointer;color:var(--ink)}
   #histlist{flex:1;overflow-y:auto;padding:10px}
-  .hitem{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;
-       cursor:pointer;position:relative;background:var(--bg)}
-  .hitem:hover{border-color:var(--brand)}
+  .hitem{border:1.5px solid var(--line);border-radius:13px;padding:10px 12px;margin-bottom:8px;
+       cursor:pointer;position:relative;background:#fbfcff}
+  .hitem:hover{border-color:var(--blue)}
   .htitle{font-size:13.5px;font-weight:600;color:var(--ink);padding-right:46px}
-  .hbadge{font-size:11px;color:var(--brand);border:1px solid var(--brand);
+  .hbadge{font-size:11px;color:var(--blue-deep);border:1px solid var(--blue);
        border-radius:999px;padding:1px 7px;margin-left:6px;font-weight:400}
   .hmeta{font-size:12px;color:var(--dim);margin-top:4px}
   .hdel{position:absolute;right:8px;top:8px;border:none;background:transparent;
-       color:var(--dim);cursor:pointer;font-size:12px;font-family:inherit}
-  .hdel:hover{color:#a33a2a}
+       color:var(--dim);cursor:pointer;font-size:12px}
+  .hdel:hover{color:#e05c3d}
   .hempty{color:var(--dim);font-size:13px;text-align:center;padding:30px 12px;line-height:1.9}
-  /* 新对话规划表单：先填目的地等，再进对话 */
+  /* ---------- 新对话规划表单（首页） ---------- */
   #planner{flex:1;overflow-y:auto;padding:24px 16px 34px;display:none}
-  #planner .hero{max-width:920px;margin:0 auto 18px;border-radius:18px;padding:34px 36px;
-    position:relative;overflow:hidden;color:#22301f;
-    background:linear-gradient(135deg,#eef0e2,#e3ebd9 55%,#d9e7d3)}
-  #planner .hero .brand{font-size:11.5px;letter-spacing:3px;color:#4b5f45;font-weight:600}
-  #planner .hero h2{font-size:30px;line-height:1.4;margin:14px 0 10px;font-weight:700}
-  #planner .hero p{font-size:13.5px;color:#5c6b55}
-  #planner .hero .sun{position:absolute;right:76px;top:36px;width:62px;height:62px;
-    border-radius:50%;background:#eec27c}
-  #planner .hero .hill{position:absolute;right:-50px;bottom:-80px;width:280px;height:160px;
-    border-radius:50%;background:#c9d8bd;opacity:.85}
+  #planner .hero{max-width:920px;margin:0 auto 18px;border-radius:24px;padding:36px 38px;
+    position:relative;overflow:hidden;color:#1d2333;
+    background:linear-gradient(180deg,#dcebff 0%,#f0e7ff 60%,#fff0e4 100%);
+    box-shadow:0 16px 44px rgba(61,123,255,.12)}
+  #planner .hero .brand{display:inline-block;background:#fff;border:1px solid var(--line);
+    color:var(--blue);border-radius:999px;padding:6px 15px;font-size:12px;font-weight:700;
+    letter-spacing:2px}
+  #planner .hero h2{font-size:clamp(24px,3vw,32px);line-height:1.4;margin:16px 0 10px;
+    font-weight:800}
+  #planner .hero h2 .hl{background:var(--grad);-webkit-background-clip:text;
+    background-clip:text;color:transparent}
+  #planner .hero p{font-size:13.5px;color:var(--dim)}
+  #planner .hero .sun{position:absolute;right:80px;top:34px;width:58px;height:58px;
+    border-radius:50%;background:linear-gradient(135deg,#ffd06e,#ffb937);
+    box-shadow:0 0 0 14px rgba(255,185,55,.18)}
+  #planner .hero .hill{position:absolute;right:-50px;bottom:-80px;width:300px;height:170px;
+    border-radius:50%;background:rgba(61,123,255,.14)}
+  #planner .hero .hill2{position:absolute;right:60px;bottom:-120px;width:340px;height:190px;
+    border-radius:50%;background:rgba(122,92,255,.10)}
   #planner .card{max-width:920px;margin:0 auto;background:var(--card);border:1px solid var(--line);
-    border-radius:16px;padding:26px 28px}
+    border-radius:20px;padding:26px 28px;box-shadow:0 14px 40px rgba(29,35,51,.07)}
   #planner .chead{display:flex;justify-content:space-between;align-items:baseline;
     margin-bottom:16px;gap:10px;flex-wrap:wrap}
   #planner .chead h3{font-size:16px}
-  #planner .chead h3 .no{color:var(--brand);font-size:13px;margin-right:6px}
+  #planner .chead h3 .no{color:var(--blue-deep);font-size:13px;margin-right:6px;font-weight:700}
   #planner .chead .note{font-size:12px;color:var(--dim)}
   #planner .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 16px}
   #planner .f{display:flex;flex-direction:column;gap:6px}
   #planner .f.w2{grid-column:span 2}
-  #planner label{font-size:12.5px;color:#4a4840;font-weight:600}
+  #planner label{font-size:12.5px;color:#3c4358;font-weight:600}
   #planner label .opt{color:var(--dim);font-weight:400;margin-left:4px}
-  #planner label .req{color:#c0392b;margin-left:2px}
-  #planner input,#planner select{border:1px solid var(--line);border-radius:9px;padding:9px 11px;
-    font-size:13.5px;background:#fbfaf7;color:var(--ink);font-family:inherit;outline:none;width:100%}
-  #planner input:focus,#planner select:focus{border-color:var(--brand);background:#fff}
-  #planner .err{color:#c0392b;font-size:12.5px;margin-top:10px;display:none}
+  #planner label .req{color:var(--coral);margin-left:2px}
+  #planner input,#planner select{border:1.5px solid var(--line);border-radius:12px;
+    padding:9px 12px;font-size:13.5px;background:#fbfcff;color:var(--ink);
+    font-family:inherit;outline:none;width:100%}
+  #planner input:focus,#planner select:focus{border-color:var(--blue);background:#fff}
+  #planner .err{color:#e05c3d;font-size:12.5px;margin-top:10px;display:none}
   #planner .foot{display:flex;justify-content:space-between;align-items:center;margin-top:18px;
     padding-top:14px;border-top:1px solid var(--line)}
   #planner .foot .src{font-size:12px;color:var(--dim)}
-  #planner .go{display:flex;align-items:center;gap:8px;background:var(--brand);color:#fff;
-    border:none;border-radius:999px;padding:11px 26px;font-size:14px;cursor:pointer;
-    font-family:inherit}
-  #planner .go:hover{background:#285e5a}
+  #planner .go{display:flex;align-items:center;gap:8px;background:var(--grad);color:#fff;
+    border:none;border-radius:999px;padding:12px 28px;font-size:14px;font-weight:600;
+    cursor:pointer;box-shadow:0 8px 22px rgba(122,92,255,.3)}
+  #planner .go:hover{filter:brightness(1.06)}
   @media(max-width:760px){#planner .grid{grid-template-columns:repeat(2,1fr)}
-    #planner .hero h2{font-size:24px}}
+    #planner .hero h2{font-size:23px}}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">&#9992;</div>
-  <div><h1>智能旅行规划助手</h1>
-       <div class="sub">天气 16 天内为实时预报 &middot; 真实路网耗时 &middot; 在售酒店班次 &middot; 全部本地运行</div></div>
+  <div class="logo">&#129517;</div>
+  <div><h1>晴航</h1>
+       <div class="sub">会聊天的行程规划师 &middot; 真实班次 &middot; 逐日天气 &middot; 沿道路动线</div></div>
   <button id="guestbar" onclick="showLogin('登录后即可开始规划')" title="点击登录">未登录 · 点此登录</button>
   <div class="userwrap" id="userwrap" style="display:none">
     <span class="userbox" id="userbox" title="当前登录账号">
@@ -466,7 +532,7 @@ PAGE = """<!DOCTYPE html>
   </div>
   <button id="btn-hist" onclick="openHist()" style="display:none"
           title="你保存的历次行程，含与助手的完整对话，点开可继续">历史行程</button>
-  <button onclick="newChat()">新对话</button>
+  <button id="btn-new" onclick="newChat()">＋ 新对话</button>
 </header>
 <div id="histmask" onclick="closeHist()"></div>
 <div id="histpanel">
@@ -474,17 +540,37 @@ PAGE = """<!DOCTYPE html>
   <div id="histlist"></div>
 </div>
 <div id="login">
-  <div class="card">
-    <h2>手机号登录</h2>
-    <div class="hint">首次登录自动注册，并赠送 <b>500 积分</b>（约 15 次完整行程规划）</div>
-    <input id="lg-phone" maxlength="11" inputmode="numeric" placeholder="手机号">
-    <div class="row2">
-      <input id="lg-code" maxlength="6" inputmode="numeric" placeholder="验证码">
-      <button id="lg-send" onclick="sendCode()">获取验证码</button>
+  <div class="lg-inner">
+    <div class="cloud" style="width:120px;height:38px;top:12%;animation-duration:32s"></div>
+    <div class="cloud" style="width:90px;height:30px;top:30%;animation-duration:40s;animation-delay:-14s"></div>
+    <div class="cloud" style="width:150px;height:44px;top:64%;animation-duration:48s;animation-delay:-28s"></div>
+    <div class="lg-nav"><div class="logo">&#129517;</div><b>晴航</b></div>
+    <div class="lg-main">
+      <div class="lg-copy">
+        <span class="tag">&#10022; 会聊天的行程规划师</span>
+        <h1>说一句「想去大理」<br><span class="hl">行程、班次、预算全备齐</span></h1>
+        <p>真实班次查询、逐日天气、沿道路的动线地图、算到 10% 机动费的预算——像聊天一样把旅行定下来。</p>
+        <div class="lg-cards">
+          <div class="mini"><b>&#128646; 真实班次</b><small>往返车次按时段锁好</small></div>
+          <div class="mini"><b>&#128506; 沿路动线</b><small>地图连线是真道路</small></div>
+          <div class="mini"><b>&#128176; 预算透明</b><small>人均多少一目了然</small></div>
+        </div>
+      </div>
+      <div class="lg-panel">
+        <h2>欢迎来到晴航 &#9992;&#65039;</h2>
+        <div class="hint">手机验证码登录，首次登录自动注册，并赠送 <b>500 积分</b>（约 15 次完整行程规划）</div>
+        <div class="f-label">手机号</div>
+        <div class="row2"><input id="lg-phone" maxlength="11" inputmode="numeric" placeholder="请输入 11 位手机号"></div>
+        <div class="f-label">验证码</div>
+        <div class="row2">
+          <input id="lg-code" maxlength="6" inputmode="numeric" placeholder="6 位验证码">
+          <button id="lg-send" onclick="sendCode()">获取验证码</button>
+        </div>
+        <button class="pri" id="lg-btn" onclick="doLogin()">登录 / 注册</button>
+        <button class="ghost" onclick="closeLogin()">先看看，稍后登录</button>
+        <div class="hint" id="lg-msg"></div>
+      </div>
     </div>
-    <button class="pri" id="lg-btn" onclick="doLogin()">登录 / 注册</button>
-    <button class="ghost" onclick="closeLogin()">先看看，稍后登录</button>
-    <div class="hint" id="lg-msg"></div>
   </div>
 </div>
 <div id="logoutmask">
@@ -500,9 +586,9 @@ PAGE = """<!DOCTYPE html>
 <div id="planner">
   <div class="hero">
     <div class="brand">&#10022; SMART TRAVEL PLANNER</div>
-    <h2>把想去的地方，<br>变成刚刚好的旅程。</h2>
+    <h2>说一句「想去大理」，<br><span class="hl">行程、班次、预算全备齐。</span></h2>
     <p>从目的地和日期开始。先探索真实地点，再一起编排行程。</p>
-    <div class="sun"></div><div class="hill"></div>
+    <div class="sun"></div><div class="hill"></div><div class="hill2"></div>
   </div>
   <div class="card">
     <div class="chead">
@@ -905,7 +991,7 @@ function dayCard(d,idx){
     wtxt=(wx.low!=null&&wx.high!=null)?(' '+wx.low+'~'+wx.high+'℃'):'';
     if(wx.desc)wtxt=esc(wx.desc)+wtxt;
     // 口径标注：超出预报窗口的日期是历史同期，不能和"实时预报"长得一样
-    if(wx.is_forecast===false)wtxt+=' <span style="color:#8A6A2F">历史同期</span>';
+    if(wx.is_forecast===false)wtxt+=' <span style="color:#B26A00">历史同期</span>';
   }
   let h='<div class="bday"><h4>第'+d.day+'天 · '+esc(d.theme||'')
     +'<span class="wx">'+esc(d.date||'')+wtxt+'</span></h4><div class="bcard">';
@@ -916,18 +1002,18 @@ function dayCard(d,idx){
     (n.interests||[]).forEach(it=>{
       const s=it.level==='strong';
       itag+=' <span style="font-size:11px;padding:1px 6px;border-radius:3px;background:'
-        +(s?'#EAF3F1':'#F6F1E4')+';color:'+(s?'#2F6F6B':'#8A6A2F')+'">'
+        +(s?'#E8F0FF':'#FFF4E8')+';color:'+(s?'#2b5fe0':'#B26A00')+'">'
         +(s?'兴趣·':'近似·')+esc(it.word||'')+'</span>';
     });
     h+='<div class="bnode" onclick="nodeMenu(event,\\''+jsq(n.name)+'\\',\\''+(n.type||'other')+'\\')">'
       +'<span class="tm">'+esc(String(n.time||'').slice(0,5))+'</span>'
       +'<span class="ic">'+(TYPE_ICONS[n.type]||TYPE_ICONS.other)+'</span>'
-      +'<span class="nm">'+esc(n.name)+itag+(uncer?' <span style="color:#B4693F;font-size:11px">位置待确认</span>':'')+'</span>'
+      +'<span class="nm">'+esc(n.name)+itag+(uncer?' <span style="color:#e05c3d;font-size:11px">位置待确认</span>':'')+'</span>'
       +(n.duration_min?'<span class="mn">'+n.duration_min+'分钟</span>':'')
       +'</div>';
   });
   h+='</div>';
-  if(d.geo_uncertain)h+='<div class="bnote" style="margin-top:4px;color:#B4693F">\\u26A0 这天有点位没查到确切位置，交通时间未计入，出发前请确认</div>';
+  if(d.geo_uncertain)h+='<div class="bnote" style="margin-top:4px;color:#e05c3d">\\u26A0 这天有点位没查到确切位置，交通时间未计入，出发前请确认</div>';
   if(d.move_min)h+='<div class="bnote" style="margin-top:4px">\\u{1F6B6} 当天步行/乘车约 '+d.move_min+' 分钟 · '+(d.rainy_plan||'')+'</div>';
   return h+'</div>';
 }
@@ -1222,6 +1308,8 @@ async function refreshHistHint(){
   }else{
     showGuest();                             // 打开网站不弹登录框
   }
+  // #login 深链：直达登录页（分享/收藏登录入口用），不影响默认访客首屏
+  if(location.hash==='#login') showLogin();
 })();
 
 inp.addEventListener('keydown',e=>{

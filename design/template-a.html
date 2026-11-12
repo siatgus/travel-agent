@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模板 A · 青屿 — 清新自然</title>
+<style>
+:root{
+  --bg:#f4f6f2; --card:#ffffff; --ink:#26332e; --dim:#7d8a82; --line:#e3e8e0;
+  --brand:#2e7d6e; --brand-deep:#1f5c50; --brand-soft:#e6f2ee; --gold:#c9a45c;
+  --radius:16px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--ink);height:100vh;overflow:hidden}
+button{font-family:inherit;cursor:pointer}
+/* ===================== 登录页 ===================== */
+#login{height:100vh;display:flex}
+.lg-left{flex:1.15;background:linear-gradient(160deg,#1f5c50 0%,#2e7d6e 55%,#4a9a87 100%);color:#fff;position:relative;overflow:hidden;display:flex;flex-direction:column;justify-content:center;padding:8vh 7vw}
+.lg-left svg{position:absolute;left:0;right:0;bottom:0;width:100%;height:46%}
+.lg-brand{display:flex;align-items:center;gap:12px;margin-bottom:5vh}
+.lg-brand .logo{width:46px;height:46px;border-radius:14px;background:rgba(255,255,255,.16);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;font-size:24px}
+.lg-brand b{font-size:20px;letter-spacing:1px}
+.lg-slogan{font-size:34px;font-weight:700;line-height:1.5;max-width:18em}
+.lg-slogan em{font-style:normal;color:#ffe9bd}
+.lg-sub{margin-top:18px;font-size:15px;opacity:.85;line-height:1.8;max-width:24em}
+.lg-feats{margin-top:5vh;display:flex;gap:12px;flex-wrap:wrap}
+.lg-feats span{background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:7px 16px;font-size:13px;backdrop-filter:blur(4px)}
+.lg-right{flex:.85;display:flex;align-items:center;justify-content:center;background:var(--card)}
+.lg-card{width:min(400px,86%)}
+.lg-card h2{font-size:24px;margin-bottom:8px}
+.lg-card .hint{font-size:14px;color:var(--dim);margin-bottom:30px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:13px;color:var(--dim);margin-bottom:7px}
+.field .row{display:flex;gap:10px}
+.field input{width:100%;border:1.5px solid var(--line);border-radius:12px;padding:13px 16px;font-size:15px;outline:none;background:#fbfcfa;transition:border-color .15s;font-family:inherit}
+.field input:focus{border-color:var(--brand)}
+#lg-send{flex:none;border:1.5px solid var(--brand);color:var(--brand);background:var(--brand-soft);border-radius:12px;padding:0 16px;font-size:13.5px;white-space:nowrap}
+#lg-btn{width:100%;border:none;background:var(--brand);color:#fff;border-radius:12px;padding:14px;font-size:16px;margin-top:10px;transition:background .15s}
+#lg-btn:hover{background:var(--brand-deep)}
+.lg-tip{margin-top:14px;font-size:12.5px;color:var(--dim);text-align:center;line-height:1.7}
+.lg-code-demo{margin-top:12px;font-size:12.5px;color:var(--brand);background:var(--brand-soft);border-radius:9px;padding:8px 12px;display:none;text-align:center}
+/* ===================== 首页 ===================== */
+#home{height:100vh;display:none;flex-direction:column}
+.top{background:var(--card);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;padding:0 20px;height:58px;flex:none}
+.top .logo{width:34px;height:34px;border-radius:10px;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;font-size:17px}
+.top b{font-size:15.5px}
+.top .sub{font-size:12px;color:var(--dim)}
+.top .sp{flex:1}
+.credits{display:flex;align-items:center;gap:6px;background:linear-gradient(120deg,#fdf6e8,#f7ecd4);border:1px solid #ecd9ae;color:#8a6d2f;border-radius:999px;padding:6px 14px;font-size:13px}
+.avatar{width:32px;height:32px;border-radius:50%;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:14px}
+.body{flex:1;display:flex;min-height:0}
+/* 左栏：会话 */
+.side{width:236px;flex:none;background:var(--card);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:14px 10px}
+.newchat{border:none;background:var(--brand);color:#fff;border-radius:12px;padding:11px;font-size:14px;margin-bottom:14px}
+.side h5{font-size:12px;color:var(--dim);margin:4px 6px 8px;font-weight:500}
+.conv{padding:10px 12px;border-radius:10px;font-size:13.5px;color:var(--ink);cursor:pointer;line-height:1.5;margin-bottom:2px}
+.conv small{display:block;color:var(--dim);font-size:11.5px;margin-top:2px}
+.conv:hover{background:var(--bg)}
+.conv.act{background:var(--brand-soft);color:var(--brand-deep)}
+/* 中间：聊天 */
+.chatcol{flex:1;display:flex;flex-direction:column;min-width:0}
+#chat{flex:1;overflow-y:auto;padding:24px 6%;display:flex;flex-direction:column;gap:16px}
+.welcome{text-align:center;padding:5vh 0 2vh}
+.welcome .big{font-size:30px;font-weight:700}
+.welcome .big em{font-style:normal;color:var(--brand)}
+.welcome p{color:var(--dim);font-size:14px;margin-top:10px}
+.msg{max-width:78%;border-radius:16px;padding:13px 17px;font-size:14px;line-height:1.75;white-space:pre-wrap;word-break:break-word;animation:fin .3s ease}
+.msg.user{align-self:flex-end;background:var(--brand);color:#fff;border-bottom-right-radius:5px}
+.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-bottom-left-radius:5px}
+.msg.bot h4{font-size:14.5px;color:var(--brand-deep);margin:10px 0 4px}
+.msg.bot h4:first-child{margin-top:0}
+.msg.bot .quote{border-left:3px solid var(--gold);padding:2px 10px;margin:6px 0;color:var(--dim);font-size:13px;background:#fbf7ee;border-radius:0 8px 8px 0}
+.msg.bot .sec{display:block;color:var(--dim);font-size:12.5px;margin-top:6px}
+.planlink{display:inline-block;margin-top:10px;background:var(--brand);color:#fff;text-decoration:none;border-radius:9px;padding:7px 16px;font-size:13px}
+@keyframes fin{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.sugs{display:flex;gap:8px;flex-wrap:wrap;padding:0 6% 12px}
+.sugs button{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:7px 15px;font-size:13px;color:var(--ink)}
+.sugs button:hover{border-color:var(--brand);color:var(--brand);background:var(--brand-soft)}
+.inputbar{background:var(--card);border-top:1px solid var(--line);padding:14px 6% 10px}
+.inputbar .row{display:flex;gap:10px}
+#inp{flex:1;border:1.5px solid var(--line);border-radius:14px;padding:12px 16px;font-size:14px;resize:none;outline:none;font-family:inherit;background:#fbfcfa}
+#inp:focus{border-color:var(--brand)}
+#sendbtn{border:none;background:var(--brand);color:#fff;border-radius:14px;padding:0 26px;font-size:14px}
+.foot{text-align:center;font-size:11px;color:var(--dim);padding:6px 0 8px}
+/* 右栏：行程面板 */
+.board{width:400px;flex:none;background:var(--card);border-left:1px solid var(--line);display:flex;flex-direction:column}
+.bhead{padding:14px 18px 10px;border-bottom:1px solid var(--line)}
+.bhead b{font-size:15px}
+.bhead .bsub{font-size:12px;color:var(--dim);margin-top:3px}
+.bdays{flex:1;overflow-y:auto;padding:14px 18px}
+.day{margin-bottom:16px}
+.day h4{font-size:13.5px;color:var(--brand-deep);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.day h4 .pill{background:var(--brand-soft);color:var(--brand);border-radius:999px;font-size:11px;padding:2px 9px;font-weight:500}
+.node{display:flex;gap:10px;padding:8px 10px;border-radius:11px;border:1px solid var(--line);background:#fbfcfa;margin-bottom:6px;align-items:flex-start}
+.node .tm{font-size:11.5px;color:var(--dim);width:38px;flex:none;padding-top:2px}
+.node .ic{font-size:15px}
+.node .nm{font-size:13.5px;flex:1}
+.node .mn{font-size:11px;color:var(--dim)}
+.budget{border-top:1px solid var(--line);padding:12px 18px;font-size:12.5px;color:var(--dim)}
+.budget b{color:var(--ink)}
+/* 切换提示 */
+.switch{position:fixed;left:18px;bottom:18px;z-index:9;border:1px dashed var(--dim);background:rgba(255,255,255,.85);color:var(--dim);border-radius:999px;padding:8px 16px;font-size:12.5px;backdrop-filter:blur(4px)}
+@media(max-width:1100px){.board{display:none}}
+@media(max-width:860px){.side{display:none}.lg-left{display:none}}
+</style>
+</head>
+<body>
+
+<!-- ============ 登录页 ============ -->
+<div id="login">
+  <div class="lg-left">
+    <div class="lg-brand"><div class="logo">🧭</div><b>行迹 · 智能旅行规划</b></div>
+    <div class="lg-slogan">把「想去」变成<br><em>一份能照着走的行程</em></div>
+    <div class="lg-sub">真实班次、真实天气、真实动线。像聊天一样说需求，出一份每天几点干什么、花多少钱都算清楚的方案。</div>
+    <div class="lg-feats"><span>🚄 真实班次查询</span><span>🌤 逐日天气</span><span>🗺 沿道路动线</span><span>💰 预算算到机动 10%</span></div>
+    <svg viewBox="0 0 800 260" preserveAspectRatio="none">
+      <path d="M0,200 C150,120 260,180 400,140 C540,100 660,170 800,120 L800,260 L0,260 Z" fill="rgba(255,255,255,.10)"/>
+      <path d="M0,230 C180,170 320,220 520,180 C660,152 740,190 800,175 L800,260 L0,260 Z" fill="rgba(255,255,255,.16)"/>
+      <circle cx="640" cy="60" r="34" fill="rgba(255,233,189,.85)"/>
+    </svg>
+  </div>
+  <div class="lg-right">
+    <div class="lg-card">
+      <h2>欢迎回来 👋</h2>
+      <div class="hint">手机验证码登录，首次登录自动注册并赠送体验积分</div>
+      <div class="field">
+        <label>手机号</label>
+        <div class="row"><input id="lg-phone" maxlength="11" inputmode="numeric" placeholder="请输入 11 位手机号"></div>
+      </div>
+      <div class="field">
+        <label>验证码</label>
+        <div class="row">
+          <input id="lg-code" maxlength="6" inputmode="numeric" placeholder="6 位验证码">
+          <button id="lg-send" onclick="sendCode(this)">获取验证码</button>
+        </div>
+      </div>
+      <button id="lg-btn" onclick="doLogin()">登录 / 注册</button>
+      <div class="lg-code-demo" id="lg-demo">演示模式验证码：<b>246810</b>（已自动填入）</div>
+      <div class="lg-tip">登录即代表同意《用户协议》与《隐私政策》<br>本机已有对话记录不会删除，重新登录后可继续使用</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 首页 ============ -->
+<div id="home">
+  <div class="top">
+    <div class="logo">🧭</div><b>行迹</b><span class="sub">智能旅行规划</span>
+    <span class="sp"></span>
+    <div class="credits">✦ 积分 1,280</div>
+    <div class="avatar">旅</div>
+  </div>
+  <div class="body">
+    <div class="side">
+      <button class="newchat" onclick="fakeSend()">＋ 新的行程对话</button>
+      <h5>最近对话</h5>
+      <div class="conv act">邯郸 3 天 · 2 人 · 预算 2000<small>11-16 出发 · 已出行程</small></div>
+      <div class="conv">大理 4 天 · 不想太赶<small>11-08 出发 · 已出行程</small></div>
+      <div class="conv">成都周末两日 · 带娃<small>聊天中</small></div>
+      <div class="conv">北京 5 天 · 博物馆路线<small>10-28 · 已出行程</small></div>
+    </div>
+    <div class="chatcol">
+      <div id="chat">
+        <div class="welcome">
+          <div class="big">这趟想去哪，<em>说一句就行</em></div>
+          <p>告诉我目的地、日期和人数，其余的我来补：班次、天气、动线、预算全部算好</p>
+        </div>
+        <div class="msg bot">你好！我是你的行程规划助手 🧭<br>可以说「11月16号从石家庄去邯郸玩3天，2人，预算2000」，我先出个能直接用的方案，之后想改哪天、加减哪里，直接说。</div>
+      </div>
+      <div class="sugs">
+        <button onclick="fakeSend()">城市规划：邯郸 3 天</button>
+        <button onclick="fakeSend()">大理 4 天，不想太赶</button>
+        <button onclick="fakeSend()">成都带娃两日游</button>
+      </div>
+      <div class="inputbar">
+        <div class="row">
+          <textarea id="inp" rows="1" placeholder="说说你的计划，或者问点别的…"></textarea>
+          <button id="sendbtn" onclick="fakeSend()">发送</button>
+        </div>
+        <div class="foot">行迹 · 行程数据来自资料库与实时检索 · 出行前请再核对票价与开放时间</div>
+      </div>
+    </div>
+    <div class="board">
+      <div class="bhead">
+        <b>🌴 邯郸 3 天行程</b>
+        <div class="bsub">11-16 ~ 11-18 · 2 人 · 预算内（人均 925 元）</div>
+      </div>
+      <div class="bdays">
+        <div class="day">
+          <h4>Day 1 · 古城与碑刻 <span class="pill">11-16</span></h4>
+          <div class="node"><span class="tm">10:30</span><span class="ic">🏰</span><span class="nm">广府古城<small style="display:block;color:var(--dim);font-size:12px">城墙可以登，太极宗师故里</small></span><span class="mn">150分</span></div>
+          <div class="node"><span class="tm">15:00</span><span class="ic">🏛️</span><span class="nm">邯郸市博物馆<small style="display:block;color:var(--dim);font-size:12px">需提前预约 · 免费换票</small></span><span class="mn">120分</span></div>
+        </div>
+        <div class="day">
+          <h4>Day 2 · 响堂山石窟 <span class="pill">11-17</span></h4>
+          <div class="node"><span class="tm">09:00</span><span class="ic">⛰️</span><span class="nm">响堂山石窟<small style="display:block;color:var(--dim);font-size:12px">北齐石窟代表作</small></span><span class="mn">180分</span></div>
+          <div class="node"><span class="tm">14:00</span><span class="ic">🛍️</span><span class="nm">早市 / 伴手礼<small style="display:block;color:var(--dim);font-size:12px">自由安排</small></span><span class="mn">60分</span></div>
+        </div>
+        <div class="day">
+          <h4>Day 3 · 市区收尾 <span class="pill">11-18</span></h4>
+          <div class="node"><span class="tm">09:30</span><span class="ic">🏯</span><span class="nm">丛台公园<small style="display:block;color:var(--dim);font-size:12px">武灵丛台，邯郸地标</small></span><span class="mn">120分</span></div>
+          <div class="node"><span class="tm">16:00</span><span class="ic">🚄</span><span class="nm">返程 · G5678</span><span class="mn">90分</span></div>
+        </div>
+      </div>
+      <div class="budget">今日合计 <b>¥1,850</b> · 人均 <b>¥925</b> · 含 10% 机动</div>
+    </div>
+  </div>
+</div>
+
+<button class="switch" onclick="toggleView()">⇄ 切换 登录页 / 首页</button>
+
+<script>
+function toggleView(){
+  var l=document.getElementById('login'),h=document.getElementById('home');
+  var onLogin=l.style.display!=='none';
+  l.style.display=onLogin?'none':'flex';
+  h.style.display=onLogin?'flex':'none';
+}
+function sendCode(btn){
+  var p=document.getElementById('lg-phone');
+  if(!/^\d{11}$/.test(p.value)){p.focus();p.style.borderColor='#c0392b';return;}
+  p.style.borderColor='';
+  btn.disabled=true;var left=60;
+  btn.textContent=left+'s 后重发';
+  var t=setInterval(function(){left--;if(left<=0){clearInterval(t);btn.disabled=false;btn.textContent='获取验证码';}else btn.textContent=left+'s 后重发';},1000);
+  document.getElementById('lg-demo').style.display='block';
+  document.getElementById('lg-code').value='246810';
+}
+function doLogin(){toggleView();}
+function fakeSend(){
+  var chat=document.getElementById('chat');
+  chat.querySelector('.welcome')&&(chat.querySelector('.welcome').style.display='none');
+  var u=document.createElement('div');u.className='msg user';
+  u.textContent='11月16号从石家庄去邯郸玩3天，2人，预算2000';
+  chat.appendChild(u);
+  var t=document.createElement('div');t.className='msg bot';t.textContent='正在核对目的地资料，准备编排…';
+  chat.appendChild(t);chat.scrollTop=chat.scrollHeight;
+  setTimeout(function(){
+    t.innerHTML='邯郸行程排好了，3 天 2 晚，预算内（人均 925 元）。\n\n'+
+    '<h4>这趟怎么玩</h4>第一天到了先吃顿老驴头驴肉火烧垫底；第二天重头戏，市博物馆加丛台公园；第三天返程前绕广府古城收尾。\n\n'+
+    '<h4>必玩体验</h4>· 邯郸市博物馆：需提前预约——09:00-17:00 开放\n· 广府古城：你点名的必去——城墙可以登\n\n'+
+    '<h4>味蕾印象</h4>· 老驴头驴肉火烧：回住宿方向顺路吃\n· 圣旨骨酥鱼（滏东店）：先吃饭再逛\n\n'+
+    '<span class="sec">🌅 上午 / ☀️ 下午 / 🌙 晚上逐段排好了，每天预算和雨天备案都写在卡片里</span>'+
+    '<a class="planlink" href="javascript:void(0)" onclick="alert(\'此处跳转完整行程页（地图动线 + 每日卡片）\')">查看完整行程 →</a>';
+    chat.scrollTop=chat.scrollHeight;
+  },1400);
+}
+document.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&!e.shiftKey&&document.getElementById('home').style.display!=='none'){
+    var inp=document.getElementById('inp');
+    if(document.activeElement===inp&&inp.value.trim()){inp.value='';fakeSend();}
+  }
+});
+</script>
+</body>
+</html>
