@@ -1151,7 +1151,7 @@ class Session:
         if not slots.get("budget_total"):
             tiers = self._budget_tiers(result)
 
-        text = agent.render(result)
+        text = agent.render(result, client=self.client)
         if tiers:
             text += "\n\n" + self._render_tiers(tiers)
 

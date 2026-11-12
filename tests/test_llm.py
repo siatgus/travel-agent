@@ -304,6 +304,37 @@ def test_unknown_spot_reply() -> None:
           llm.unknown_spot_reply(bad, "邯郸", "某景点") is None)
 
 
+def test_plan_intro_guard() -> None:
+    """方案导览段：模型写的开场必须忠实于事实——数字超纲整段弃用回模板。"""
+    facts = {"目的地": "邯郸", "天数": 3, "出发地": "石家庄", "节奏": "适中",
+             "每天": [{"Day": 1, "主题": "古城与碑刻", "主打": ["广府古城", "邯郸市博物馆"]},
+                      {"Day": 2, "主题": "响堂山石窟", "主打": ["响堂山石窟"]},
+                      {"Day": 3, "主题": "市区收尾", "主打": ["丛台公园"]}]}
+    good = ("邯郸这趟三天，走的是「从古城看到石窟」的赵文化主线："
+            "Day1 广府古城加博物馆打底，Day2 专程留给响堂山石窟，"
+            "Day3 丛台公园收尾，节奏不紧不慢，适合不赶时间的周末游。")
+    out = llm.compose_reply(llm.ScriptedClient([good]), "plan_intro", facts,
+                            must_keep=["邯郸"])
+    check("plan_intro：忠实输出原样返回", out is not None and "主线" in out,
+          f"{out}")
+
+    # 温度/日期/价格都不在事实里——写出来就是脑补，整段弃用
+    for bad_text, label in (
+            ("邯郸 11 月 16 日出发正合适，白天 16℃ 挺舒服，三天玩得刚刚好。",
+             "出现日期/温度 → 弃用"),
+            ("邯郸人均消费 200 元出头，三天吃住行都能安排得很体面。",
+             "出现价格 → 弃用")):
+        out2 = llm.compose_reply(llm.ScriptedClient([bad_text]), "plan_intro",
+                                 facts, must_keep=["邯郸"])
+        check(f"plan_intro：{label}", out2 is None, f"{out2}")
+
+    out3 = llm.compose_reply(llm.ScriptedClient([llm.LLMError("超时")]),
+                             "plan_intro", facts, must_keep=["邯郸"])
+    check("plan_intro：模型异常 → None 回退模板", out3 is None)
+    out4 = llm.compose_reply(None, "plan_intro", facts)
+    check("plan_intro：无模型 → None 回退模板", out4 is None)
+
+
 # ------------------------------------------------------------------ 汇总
 
 def main() -> int:
@@ -318,7 +349,8 @@ def main() -> int:
                test_rerank_hallucination_filtered, test_rerank_all_invalid,
                test_rerank_end_to_end_survives_failure,
                test_rerank_bonus_does_not_break_geometry,
-               test_lookup_poi_coerce, test_unknown_spot_reply):
+               test_lookup_poi_coerce, test_unknown_spot_reply,
+               test_plan_intro_guard):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

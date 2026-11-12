@@ -1505,6 +1505,81 @@ def test_foreign_city_center_from_kb() -> None:
           "should be None")
 
 
+def test_render_narrative_layout() -> None:
+    """方案正文 = 示例式叙事：导览段/必玩体验/味蕾印象/分日三段/出行贴士。"""
+    r = _fake_result()
+    r["slots"] = dict(r["slots"], origin="石家庄", destination="邯郸",
+                      days=2, must_visit=["广府古城"], pace="moderate")
+    r["outbound"] = {"ok": True, "items": [{"code": "G1234", "depart": "08:00",
+                                            "arrive": "09:00", "price": 60}]}
+    r["inbound"] = {"ok": True, "items": [{"code": "G5678", "depart": "18:00",
+                                           "arrive": "19:00", "price": 60}]}
+    r["days_plan"] = [
+        {"day": 1, "date": "2026-11-16", "theme": "古城与碑刻",
+         "intensity": "中", "move_min": 40, "day_budget": 420,
+         "rainy_plan": "改博物馆",
+         "nodes": [
+             {"time": "10:30", "name": "广府古城", "type": "attraction",
+              "duration_min": 150, "transit": "—", "tip": "城墙可以登",
+              "cost": 70, "booking_required": False, "poi_id": "p1",
+              "geo": [36.69, 114.68]},
+             {"time": "13:40", "name": "午饭", "type": "restaurant",
+              "duration_min": 60, "transit": "步行 5 分钟", "tip": "永年酥鱼",
+              "cost": 45, "booking_required": False, "poi_id": "p2",
+              "geo": [36.69, 114.69]},
+             {"time": "15:00", "name": "邯郸市博物馆", "type": "attraction",
+              "duration_min": 120, "transit": "打车 20 分钟", "tip": "免费换票",
+              "cost": 0, "booking_required": True, "poi_id": "p3",
+              "geo": [36.61, 114.49]},
+             {"time": "18:30", "name": "老槐树烧饼（学步桥店）", "type": "restaurant",
+              "duration_min": 60, "transit": "步行 8 分钟", "tip": "烧饼夹肉",
+              "cost": 50, "booking_required": False, "poi_id": "p4",
+              "geo": [36.61, 114.50]},
+         ]},
+        {"day": 2, "date": "2026-11-17", "theme": "市区收尾",
+         "intensity": "低", "move_min": 30, "day_budget": 300,
+         "rainy_plan": "商场",
+         "nodes": [
+             {"time": "09:30", "name": "丛台公园", "type": "attraction",
+              "duration_min": 120, "transit": "—", "tip": "武灵丛台",
+              "cost": 5, "booking_required": False, "poi_id": "p6",
+              "geo": [36.61, 114.49]},
+             {"time": "16:00", "name": "返程", "type": "transit",
+              "duration_min": 90, "transit": "—", "tip": "",
+              "cost": 60, "booking_required": False, "poi_id": "t9",
+              "geo": [36.60, 114.50]},
+         ]},
+    ]
+    r["budget"] = dict(r["budget"], breakdown=[
+        {"category": "hotel", "label": "住宿 2 晚", "amount": 600},
+        {"category": "ticket", "label": "门票", "amount": 75},
+        {"category": "food", "label": "餐饮", "amount": 335},
+        {"category": "local_transit", "label": "市内交通", "amount": 160},
+    ])
+    text = agent.render(r)
+    check("导览段按天串玩法主线", "这趟怎么玩" in text
+          and "广府古城" in text.split("### 必玩体验")[0], text[:400])
+    check("导览段不拿午饭/晚饭当主线",
+          "玩到晚饭" not in text and "主打午饭" not in text, text[:300])
+    check("分日按上午/下午/晚上叙事（不再是表格）",
+          "🌅 上午" in text and "☀️ 下午" in text and "🌙 晚上" in text
+          and "| 时间 | 安排 |" not in text)
+    check("需预约的点进必玩体验", "**邯郸市博物馆**：需提前预约" in text)
+    check("点名必去进必玩体验", "**广府古城**：你点名的必去" in text)
+    check("味蕾印象收录具名餐厅、泛指餐名不进",
+          "### 味蕾印象" in text and "老槐树烧饼（学步桥店）" in text
+          and "**午饭**：" not in text)
+    check("出行贴士含天气/交通/住宿/预约四行",
+          text.count("\n- 天气：") == 1 and "\n- 交通：去程" in text
+          and "\n- 住宿：按 1 晚" in text and "\n- 需提前预约：" in text)
+    check("非首节点把交通读进句子", "打车 20 分钟，15:00" in text)
+    # 单日：不写住宿行，当日往返
+    r1 = _fake_result()
+    r1["slots"] = dict(r1["slots"], days=1)
+    t1 = agent.render(r1)
+    check("单日方案住宿行写当日往返", "当天往返，不用订房" in t1)
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -1527,7 +1602,8 @@ def main() -> int:
                test_map_marks_uncertain_points, test_route_map_real,
                test_route_map_js_syntax, test_wrap_contains_daily,
                test_poi_info_cards,
-               test_render_budget_and_weather, test_pace_noop_is_honest,
+               test_render_budget_and_weather, test_render_narrative_layout,
+               test_pace_noop_is_honest,
                test_uncertain_spot_owns_a_day, test_day_sight_cap,
                test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice):
         fn()

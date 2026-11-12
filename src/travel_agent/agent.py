@@ -1814,7 +1814,166 @@ def _wx_caliber(weather: dict) -> str:
             f"估算（每日卡片已标注），出行前请再查一次")
 
 
-def render(result: dict) -> str:
+# 系统填充项 + 泛指餐名的统一过滤前缀（组合名如「午餐 · 就近自选」也能拦住）
+_FILLER_PREFIX = ("早市", "自由活动", "就近自选",
+                  "早饭", "早餐", "午饭", "午餐", "晚饭", "晚餐",
+                  "宵夜", "下午茶")
+
+
+def _day_main_spots(d: dict) -> list[str]:
+    """一天里真正由用户/编排器选的核心点（景点+餐厅），剔除系统填充项。
+
+    导览段、必玩体验、味蕾印象都从这里取材——「早市 / 自由活动」这类
+    填充节点不是玩法主线，写进导览等于告诉用户"我们安排了叫自由活动"。
+    泛指的「午饭/晚饭」也不当主线（"从A玩到晚饭"读不通），餐厅具体
+    店名（老槐树烧饼夹肉）才算。
+    """
+    out = []
+    for n in d["nodes"]:
+        if n.get("type") not in ("attraction", "restaurant"):
+            continue
+        nm = n.get("name") or ""
+        if nm.startswith(_FILLER_PREFIX):
+            continue
+        out.append(nm)
+    return out
+
+
+def _node_hour(t: str) -> int:
+    """「09:30」→ 9；解析不了给 12（落进下午组，不丢节点）。"""
+    try:
+        return int(str(t).split(":")[0])
+    except (ValueError, IndexError):
+        return 12
+
+
+def _day_narrative(d: dict) -> list[str]:
+    """一天 = 上午/下午/晚上三段叙事，替代原来的四列表格。
+
+    每个节点：时段图标 + 「时间 · 名称（时长）」+ 换行缩进的备注；
+    非当天第一个节点把交通方式读进句子里（原来表格里交通是一列，
+    叙事里硬塞会断句）。景点/餐厅加粗，填充项（早市/交通/休息）保持普通字重。
+    """
+    groups: dict[str, list] = {"上午": [], "下午": [], "晚上": []}
+    for n in d["nodes"]:
+        h = _node_hour(n.get("time") or "")
+        groups["上午" if h < 12 else "下午" if h < 18 else "晚上"].append(n)
+    lines: list[str] = []
+    first_of_day = True
+    for label, icon in (("上午", "🌅"), ("下午", "☀️"), ("晚上", "🌙")):
+        ns = groups[label]
+        if not ns:
+            continue
+        lines.append(f"{icon} {label}")
+        for n in ns:
+            core = n.get("type") in ("attraction", "restaurant")
+            name = f"**{n['name']}**" if core else n["name"]
+            dur = n.get("duration_min")
+            dur_s = f"（约 {dur} 分钟）" if dur else ""
+            tr = (n.get("transit") or "").strip()
+            lead = ""
+            if not first_of_day and tr and tr not in ("—", "-"):
+                lead = f"{tr}，"
+            lines.append(f"- {lead}{n['time']} · {name}{dur_s}")
+            tip = (n.get("tip") or "").strip()
+            if tip:
+                lines.append(f"  {tip}")
+            first_of_day = False
+    return lines
+
+
+def _tour_overview(result: dict) -> str:
+    """导览段模板版：几天每天怎么串，一句话一天。LLM 不可用时的兜底。"""
+    s = result["slots"]
+    dest, days = s["destination"], s["days"]
+    origin = result.get("origin") or s.get("origin")
+    pace = {"relaxed": "轻松", "intensive": "紧凑"}.get(s.get("pace"), "适中")
+    parts = []
+    for d in result["days_plan"]:
+        main = _day_main_spots(d)
+        theme = d.get("theme") or ""
+        if len(main) >= 2:
+            parts.append(f"Day{d['day']} 从{main[0]}玩到{main[-1]}（{theme}）")
+        elif main:
+            parts.append(f"Day{d['day']} 全天主打{main[0]}")
+        elif theme:
+            parts.append(f"Day{d['day']} {theme}")
+        else:
+            parts.append(f"Day{d['day']} 自由安排")
+    head = (f"从{origin}出发，" if origin else "") + \
+        f"{dest}这 {days} 天走{pace}节奏："
+    return (head + "；".join(parts)
+            + "。想改哪天、加减哪里，直接说就行。")
+
+
+def _intro_llm(result: dict, client) -> str | None:
+    """导览段模型版：让开场像示例那样有一点目的地氛围，而不是流水账。
+
+    只喂城市/天数/每日主题/主打点名，日期和温度都不给——模型写不出
+    「11月16日」「18℃」这类数字，_numbers_faithful 会整段拒收。
+    """
+    if client is None:
+        return None
+    s = result["slots"]
+    facts = {
+        "目的地": s["destination"],
+        "天数": s["days"],
+        "出发地": result.get("origin") or s.get("origin") or "",
+        "节奏": {"relaxed": "轻松", "intensive": "紧凑"}.get(s.get("pace"), "适中"),
+        "每天": [{"Day": d["day"], "主题": d.get("theme") or "",
+                  "主打": _day_main_spots(d)[:3]} for d in result["days_plan"]],
+    }
+    try:
+        from . import llm as llm_layer
+        return llm_layer.compose_reply(client, "plan_intro", facts,
+                                       must_keep=[s["destination"]])
+    except Exception:
+        return None
+
+
+def _highlight_lines(result: dict) -> list[str]:
+    """必玩体验：需预约的先列（错过要害），再补用户点名的必去点。"""
+    s = result["slots"]
+    seen: set[str] = set()
+    lines: list[str] = []
+    for d in result["days_plan"]:
+        for n in d["nodes"]:
+            nm = n.get("name") or ""
+            if n.get("booking_required") and nm not in seen:
+                seen.add(nm)
+                tip = (n.get("tip") or "").strip()
+                lines.append(f"- **{nm}**：需提前预约" + (f"——{tip}" if tip else ""))
+    for m in (s.get("must_visit") or []):
+        for d in result["days_plan"]:
+            for n in d["nodes"]:
+                nm = n.get("name") or ""
+                if (nm not in seen and n.get("type") == "attraction"
+                        and (m in nm or nm in m)):
+                    seen.add(nm)
+                    tip = (n.get("tip") or "").strip()
+                    lines.append(f"- **{nm}**：你点名的必去"
+                                 + (f"——{tip}" if tip else ""))
+    return lines[:6]
+
+
+def _taste_lines(result: dict) -> list[str]:
+    """味蕾印象：行程里排到的真实餐厅（填充项不算），一句一个。"""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for d in result["days_plan"]:
+        for n in d["nodes"]:
+            nm = n.get("name") or ""
+            if n.get("type") != "restaurant" or nm in seen:
+                continue
+            if nm.startswith(_FILLER_PREFIX):
+                continue
+            seen.add(nm)
+            tip = (n.get("tip") or "").strip()
+            lines.append(f"- **{nm}**" + (f"：{tip}" if tip else ""))
+    return lines[:4]
+
+
+def render(result: dict, client=None) -> str:
     s, b = result["slots"], result["budget"]
     out = [
         f"## {s['destination']} {s['days']} 天行程 · 起 {s['date_range']['start']}",
@@ -1827,34 +1986,52 @@ def render(result: dict) -> str:
     _cal = _wx_caliber(result.get("weather") or {})
     if _cal:
         out.append(f"> {_cal}")
+    out += [
+        "### 出行概要",
+        *summary_lines(result),
+        "",
+        "### 这趟怎么玩",
+        (_intro_llm(result, client) or _tour_overview(result)),
+        "",
+    ]
+    highlights = _highlight_lines(result)
+    if highlights:
+        out += ["### 必玩体验", *highlights, ""]
+    tastes = _taste_lines(result)
+    if tastes:
+        out += ["### 味蕾印象", *tastes, ""]
+    for d in result["days_plan"]:
+        out.append(f"### Day {d['day']} · {d['date']} · {d['theme']}（{d['intensity']}）")
+        out += _day_narrative(d)
+        out.append(f"\n**今日预算**：约 {d['day_budget']} 元　**雨天备案**：{d['rainy_plan']}\n")
+
     # 两腿的方向写在班次前面：返程是 destination→origin，不是反过来。
     # 只写班次号时用户得自己猜这班车往哪儿开，很容易照去程方向查回程票。
     _org = result.get("origin") or s.get("origin") or ""
     _dst = s.get("destination") or ""
     _out_route = (leg_route("去程", _org, _dst) + " ") if (_org and _dst) else ""
     _inb_route = (leg_route("返程", _org, _dst) + " ") if (_org and _dst) else ""
+    nights = max((s.get("days") or 1) - 1, 0)
+    hotel_amt = next((round(it["amount"]) for it in b["breakdown"]
+                      if it["category"] == "hotel"), 0)
+    if not nights:
+        stay_line = "- 住宿：当天往返，不用订房"
+    elif hotel_amt:
+        stay_line = (f"- 住宿：按 {nights} 晚 ¥{hotel_amt:,} 估算（已含在预算里）；"
+                     "想住具体片区（如「住古城边上」「住海边」）说一声，我按片区重排")
+    else:
+        stay_line = "- 住宿：按城市均价估算，想指定片区直接说"
     out += [
-        "### 出行概要",
-        *summary_lines(result),
-        "",
-        "### 行前准备",
+        "### 出行贴士",
         f"- 天气：{_wx_line((result['weather'].get('days') or [{}])[0])}",
         (f"- 交通：去程 {_out_route}{outbound_label(result['outbound'])}；"
          f"返程 {_inb_route}{outbound_label(result['inbound'])}"
          if result.get("outbound") is not None
          else "- 交通：未指定出发地，往返大交通未安排（预算未含）；定了出发地我补上班次"),
+        stay_line,
         f"- 需提前预约：{'、'.join(n['name'] for d in result['days_plan'] for n in d['nodes'] if n['booking_required']) or '无'}",
         "",
     ]
-    for d in result["days_plan"]:
-        out.append(f"### Day {d['day']} · {d['date']} · {d['theme']}（{d['intensity']}）")
-        out.append("| 时间 | 安排 | 时长 | 交通 | 备注 |")
-        out.append("|---|---|---|---|---|")
-        for n in d["nodes"]:
-            out.append(f"| {n['time']} | {n['name']} | {n['duration_min']}min | "
-                       f"{n['transit']} | {n['tip']} |")
-        out.append(f"\n**今日预算**：约 {d['day_budget']} 元　**雨天备案**：{d['rainy_plan']}\n")
-
     out.append("### 预算明细")
     for item in b["breakdown"]:
         # 以前直接打 category（local_transit 这种英文键名），用户看不懂；
