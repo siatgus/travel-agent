@@ -337,6 +337,55 @@ def test_plan_intro_guard() -> None:
 
 # ------------------------------------------------------------------ 汇总
 
+def test_history_scope() -> None:
+    """历史只喂说话层/闲聊层：分类与槽位抽取必须单句（否则上一轮意图会污染判断）。"""
+    turns = [{"role": "user", "content": "我想去大理"},
+             {"role": "assistant", "content": "大理可以安排几天？"}]
+    c = llm.ScriptedClient(['{"intent":"poi"}', "大理古城和洱海都值得去"])
+    llm.attach_history(c, turns)
+    llm.classify_intent(c, "那边有什么好玩的")
+    check("分类调用不带历史", c.histories[-1] == [], f"{c.histories[-1]}")
+    out = llm.compose_reply(c, "poi", {"城市": "大理"}, "那边有什么好玩的")
+    check("说话层带历史", len(c.histories[-1]) == 2, f"{c.histories[-1]}")
+    check("说话层正常返回", out is not None and "大理" in out, f"{out}")
+
+    # 槽位抽取：json_task 内部多次调用，全都不许带历史
+    c2 = llm.ScriptedClient(["{}", "{}", "{}", "{}"])
+    llm.attach_history(c2, turns)
+    llm.extract_slots_llm(c2, "大理有什么好玩的", TODAY)
+    check("槽位抽取不带历史", all(h == [] for h in c2.histories),
+          f"{c2.histories}")
+
+    # 闲聊层也带历史，且没有历史时退化成单句（不能报错）
+    c3 = llm.ScriptedClient(["我在的，你想问哪儿的行程？"])
+    llm.attach_history(c3, turns)
+    out3 = llm.chat_reply(c3, "你还在吗")
+    check("闲聊层带历史", len(c3.histories[-1]) == 2 and out3 is not None,
+          f"{c3.histories}")
+    c4 = llm.ScriptedClient(["我在的"])
+    out4 = llm.chat_reply(c4, "你还在吗")
+    check("无历史时闲聊照常单句", out4 == "我在的" and c4.histories[-1] == [],
+          f"{c4.histories}")
+
+    # 线上一定是 MeteredClient 包一层：历史要能透到内层，否则"加了上下文"
+    # 只在测试里成立、线上每句都失忆
+    class _FakeMeter:
+        def freeze(self, *a, **k): pass
+        def release(self, *a, **k): pass
+        def settle(self, *a, **k): pass
+        def tokens_to_credits(self, n): return n
+
+    inner = llm.ScriptedClient(["大理古城和洱海都值得去"])
+    mc = llm.MeteredClient(inner, 1, _FakeMeter())
+    llm.attach_history(mc, turns)
+    llm.compose_reply(mc, "poi", {"城市": "大理"}, "那边呢")
+    check("计量客户端把历史透到内层", len(inner.histories[-1]) == 2,
+          f"{inner.histories}")
+    llm.classify_intent(mc, "那边有什么好玩的")
+    check("计量客户端下分类仍不带历史", inner.histories[-1] == [],
+          f"{inner.histories}")
+
+
 def main() -> int:
     for fn in (test_fenced_json, test_numeric_coercion,
                test_avoid_coerced_and_wins_over_must,
@@ -350,7 +399,7 @@ def main() -> int:
                test_rerank_end_to_end_survives_failure,
                test_rerank_bonus_does_not_break_geometry,
                test_lookup_poi_coerce, test_unknown_spot_reply,
-               test_plan_intro_guard):
+               test_plan_intro_guard, test_history_scope):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

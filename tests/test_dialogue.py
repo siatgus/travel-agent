@@ -1442,6 +1442,27 @@ def test_no_new_slots_no_replan() -> None:
           f"mode={r3.mode}")
 
 
+def test_chat_history_attached() -> None:
+    """多轮上下文：闲聊层要能看到最近几轮，但要截断、且不含本轮这句。"""
+    from travel_agent.llm import ScriptedClient
+    s = session()
+    s.turn("11月8号去大理玩4天，2人，预算6000")
+    c = ScriptedClient(["{}", "接着刚才那份大理的安排说，你想改哪块？"])
+    s.client = c
+    r = s.turn("继续说")
+    check("闲聊兜底被触发", r.mode == "answer" and "大理" in r.render, r.render[:80])
+    h = c.histories[-1] if c.histories else []
+    check("闲聊层拿到最近几轮",
+          len(h) >= 2 and h[0]["role"] == "user"
+          and any(x["role"] == "assistant" for x in h), f"{h}"[:160])
+    check("历史里没有本轮这句", all(x["content"] != "继续说" for x in h), f"{h}"[:160])
+    check("长回复（整份方案）被截断",
+          all(len(x["content"]) <= 241 for x in h),
+          f"{[len(x['content']) for x in h]}")
+    check("历史总字数受控", sum(len(x["content"]) for x in h) <= 800,
+          f"{sum(len(x['content']) for x in h)}")
+
+
 def test_comparison_question_not_generic_list() -> None:
     """「邯郸有没有像迪士尼一样的地方」→ 按类型找同类，不甩本地景点清单。
 
@@ -1582,7 +1603,8 @@ def main() -> int:
                test_bare_day_answered_once, test_month_then_day_merges,
                test_day_then_month_not_overridden,
                test_meta_question_answered,
-               test_comparison_question_not_generic_list):
+               test_comparison_question_not_generic_list,
+               test_chat_history_attached):
         fn()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)

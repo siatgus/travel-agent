@@ -470,6 +470,28 @@ class Session:
             return self._general_answer(utterance)
         return None
 
+    def _llm_history(self, limit: int = 6, per_msg: int = 240,
+                     total: int = 800) -> list[dict]:
+        """给说话层/闲聊层的最近几轮（不含本轮这句，它单独作为 user 消息传）。
+
+        只喂「说话」和「闲聊」两个入口：让回答接得上上一轮的指代（「那它呢」）
+        和语气。分类、槽位抽取、数据校验一律单句——历史进去会让模型把上一轮
+        的意图/日期带到这一轮，判错面变大。
+        行程正文很长（一整份方案），按 per_msg 截断、按 total 总字数从旧往新
+        砍，避免每轮把整份行程塞进 prompt。
+        """
+        turns = [m for m in self.history[:-1] if (m.get("content") or "").strip()]
+        out: list[dict] = []
+        for m in turns[-limit:]:
+            role = "assistant" if m.get("role") == "agent" else "user"
+            c = str(m["content"]).strip()
+            if len(c) > per_msg:
+                c = c[:per_msg].rstrip() + "…"
+            out.append({"role": role, "content": c})
+        while out and sum(len(x["content"]) for x in out) > total:
+            out.pop(0)
+        return out
+
     # -------------------------------------------------- 主入口
     def turn(self, utterance: str) -> Reply:
         """混合指令拆分：交通时刻修改从句拒绝，其余行程请求照常处理。
@@ -527,6 +549,8 @@ class Session:
         self.turn_no += 1
         self.history.append({"role": "user",
                              "content": history_text or utterance})
+        # 说话层/闲聊层带最近几轮（分类、抽取、校验层不读它，见 llm.attach_history）
+        llm.attach_history(self.client, self._llm_history())
 
         # ---- 点名行程里的店/景点问细节：抢在意图分类前接住 ----
         gated = self._plan_spot_gate(utterance)

@@ -123,11 +123,24 @@ class Client:
         self.task = ""                          # 当前调用属于哪类任务（写进用量流水）
 
     # -------------------------------------------------- 网络
-    def chat(self, system: str, user: str, *, temperature: float | None = None) -> str:
+    def chat(self, system: str, user: str, *, temperature: float | None = None,
+             history: list[dict] | None = None) -> str:
+        """一次调用。history 是**说话层专用**的最近几轮（[{role,content}]）。
+
+        只有 compose_reply / chat_reply 会传它：让回答接得上上一轮的指代和语气。
+        分类、槽位抽取、重排、校验一律不传——那几层要确定性，历史塞进去
+        会让模型把上一轮的意图/日期带进这一轮（判错面变大）。
+        """
+        messages = [{"role": "system", "content": system}]
+        for m in (history or []):
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user})
         payload = {
             "model": self.model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
+            "messages": messages,
             "temperature": self.temperature if temperature is None else temperature,
         }
         req = urllib.request.Request(
@@ -226,14 +239,19 @@ class MeteredClient(Client):
         self.last_usage = None
         self.task = ""
 
-    def chat(self, system: str, user: str, *, temperature: float | None = None) -> str:
+    def chat(self, system: str, user: str, *, temperature: float | None = None,
+             history: list[dict] | None = None) -> str:
         import uuid
-        chars = len(system) + len(user)
+        chars = len(system) + len(user) + sum(len(m.get("content") or "")
+                                              for m in (history or []))
         est_tokens = min(6000, max(400, chars // 2 + 400))   # 粗估，结算时多退少补
         ref = f"u{self.uid}-{uuid.uuid4().hex[:10]}"
         self._meter.freeze(self.uid, self._meter.tokens_to_credits(est_tokens), ref)
         try:
-            text = self._inner.chat(system, user, temperature=temperature)
+            # 历史是说话层专属：外层收到的 history 必须显式透给内层，
+            # 否则计量客户端包一层之后，每条回复都会悄悄丢掉上下文
+            text = self._inner.chat(system, user, temperature=temperature,
+                                    history=history)
         except Exception:
             self._meter.release(self.uid, ref)
             raise
@@ -261,9 +279,12 @@ class ScriptedClient(Client):
         self._responses = list(responses)
         self._i = 0
         self.prompts: list[str] = []
+        self.histories: list[list[dict]] = []   # 每次调用收到的 history（测试断言用）
 
-    def chat(self, system: str, user: str, *, temperature: float | None = None) -> str:
+    def chat(self, system: str, user: str, *, temperature: float | None = None,
+             history: list[dict] | None = None) -> str:
         self.prompts.append(user)
+        self.histories.append(list(history or []))
         if self._i >= len(self._responses):
             raise LLMError("脚本已用尽")
         item = self._responses[self._i]
@@ -834,7 +855,9 @@ _KIND_TASK = {
     "smalltalk": "用户在打招呼、问你是谁/是什么模型/能做什么、道谢或告别。简短回应："
                  "问身份就说清你是这个产品里的旅行规划助手，背后接的是后台配置的大模型"
                  "（OpenAI 兼容接口，可换），不要自称某个具体商业型号（别冒充 GPT、文心等）；"
-                 "再顺带说清你能做什么：查真实天气、真实班次、城市景点，也能直接排行程。",
+                 "再顺带说清你能做什么：查真实天气、真实班次、城市景点，也能直接排行程。"
+                 "如果【场景】是「追问」（用户在质疑或追问你刚才说的话），"
+                 "直接针对上一轮内容正面回应，别再自我介绍、别绕回「在的」。",
     "clarify": "用户想排行程但信息不全。只问【要问的】里的那一件事（已经只列了一件，"
                "不要自己再加问题），并附一句具体建议让用户容易回答。"
                "如果【用户刚才的话】是在反问我而不是回答（比如问「你不问我从哪出发吗」），"
@@ -916,6 +939,20 @@ def _numbers_faithful(text: str, facts: dict) -> bool:
     return True
 
 
+def attach_history(client: Client | None, turns: list[dict] | None) -> None:
+    """把「最近几轮」挂到客户端上，供说话层/闲聊层取用（分类与抽取层不读）。
+
+    放在客户端上而不是逐个函数传参：天气/景点/班次/闲聊的作答入口散在
+    intent 的十来个函数里，逐个加参数会漏；这里只让 compose_reply 和
+    chat_reply 主动去读，其它调用照旧单句。
+    """
+    if client is not None:
+        try:
+            client.history = list(turns or [])
+        except Exception:
+            pass
+
+
 def compose_reply(client: Client | None, kind: str, facts: dict,
                   user_text: str = "", must_keep: list | None = None) -> str | None:
     """让模型把结构化事实说成人话。任何异常/跑偏都返回 None，由调用方回退模板。
@@ -940,7 +977,8 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     except Exception:
         pass
     try:
-        text = client.chat(_REPLY_STYLE, "\n".join(parts))
+        text = client.chat(_REPLY_STYLE, "\n".join(parts),
+                           history=getattr(client, "history", None))
     except LLMError:
         return None
     text = _clean_reply(text)
@@ -986,7 +1024,8 @@ def chat_reply(client: Client | None, text: str,
     except Exception:
         pass
     try:
-        raw = client.chat(_CHAT_SYS, "\n".join(parts))
+        raw = client.chat(_CHAT_SYS, "\n".join(parts),
+                          history=getattr(client, "history", None))
     except LLMError:
         return None
     out = _clean_reply(raw, 200)
