@@ -670,9 +670,9 @@ const store = {
 const chat = document.getElementById('chat');
 const inp  = document.getElementById('inp');
 const sendBtn = document.getElementById('send');
-// 每次打开网页都从新对话开始：不读上次的 sid（刷新/重开一律新会话）。
-// 旧对话已自动存档，登录后可在「历史行程」里回看或点开续聊。
-let sid = genSid();
+// 刷新沿用上次的会话：正在聊的对话不能因为 F5 就断线重开。
+// 恢复逻辑在 boot 里——登录态且该会话有消息才回放，否则仍落规划表单页。
+let sid = store.get('ta_sid') || genSid();
 store.set('ta_sid', sid);
 
 // 任何运行期错误都显示在聊天区，而不是无声无息
@@ -1252,14 +1252,18 @@ async function refreshHistList(){
     list.appendChild(d);
   }
 }
-// 点开一次历史行程：整段对话原样回放，之后继续说话就接着这次排
-async function loadConv(sid_){
-  let r=await fetch('/api/conversations/'+encodeURIComponent(sid_),{headers:authHeaders()});
-  if(r.status===401){
-    if(await tryRefresh()){ return loadConv(sid_); }
-    showLogin('登录已过期，请重新登录'); return;
+// 点开一次历史行程：整段对话原样回放，之后继续说话就接着这次排。
+// pre = boot 恢复时已经取到的响应，避免同一会话连拉两次。
+async function loadConv(sid_, pre){
+  let j = pre;
+  if(!j){
+    let r=await fetch('/api/conversations/'+encodeURIComponent(sid_),{headers:authHeaders()});
+    if(r.status===401){
+      if(await tryRefresh()){ return loadConv(sid_); }
+      showLogin('登录已过期，请重新登录'); return;
+    }
+    j=await r.json();
   }
-  const j=await r.json();
   if(!j.ok){ return; }
   closeHist();
   sid=sid_; store.set('ta_sid', sid);
@@ -1308,7 +1312,20 @@ async function refreshHistHint(){
     showGuest();                             // 打开网站不弹登录框
   }
   // #login 深链：直达登录页（分享/收藏登录入口用），不影响默认访客首屏
-  if(location.hash==='#login') showLogin();
+  if(location.hash==='#login') return showLogin();
+  // 刷新恢复：登录态且上次会话已有消息 → 原样回放；否则留在规划表单页
+  if(!token || !sid) return;
+  try{
+    let r = await fetch('/api/conversations/'+encodeURIComponent(sid),
+                        {headers:authHeaders()});
+    if(r.status===401 && await tryRefresh()){
+      r = await fetch('/api/conversations/'+encodeURIComponent(sid),
+                      {headers:authHeaders()});
+    }
+    if(!r.ok) return;
+    const j = await r.json();
+    if(j.ok && (j.messages||[]).length) loadConv(sid, j);
+  }catch(e){}
 })();
 
 inp.addEventListener('keydown',e=>{
