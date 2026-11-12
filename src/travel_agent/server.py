@@ -924,9 +924,8 @@ function logout(){
   token=''; refreshToken='';
   store.set('ta_token',''); store.set('ta_refresh','');
   pendingMsg='';
-  document.getElementById('login').style.display = 'none';
-  showGuest();
-  addBot(esc('已退出登录。页面仍可正常浏览，需要发送对话时再点右上角登录即可。'));
+  // 退出后回到登录界面（点「先看看，稍后登录」仍可回到访客浏览态）
+  showLogin('已退出登录，重新登录后继续规划');
 }
 
 // 点遮罩空白处 / 按 Esc 都算取消，不退出
