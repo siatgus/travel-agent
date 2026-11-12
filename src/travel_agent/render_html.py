@@ -159,6 +159,39 @@ def get_tdt_key() -> str:
         return ""
 
 
+def get_amap_key() -> str:
+    """高德 JS API Key：环境变量 AMAP_KEY 优先，其次设置文件 amap_key。"""
+    k = (os.environ.get("AMAP_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        from . import llm
+        return str(llm.load_settings().get("amap_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def get_amap_security() -> str:
+    """高德安全密钥（securityJsCode）：2021-12-02 之后申请的 Key 必配。"""
+    k = (os.environ.get("AMAP_SECURITY_CODE") or "").strip()
+    if k:
+        return k
+    try:
+        from . import llm
+        return str(llm.load_settings().get("amap_security") or "").strip()
+    except Exception:
+        return ""
+
+
+def map_mode() -> str:
+    """行程页地图模式：amap（高德 JS API）> tdt（天地图）> svg（示意图兜底）。"""
+    if get_amap_key():
+        return "amap"
+    if get_tdt_key():
+        return "tdt"
+    return "svg"
+
+
 def route_map_data(result: dict) -> dict:
     """抽给前端地图的最小数据集：只传坐标点位与连线所需字段。
 
@@ -1013,27 +1046,836 @@ ROUTE_MAP_JS = """
 })();
 """
 
+# 高德地图 JS API 2.0（webapi.amap.com），用户指定的首选底图。
+# 与天地图版的差异（其余交互逻辑——两态图钉、hover 卡片、卡片避让、
+# 天数页签、定位——逐行对齐，方便两侧同步修 bug）：
+# 1. 坐标系：库内是 WGS-84/CGCS2000，高德底图是 GCJ-02，ll() 出口统一做
+#    wgs2gcj 标准数学纠偏（境内 ±1m；境外坐标直通不纠，出境行程不受影响）。
+# 2. 驾车规划用 AMap.Driving 插件直连（JS Key 即可用）——天地图 HTTPS
+#    /drive 挂死才需要服务端代理，高德没这个问题，/api/tianditu/drive 不参与。
+# 3. 高德 InfoWindow 没有 setOffset/update：卡片避让（fitCardInMap）改成
+#    「关闭后按累计偏移重开」，同一份内容重建实例，语义与天地图版一致。
+# 4. InfoWindow 用 isCustom 自绘气泡（.rt-bubble 白底圆角+小尾巴）——
+#    默认窗体宽度不可控，会把 238px 介绍卡挤变形；迷你卡依旧无自带外框，
+#    「气泡就是唯一的框」。
+# 5. 定位用 AMap.Geolocation 插件（浏览器→IP 自动兜底，返回即 GCJ-02）。
+# __DATA__ / __KEY__ / __SEC__ 在渲染时替换。
+AMAP_ROUTE_JS = """
+(function () {
+  var DATA = __DATA__;
+  var TK = "__KEY__";
+  var SEC = "__SEC__";
+  var box = document.getElementById('route-map');
+  var fb = document.getElementById('route-fallback');
+  var tabs = document.getElementById('rt-tabs');
+  var note = document.getElementById('rt-route-note');
+  var locBtn = document.getElementById('rt-locate');
+  var locTip = document.getElementById('rt-locate-tip');
+  function showFallback() {
+    if (fb) fb.style.display = '';
+    if (box) box.style.display = 'none';
+    if (tabs) tabs.style.display = 'none';
+    if (locBtn) locBtn.style.display = 'none';
+    if (locTip) locTip.style.display = 'none';
+  }
+  // ---- 坐标纠偏：WGS-84 → GCJ-02（国测局火星坐标系，高德底图坐标系）。
+  // 标准公开算法；境外（包围盒之外）直通不纠。
+  var GCJ_PI = 3.14159265358979323846, GCJ_A = 6378245.0,
+      GCJ_EE = 0.00669342162296594323;
+  function gcjOutOfChina(lng, lat) {
+    return (lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271);
+  }
+  function gcjTLat(x, y) {
+    var ret = -100.0 + 2.0 * x + 3.0 * y * y + 0.2 * y * y * y
+      + 0.1 * x * y * y + 0.2 * Math.sqrt(Math.abs(x));
+    ret += (20.0 * Math.sin(6.0 * x * GCJ_PI) + 20.0 * Math.sin(2.0 * x * GCJ_PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(y * GCJ_PI) + 40.0 * Math.sin(y / 3.0 * GCJ_PI)) * 2.0 / 3.0;
+    ret += (160.0 * Math.sin(y / 12.0 * GCJ_PI) + 320.0 * Math.sin(y * GCJ_PI / 30.0)) * 2.0 / 3.0;
+    return ret;
+  }
+  function gcjTLng(x, y) {
+    var ret = 300.0 + x + 2.0 * y * y + 0.1 * x * x + 0.1 * x * y
+      + 0.1 * Math.sqrt(Math.abs(x));
+    ret += (20.0 * Math.sin(6.0 * x * GCJ_PI) + 20.0 * Math.sin(2.0 * x * GCJ_PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(x * GCJ_PI) + 40.0 * Math.sin(x / 3.0 * GCJ_PI)) * 2.0 / 3.0;
+    ret += (150.0 * Math.sin(x / 12.0 * GCJ_PI) + 300.0 * Math.sin(x / 30.0 * GCJ_PI)) * 2.0 / 3.0;
+    return ret;
+  }
+  function wgs2gcj(lng, lat) {
+    if (gcjOutOfChina(lng, lat)) { return [lng, lat]; }
+    var x = lng - 105.0, y = lat - 35.0;
+    var dLat = gcjTLat(x, y), dLng = gcjTLng(x, y);
+    var radLat = lat / 180.0 * GCJ_PI, magic = Math.sin(radLat);
+    magic = 1 - GCJ_EE * magic * magic;
+    var sm = Math.sqrt(magic);
+    dLat = (dLat * 180.0) / ((GCJ_A * (1 - GCJ_EE)) / (magic * sm) * GCJ_PI);
+    dLng = (dLng * 180.0) / (GCJ_A / sm * Math.cos(radLat) * GCJ_PI);
+    return [lng + dLng, lat + dLat];
+  }
+  // 「圆章式」图钉（效仿行程类 App）：上半是序号/标识，下半是类型小图标。
+  // 图标全部内联 SVG 白色线条，不引用任何外部图片资源。
+  function glyph(kind) {
+    var s = 'stroke="#FFFFFF" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+    switch (kind) {
+      case 'sight':        // 地标建筑（景点）
+        return '<rect x="4.6" y="3.2" width="2.8" height="7.3" fill="#FFFFFF"/>'
+          + '<path d="M6 0.6v2.6M2.6 10.6h6.8" ' + s + ' stroke-width="1.2"/>';
+      case 'restaurant':   // 刀叉（餐饮）
+        return '<path d="M3.4 1v2.9M5 1v2.9M6.6 1v2.9M5 4.6v6.2" '
+          + s + ' stroke-width="1.1"/>'
+          + '<path d="M8.9 1c-1.1 1.6-1.1 4.3 0 5.5v4.3" ' + s + ' stroke-width="1.1"/>';
+      case 'transit':      // 车站/列车
+        return '<rect x="3.2" y="1.6" width="5.6" height="7" rx="1.5" '
+          + s + ' stroke-width="1.2"/>'
+          + '<path d="M3.2 5.1h5.6M4.7 8.6l-1.3 2.4M7.3 8.6l1.3 2.4" '
+          + s + ' stroke-width="1.1"/>';
+      case 'hotel':        // 床（住宿）
+        return '<path d="M1.6 10.8V5.2M1.6 8.5h8.8v2.3M10.4 8.5V7c0-.9-.7-1.6-1.6-1.6H5.2" '
+          + s + ' stroke-width="1.2"/>'
+          + '<circle cx="3.6" cy="6.6" r="1.15" fill="#FFFFFF"/>';
+      case 'rest':         // 月牙（午休/自由活动）
+        return '<path d="M7.6 1.4a4.7 4.7 0 1 0 3 7.2A5 5 0 0 1 7.6 1.4z" fill="#FFFFFF"/>';
+      default:
+        return '';
+    }
+  }
+  function pin(color, kind, txt) {
+    var inner;
+    if (txt) {
+      // 上半序号 + 下半小图标（类别小图标必须与序号同轴心：12px 图标格
+      // 缩放 0.78 后宽 9.36，translate x = 15 - 9.36/2 = 10.3，否则
+      // 数字和类别标志看着不匹配——用户的原话）
+      inner = '<text x="15" y="12.4" font-size="11" font-family="Arial,sans-serif"'
+        + ' font-weight="bold" fill="#FFFFFF" text-anchor="middle">' + txt + '</text>'
+        + '<g transform="translate(10.3,14.2) scale(0.78)" opacity="0.95">'
+        + glyph(kind) + '</g>';
+    } else {
+      inner = '<g transform="translate(9.3,7.6) scale(0.95)" opacity="0.95">'
+        + glyph(kind) + '</g>';
+    }
+    var body = '<path d="M10 23.5L15 38.5l5-15z" fill="' + color + '"/>'
+      + '<circle cx="15" cy="13.5" r="12.2" fill="' + color + '" stroke="#FFFFFF"'
+      + ' stroke-width="1.8"/>'
+      + inner;
+    // 弹入动画必须放在 SVG 内部（SMIL）：img 元素上的 CSS transform 是
+    // 高德框架的定位机制（translate），CSS keyframes 一动它图标就被甩到
+    // 图层面板原点附近（天地图时代的教训）。SMIL 随新 src 加载自动播放。
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="40" viewBox="0 0 30 40">'
+      + '<g transform="translate(15,38.5)"><g opacity="0.35">'
+      + '<animate attributeName="opacity" values="0.35;1;1" keyTimes="0;0.65;1"'
+      + ' dur="0.22s" fill="freeze"/>'
+      + '<g><animateTransform attributeName="transform" type="scale"'
+      + ' values="0.45;1.15;1" keyTimes="0;0.65;1" dur="0.22s" fill="freeze"/>'
+      + '<g transform="translate(-15,-38.5)">' + body + '</g>'
+      + '</g></g></g></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  function mDot(color) {
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
+      + '<circle cx="11" cy="11" r="7.5" fill="' + color + '" stroke="#FFFFFF"'
+      + ' stroke-width="2.6"/></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  function dot() {
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
+      + '<circle cx="10" cy="10" r="7" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2.6"/></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+  var map, all = [], dayRecs = [], homeOv = null, curTab = -1;
+  var locMarker = null, locCircle = null;
+  var drv = null;                     // 共享驾车规划实例（AMap.Driving）
+  function ll(lng, lat) {
+    var p = wgs2gcj(lng, lat);        // 库内 WGS-84 → 高德 GCJ-02
+    all.push(p);
+    return p;
+  }
+  function visibleCardRect() {
+    try {
+      var scope = map && map.getContainer ? (map.getContainer() || null) : null;
+      if (!scope) { scope = document.getElementById('route-map'); }
+      if (!scope || !scope.querySelectorAll) { return null; }
+      var els = scope.querySelectorAll('.rt-card'), best = null, fallback = null;
+      for (var i = 0; i < els.length; i++) {
+        var r = els[i].getBoundingClientRect();
+        if (r.width > 80 && r.height > 40) {
+          fallback = r;
+          if (els[i].offsetParent !== null) { best = r; }
+        }
+      }
+      return best || fallback;
+    } catch (e) { return null; }
+  }
+  function iconRectAt(mx, my) {
+    try {
+      var scope = map && map.getContainer ? map.getContainer()
+                                          : document.getElementById('route-map');
+      if (!scope || !scope.querySelectorAll) { return null; }
+      var els = scope.querySelectorAll('.amap-icon img');
+      var best = null, nd = 1e18;
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) { continue; }
+        var r = els[i].getBoundingClientRect();
+        if (r.width < 4) { continue; }
+        var dx = Math.max(r.left - mx, mx - r.right, 0);
+        var dy = Math.max(r.top - my, my - r.bottom, 0);
+        var d = dx * dx + dy * dy;
+        if (d < nd) { nd = d; best = r; }
+      }
+      return (best && nd <= 900) ? best : null;
+    } catch (e) { return null; }
+  }
+  function overlapArea(a, q) {
+    var oy = Math.min(a.bottom, q.bottom) - Math.max(a.top, q.top);
+    var ox = Math.min(a.right, q.right) - Math.max(a.left, q.left);
+    return (oy > 0 && ox > 0) ? oy * ox : 0;
+  }
+  function clearShift(t, guards, axis, sign, m, pad) {
+    var d = 0;
+    for (var it = 0; it < 6; it++) {
+      var need = 0;
+      for (var i = 0; i < guards.length; i++) {
+        var a = { top: t.top + (axis === 'y' ? sign * d : 0),
+                  bottom: t.bottom + (axis === 'y' ? sign * d : 0),
+                  left: t.left + (axis === 'x' ? sign * d : 0),
+                  right: t.right + (axis === 'x' ? sign * d : 0) };
+        if (overlapArea(a, guards[i]) <= 0) { continue; }
+        var sep = (axis === 'y')
+          ? (sign < 0 ? a.bottom - guards[i].top : guards[i].bottom - a.top)
+          : (sign < 0 ? a.right - guards[i].left : guards[i].right - a.left);
+        if (sep > need) { need = sep; }
+      }
+      if (!need) { break; }
+      d += need + 2;
+    }
+    var a0 = { top: t.top + (axis === 'y' ? sign * d : 0),
+               bottom: t.bottom + (axis === 'y' ? sign * d : 0),
+               left: t.left + (axis === 'x' ? sign * d : 0),
+               right: t.right + (axis === 'x' ? sign * d : 0) };
+    var out = Math.max(0, m.top + pad - a0.top)
+            + Math.max(0, a0.bottom - (m.bottom - pad))
+            + Math.max(0, m.left + pad - a0.left)
+            + Math.max(0, a0.right - (m.right - pad));
+    var hit = 0;
+    for (var j = 0; j < guards.length; j++) { hit += overlapArea(a0, guards[j]); }
+    return { d: Math.round(d), out: Math.round(out), hit: hit };
+  }
+  // 卡片位置收敛。高德 InfoWindow 没有 setOffset/update（天地图版避让的
+  // 基石），改用「关闭后按累计偏移重开」——同一份内容重建实例，视觉连续。
+  // 收敛时机与天地图版一致：首轮 0ms（open 同步渲染完 DOM 立即量立即挪），
+  // 复测轮 620ms 兜残差。
+  function fitCardInMap(st, round) {
+    if (!st || round > 1) { return; }
+    setTimeout(function () {
+      try {
+        if (RT.open !== st) { return; }        // 卡片已换/已关，复测作废
+        var r = visibleCardRect();
+        var boxEl = document.getElementById('route-map');
+        if (!r || !boxEl) { return; }
+        var m = boxEl.getBoundingClientRect();
+        if (round === 0) { st.guard = st.guard0; }
+        var guards = st.guard ? [st.guard] : [];
+        var pad = 8, cx = 0, cy = 0;
+        if (r.top < m.top + pad) { cy = Math.round(m.top + pad - r.top); }
+        else if (r.bottom > m.bottom - pad) { cy = -Math.round(r.bottom - (m.bottom - pad)); }
+        if (r.left < m.left + pad) { cx = Math.round(m.left + pad - r.left); }
+        else if (r.right > m.right - pad) { cx = -Math.round(r.right - (m.right - pad)); }
+        var t = { top: r.top + cy, bottom: r.bottom + cy,
+                  left: r.left + cx, right: r.right + cx };
+        var ax = 0, ay = 0;
+        if (guards.length) {
+          var dirs = [
+            { axis: 'y', sign: -1 }, { axis: 'y', sign: 1 },
+            { axis: 'x', sign: -1 }, { axis: 'x', sign: 1 }
+          ];
+          var best = null;
+          for (var i = 0; i < dirs.length; i++) {
+            var c = clearShift(t, guards, dirs[i].axis, dirs[i].sign, m, pad);
+            if (best === null || c.hit < best.hit ||
+                (c.hit === best.hit && (c.out < best.out - 4 ||
+                 (Math.abs(c.out - best.out) <= 4 && c.d < best.d)))) {
+              best = { hit: c.hit, out: c.out, d: c.d, axis: dirs[i].axis, sign: dirs[i].sign };
+            }
+          }
+          if (best && best.d > 0) {
+            if (best.axis === 'x') { ax = best.sign * best.d; } else { ay = best.sign * best.d; }
+          }
+        }
+        if (!cx && !cy && !ax && !ay) { return; }
+        st.adj.x += cx + ax;
+        st.adj.y += cy + ay;
+        try { st.iw.close(); } catch (e) {}
+        st.iw = makeIW(st.pos, st.html, st.adj);
+        st.iw.open(map, st.pos);
+        fitCardInMap(st, round + 1);
+      } catch (e) {}
+    }, round ? 620 : 0);
+  }
+  // hover 卡片的开关状态机（window.RThover 供 InfoWindow 内联事件回调）
+  var RT = { timer: null, open: null, mouse: null };
+  // open = { mk, iw, pos, html, adj:{x,y}, guard0, guard }
+  var BASE_OFF_Y = -42;   // 气泡底缘距图钉锚点：清掉展开后的 40px 圆章
+  function makeIW(pos, html, adj) {
+    return new AMap.InfoWindow({
+      isCustom: true,
+      content: '<div class="rt-bubble">' + html + '</div>',
+      anchor: 'bottom-center',
+      offset: new AMap.Pixel(adj ? adj.x : 0, BASE_OFF_Y + (adj ? adj.y : 0))
+    });
+  }
+  // 文档级跟踪光标：悬停图钉前必先移动鼠标，开卡时 RT.mouse 永远新鲜
+  document.addEventListener('mousemove', function (ev) {
+    RT.mouse = { x: ev.clientX, y: ev.clientY };
+    hoverTick();
+  });
+  function hoverStay() {
+    if (RT.timer) { clearTimeout(RT.timer); RT.timer = null; }
+  }
+  function cursorOnCard(p) {
+    var r = visibleCardRect();
+    return !!(r && p.x >= r.left && p.x <= r.right
+                && p.y >= r.top && p.y <= r.bottom);
+  }
+  function cursorOnPin(p) {
+    try {
+      var scope = map && map.getContainer ? map.getContainer()
+                                          : document.getElementById('route-map');
+      if (!scope || !scope.querySelectorAll) { return false; }
+      var els = scope.querySelectorAll('.amap-icon img');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) { continue; }
+        var r = els[i].getBoundingClientRect();
+        if (r.width < 4) { continue; }
+        if (p.x >= r.left - 6 && p.x <= r.right + 6
+            && p.y >= r.top - 6 && p.y <= r.bottom + 6) { return true; }
+      }
+    } catch (e) {}
+    return false;
+  }
+  function hoverTick() {
+    if (!RT.open) { return; }
+    var p = RT.mouse;
+    if (!p) { return; }
+    if (cursorOnCard(p) || cursorOnPin(p)) { hoverStay(); return; }
+    if (!RT.timer) {
+      RT.timer = setTimeout(function () {
+        RT.timer = null;
+        var q = RT.mouse;
+        if (q && (cursorOnCard(q) || cursorOnPin(q))) { return; }
+        closeCard();
+      }, 350);
+    }
+  }
+  function hoverClose() { hoverTick(); }
+  window.RThover = { stay: hoverStay, leave: hoverClose };
+  function closeCard() {
+    var st = RT.open;
+    if (!st) { return; }
+    RT.open = null;
+    hoverStay();
+    try { st.iw.close(); } catch (e) {}
+    selMk(st.mk, false);
+  }
+  function miniCard(n, color, tag, note) {
+    return '<div class="rt-card rt-mini" style="border-left-color:' + darken(color, 0.75)
+      + ';" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">'
+      + '<div class="rt-mini-name">' + n.name + '</div>'
+      + '<div class="rt-mini-meta"><span class="rt-mini-tag" style="background:'
+      + darken(color, 0.75) + ';">' + tag + '</span>'
+      + (n.time ? '<span>' + n.time + '</span>' : '')
+      + '</div>'
+      + locRow(n)
+      + (note ? '<div class="rt-mini-note">' + note + '</div>' : '')
+      + '</div>';
+  }
+  var IMG_ONLY_TAG = '百度图片';
+  function locRow(n) {
+    if (n.dist == null && !DATA.city) { return ''; }
+    return '<div class="rt-poi-loc">📍 ' + (DATA.city || '')
+      + (n.dist != null ? ' · 距市中心直线' + n.dist + '公里' : '') + '</div>';
+  }
+  function poiCard(n) {
+    var L = n.link || {};
+    var imgCss = String(L.img || '').replace(/[()\\s'"]/g, '');
+    var img = imgCss
+      ? '<div class="rt-card-img" style="background-image:url(' + imgCss + ');"></div>'
+      : '<div class="rt-card-img rt-card-noimg">' + String(n.name).slice(0, 1) + '</div>';
+    return '<div class="rt-card" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">' + img
+      + '<div class="rt-card-body"><div class="rt-card-name">' + n.name + '</div>'
+      + '<div class="rt-poi-row"><span class="rt-poi-day">第' + n.day + '天</span>'
+      + '<span>已添加至行程</span>'
+      + (n.price ? '<span class="rt-poi-price">' + n.price + '</span>' : '')
+      + '</div>'
+      + (L.site ? '<div class="rt-card-src">' + (L.site == IMG_ONLY_TAG
+        ? '图片来源：' + L.site : '介绍来源：' + L.site
+        + ' · 点击下方链接查看完整攻略') + '</div>' : '')
+      + (L.snippet ? '<div class="rt-card-snip">' + L.snippet + '</div>' : '')
+      + locRow(n)
+      + '</div>'
+      + (L.url ? '<a class="rt-card-link" href="' + L.url
+        + '" target="_blank" rel="noopener">'
+        + (L.site == IMG_ONLY_TAG ? '查看更多图片 ↗' : '查看介绍 ↗') + '</a>'
+        : '<div class="rt-card-link">✓ 已添加</div>')
+      + '</div>';
+  }
+  function mIcon(url, w, h) {
+    return new AMap.Icon({ image: url, size: new AMap.Size(w, h) });
+  }
+  function addMarker(pos, color, kind, txt, infoHtml, uncertain) {
+    var mk;
+    try {
+      // 未选中态默认小圆点；选中才展开完整圆章（两态 + 过渡，见 selMk）
+      mk = new AMap.Marker({ position: pos, icon: mIcon(mDot(color), 22, 22),
+                             anchor: 'center' });
+    } catch (e) { mk = new AMap.Marker({ position: pos }); }
+    map.add(mk);
+    mk.RTpin = { color: color, kind: kind, txt: txt };
+    function openCard() {
+      if (RT.open && RT.open.mk === mk) { hoverStay(); return; }
+      if (RT.open) { closeCard(); }        // 换选：旧钉回落小圆点
+      hoverStay();
+      selMk(mk, true);                     // 先展开圆章，守卫量的才是展开后的矩形
+      var st = { mk: mk, pos: mk.getPosition(), html: infoHtml,
+                 adj: { x: 0, y: 0 },
+                 guard0: RT.mouse ? iconRectAt(RT.mouse.x, RT.mouse.y) : null };
+      st.iw = makeIW(st.pos, st.html, null);
+      try { st.iw.open(map, st.pos); } catch (e) {}
+      RT.open = st;
+      fitCardInMap(st, 0);
+    }
+    try {
+      // hover 开卡；关卡不挂任何 DOM 边界事件——唯一裁判是光标坐标（见 hoverTick）
+      mk.on('mouseover', openCard);
+      if (uncertain) {
+        mk.on('click', openCard);
+      }
+    } catch (e) {}
+    return mk;
+  }
+  function selMk(mk, on) {
+    try {
+      var p = mk.RTpin;
+      if (!p || typeof mk.setIcon !== 'function') { return; }
+      mk.setIcon(on ? mIcon(pin(p.color, p.kind, p.txt), 30, 40)
+                    : mIcon(mDot(p.color), 22, 22));
+      // 小圆点锚点是中心，圆章锚点是尾尖（bottom-center）：换图标必须同步换锚点
+      if (typeof mk.setAnchor === 'function') {
+        mk.setAnchor(on ? 'bottom-center' : 'center');
+      }
+    } catch (e) {}
+  }
+  function addLabel(text, pos, dx) {
+    try {
+      var lb = new AMap.Marker({ position: pos,
+        content: '<div class="tdt-label">' + text + '</div>',
+        anchor: 'middle-left', offset: new AMap.Pixel(dx, -10) });
+      map.add(lb);
+      return lb;
+    } catch (e) { return null; }
+  }
+  function darken(hex, f) {
+    var m = /^#?([0-9a-fA-F]{6})$/.exec(hex || '');
+    if (!m) { return hex; }
+    var n = parseInt(m[1], 16);
+    return 'rgb(' + Math.round(((n >> 16) & 255) * f) + ','
+      + Math.round(((n >> 8) & 255) * f) + ','
+      + Math.round((n & 255) * f) + ')';
+  }
+  function addBadge(text, pos, color) {
+    try {
+      var lb = new AMap.Marker({
+        content: '<span class="rt-badge" style="background:' + darken(color, 0.68)
+          + ';">' + text + '</span>',
+        position: pos, anchor: 'center', offset: new AMap.Pixel(0, -14) });
+      map.add(lb);
+      return lb;
+    } catch (e) { return null; }
+  }
+  function visible(o, on) {
+    if (!o) return;
+    try { if (on) { o.show(); } else { o.hide(); } } catch (e) {}
+  }
+  function setTab(idx) {
+    curTab = idx;
+    var btns = tabs ? tabs.querySelectorAll('button[data-idx]') : [];
+    dayRecs.forEach(function (rec, i) {
+      var on = (idx < 0) || (i === idx);
+      rec.ov.forEach(function (o) { visible(o, on); });
+    });
+    visible(homeOv, idx < 0);
+    try {
+      var rec = dayRecs[idx];
+      if (idx < 0) { map.setFitView(null, false, [60, 60, 60, 60]); }
+      else if (rec && rec.ov.length > 1) { map.setFitView(rec.ov, false, [60, 60, 60, 60]); }
+      else if (rec && rec.pts.length === 1) { map.setZoomAndCenter(14, rec.pts[0]); }
+    } catch (e) {}
+    for (var k = 0; k < btns.length; k++) {
+      btns[k].className =
+        (btns[k].getAttribute('data-idx') === String(idx)) ? 'on' : '';
+    }
+  }
+  function bindTabs() {
+    if (!tabs) return;
+    var btns = tabs.querySelectorAll('button[data-idx]');
+    for (var k = 0; k < btns.length; k++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          setTab(parseInt(b.getAttribute('data-idx'), 10));
+        });
+      })(btns[k]);
+    }
+  }
+  // ---------- 沿道路画路径（AMap.Driving 插件，JS Key 直连，无需服务端代理）。
+  // 高德路径服务返回 GCJ-02，与纠偏后的图钉坐标系一致，直接画。
+  function planSeg(a, b, cb) {
+    var finished = false;
+    function done(path) {
+      if (finished) return;
+      finished = true;
+      cb(path);
+    }
+    var timer = setTimeout(function () { done(null); }, 12000);
+    try {
+      if (!drv) { done(null); return; }
+      drv.search(new AMap.LngLat(a[0], a[1]), new AMap.LngLat(b[0], b[1]),
+        function (status, result) {
+          if (finished) return;
+          clearTimeout(timer);
+          var pts = [];
+          if (status === 'complete' && result && result.route
+              && result.route.paths && result.route.paths.length) {
+            var steps = result.route.paths[0].steps || [];
+            for (var i = 0; i < steps.length; i++) {
+              var sp = steps[i].path || [];
+              for (var k = 0; k < sp.length; k++) {
+                var p = sp[k];
+                pts.push([(p.lng !== undefined) ? p.lng : p[0],
+                          (p.lat !== undefined) ? p.lat : p[1]]);
+              }
+            }
+          }
+          done(pts.length > 1 ? pts : null);
+        });
+    } catch (e) { clearTimeout(timer); done(null); }
+  }
+  function thin(pts, maxPts) {
+    if (pts.length <= maxPts) { return pts; }
+    var step = Math.ceil(pts.length / maxPts), out = [], i;
+    for (i = 0; i < pts.length; i += step) { out.push(pts[i]); }
+    if (out[out.length - 1] !== pts[pts.length - 1]) { out.push(pts[pts.length - 1]); }
+    return out;
+  }
+  // 全局串行队列：路径服务有配额/QPS 限制，同城多段一次打出去容易被限流
+  var jobQueue = [], jobRunning = false;
+  function nextJob() {
+    if (!jobQueue.length) { jobRunning = false; return; }
+    var fn = jobQueue.shift();
+    fn(function () { setTimeout(nextJob, 150); });
+  }
+  function enqueue(fn) {
+    jobQueue.push(fn);
+    if (!jobRunning) { jobRunning = true; nextJob(); }
+  }
+  function planDay(rec, cb) {
+    var chain = rec.chain, idx = 0, segs = [], okCount = 0;
+    function schedule() {
+      if (idx >= chain.length - 1) { cb(segs, okCount); return; }
+      var a = chain[idx], b = chain[idx + 1];
+      enqueue(function (release) {
+        planSeg(a, b, function (path) {
+          if (path) { segs.push(path); okCount += 1; }
+          else { segs.push([a, b]); }
+          idx += 1;
+          release();
+          schedule();
+        });
+      });
+    }
+    schedule();
+  }
+  function flatten(segs) {
+    var out = [], i, k;
+    for (i = 0; i < segs.length; i++) {
+      for (k = 0; k < segs[i].length; k++) {
+        var p = segs[i][k], last = out[out.length - 1];
+        if (last && last[0] === p[0] && last[1] === p[1]) { continue; }
+        out.push(p);
+      }
+    }
+    return out;
+  }
+  function midOf(pts) { return pts[Math.floor(pts.length / 2)] || pts[0]; }
+  function replaceGhost(rec, pts) {
+    var real = null;
+    try {
+      real = new AMap.Polyline({ path: thin(pts, 320), strokeColor: rec.color,
+                                 strokeWeight: 5, strokeOpacity: 0.85 });
+      map.add(real);
+    } catch (e) { return; }
+    rec.ov = rec.ov.filter(function (o) { return o !== rec.ghost; });
+    try { map.remove(rec.ghost); } catch (e) {}
+    rec.ghost = null;
+    rec.ov.push(real);
+    if (rec.badge) {
+      rec.ov = rec.ov.filter(function (o) { return o !== rec.badge; });
+      try { map.remove(rec.badge); } catch (e) {}
+    }
+    rec.badge = addBadge('第' + rec.day + '天', midOf(pts), rec.color);
+    rec.ov.push(rec.badge);
+    var on = (curTab < 0) || (curTab === rec.idx);
+    visible(real, on);
+    visible(rec.badge, on);
+  }
+  // ---------- 定位：AMap.Geolocation 插件（浏览器定位 → IP 定位自动兜底，
+  // 返回即 GCJ-02，无需手动纠偏）
+  function placeMe(lng, lat, acc) {
+    var pos = [lng, lat];
+    if (!locMarker) {
+      try {
+        locMarker = new AMap.Marker({ position: pos, icon: mIcon(dot(), 20, 20),
+                                      anchor: 'center' });
+        map.add(locMarker);
+      } catch (e) { locMarker = null; }
+    } else {
+      try { locMarker.setPosition(pos); } catch (e) {}
+    }
+    try {
+      if (locCircle) { map.remove(locCircle); locCircle = null; }
+      if (acc && acc > 30) {
+        locCircle = new AMap.Circle({ center: pos, radius: Math.min(acc, 3000),
+          strokeColor: '#1A73E8', strokeWeight: 1,
+          fillColor: '#1A73E8', fillOpacity: 0.12 });
+        map.add(locCircle);
+      }
+    } catch (e) {}
+    try {
+      var z = 15;
+      try { z = Math.max(map.getZoom(), 15); } catch (e) {}
+      map.setZoomAndCenter(z, pos);
+    } catch (e) {}
+  }
+  function bindLocate() {
+    if (!locBtn) return;
+    locBtn.style.display = '';
+    locBtn.addEventListener('click', function () {
+      locBtn.disabled = true;
+      locBtn.textContent = '定位中…';
+      if (locTip) { locTip.style.display = ''; locTip.textContent = ''; }
+      function ok(lng, lat, acc) {
+        placeMe(lng, lat, acc);
+        locBtn.disabled = false;
+        locBtn.textContent = '◎ 我的位置';
+        if (locTip) {
+          locTip.textContent = '已定位到当前位置'
+            + (acc ? '（精度约 ' + Math.round(acc) + ' 米）' : '（IP 粗定位）');
+        }
+      }
+      function fail(msg) {
+        locBtn.disabled = false;
+        locBtn.textContent = '◎ 我的位置';
+        if (locTip) { locTip.textContent = msg; }
+      }
+      try {
+        AMap.plugin('AMap.Geolocation', function () {
+          try {
+            var geo = new AMap.Geolocation({
+              enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 });
+            geo.getCurrentPosition(function (status, result) {
+              if (status === 'complete' && result && result.position) {
+                ok(result.position.lng, result.position.lat,
+                   result.accuracy || 0);
+              } else {
+                fail('定位失败：浏览器未授权定位，IP 定位也不可用');
+              }
+            });
+          } catch (e) { fail('定位失败：当前浏览器不支持定位'); }
+        });
+      } catch (e) { fail('定位失败：当前浏览器不支持定位'); }
+    });
+  }
+  function init() {
+    if (typeof AMap === 'undefined') { showFallback(); return; }
+    var days = DATA.days || [];
+    var colors = DATA.colors || [];
+    var first = null, i;
+    for (i = 0; i < days.length && !first; i++) {
+      if (days[i].nodes && days[i].nodes.length) { first = days[i].nodes[0]; }
+    }
+    if (!first && DATA.home) { first = { lng: DATA.home[1], lat: DATA.home[0] }; }
+    if (!first) { showFallback(); return; }
+    // 容器必须先有尺寸再初始化，否则瓦片按 0x0 计算，地图是空白
+    if (box) box.style.display = '';
+    try {
+      map = new AMap.Map('route-map', {
+        zoom: 12, center: wgs2gcj(first.lng, first.lat),
+        scrollWheel: true, resizeEnable: true, zoomEnable: true, dragEnable: true });
+    } catch (e) { showFallback(); return; }
+    try { drv = new AMap.Driving({ policy: 0 }); } catch (e) { drv = null; }
+    days.forEach(function (d, i) {
+      var color = colors[i % colors.length] || '#2b5fe0';
+      var rec = { idx: i, day: d.day, color: color, ov: [], pts: [], chain: [],
+                  ghost: null, badge: null };
+      var seq = 0;
+      (d.nodes || []).forEach(function (n) {
+        var pos = ll(n.lng, n.lat);
+        rec.pts.push(pos);
+        if (n.uncertain) {
+          // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
+          rec.ov.push(addMarker(pos, '#a0a8bd', 'unknown', '?',
+            miniCard(n, '#a0a8bd', '位置估算',
+                     '位置待确认 · 坐标按市区估算，交通时间未计入'), true));
+          rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
+          return;
+        }
+        rec.chain.push(pos);
+        if (n.type === 'restaurant') {
+          rec.ov.push(addMarker(pos, color, 'restaurant', '', miniCard(n, color, '用餐'), false));
+          return;
+        }
+        if (n.type === 'transit') {
+          rec.ov.push(addMarker(pos, color, 'transit', '', miniCard(n, color, '交通'), false));
+          return;
+        }
+        if (n.type !== 'attraction') { return; }
+        seq += 1;
+        rec.ov.push(addMarker(pos, color, 'sight', String(seq),
+                              n.link ? poiCard(n) : miniCard(n, color, '景点'), false));
+        rec.ov.push(addLabel(n.name, pos, -10));
+      });
+      if (rec.chain.length >= 2) {
+        try {
+          // 先铺一条虚线直线占位，路径规划回来后替换成沿道路的实线
+          rec.ghost = new AMap.Polyline({ path: rec.chain, strokeColor: color,
+            strokeWeight: 3, strokeOpacity: 0.35, strokeStyle: 'dashed' });
+          map.add(rec.ghost);
+          rec.ov.push(rec.ghost);
+          rec.badge = addBadge('第' + d.day + '天', midOf(rec.chain), color);
+          rec.ov.push(rec.badge);
+        } catch (e) {}
+      }
+      dayRecs.push(rec);
+    });
+    if (DATA.home) {
+      var hp = ll(DATA.home[1], DATA.home[0]);
+      homeOv = addMarker(hp, '#1d2333', 'hotel', '',
+                         miniCard({name: '住宿'}, '#2c3550', '酒店'), false);
+      addLabel('住宿', hp, -22);
+    }
+    if (all.length > 1) {
+      try { map.setFitView(null, false, [60, 60, 60, 60]); } catch (e) {}
+    }
+    if (fb) fb.style.display = 'none';
+    bindTabs();
+    bindLocate();
+    // 逐天把直线占位换成真实道路走线；全失败也不影响页面可用
+    var pending = dayRecs.filter(function (r) { return r.chain.length >= 2; }).length;
+    var doneDays = 0, okSegs = 0, allSegs = 0;
+    if (!pending) {
+      if (note) { note.textContent = '点位不足，未生成动线。'; }
+      return;
+    }
+    if (note) { note.textContent = '正在按道路规划路线（' + pending + ' 天）…'; }
+    dayRecs.forEach(function (rec) {
+      if (rec.chain.length < 2) { return; }
+      planDay(rec, function (segs, ok) {
+        if (segs.length) {
+          replaceGhost(rec, flatten(segs));
+        }
+        okSegs += ok;
+        allSegs += segs.length;
+        doneDays += 1;
+        if (note && doneDays >= pending) {
+          if (okSegs === allSegs) {
+            note.textContent = '动线已按驾车路线沿道路绘制（' + allSegs + ' 段全部规划成功）。';
+          } else if (okSegs > 0) {
+            note.textContent = '动线按驾车路线绘制，' + (allSegs - okSegs)
+              + ' 段规划失败已退回直线连接（共 ' + allSegs + ' 段）。';
+          } else {
+            note.textContent = '路径规划服务不可用，动线为直线示意（不是实际道路）。';
+          }
+        }
+      });
+    });
+  }
+  // 安全密钥必须在加载 SDK 前设置（2021-12-02 之后申请的 Key 必配）
+  if (SEC) {
+    window._AMapSecurityConfig = { securityJsCode: SEC };
+  }
+  var s = document.createElement('script');
+  s.src = 'https://webapi.amap.com/maps?v=2.0&key=' + encodeURIComponent(TK)
+    + '&plugin=AMap.Driving,AMap.Geolocation';
+  var settled = false;
+  var timer = setTimeout(function () {
+    if (!settled) { settled = true; showFallback(); }
+  }, 8000);
+  // 高德偶发的「脚本 onload 了但 window.AMap 还没就绪」：短暂轮询几次再放弃
+  var tries = 0;
+  function boot() {
+    if (typeof AMap !== 'undefined') {
+      try { init(); } catch (e) { showFallback(); }
+      return;
+    }
+    if (tries++ < 6) { setTimeout(boot, 250); return; }
+    showFallback();
+  }
+  s.onload = function () {
+    if (settled) return;
+    settled = true; clearTimeout(timer);
+    boot();
+  };
+  s.onerror = function () {
+    if (settled) return;
+    settled = true; clearTimeout(timer); showFallback();
+  };
+  (document.head || document.documentElement).appendChild(s);
+})();
+"""
+
 
 def render_route_map(result: dict) -> str:
-    """路线区：真实地图（天地图 JS API）优先，SVG 示意图兜底。
+    """路线区：真实地图优先（高德 JS API 2.0，用户指定），天地图次之，SVG 兜底。
 
-    - 没配 Key：只渲染 SVG 示意图，并提示去哪里申请；
-    - 配了 Key：地图容器 + SVG 兜底（SDK 8 秒加载不出来就回落），
+    - 配了高德 Key（amap_key/AMAP_KEY，2021-12 后申请的还需安全密钥）：
+      高德底图（GCJ-02，前端 wgs2gcj 纠偏）+ AMap.Driving 直连规划；
+    - 没有高德但有天地图 Key：沿用天地图（CGCS2000 免纠偏 + 服务端代理）；
+    - 都没配：只渲染 SVG 示意图，并提示去哪里申请；
+    - 配了任意一个：地图容器 + SVG 兜底（SDK 8 秒加载不出来就回落），
       弱网/打印时页面也不会是空白。
     """
     svg = render_map(result)
-    key = get_tdt_key()
-    if not key:
-        hint = ('<div style="font-size:12px;color:#a0a8bd;margin-top:10px;">'
-                '当前为示意图。在管理后台「模型设置」填入天地图 Key，或设置环境变量 '
-                'TIANDITU_KEY（console.tianditu.gov.cn 免费申请，应用类型选'
-                '「浏览器端」）后，这里会显示真实地图。</div>')
-        return f'{svg}{hint}'
     data = json.dumps(route_map_data(result), ensure_ascii=False).replace("<", "\\u003c")
-    safe_key = "".join(ch for ch in key if ch.isalnum())
-    if not safe_key:
-        return svg
-    js = ROUTE_MAP_JS.replace("__DATA__", data).replace("__KEY__", safe_key)
+    # 图钉图例（两种底图共用）
+    legend = ('图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点；'
+              '鼠标悬停景点图钉可看介绍卡片，点击「查看介绍」跳转攻略网页。'
+              '动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'
+              '位置估算点不参与连线。')
+    mode = map_mode()
+    js = None
+    source = None
+    if mode == "amap":
+        safe_key = "".join(ch for ch in get_amap_key() if ch.isalnum())
+        safe_sec = "".join(ch for ch in get_amap_security() if ch.isalnum())
+        if safe_key:
+            js = (AMAP_ROUTE_JS.replace("__DATA__", data)
+                               .replace("__KEY__", safe_key)
+                               .replace("__SEC__", safe_sec))
+            source = '底图与路径规划：高德地图（www.amap.com）。' + legend
+        else:
+            mode = "tdt"
+    if js is None and mode == "tdt":
+        key = get_tdt_key()
+        safe_key = "".join(ch for ch in key if ch.isalnum())
+        if safe_key:
+            js = ROUTE_MAP_JS.replace("__DATA__", data).replace("__KEY__", safe_key)
+            source = ('底图与路径规划：天地图 · 国家地理信息公共服务平台'
+                      '（www.tianditu.gov.cn）。' + legend)
+    if js is None:
+        hint = ('<div style="font-size:12px;color:#a0a8bd;margin-top:10px;">'
+                '当前为示意图。在管理后台「模型设置」填入高德 Key 与安全密钥'
+                '（lbs.amap.com 免费申请，Key 类型选「Web端(JS API)」，'
+                '2021-12 之后申请的 Key 需同时填安全密钥），或设置环境变量 '
+                'AMAP_KEY / AMAP_SECURITY_CODE；也可填天地图 Key（TIANDITU_KEY，'
+                'console.tianditu.gov.cn）。配置后这里会显示真实地图。</div>')
+        return f'{svg}{hint}'
     # 天数页签（效仿行程类 App 的「总览/第1天/第2天…」筛选），点击只看某天的动线
     md = route_map_data(result)
     tabs = ('<div id="rt-tabs" class="rt-tabs">'
@@ -1052,6 +1894,14 @@ def render_route_map(result: dict) -> str:
         f'.rt-tabs button i{{width:8px;height:8px;border-radius:50%;display:inline-block;}}'
         f'.rt-tabs button.on{{background:#2b5fe0;color:#FFFFFF;border-color:#2b5fe0;}}'
         f'.rt-tabs button.on i{{background:#FFFFFF;}}'
+        # 高德 isCustom InfoWindow：自绘白底圆角气泡 + 小尾巴——默认窗体
+        # 宽度不可控，会把 238px 介绍卡挤变形；迷你卡依旧无自带外框，
+        # 「气泡就是唯一的框」
+        f'.rt-bubble{{position:relative;background:#FFFFFF;border-radius:10px;'
+        f'box-shadow:0 4px 16px rgba(0,0,0,.2);padding:7px;}}'
+        f'.rt-bubble:after{{content:"";position:absolute;left:50%;bottom:-6px;'
+        f'width:12px;height:12px;background:#FFFFFF;'
+        f'transform:translateX(-50%) rotate(45deg);}}'
         # 线上「第N天」徽标与景点名标签：透明底 + 白描边字，接近行程 App 观感
         f'.tdt-label{{background:transparent!important;border:none!important;'
         f'box-shadow:none!important;font-size:12px;color:#2c3550;'
@@ -1111,7 +1961,7 @@ def render_route_map(result: dict) -> str:
         f'<div id="route-fallback">{svg}</div>'
         f'<div style="font-size:12px;color:#a0a8bd;margin-top:8px;">'
         f'<span id="rt-route-note">正在按道路规划路线…</span><br>'
-        f'底图与路径规划：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
+        f'{source}'
         f'图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点；'
         f'鼠标悬停景点图钉可看介绍卡片，点击「查看介绍」跳转攻略网页。'
         f'动线为驾车路线规划结果，非实时路况，也不代表实际步行/公交走法；'

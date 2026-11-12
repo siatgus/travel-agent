@@ -637,17 +637,24 @@ def test_route_map_real() -> None:
     plan, _ = _compose()
     res = _fake_result(days_plan=plan)
     orig = render_html.get_tdt_key
+    orig_amap = render_html.get_amap_key
+    orig_sec = render_html.get_amap_security
     try:
         render_html.get_tdt_key = lambda: ""
+        render_html.get_amap_key = lambda: ""
+        render_html.get_amap_security = lambda: ""
         h = render_html.build_html(res, "成都4天")
-        check("没配 Key 时不加载地图 SDK", "api.tianditu.gov.cn" not in h)
+        check("没配 Key 时不加载地图 SDK",
+              "api.tianditu.gov.cn" not in h and "webapi.amap.com" not in h)
         check("不再引用腾讯地图", "map.qq.com" not in h)
         check("没配 Key 时仍有 SVG 示意图", "<svg" in h)
         check("没配 Key 时提示去哪里申请 Key", "console.tianditu.gov.cn" in h)
 
         render_html.get_tdt_key = lambda: "0123456789abcdef0123456789abcdef"
+        render_html.get_amap_key = lambda: ""
         h2 = render_html.build_html(res, "成都4天")
         check("配 Key 后加载天地图 JS API", "api.tianditu.gov.cn/api?v=4.0&tk=" in h2)
+        check("没配高德时不加载高德 SDK", "webapi.amap.com" not in h2)
         check("地图容器与 SVG 兜底同时存在",
               'id="route-map"' in h2 and 'id="route-fallback"' in h2)
         check("行程点位注入地图脚本", "成都大熊猫繁育研究基地" in h2 or "宽窄巷子" in h2)
@@ -763,8 +770,67 @@ def test_route_map_real() -> None:
         render_html.get_tdt_key = lambda: "abc';alert(1)//"
         h3 = render_html.build_html(res, "成都4天")
         check("非法字符的 Key 被过滤成纯字母数字", "alert(1)" not in h3)
+
+        # ---- 高德模式（用户指定的首选底图）：高德 Key > 天地图 Key > SVG ----
+        render_html.get_amap_key = lambda: "0123456789abcdef0123456789abcdef"
+        render_html.get_amap_security = lambda: "sec0123456789abcdef0123456789abcd"
+        h4 = render_html.build_html(res, "成都4天")
+        check("配高德 Key 后加载高德 JS API 2.0",
+              "webapi.amap.com/maps?v=2.0&key=" in h4)
+        check("高德优先于天地图",
+              "api.tianditu.gov.cn/api?" not in h4)
+        check("高德驱动驾车规划（插件直连，不走天地图代理）",
+              "/api/tianditu/drive" not in h4 and "AMap.Driving" in h4)
+        check("安全密钥在 SDK 加载之前注入",
+              "window._AMapSecurityConfig" in h4
+              and h4.find("_AMapSecurityConfig") < h4.find("webapi.amap.com"))
+        check("高德 Key 与安全密钥只以安全字符注入",
+              'var TK = "0123456789abcdef0123456789abcdef"' in h4
+              and 'var SEC = "sec0123456789abcdef0123456789abcd"' in h4)
+        check("页脚标注底图来源是高德地图", "底图与路径规划：高德地图" in h4)
+        check("高德模式前端做 WGS-84→GCJ-02 纠偏",
+              "function wgs2gcj" in h4 and "0.00669342162296594323" in h4)
+        check("境外坐标直通不纠偏（出境行程不受影响）", "gcjOutOfChina" in h4)
+        check("估算点不进连线的语义写进页面", "不参与连线" in h4)
+        check("有天数筛选页签", 'id="rt-tabs"' in h4 and "第2天" in h4)
+        check("地图容器与 SVG 兜底同时存在",
+              'id="route-map"' in h4 and 'id="route-fallback"' in h4)
+        # 高德 InfoWindow 没有 setOffset/update：避让改成关闭后按新偏移重开
+        check("卡片避让用关闭后重开实现（高德无 setOffset）",
+              "function fitCardInMap" in h4 and "st.iw.close()" in h4
+              and "makeIW(st.pos, st.html, st.adj)" in h4
+              and "round ? 620 : 0" in h4)
+        check("自绘白底气泡（isCustom，气泡是唯一的框）",
+              "isCustom: true" in h4 and ".rt-bubble" in h4)
+        check("两态图钉换图标同步换锚点",
+              "mk.setAnchor(on ? 'bottom-center' : 'center')" in h4)
+        check("弹入动画仍在 SVG 内部（SMIL）",
+              "animateTransform" in h4 and "@keyframes rt-pop" not in h4)
+        check("hover 状态机与光标裁判仍在（两模板对齐）",
+              "function hoverStay" in h4 and "function hoverTick" in h4
+              and "cursorOnCard(p) || cursorOnPin(p)" in h4)
+        check("定位走 AMap.Geolocation 插件（浏览器→IP 自动兜底）",
+              "AMap.Geolocation" in h4)
+        check("定位点用蓝点 + 精度圈显示", "locCircle" in h4 and "new AMap.Circle(" in h4)
+        check("图钉分类型图标（楼/刀叉/列车/床）",
+              all(f"case '{k}'" in h4 for k in ("sight", "restaurant", "transit", "hotel")))
+        check("估算点是灰色?图钉", "'#a0a8bd', 'unknown', '?'" in h4)
+        check("动线失败退回直线的文案仍在", "规划失败已退回直线" in h4)
+        render_html.get_amap_key = lambda: "zz';alert(1)//"
+        h5 = render_html.build_html(res, "成都4天")
+        check("高德非法字符的 Key 被过滤", "alert(1)" not in h5)
+        render_html.get_amap_key = lambda: "0123456789abcdef0123456789abcdef"
+        render_html.get_amap_security = lambda: ""
+        h6 = render_html.build_html(res, "成都4天")
+        check("没配安全密钥时注入空 SEC（运行时 if (SEC) 守卫跳过）",
+              'var SEC = ""' in h6 and "if (SEC) {" in h6)
+        render_html.get_amap_key = lambda: ""
+        h7 = render_html.build_html(res, "成都4天")
+        check("没配高德时回落天地图", "api.tianditu.gov.cn/api?v=4.0&tk=" in h7)
     finally:
         render_html.get_tdt_key = orig
+        render_html.get_amap_key = orig_amap
+        render_html.get_amap_security = orig_sec
 
     # 环境变量优先于设置文件（部署时不想落盘就设 TIANDITU_KEY）
     import os
@@ -779,6 +845,35 @@ def test_route_map_real() -> None:
         else:
             os.environ["TIANDITU_KEY"] = orig_env
 
+    # AMAP_KEY 环境变量同理（且 map_mode 判定为高德）
+    orig_env2 = os.environ.get("AMAP_KEY")
+    orig_env3 = os.environ.get("TIANDITU_KEY")
+    try:
+        os.environ["AMAP_KEY"] = "envamapkey0123456789abcdef012345"
+        check("AMAP_KEY 环境变量生效",
+              render_html.get_amap_key() == "envamapkey0123456789abcdef012345")
+        check("有高德 Key 时 map_mode 判定为 amap", render_html.map_mode() == "amap")
+        os.environ["AMAP_KEY"] = ""
+        os.environ["TIANDITU_KEY"] = "envkey0123456789abcdef0123456789"
+        check("只有天地图 Key 时 map_mode 判定为 tdt", render_html.map_mode() == "tdt")
+        os.environ.pop("TIANDITU_KEY", None)
+        # 本机设置文件可能真配了 tdt_key，把读取函数一并桩掉才构成「都没有」
+        _orig_tdt2 = render_html.get_tdt_key
+        render_html.get_tdt_key = lambda: ""
+        try:
+            check("都没有时 map_mode 判定为 svg", render_html.map_mode() == "svg")
+        finally:
+            render_html.get_tdt_key = _orig_tdt2
+    finally:
+        if orig_env2 is None:
+            os.environ.pop("AMAP_KEY", None)
+        else:
+            os.environ["AMAP_KEY"] = orig_env2
+        if orig_env3 is None:
+            os.environ.pop("TIANDITU_KEY", None)
+        else:
+            os.environ["TIANDITU_KEY"] = orig_env3
+
 
 def test_route_map_js_syntax() -> None:
     """地图脚本是普通字符串模板：对模板本体做 node --check（有 node 才查）。"""
@@ -790,18 +885,25 @@ def test_route_map_js_syntax() -> None:
     if not node:
         print("[SKIP] 环境里没有 node，跳过 JS 语法检查")
         return
-    js = (render_html.ROUTE_MAP_JS
-          .replace("__DATA__", '{"days":[],"home":null,"colors":[]}')
-          .replace("__KEY__", "TESTKEY"))
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
-                                     encoding="utf-8") as f:
-        f.write(js)
-        tmp = f.name
-    try:
-        r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
-        check("地图 JS 通过 node --check", r.returncode == 0, r.stderr[-300:])
-    finally:
-        _TA_PATH(tmp).unlink(missing_ok=True)
+    templates = [
+        (render_html.ROUTE_MAP_JS, {"__KEY__": "TESTKEY"}),
+        (render_html.AMAP_ROUTE_JS, {"__KEY__": "TESTKEY", "__SEC__": ""}),
+        (render_html.AMAP_ROUTE_JS, {"__KEY__": "TESTKEY", "__SEC__": "TESTSEC"}),
+    ]
+    for tpl, subs in templates:
+        js = tpl.replace("__DATA__", '{"days":[],"home":null,"colors":[]}')
+        for k, v in subs.items():
+            js = js.replace(k, v)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(js)
+            tmp = f.name
+        try:
+            r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
+            check(f"地图 JS 通过 node --check（{tpl[:20].strip()[:12]}…）",
+                  r.returncode == 0, r.stderr[-300:])
+        finally:
+            _TA_PATH(tmp).unlink(missing_ok=True)
 
 
 def test_wrap_contains_daily() -> None:

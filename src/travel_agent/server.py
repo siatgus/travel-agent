@@ -59,7 +59,7 @@ from . import llm as llm_layer
 from . import paths
 from . import progress
 from .dialogue import Session, PreferenceMemory
-from .render_html import build_html, get_tdt_key
+from .render_html import build_html, get_tdt_key, map_mode
 
 HOST = "127.0.0.1"          # 本机自访问地址（探测占用、默认展示）；对外绑定见 main()
 
@@ -1970,8 +1970,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(f"<h1>渲染失败</h1><pre>{e}</pre>", 500)
             finally:
                 # 页面已回给用户，后台同步把动线路段预热进缓存——
-                # 前端 fetch 毫秒级命中，不再赌用户浏览器的网络时序
-                prefetch_drive_routes(sid, result)
+                # 前端 fetch 毫秒级命中，不再赌用户浏览器的网络时序。
+                # 只有天地图模式需要预热（高德模式走 AMap.Driving 插件直连）
+                if map_mode() == "tdt":
+                    prefetch_drive_routes(sid, result)
         elif path.startswith("/api/conversations/"):
             user = self._auth_user()
             if user is None:

@@ -358,9 +358,16 @@ PAGE = """<!DOCTYPE html>
       <button onclick="testLlm()">测试连接</button>
     </div>
     <div class="row">
+      <input id="llm-amapkey" type="password" placeholder="高德 Key（选填）" size="30">
+      <input id="llm-amapsecurity" type="password" placeholder="高德安全密钥（选填）" size="30">
+      <span style="font-size:12px;color:#8A8A82;align-self:center;">
+        行程页首选底图 · lbs.amap.com 免费申请（Key 类型选「Web端(JS API)」，
+        2021-12 之后申请的 Key 需同时填安全密钥）</span>
+    </div>
+    <div class="row">
       <input id="llm-tdtkey" type="password" placeholder="天地图 Key（选填）" size="30">
       <span style="font-size:12px;color:#8A8A82;align-self:center;">
-        行程页真实地图用 · console.tianditu.gov.cn 免费申请（应用类型选「浏览器端」）</span>
+        行程页备用底图（没配高德时用） · console.tianditu.gov.cn 免费申请（应用类型选「浏览器端」）</span>
     </div>
     <div class="fresh">保存后对话服务下一句话即刻生效，无需重启。Key 只保存在本机设置文件中，界面上永远只显示脱敏形式；留空表示不修改。</div>
   </section>
@@ -778,6 +785,12 @@ async function loadLlm(){
   $('llm-tdtkey').value='';
   $('llm-tdtkey').placeholder=s.has_tdt_key
     ?('已保存 '+s.tdt_masked+'（留空则不修改）'):'天地图 Key（选填）';
+  $('llm-amapkey').value='';
+  $('llm-amapkey').placeholder=s.has_amap_key
+    ?('已保存 '+s.amap_masked+'（留空则不修改）'):'高德 Key（选填）';
+  $('llm-amapsecurity').value='';
+  $('llm-amapsecurity').placeholder=s.has_amap_security
+    ?('已保存 '+s.amapsec_masked+'（留空则不修改）'):'高德安全密钥（选填）';
   $('llm-state').textContent=(s.chat&&s.chat.online)
     ?(s.chat.has_detail?'对话服务在线 · 实时读取':'对话服务在线 · 旧版本，按配置显示')
     :'对话服务未探测到 · 显示配置值';
@@ -789,7 +802,9 @@ async function saveLlm(){
     provider:$('llm-provider').value, base_url:$('llm-base').value.trim(),
     model:$('llm-model').value.trim(), timeout:Number($('llm-timeout').value)||60,
     api_key:$('llm-key').value.trim(),
-    tdt_key:$('llm-tdtkey').value.trim()});
+    tdt_key:$('llm-tdtkey').value.trim(),
+    amap_key:$('llm-amapkey').value.trim(),
+    amap_security:$('llm-amapsecurity').value.trim()});
   showLlm(r.ok, r.ok?'已保存 —— 对话服务下一句话即刻生效':('保存失败：'+(r.error||'未知错误')));
   loadLlm();
 }
@@ -1164,7 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
         elif enabled and not llm.load_settings().get("api_key"):
             self._json({"ok": False, "error": "启用 LLM 需要先填写 API Key"}, 400)
             return
-        # 天地图 Key（行程页真实地图用），选填；留空表示不修改
+        # 天地图 Key（行程页备用底图），选填；留空表示不修改
         tdt_key = str(data.get("tdt_key") or "").strip()
         if tdt_key:
             if not tdt_key.isalnum() or not 16 <= len(tdt_key) <= 64:
@@ -1173,6 +1188,23 @@ class Handler(BaseHTTPRequestHandler):
                                      "console.tianditu.gov.cn「应用管理」可查）"}, 400)
                 return
             cfg["tdt_key"] = tdt_key
+        # 高德 JS API Key（行程页首选底图），选填；留空表示不修改
+        amap_key = str(data.get("amap_key") or "").strip()
+        if amap_key:
+            if not amap_key.isalnum() or not 16 <= len(amap_key) <= 64:
+                self._json({"ok": False,
+                            "error": "高德 Key 格式异常（通常为 32 位字母数字，"
+                                     "lbs.amap.com「应用管理」可查）"}, 400)
+                return
+            cfg["amap_key"] = amap_key
+        # 高德安全密钥 securityJsCode（2021-12 后申请的 Key 必配），选填
+        amap_sec = str(data.get("amap_security") or "").strip()
+        if amap_sec:
+            if not amap_sec.isalnum() or len(amap_sec) < 8 or len(amap_sec) > 128:
+                self._json({"ok": False,
+                            "error": "高德安全密钥格式异常（通常为 32 位字母数字）"}, 400)
+                return
+            cfg["amap_security"] = amap_sec
         llm.save_settings(cfg)
         self._json({"ok": True})
 

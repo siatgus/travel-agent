@@ -1136,6 +1136,11 @@ def settings_summary() -> dict:
         # 天地图 Key（行程页真实地图用），同一设置文件、同样只显示脱敏形式
         "has_tdt_key": bool(s.get("tdt_key")),
         "tdt_masked": mask_key(s.get("tdt_key")),
+        # 高德 JS API Key 与安全密钥（行程页首选底图，用户指定），同样脱敏
+        "has_amap_key": bool(s.get("amap_key")),
+        "amap_masked": mask_key(s.get("amap_key")),
+        "has_amap_security": bool(s.get("amap_security")),
+        "amapsec_masked": mask_key(s.get("amap_security")),
         "updated_at": str(s.get("updated_at") or ""),
         "env_fallback": bool(os.environ.get("OPENAI_API_KEY")),
         "env_model": os.environ.get("OPENAI_MODEL", ""),
