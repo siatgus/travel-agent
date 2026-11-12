@@ -185,6 +185,25 @@ def test_health(base: str) -> None:
           and body.get("ok") is True, f"status={status} body={raw[:80]}")
 
 
+def test_lan_and_mobile(base: str) -> None:
+    """手机互通：/api/lan 返回可用地址；页面带扫码弹窗与移动端适配。"""
+    status, raw = _get(base, "/api/lan")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        body = {}
+    check("/api/lan 返回局域网访问地址", status == 200 and body.get("ok") is True
+          and body.get("url", "").startswith("http://"), f"status={status} body={raw[:120]}")
+    status, html = _get(base, "/")
+    check("顶栏有「手机访问」入口且弹窗函数齐全",
+          'id="btn-qr"' in html and 'id="qrmask"' in html
+          and "function openQr" in html and "function copyLan" in html)
+    check("二维码库已 base64 内嵌（离线可用，不依赖外网 CDN）",
+          re.search(r'atob\("([A-Za-z0-9+/=]{1000,})"\)', html) is not None)
+    check("移动端断点样式存在（≤760px 整体适配、手机上隐藏扫码入口）",
+          "@media(max-width:760px)" in html and "#btn-qr{display:none}" in html)
+
+
 def test_clarify_flow(base: str, token: str) -> None:
     status, j = _post(base, "/api/chat",
                       {"sid": "t-clarify", "message": "想去云南玩"}, token=token)
@@ -388,6 +407,7 @@ def main() -> int:
     test_guest_mode(base)
     test_evaluated_js_syntax()
     test_health(base)
+    test_lan_and_mobile(base)
     test_auth_endpoints(base)
     test_chat_no_auth(base)
     token = _login(base, "13800001111")

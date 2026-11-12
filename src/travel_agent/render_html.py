@@ -1356,6 +1356,14 @@ def build_html(result: dict, utterance: str) -> str:
     .rt-mapcard {{ width:100%; margin-left:0; transform:none; }}
     #route-map {{ height:440px !important; }}
   }}
+  /* 手机端：收窄留白，超宽表格/地图在卡片内横向滚动而不是撑破版心 */
+  @media (max-width:640px) {{
+    .wrap {{ padding:26px 14px 44px; }}
+    h1 {{ font-size:22px; }}
+    .card {{ padding:14px 16px; overflow-x:auto; }}
+    table {{ font-size:12px; }}
+    #route-map {{ height:360px !important; }}
+  }}
   table td {{ border-bottom:1px solid #eef1fa; }}
   table tr:last-child td {{ border-bottom:none; }}
   @media print {{

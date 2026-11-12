@@ -922,7 +922,7 @@ def test_kid_party_and_schedule() -> None:
     from travel_agent import server as _srv
     srv_src = inspect.getsource(_srv)
     check("表单人数非纯数字时原样透传",
-          "/^\\d{1,3}$/.test(partyRaw)" in srv_src and "parts.push(partyRaw)" in srv_src,
+          "/^\\\\d{1,3}$/.test(partyRaw)" in srv_src and "parts.push(partyRaw)" in srv_src,
           "submitPlanner 仍在 parseInt 人数栏")
     check("表单不再 parseInt 人数栏",
           "parseInt(document.getElementById('pf-party')" not in srv_src)
