@@ -402,10 +402,6 @@ PAGE_SRC = """<!DOCTYPE html>
   .tdot:nth-child(3){animation-delay:.4s}
   @keyframes tb{0%,80%,100%{opacity:.25}40%{opacity:1}}
   #bar{background:var(--card);border-top:1px solid var(--line);padding:12px 20px}
-  #sugs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-  #sugs button{border:1.5px solid var(--line);background:#fff;border-radius:999px;
-       padding:5px 15px;font-size:13px;cursor:pointer;color:var(--ink)}
-  #sugs button:hover{border-color:var(--blue);color:var(--blue-deep);background:#eef4ff}
   #row{display:flex;gap:10px}
   #inp{flex:1;border:2px solid var(--line);border-radius:16px;padding:11px 15px;
        font-size:14px;font-family:inherit;resize:none;outline:none;background:#fbfcff}
@@ -756,11 +752,6 @@ PAGE_SRC = """<!DOCTYPE html>
 </div>
 <div id="bmenu"></div>
 <div id="bar">
-  <div id="sugs">
-    <button>11月8号去大理玩4天，2人，预算6000</button>
-    <button>我和孩子（3岁）下月从杭州去大理玩4天，不想太赶</button>
-    <button>五一去云南玩</button>
-  </div>
   <div id="row">
     <textarea id="inp" rows="1" placeholder="说出你的旅行想法，回车发送…"></textarea>
     <button id="send" onclick="send()">发送</button>
@@ -1478,8 +1469,6 @@ inp.addEventListener('keydown',e=>{
 });
 inp.addEventListener('input',()=>{inp.style.height='auto';
   inp.style.height=Math.min(inp.scrollHeight,120)+'px';});
-document.getElementById('sugs').addEventListener('click',e=>{
-  if(e.target.tagName==='BUTTON')send(e.target.textContent);});
 
 // 打开网页默认规划表单；但登录态且有存储会话时先全部藏住（不闪表单帧），
 // 等 boot 决定回放对话还是兜底落回表单
