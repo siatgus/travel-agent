@@ -856,8 +856,8 @@ function closeLogin(){
   document.getElementById('lg-msg').textContent = '';
   pendingMsg = '';                 // 关掉就当放弃这次发送，不偷偷补发
   if(!token){ showGuest();
-    // 访客从表单提交进来又取消登录：回到表单页，别留在空白聊天区
-    if(!chat.children.length && planner.style.display==='none') showPlanner();
+    // 「先看看」= 访客一律回规划首页；对话区有历史内容也不留在对话页
+    showPlanner();
   }
 }
 
