@@ -53,6 +53,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 CENTER = [30.00, 120.00]          # 假城市中心（绍兴附近，与任何种子城市无关）
 CITY = "测试城"
+# main() 会把 tdt_geocode 整体换成桩；境外兜底测试要打真实现，先留档
+_REAL_TDT_GEOCODE = autofetch.tdt_geocode
 
 
 def _poi(name: str, lat: float, lon: float, **kw) -> dict:
@@ -442,6 +444,70 @@ def test_llm_coord_refined() -> None:
           and abs(geo2[1] - 120.05) < 1e-6, f"geo={geo2}")
 
 
+def test_overseas_nominatim_fallback() -> None:
+    """境外城市天地图查不到（数据只覆盖国内）：坐标兜底退 Nominatim。
+
+    2026-11-12 洛杉矶实测：模型近似坐标（2 位小数）原样入库，图钉偏约 1km。
+    Nominatim 主名是英文，所以要点名/发现环节带出 name_en；这条兜底不依赖
+    天地图 Key，境内城市绝不走 Nominatim（数据源白名单口径）。
+    """
+    old_key = autofetch._tdt_key
+    old_nom = autofetch._nominatim_geocode
+    autofetch._tdt_key = lambda: ""          # 无 Key 也要能走境外兜底
+    autofetch._GEO_CACHE.clear()
+    try:
+        autofetch._nominatim_geocode = (
+            lambda name, city, center: (34.1182, -118.3003))
+        out = _REAL_TDT_GEOCODE("格里菲斯天文台", "洛杉矶",
+                                [34.05, -118.24],
+                                name_en="Griffith Observatory")
+        check("境外坐标经 Nominatim 兜底校正",
+              out == (34.1182, -118.3003), f"out={out}")
+
+        nom_calls: list[str] = []
+        autofetch._nominatim_geocode = (
+            lambda name, city, center: nom_calls.append(name))
+        out2 = _REAL_TDT_GEOCODE("故宫", "北京", [39.9, 116.4])
+        check("境内无 Key 不走 Nominatim（保持 None 降级）",
+              out2 is None and not nom_calls, f"out={out2} calls={nom_calls}")
+
+        check("境内外判定：洛杉矶境外 / 成都境内",
+              not autofetch._in_china([34.05, -118.24])
+              and autofetch._in_china([30.65, 104.06]),
+              "LA / 成都")
+    finally:
+        autofetch._tdt_key = old_key
+        autofetch._nominatim_geocode = old_nom
+        autofetch._GEO_CACHE.clear()
+
+
+def test_llm_en_name_plumbed_to_refine() -> None:
+    """模型给出的英文名要透传到坐标校正链路（境外 Nominatim 靠它命中）。"""
+    captured: dict = {}
+    old_lookup, old_geo = llm.lookup_poi, autofetch.tdt_geocode
+    row = {"name": "格里菲斯天文台", "name_en": "Griffith Observatory",
+           "lat": 34.12, "lon": -118.30, "category": "attraction",
+           "duration_min": 120, "ticket": 0, "open_hours": "", "note": ""}
+
+    def fake_geocode(name, city, center=None, name_en=None):
+        captured["name"], captured["name_en"] = name, name_en
+        return (34.1182, -118.3003)
+
+    llm.lookup_poi = lambda client, city, name: (row, None)
+    autofetch.tdt_geocode = fake_geocode
+    restore = _patch_center([34.05, -118.24])
+    try:
+        r = autofetch.ensure_spot("洛杉矶", "格里菲斯天文台", client=object())
+    finally:
+        llm.lookup_poi, autofetch.tdt_geocode = old_lookup, old_geo
+        restore()
+    check("英文名透传到地理编码", captured.get("name_en") == "Griffith Observatory"
+          and captured.get("name") == "格里菲斯天文台", str(captured))
+    geo = (r.get("poi") or {}).get("geo") or []
+    check("境外模型坐标被校正入库",
+          r["status"] == "fetched" and abs(geo[0] - 34.1182) < 1e-6, f"geo={geo}")
+
+
 def main() -> int:
     # 默认关掉真实地理编码：单测不打外网（专项测试自己临时替换桩）
     autofetch.tdt_geocode = lambda *a, **k: None
@@ -460,6 +526,8 @@ def main() -> int:
     test_spot_fetch_by_name()
     test_spot_llm_preferred()
     test_llm_coord_refined()
+    test_overseas_nominatim_fallback()
+    test_llm_en_name_plumbed_to_refine()
     test_spot_custom_fallback()
     test_bad_spot_name_never_stored()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

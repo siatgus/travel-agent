@@ -19,3 +19,5 @@ output/
 scripts/map_probe.png
 scripts/map_crop.png
 scripts/map_v2.png
+server.log
+design/shots/

@@ -650,14 +650,15 @@ def rerank_llm(client: Client, candidates: list[dict], slots: dict
 # 景点，坐标交给调用方做距离校验：编一个城市名容易，编一个"恰好落在城区
 # 60 公里内"的坐标很难，这道校验能挡掉绝大部分幻觉。
 
-DISCOVER_SYSTEM = """你是城市景点资料员。给定一个中国城市，列出该城市最值得去、真实存在的景点。
+DISCOVER_SYSTEM = """你是城市景点资料员。给定一个城市（境内或境外均可），列出该城市最值得去、真实存在的景点。
 
 硬性要求：
-1. 只输出 JSON：{"pois":[{"name":"景点常用名","category":"attraction","duration_min":90,"ticket":0,"lat":36.80,"lon":118.05}]}
+1. 只输出 JSON：{"pois":[{"name":"景点常用名","name_en":"景点通用英文名","category":"attraction","duration_min":90,"ticket":0,"lat":36.80,"lon":118.05}]}
 2. 8~12 个，必须是这个城市的景点；不确定的宁可不写。
 3. category 只能是 attraction / museum / viewpoint / park。
 4. duration_min 为建议游玩分钟数（30~300），ticket 为成人门票人民币整数（免费填 0）。
 5. lat/lon 必须是该景点的真实坐标（WGS84，保留 2 位小数），不允许用城市中心凑数。
+6. name_en 为该景点的通用英文名（用于境外地理编码核对位置；确实没有就填空字符串）。
 不要解释、不要代码围栏。"""
 
 _POI_CATEGORIES = {"attraction", "museum", "viewpoint", "park"}
@@ -696,6 +697,7 @@ def discover_pois(client: Client, city: str, limit: int = 12
             seen.add(name)
             out.append({
                 "name": name,
+                "name_en": str(r.get("name_en") or "").strip()[:60],
                 "category": (r.get("category")
                              if r.get("category") in _POI_CATEGORIES else "attraction"),
                 "duration_min": dur,
@@ -721,12 +723,13 @@ LOOKUP_SYSTEM = """你是景点资料员。给定城市和一个景点名，补�
 
 硬性要求：
 1. 只输出 JSON：
-{"found":true,"name":"景点正式全名","category":"attraction","duration_min":120,"ticket":0,
+{"found":true,"name":"景点正式全名","name_en":"English name","category":"attraction","duration_min":120,"ticket":0,
  "lat":31.14,"lon":121.66,"open_hours":"08:30-20:30","note":"一句话实用提示"}
 2. 不确定它是否在该城市、或不确定它的位置，就输出 {"found":false}，不要猜。
 3. lat/lon 必须是该景点的真实坐标（WGS84，保留 2 位小数），不允许用城市中心凑数。
 4. duration_min 为建议游玩分钟数（30~480），ticket 为成人票价人民币整数（免费填 0）。
 5. category 只能是 attraction / museum / viewpoint / park。
+6. name_en 为该景点的通用英文名（用于境外地理编码核对位置；确实没有就填空字符串）。
 不要解释、不要代码围栏。"""
 
 
@@ -750,6 +753,7 @@ def lookup_poi(client: Client, city: str, name: str
             return None, ["坐标越界"], []
         return {
             "name": nm,
+            "name_en": str(raw.get("name_en") or "").strip()[:60],
             "category": (raw.get("category")
                          if raw.get("category") in _POI_CATEGORIES else "attraction"),
             "duration_min": _to_int(raw.get("duration_min"), 20, 480,
@@ -762,6 +766,44 @@ def lookup_poi(client: Client, city: str, name: str
 
     return client.json_task("poi_lookup", LOOKUP_SYSTEM,
                             f"城市：{city}\n景点：{name}", coerce)
+
+
+# ------------------------------------------------- 景点名中译英（境外坐标校正）
+#
+# 天地图只覆盖国内，境外坐标兜底走 Nominatim（OSM），而 OSM 的主名几乎都是
+# 英文——中文名直接查通常全军覆没（洛杉矶实测）。让模型顺带给出英文名：
+# 城市级发现/点名补全在主调用里捎带（零额外开销），存量修复用这里的批量版。
+
+_POI_EN_SYSTEM = """你是翻译。把给定的景点中文名翻译成该景点的通用英文名。
+
+硬性要求：
+1. 只输出 JSON：{"items":[{"zh":"中文名","en":"English name"}]}
+2. items 必须与输入列表一一对应、顺序一致；不知道英文名就填空字符串，不要猜。
+不要解释、不要代码围栏。"""
+
+
+def poi_names_en(client: Client, city: str, names: list[str]
+                 ) -> tuple[dict[str, str], CallRecord]:
+    """批量把景点中文名译成英文名，返回 {中文名: 英文名}（查不到的不在表里）。"""
+
+    def coerce(raw):
+        items = raw.get("items") if isinstance(raw, dict) else None
+        if not isinstance(items, list):
+            return None, ["items 必须是数组"], []
+        out: dict[str, str] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            zh = str(it.get("zh") or "").strip()
+            en = str(it.get("en") or "").strip()
+            if zh and en:
+                out[zh] = en[:80]
+        return out, [], []
+
+    listing = "\n".join(f"- {n}" for n in names)
+    val, rec = client.json_task("poi_name_en", _POI_EN_SYSTEM,
+                                f"城市：{city}\n景点：\n{listing}", coerce)
+    return (val or {}), rec
 
 
 # ------------------------------------------------------- 自然语言回复（"说话"这一层）

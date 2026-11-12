@@ -62,7 +62,8 @@ def _tdt_key() -> str:
         return ""
 
 
-def tdt_geocode(name: str, city: str, center: list[float] | None = None
+def tdt_geocode(name: str, city: str, center: list[float] | None = None,
+                name_en: str | None = None
                 ) -> tuple[float, float] | None:
     """查天地图，返回 (lat, lon) 或 None。CGCS2000，与库内点位同系。
 
@@ -70,6 +71,10 @@ def tdt_geocode(name: str, city: str, center: list[float] | None = None
     搜不到再退 geocoder，但**只收精确匹配**——geocoder 会把查不到的
     POI 名降级到「区县及以上级行政区划」返回区划质心（实测「圆明园
     遗址公园」被配到 10km 外），这种结果对景点毫无意义，不如不校正。
+    天地图数据只覆盖国内（geocoder 的 specify 固定 156），境外城市两级
+    都查不到：城市中心在境外时退 Nominatim（OSM 地理编码）兜底，OSM
+    主名是英文，优先用 name_en 查——这条不依赖天地图 Key，放在 Key
+    检查之外。
     失败/没配 Key/熔断中一律返回 None——调用方保留原坐标（诚实降级）。
     """
     if not name or not city:
@@ -78,12 +83,17 @@ def tdt_geocode(name: str, city: str, center: list[float] | None = None
     if ck in _GEO_CACHE:
         return _GEO_CACHE[ck]
     global _GEO_DOWN_UNTIL
-    key = _tdt_key()
-    if not key or time.time() < _GEO_DOWN_UNTIL:
-        return None
-    out = _tdt_search_poi(name, center)
-    if out is None:
-        out = _tdt_geocoder(name, city)
+    out = None
+    if center is not None and not _in_china(center):
+        # 境外：天地图数据只覆盖国内，硬查会把「洛杉矶好莱坞星光大道」
+        # 配到国内同名点（实测偏 1.1 万公里）——直接走 Nominatim，不碰天地图。
+        out = _nominatim_geocode(name_en or name, city, center)
+    else:
+        key = _tdt_key()
+        if key and time.time() >= _GEO_DOWN_UNTIL:
+            out = _tdt_search_poi(name, center)
+            if out is None:
+                out = _tdt_geocoder(name, city)
     # 两级都没命中不算故障（确实查不到的名字）：按名字缓存 None 防重查；
     # 熔断只对网络异常生效（见 _tdt_search_poi/_tdt_geocoder）。
     if len(_GEO_CACHE) > 500:
@@ -152,14 +162,80 @@ def _tdt_geocoder(name: str, city: str) -> tuple[float, float] | None:
         return None
 
 
+def _in_china(center: list[float]) -> bool:
+    """城市中心是否落在境内（粗包围盒判定，只用于选地理编码源）。"""
+    lat, lon = float(center[0]), float(center[1])
+    return 17.5 <= lat <= 54.5 and 72.0 <= lon <= 136.0
+
+
+# Nominatim（OSM 地理编码）：境外城市天地图查不到时的坐标兜底源。
+# WGS84 与库内 CGCS2000 在景点级精度上同系，直接可用。官方配额 1 req/s，
+# 串行节流；结果必须仍在本城包围盒内（bounded=1 由服务端先筛一道）。
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_NOMINATIM_LAST = 0.0
+
+
+def _nominatim_geocode(name: str, city: str, center: list[float]
+                       ) -> tuple[float, float] | None:
+    """按「城市 + 景点名」查 Nominatim，返回 (lat, lon) 或 None。
+
+    OSM 的主名几乎都是英文：英文查询词直接用名字（城市限位交给
+    bounded viewbox），中文名才拼上城市一起查。匹配大小写不敏感，
+    子串之外再退一步 token 重叠（"The Getty Center" 要能命中
+    "The J. Paul Getty Museum"）；复合名（"X and Y"）查不到时拆开重试
+    （"Santa Monica Beach and Pier" 在 OSM 里叫 "Santa Monica ..."）。
+    位置是否可信交给调用方的「离城心 ≤ 60km」与修复脚本的 20km 阈把守。
+    """
+    queries = [name]
+    head, sep, tail = name.partition(" and ")
+    if sep and len(head) >= 3:
+        queries.append(head)                    # "Santa Monica Beach and Pier" → 前半段
+    low = name.lower()
+    for q in queries:
+        global _NOMINATIM_LAST
+        wait = _NOMINATIM_LAST + 1.1 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _NOMINATIM_LAST = time.time()
+        try:
+            s, w = center[0] - 0.45, center[1] - 0.60
+            n, e = center[0] + 0.45, center[1] + 0.60
+            qq = q if all(ord(c) < 128 for c in q) else f"{city} {q}"
+            params = urllib.parse.urlencode({
+                "q": qq, "format": "jsonv2", "limit": "5",
+                "viewbox": f"{w},{n},{e},{s}", "bounded": "1",
+            })
+            req = urllib.request.Request(
+                f"{_NOMINATIM_URL}?{params}",
+                headers={"User-Agent": "travel-agent/1.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                rows = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            return None                         # 网络不通：诚实降级，保留原坐标
+        q_tokens = {t for t in re.findall(r"[a-z0-9]+", low) if len(t) >= 4}
+        for row in rows or []:
+            nm = str(row.get("name") or "")
+            disp = str(row.get("display_name") or "")
+            both = f"{nm} {disp}".lower()
+            # ① 双向子串（忽略大小写）；② token 兜底：与查询有显著词重叠
+            if (low in both or (nm and nm.lower() in low)
+                    or (q_tokens & set(re.findall(r"[a-z0-9]+", both)))):
+                try:
+                    return (float(row["lat"]), float(row["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    return None
+
+
 def refine_llm_coord(name: str, city: str, lat: float, lon: float,
-                     center: list[float]) -> tuple[float, float]:
-    """模型坐标 → 天地图校正；查不到或落点可疑时保留原坐标。
+                     center: list[float], name_en: str | None = None
+                     ) -> tuple[float, float]:
+    """模型坐标 → 天地图校正（境外退 Nominatim）；查不到或落点可疑时保留原坐标。
 
     校正点必须仍在本市范围（离城心 ≤ LLM_MAX_KM）才采纳——搜索也有
     撞同名地名的可能，这条是最后一道幻觉闸。
     """
-    fix = tdt_geocode(name, city, center)
+    fix = tdt_geocode(name, city, center, name_en=name_en)
     if fix and _km(center[0], center[1], fix[0], fix[1]) <= LLM_MAX_KM:
         return fix
     return (lat, lon)
@@ -455,7 +531,8 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
             # 查不到再退回模型原值——图钉与连线都以这个点为准，宁可多花一次
             # 毫秒级 HTTP，也不能让"故宫"画到错误街区（北京实测）
             lat, lon = refine_llm_coord(row["name"], city,
-                                        row["lat"], row["lon"], center)
+                                        row["lat"], row["lon"], center,
+                                        name_en=row.get("name_en") or None)
             poi = {
                 "name": row["name"], "category": row["category"],
                 "area": city, "geo": [round(lat, 4), round(lon, 4)],
@@ -565,7 +642,8 @@ def fetch_city_llm(client, city: str, center: list[float]
     for r in rows:
         if _km(center[0], center[1], r["lat"], r["lon"]) > LLM_MAX_KM:
             continue                              # 坐标离城区太远：不是本市或纯属编造
-        lat, lon = refine_llm_coord(r["name"], city, r["lat"], r["lon"], center)
+        lat, lon = refine_llm_coord(r["name"], city, r["lat"], r["lon"], center,
+                                    name_en=r.get("name_en") or None)
         out.append({
             "name": r["name"],
             "category": "attraction" if r["category"] in ("attraction", "park")
