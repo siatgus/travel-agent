@@ -34,13 +34,13 @@ from .tools import haversine_km
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-DAY_COLORS = ["#2F6F6B", "#B4693F", "#4A5C8A", "#8A6A2F", "#6B4A7A"]
+DAY_COLORS = ["#3d7bff", "#ff7a59", "#7a5cff", "#0aa574", "#b44df0"]
 BUDGET_COLORS = {
-    "transport": "#2F6F6B",
-    "hotel": "#B4693F",
-    "ticket": "#4A5C8A",
-    "food": "#8A6A2F",
-    "local_transit": "#6B7A6B",
+    "transport": "#3d7bff",
+    "hotel": "#ff7a59",
+    "ticket": "#7a5cff",
+    "food": "#f0a03a",
+    "local_transit": "#2ec4a5",
 }
 BUDGET_LABELS = {
     "transport": "交通", "hotel": "住宿", "ticket": "门票",
@@ -95,14 +95,14 @@ def render_map(result: dict, w: int = 660, h: int = 380) -> str:
              '<title>行程路线示意</title>']
     # 极淡网格，仅作视觉参照，不含任何地理信息
     for gx in range(0, w, 44):
-        parts.append(f'<line x1="{gx}" y1="0" x2="{gx}" y2="{h}" stroke="#EEEDE8" stroke-width="1"/>')
+        parts.append(f'<line x1="{gx}" y1="0" x2="{gx}" y2="{h}" stroke="#e6eaf5" stroke-width="1"/>')
     for gy in range(0, h, 44):
-        parts.append(f'<line x1="0" y1="{gy}" x2="{w}" y2="{gy}" stroke="#EEEDE8" stroke-width="1"/>')
+        parts.append(f'<line x1="0" y1="{gy}" x2="{w}" y2="{gy}" stroke="#e6eaf5" stroke-width="1"/>')
 
     if home:
         hx, hy = pt(home)
-        parts.append(f'<rect x="{hx-5:.1f}" y="{hy-5:.1f}" width="10" height="10" rx="2" fill="#444441"/>')
-        parts.append(f'<text x="{hx+10:.1f}" y="{hy+4:.1f}" font-size="11" fill="#6B6A63">住宿</text>')
+        parts.append(f'<rect x="{hx-5:.1f}" y="{hy-5:.1f}" width="10" height="10" rx="2" fill="#1d2333"/>')
+        parts.append(f'<text x="{hx+10:.1f}" y="{hy+4:.1f}" font-size="11" fill="#7a8299">住宿</text>')
 
     for i, d in enumerate(days):
         color = DAY_COLORS[i % len(DAY_COLORS)]
@@ -131,7 +131,7 @@ def render_map(result: dict, w: int = 660, h: int = 380) -> str:
                              f'text-anchor="middle">?</text>')
                 if all(abs(x - px) > 62 or abs(y - py) > 15 for px, py in placed):
                     placed.append((x, y))
-                    parts.append(f'<text x="{x:.1f}" y="{y+21:.1f}" font-size="10" fill="#B4693F" '
+                    parts.append(f'<text x="{x:.1f}" y="{y+21:.1f}" font-size="10" fill="#e05c3d" '
                                  f'text-anchor="middle">{esc(n["name"][:10])}·位置估算</text>')
                 continue
             seq += 1
@@ -141,7 +141,7 @@ def render_map(result: dict, w: int = 660, h: int = 380) -> str:
             # 标签避让：与已放置标签过近则省略，避免文字糊成一团
             if all(abs(x - px) > 62 or abs(y - py) > 15 for px, py in placed):
                 placed.append((x, y))
-                parts.append(f'<text x="{x:.1f}" y="{y+21:.1f}" font-size="10" fill="#444441" '
+                parts.append(f'<text x="{x:.1f}" y="{y+21:.1f}" font-size="10" fill="#1d2333" '
                              f'text-anchor="middle">{esc(n["name"][:10])}</text>')
     parts.append("</svg>")
     return "".join(parts)
@@ -846,7 +846,7 @@ ROUTE_MAP_JS = """
     try { map.addControl(new T.Control.MapType()); } catch (e) {}   // 矢量/影像切换
 
     days.forEach(function (d, i) {
-      var color = colors[i % colors.length] || '#2F6F6B';
+      var color = colors[i % colors.length] || '#2b5fe0';
       var rec = { idx: i, day: d.day, color: color, ov: [], pts: [], chain: [],
                   ghost: null, badge: null };
       var seq = 0;
@@ -855,8 +855,8 @@ ROUTE_MAP_JS = """
         rec.pts.push(pos);
         if (n.uncertain) {
           // 估算坐标的点：单独标注，绝不进连线（连出来的线是假的）
-          rec.ov.push(addMarker(pos, '#9A9992', 'unknown', '?',
-            '<b>' + n.name + '</b><br><span style="font-size:11px;color:#8A8A82;">'
+          rec.ov.push(addMarker(pos, '#a0a8bd', 'unknown', '?',
+            '<b>' + n.name + '</b><br><span style="font-size:11px;color:#7a8299;">'
             + '位置待确认（坐标按市区估算，交通时间未计入）</span>', true));
           rec.ov.push(addLabel(n.name + '·位置估算', pos, -44));
           return;
@@ -895,7 +895,7 @@ ROUTE_MAP_JS = """
     });
     if (DATA.home) {
       var hp = ll(DATA.home[1], DATA.home[0]);
-      homeOv = addMarker(hp, '#444441', 'hotel', '', '住宿', false);
+      homeOv = addMarker(hp, '#1d2333', 'hotel', '', '住宿', false);
       addLabel('住宿', hp, -22);
     }
     if (all.length > 1) {
@@ -975,7 +975,7 @@ def render_route_map(result: dict) -> str:
     svg = render_map(result)
     key = get_tdt_key()
     if not key:
-        hint = ('<div style="font-size:12px;color:#9A9992;margin-top:10px;">'
+        hint = ('<div style="font-size:12px;color:#a0a8bd;margin-top:10px;">'
                 '当前为示意图。在管理后台「模型设置」填入天地图 Key，或设置环境变量 '
                 'TIANDITU_KEY（console.tianditu.gov.cn 免费申请，应用类型选'
                 '「浏览器端」）后，这里会显示真实地图。</div>')
@@ -997,15 +997,15 @@ def render_route_map(result: dict) -> str:
     return (
         f'<style>'
         f'.rt-tabs{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}}'
-        f'.rt-tabs button{{border:1px solid #D8D7D0;background:#FFFFFF;color:#444441;'
+        f'.rt-tabs button{{border:1px solid #e6eaf5;background:#FFFFFF;color:#1d2333;'
         f'border-radius:14px;padding:3px 12px;font-size:12px;cursor:pointer;'
         f'display:inline-flex;align-items:center;gap:5px;font-family:inherit;}}'
         f'.rt-tabs button i{{width:8px;height:8px;border-radius:50%;display:inline-block;}}'
-        f'.rt-tabs button.on{{background:#2F6F6B;color:#FFFFFF;border-color:#2F6F6B;}}'
+        f'.rt-tabs button.on{{background:#2b5fe0;color:#FFFFFF;border-color:#2b5fe0;}}'
         f'.rt-tabs button.on i{{background:#FFFFFF;}}'
         # 线上「第N天」徽标与景点名标签：透明底 + 白描边字，接近行程 App 观感
         f'.tdt-label{{background:transparent!important;border:none!important;'
-        f'box-shadow:none!important;font-size:12px;color:#3B3A36;'
+        f'box-shadow:none!important;font-size:12px;color:#2c3550;'
         f'text-shadow:0 0 3px #FFF,0 0 3px #FFF,0 0 3px #FFF;white-space:nowrap;}}'
         f'.rt-badge{{display:inline-block;color:#FFFFFF;font-weight:bold;'
         f'text-shadow:0 1px 2px rgba(0,0,0,.35);border-radius:10px;'
@@ -1013,29 +1013,29 @@ def render_route_map(result: dict) -> str:
         f'box-shadow:0 1px 3px rgba(0,0,0,.25);}}'
         f'.rt-wrap{{position:relative;}}'
         f'#rt-locate{{position:absolute;top:10px;right:10px;z-index:20;display:none;'
-        f'border:1px solid #D8D7D0;background:#FFFFFF;color:#2F6F6B;border-radius:16px;'
+        f'border:1px solid #e6eaf5;background:#FFFFFF;color:#2b5fe0;border-radius:16px;'
         f'padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit;'
         f'box-shadow:0 1px 4px rgba(0,0,0,.15);}}'
-        f'#rt-locate:disabled{{color:#9A9992;cursor:default;}}'
+        f'#rt-locate:disabled{{color:#a0a8bd;cursor:default;}}'
         f'#rt-locate-tip{{position:absolute;left:10px;bottom:10px;z-index:20;display:none;'
-        f'font-size:12px;color:#3B3A36;background:rgba(255,255,255,.92);'
+        f'font-size:12px;color:#2c3550;background:rgba(255,255,255,.92);'
         f'padding:2px 9px;border-radius:10px;max-width:74%;line-height:1.5;}}'
         f'#rt-locate-tip:empty{{display:none;}}'
         # 景点介绍卡片（hover 图钉弹出，效仿行程类 App 的大卡）
         f'.rt-card{{width:238px;font-family:inherit;}}'
-        f'.rt-card-img{{height:120px;border-radius:8px 8px 0 0;background:#D8D6CE center/cover no-repeat;}}'
+        f'.rt-card-img{{height:120px;border-radius:8px 8px 0 0;background:#dfe6f5 center/cover no-repeat;}}'
         f'.rt-card-noimg{{display:flex;align-items:center;justify-content:center;'
-        f'background:linear-gradient(135deg,#2F6F6B,#4A5C8A);color:#FFFFFF;'
+        f'background:linear-gradient(135deg,#2b5fe0,#7a5cff);color:#FFFFFF;'
         f'font-size:34px;font-weight:bold;}}'
         f'.rt-card-body{{padding:8px 10px 2px;}}'
-        f'.rt-card-name{{font-size:14px;font-weight:bold;color:#3B3A36;}}'
-        f'.rt-card-src{{font-size:11px;color:#8A8A82;margin-top:3px;}}'
-        f'.rt-card-snip{{font-size:12px;color:#55544E;margin-top:5px;line-height:1.55;'
+        f'.rt-card-name{{font-size:14px;font-weight:bold;color:#2c3550;}}'
+        f'.rt-card-src{{font-size:11px;color:#7a8299;margin-top:3px;}}'
+        f'.rt-card-snip{{font-size:12px;color:#3c4358;margin-top:5px;line-height:1.55;'
         f'word-break:break-all;}}'
         f'.rt-card-link{{display:block;margin:8px 10px 10px;padding:7px 0;text-align:center;'
-        f'background:#2F6F6B;color:#FFFFFF!important;border-radius:7px;font-size:13px;'
+        f'background:#2b5fe0;color:#FFFFFF!important;border-radius:7px;font-size:13px;'
         f'font-weight:bold;letter-spacing:.05em;text-decoration:none!important;}}'
-        f'.rt-card-link:hover{{background:#255A57;color:#FFFFFF!important;}}'
+        f'.rt-card-link:hover{{background:#1e4fd0;color:#FFFFFF!important;}}'
         f'</style>'
         f'{tabs}'
         f'<div class="rt-wrap">'
@@ -1044,7 +1044,7 @@ def render_route_map(result: dict) -> str:
         f'<div id="rt-locate-tip"></div>'
         f'</div>'
         f'<div id="route-fallback">{svg}</div>'
-        f'<div style="font-size:12px;color:#9A9992;margin-top:8px;">'
+        f'<div style="font-size:12px;color:#a0a8bd;margin-top:8px;">'
         f'<span id="rt-route-note">正在按道路规划路线…</span><br>'
         f'底图与路径规划：天地图 · 国家地理信息公共服务平台（www.tianditu.gov.cn）。'
         f'图钉：序号+楼=景点，刀叉=餐饮，列车=车站，床=住宿，灰色?为位置估算点；'
@@ -1060,13 +1060,13 @@ def render_budget_bar(result: dict) -> str:
     rows = []
     for item in b["breakdown"]:
         pct = item["amount"] / total * 100
-        color = BUDGET_COLORS.get(item["category"], "#888780")
+        color = BUDGET_COLORS.get(item["category"], "#8892ab")
         rows.append(
             f'<span style="display:inline-block;height:22px;width:{pct:.2f}%;background:{color};" '
             f'title="{esc(item["label"])} {item["amount"]}"></span>')
     pct = b["contingency"] / total * 100
     rows.append(f'<span style="display:inline-block;height:22px;width:{pct:.2f}%;'
-                f'background:#D8D6CE;"></span>')
+                f'background:#dfe6f5;"></span>')
 
     legend = []
     seen = set()
@@ -1077,19 +1077,19 @@ def render_budget_bar(result: dict) -> str:
         seen.add(cat)
         amount = sum(x["amount"] for x in b["breakdown"] if x["category"] == cat)
         legend.append(
-            f'<div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444441;">'
+            f'<div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#1d2333;">'
             f'<i style="width:10px;height:10px;border-radius:2px;background:'
-            f'{BUDGET_COLORS.get(cat, "#888780")};display:inline-block;"></i>'
+            f'{BUDGET_COLORS.get(cat, "#8892ab")};display:inline-block;"></i>'
             f'{BUDGET_LABELS.get(cat, cat)} <b style="font-weight:500;">¥{amount:,.0f}</b></div>')
 
     note = ""
     if not any(x["category"] == "transport" and (x["amount"] or 0) > 0
                for x in b["breakdown"]):
         # 没有交通项时必须写出来：光看一个 ¥3,553 会以为是整趟花费
-        note = ('<div style="font-size:12px;color:#8A6A2F;margin-top:10px;">'
+        note = ('<div style="font-size:12px;color:#B26A00;margin-top:10px;">'
                 '合计不含往返大交通（班次票价未查到或未指定出发地）</div>')
     return (f'<div style="display:flex;height:22px;border-radius:4px;overflow:hidden;'
-            f'background:#F1EFE8;">{"".join(rows)}</div>'
+            f'background:#eef2fc;">{"".join(rows)}</div>'
             f'<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:14px;">'
             f'{"".join(legend)}</div>' + note)
 
@@ -1104,7 +1104,7 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
     dot_style = {"attraction": f"background:{color};",
                  "restaurant": f"background:#FFFFFF;border:2.5px solid {color};",
                  "transit": f"background:{color};border-radius:2px;",
-                 "rest": "background:#C9C7BE;"}
+                 "rest": "background:#c9d2e8;"}
     for i, n in enumerate(nodes):
         first, last = (i == 0), (i == len(nodes) - 1)
         # 兴趣标记：让用户看得见这一站是靠哪条偏好排上的；弱命中用另一套颜色，
@@ -1112,8 +1112,8 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
         badges = ""
         for it in (n.get("interests") or []):
             _s = it.get("level") == "strong"
-            _bg = "#EAF3F1" if _s else "#F6F1E4"
-            _fg = "#2F6F6B" if _s else "#8A6A2F"
+            _bg = "#E8F0FF" if _s else "#FFF4E8"
+            _fg = "#2b5fe0" if _s else "#B26A00"
             _tx = f'兴趣·{esc(it.get("word", ""))}' if _s else f'近似·{esc(it.get("word", ""))}'
             badges += (f'<span style="font-size:11px;padding:1px 6px;border-radius:3px;'
                        f'margin-left:6px;background:{_bg};color:{_fg};">{_tx}</span>')
@@ -1125,36 +1125,36 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
             dist = m_dist.group(1)
             transit = (transit[:m_dist.start()] + transit[m_dist.end():]).strip()
         transit = transit.strip(" ·，,") or "—"
-        right = (f'<div style="font-size:12px;color:#5F5E5A;line-height:1.5;">'
+        right = (f'<div style="font-size:12px;color:#3c4358;line-height:1.5;">'
                  f'{esc(transit)}'
-                 + (f'<br><span style="color:#9A9992;">{esc(dist)}</span>' if dist else "")
+                 + (f'<br><span style="color:#a0a8bd;">{esc(dist)}</span>' if dist else "")
                  + '</div>'
-                 + f'<div style="font-size:12px;color:#7A7972;margin-top:3px;">'
+                 + f'<div style="font-size:12px;color:#7a8299;margin-top:3px;">'
                    f'{stay_label.get(n["type"], "停留")} {n["duration_min"]} 分钟'
-                 + ('　<span style="color:#8A6A2F;">需预约</span>'
+                 + ('　<span style="color:#B26A00;">需预约</span>'
                     if n["booking_required"] else "")
                  + '</div>')
         # 时间轴：上下两段竖线 + 一个类型圆点（首行不画上段，末行不画下段）
         axis = (
             ('' if first else
              f'<div style="position:absolute;left:50%;top:0;height:18px;width:2px;'
-             f'margin-left:-1px;background:#E8E6DE;"></div>')
+             f'margin-left:-1px;background:#e6eaf5;"></div>')
             + ('' if last else
                f'<div style="position:absolute;left:50%;top:18px;bottom:0;width:2px;'
-               f'margin-left:-1px;background:#E8E6DE;"></div>')
+               f'margin-left:-1px;background:#e6eaf5;"></div>')
             + f'<div style="position:absolute;left:50%;top:13px;width:10px;height:10px;'
               f'margin-left:-5px;border-radius:50%;box-shadow:0 0 0 3px #FFFFFF;'
-              f'{dot_style.get(n["type"], "background:#C9C7BE;")}"></div>')
+              f'{dot_style.get(n["type"], "background:#c9d2e8;")}"></div>')
         rows.append(f"""
         <tr>
           <td style="width:54px;padding:13px 10px 13px 18px;vertical-align:top;text-align:right;
-                     font-variant-numeric:tabular-nums;font-size:13px;color:#2C2C2A;
+                     font-variant-numeric:tabular-nums;font-size:13px;color:#1d2333;
                      white-space:nowrap;">{esc(n['time'])}</td>
           <td style="width:24px;padding:0;vertical-align:top;position:relative;
                      border-bottom:none;">{axis}</td>
           <td style="padding:13px 10px;vertical-align:top;">
-            <div style="font-size:14px;color:#1F1E1C;line-height:1.5;">{esc(n['name'])}{badges}</div>
-            <div style="font-size:12px;color:#7A7972;margin-top:3px;line-height:1.55;">{esc(n['tip'])}</div>
+            <div style="font-size:14px;color:#1d2333;line-height:1.5;">{esc(n['name'])}{badges}</div>
+            <div style="font-size:12px;color:#7a8299;margin-top:3px;line-height:1.55;">{esc(n['tip'])}</div>
           </td>
           <td style="width:152px;padding:13px 18px 13px 8px;vertical-align:top;">
             {right}
@@ -1165,29 +1165,29 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
     lo, hi = w.get("low"), w.get("high")
     known = (lo is not None and hi is not None
              and w.get("desc") not in ("待查", "暂无数据", ""))
-    wcolor = "#A33" if ((rain or 0) >= 60) else "#7A7972"
+    wcolor = "#e05c3d" if ((rain or 0) >= 60) else "#7a8299"
     wtxt = ""
     if w:
         wtxt = (f'<span style="font-size:12px;color:{wcolor};">'
                 f'　☁ {esc(w.get("desc", "") or "待查")}'
                 + (f' {lo}~{hi}℃' if known else "")
                 + (f'　降水 {rain}%' if (known and rain is not None) else "")
-                + ('　<span style="color:#8A6A2F;">历史同期参考</span>'
+                + ('　<span style="color:#B26A00;">历史同期参考</span>'
                    if w.get("is_forecast") is False else "")
                 + '</span>')
     if day.get("geo_uncertain"):
-        wtxt += ('<span style="font-size:12px;color:#B4693F;">　⚠ 有点位位置待确认，'
+        wtxt += ('<span style="font-size:12px;color:#e05c3d;">　⚠ 有点位位置待确认，'
                  '交通时间未计入</span>')
     return f"""
-    <section style="border:1px solid #E4E2DA;border-radius:12px;overflow:hidden;
+    <section style="border:1px solid #e6eaf5;border-radius:12px;overflow:hidden;
                     margin-bottom:22px;background:#fff;">
-      <div style="padding:14px 18px;border-bottom:1px solid #EFEDE6;
+      <div style="padding:14px 18px;border-bottom:1px solid #eef1fa;
                   display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;row-gap:6px;">
         <span style="font-size:13px;padding:3px 9px;border-radius:4px;background:{color};
                      color:#fff;">Day {day['day']}</span>
-        <span style="font-size:14px;color:#1F1E1C;">{esc(day['date'])} · {esc(day['theme'])}</span>
+        <span style="font-size:14px;color:#1d2333;">{esc(day['date'])} · {esc(day['theme'])}</span>
         {wtxt}
-        <span style="margin-left:auto;font-size:12px;color:#7A7972;">
+        <span style="margin-left:auto;font-size:12px;color:#7a8299;">
           移动 {day['move_min']} 分钟 · 约 ¥{day['day_budget']:,}</span>
       </div>
       <table style="width:100%;border-collapse:collapse;">{' '.join(rows)}</table>
@@ -1198,15 +1198,15 @@ def render_checks(result: dict) -> str:
     rows = []
     for c in self_check(result):
         ok = c["result"] == "pass"
-        color = "#2F6F6B" if ok else "#A33"
+        color = "#2b5fe0" if ok else "#e05c3d"
         mark = "✓" if ok else "!"
-        evidence = (f'<span style="color:#9A9992;">　{esc(c["evidence"])}</span>'
+        evidence = (f'<span style="color:#a0a8bd;">　{esc(c["evidence"])}</span>'
                     if c.get("evidence") else "")
         rows.append(
             f'<div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;'
-            f'border-bottom:1px dashed #EFEDE6;font-size:13px;">'
+            f'border-bottom:1px dashed #eef1fa;font-size:13px;">'
             f'<span style="color:{color};width:12px;">{mark}</span>'
-            f'<span style="color:#444441;">{esc(c["item"])}{evidence}</span></div>')
+            f'<span style="color:#1d2333;">{esc(c["item"])}{evidence}</span></div>')
     return "".join(rows)
 
 
@@ -1226,9 +1226,9 @@ def render_transport(result: dict) -> str:
         if res is None:
             # 没有出发地就不查班次：明说未安排，而不是渲染一张假卡片
             parts.append(
-                f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
-                f'<span style="font-size:14px;color:#9A9992;">未安排</span>　'
-                f'<span style="font-size:12px;color:#9A9992;">未指定出发地</span></div>')
+                f'<div><span style="color:#7a8299;font-size:12px;">{esc(title)}</span><br>'
+                f'<span style="font-size:14px;color:#a0a8bd;">未安排</span>　'
+                f'<span style="font-size:12px;color:#a0a8bd;">未指定出发地</span></div>')
             continue
         items = res.get("items") or []
         it = items[0] if items else {}
@@ -1236,14 +1236,14 @@ def render_transport(result: dict) -> str:
         if not it or not fare:
             # 班次/票价没查到：显示 ¥0 会被当成"免费"，必须明说没查到、没计入
             parts.append(
-                f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
-                f'<span style="font-size:14px;color:#9A9992;">未查到班次/票价</span><br>'
-                f'<span style="font-size:12px;color:#9A9992;">未计入预算，出发前请自行确认</span></div>')
+                f'<div><span style="color:#7a8299;font-size:12px;">{esc(title)}</span><br>'
+                f'<span style="font-size:14px;color:#a0a8bd;">未查到班次/票价</span><br>'
+                f'<span style="font-size:12px;color:#a0a8bd;">未计入预算，出发前请自行确认</span></div>')
             continue
         parts.append(
-            f'<div><span style="color:#8A8A82;font-size:12px;">{esc(title)}</span><br>'
+            f'<div><span style="color:#7a8299;font-size:12px;">{esc(title)}</span><br>'
             f'<span style="font-size:14px;">{esc(it.get("code", "—"))}</span>　'
-            f'<span style="font-size:13px;color:#5F5E5A;">'
+            f'<span style="font-size:13px;color:#3c4358;">'
             f'{esc(it.get("depart", ""))} - {esc(it.get("arrive", ""))}　'
             f'¥{fare:,.0f}</span></div>')
     return (f'<div class="card" style="margin-top:14px;display:flex;gap:48px;'
@@ -1257,9 +1257,9 @@ def build_html(result: dict, utterance: str) -> str:
     over = b.get("target") and b["total"] > b["target"]
 
     _adv = (result.get("weather") or {}).get("advice") or ""
-    advice_html = (f'<div style="border:1px solid #E8DFC8;background:#FBF7EE;'
+    advice_html = (f'<div style="border:1px solid #d8e3ff;background:#f2f6ff;'
                    f'border-radius:12px;padding:14px 20px;margin-bottom:10px;'
-                   f'font-size:13px;color:#7A5B22;">☂ 天气提醒：{esc(_adv)}</div>'
+                   f'font-size:13px;color:#2b5fe0;">☂ 天气提醒：{esc(_adv)}</div>'
                    if _adv else "")
     days_html = "".join(
         render_day(d, DAY_COLORS[i % len(DAY_COLORS)],
@@ -1274,10 +1274,10 @@ def build_html(result: dict, utterance: str) -> str:
     _assumptions_html = ""
     if _assum:
         _assumptions_html = (
-            '<div style="border:1px solid #E8D9C8;background:#FCF8F2;border-radius:12px;'
+            '<div style="border:1px solid #d8e3ff;background:#f2f6ff;border-radius:12px;'
             'padding:14px 20px;margin-top:14px;">'
-            '<div style="font-size:13px;color:#8A5A26;margin-bottom:6px;">假设与建议</div>'
-            + "".join(f'<div style="font-size:13px;color:#5F5E5A;line-height:1.7;">'
+            '<div style="font-size:13px;color:#2b5fe0;margin-bottom:6px;">假设与建议</div>'
+            + "".join(f'<div style="font-size:13px;color:#3c4358;line-height:1.7;">'
                       f'· {esc(a)}</div>' for a in _assum)
             + '</div>')
 
@@ -1297,10 +1297,10 @@ def build_html(result: dict, utterance: str) -> str:
     prefs = "、".join(s.get("hard_prefs") or []) or "无"
 
     def fact(label: str, value: str, note: str = "") -> str:
-        tag = (f'<span style="font-size:11px;color:#9A9992;margin-left:4px;">{esc(note)}</span>'
+        tag = (f'<span style="font-size:11px;color:#a0a8bd;margin-left:4px;">{esc(note)}</span>'
                if note else "")
-        return (f'<div><div style="font-size:12px;color:#8A8A82;margin-bottom:2px;">{label}</div>'
-                f'<div style="font-size:15px;color:#1F1E1C;">{value}{tag}</div></div>')
+        return (f'<div><div style="font-size:12px;color:#7a8299;margin-bottom:2px;">{label}</div>'
+                f'<div style="font-size:15px;color:#1d2333;">{value}{tag}</div></div>')
 
     facts_html = "".join([
         fact("出发地 → 目的地", f"{origin_disp} → {esc(s['destination'])}", origin_note),
@@ -1320,15 +1320,15 @@ def build_html(result: dict, utterance: str) -> str:
     if result.get("cut_plans"):
         items = "".join(
             f'<li style="margin-bottom:10px;"><b style="font-weight:500;">{esc(p["change"])}</b>'
-            f'<span style="color:#2F6F6B;">　省约 ¥{p["save"]}</span>'
-            f'<div style="color:#7A7972;font-size:12px;margin-top:2px;">代价：{esc(p["cost_of_change"])}</div></li>'
+            f'<span style="color:#2b5fe0;">　省约 ¥{p["save"]}</span>'
+            f'<div style="color:#7a8299;font-size:12px;margin-top:2px;">代价：{esc(p["cost_of_change"])}</div></li>'
             for p in result["cut_plans"])
         cuts = f"""
-        <div style="border:1px solid #E8D9C8;background:#FCF8F2;border-radius:12px;
+        <div style="border:1px solid #d8e3ff;background:#f2f6ff;border-radius:12px;
                     padding:18px 22px;margin-top:20px;">
-          <div style="font-size:14px;color:#8A5A26;margin-bottom:10px;">
+          <div style="font-size:14px;color:#2b5fe0;margin-bottom:10px;">
             超预算 ¥{b['total'] - b['target']:,.0f} · 三个取舍方案</div>
-          <ol style="margin:0;padding-left:20px;font-size:13px;color:#444441;line-height:1.7;">{items}</ol>
+          <ol style="margin:0;padding-left:20px;font-size:13px;color:#1d2333;line-height:1.7;">{items}</ol>
         </div>"""
 
     return f"""<!DOCTYPE html>
@@ -1339,16 +1339,16 @@ def build_html(result: dict, utterance: str) -> str:
 <title>{esc(s['destination'])} {s['days']} 天行程</title>
 <style>
   * {{ box-sizing: border-box; }}
-  body {{ margin:0; background:#F7F6F1; color:#1F1E1C;
+  body {{ margin:0; background:#f7f9ff; color:#1d2333;
           font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
           line-height:1.6; -webkit-font-smoothing:antialiased; }}
   .wrap {{ max-width:860px; margin:0 auto; padding:44px 28px 60px; }}
   h1 {{ font-size:26px; font-weight:500; margin:0 0 8px; letter-spacing:-0.01em; }}
-  h2 {{ font-size:15px; font-weight:500; margin:36px 0 14px; color:#1F1E1C;
-        padding-bottom:8px; border-bottom:1px solid #E4E2DA; }}
+  h2 {{ font-size:15px; font-weight:500; margin:36px 0 14px; color:#1d2333;
+        padding-bottom:8px; border-bottom:1px solid #e6eaf5; }}
   .chip {{ display:inline-block; font-size:12px; padding:3px 9px; border-radius:4px;
-           background:#EFEDE6; color:#5F5E5A; margin-right:6px; }}
-  .card {{ background:#fff; border:1px solid #E4E2DA; border-radius:12px; padding:22px 24px; }}
+           background:#eef1fa; color:#3c4358; margin-right:6px; }}
+  .card {{ background:#fff; border:1px solid #e6eaf5; border-radius:12px; padding:22px 24px; }}
   /* 地图卡横向突破正文 860px 栏宽（大屏放大看图，窄屏自动回落 100%） */
   .rt-mapcard {{ width:min(1160px, calc(100vw - 24px)); margin-left:50%;
                  transform:translateX(-50%); }}
@@ -1356,7 +1356,7 @@ def build_html(result: dict, utterance: str) -> str:
     .rt-mapcard {{ width:100%; margin-left:0; transform:none; }}
     #route-map {{ height:440px !important; }}
   }}
-  table td {{ border-bottom:1px solid #EDEBE3; }}
+  table td {{ border-bottom:1px solid #eef1fa; }}
   table tr:last-child td {{ border-bottom:none; }}
   @media print {{
     body {{ background:#fff; }}
@@ -1368,15 +1368,15 @@ def build_html(result: dict, utterance: str) -> str:
 <body>
 <div class="wrap">
 
-  <div style="font-size:12px;color:#8A8A82;letter-spacing:0.08em;margin-bottom:10px;">
+  <div style="font-size:12px;color:#7a8299;letter-spacing:0.08em;margin-bottom:10px;">
     TRAVEL PLAN · 由旅行规划智能体生成
   </div>
   <h1>{esc(s['destination'])} · {stay_text(s['days'])}</h1>
-  <div style="font-size:13px;color:#7A7972;margin-bottom:18px;">
+  <div style="font-size:13px;color:#7a8299;margin-bottom:18px;">
     需求原文：{esc(utterance)}
   </div>
   <div class="card" style="margin-bottom:10px;padding:18px 22px;">
-    <div style="font-size:12px;color:#8A8A82;letter-spacing:0.08em;margin-bottom:12px;">
+    <div style="font-size:12px;color:#7a8299;letter-spacing:0.08em;margin-bottom:12px;">
       出行概要</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
                 gap:14px 24px;">{facts_html}</div>
@@ -1386,16 +1386,16 @@ def build_html(result: dict, utterance: str) -> str:
   <div class="card" style="display:flex;gap:36px;flex-wrap:wrap;align-items:flex-end;
                            margin-bottom:6px;">
     <div>
-      <div style="font-size:12px;color:#8A8A82;">预算合计（含 10% 机动{('，不含往返大交通' if _no_tr else '')}）</div>
+      <div style="font-size:12px;color:#7a8299;">预算合计（含 10% 机动{('，不含往返大交通' if _no_tr else '')}）</div>
       <div style="font-size:34px;font-weight:500;letter-spacing:-0.02em;">¥{b['total']:,.0f}</div>
     </div>
     <div>
-      <div style="font-size:12px;color:#8A8A82;">人均</div>
+      <div style="font-size:12px;color:#7a8299;">人均</div>
       <div style="font-size:20px;">¥{b['per_person']:,.0f}</div>
     </div>
     <div>
-      <div style="font-size:12px;color:#8A8A82;">预算目标</div>
-      <div style="font-size:20px;color:{'#A33' if over else '#2F6F6B'};">
+      <div style="font-size:12px;color:#7a8299;">预算目标</div>
+      <div style="font-size:20px;color:{'#e05c3d' if over else '#2b5fe0'};">
         {f"¥{b['target']:,.0f}" if b.get('target') else '未设定'}</div>
     </div>
   </div>
@@ -1406,15 +1406,15 @@ def build_html(result: dict, utterance: str) -> str:
   {_assumptions_html}
 
   <h2>路线</h2>
-  <div style="margin-bottom:10px;font-size:12px;color:#7A7972;">
+  <div style="margin-bottom:10px;font-size:12px;color:#7a8299;">
     {''.join(f'<span style="display:inline-flex;align-items:center;gap:6px;margin-right:16px;">'
              f'<i style="width:9px;height:9px;border-radius:50%;background:'
              f'{DAY_COLORS[i % len(DAY_COLORS)]};display:inline-block;"></i>Day {d["day"]}</span>'
              for i, d in enumerate(days))}
     <span style="display:inline-flex;align-items:center;gap:6px;">
-      <i style="width:9px;height:9px;border-radius:2px;background:#444441;display:inline-block;"></i>住宿</span>
+      <i style="width:9px;height:9px;border-radius:2px;background:#1d2333;display:inline-block;"></i>住宿</span>
     <span style="display:inline-flex;align-items:center;gap:6px;">
-      <i style="width:9px;height:9px;border-radius:50%;border:2px dashed #B4693F;display:inline-block;"></i>位置估算（坐标不可信，仅示意）</span>
+      <i style="width:9px;height:9px;border-radius:50%;border:2px dashed #e05c3d;display:inline-block;"></i>位置估算（坐标不可信，仅示意）</span>
   </div>
   <div class="card rt-mapcard" style="padding:12px;">{render_route_map(result)}</div>
 
@@ -1426,8 +1426,8 @@ def build_html(result: dict, utterance: str) -> str:
   <h2>质检结果</h2>
   <div class="card">{checks_html}</div>
 
-  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #E4E2DA;
-              font-size:11px;color:#9A9992;line-height:1.8;">
+  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e6eaf5;
+              font-size:11px;color:#a0a8bd;line-height:1.8;">
     天气：16 天内为 Open-Meteo 实时预报，更远日期为历史同期参考（每日卡片已标注）；
     景点坐标来自知识库与 OSM，位置估算项均已标注「位置待确认」；
     路线图底图与路径规划来自天地图（国家地理信息公共服务平台），动线为驾车路线
