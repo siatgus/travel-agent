@@ -604,8 +604,8 @@ ROUTE_MAP_JS = """
       + '</div>';
   }
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
-  // 「图片卡」标记：介绍页没搜到、只有搜索来的图，站点名固定为必应图片
-  var IMG_ONLY_TAG = '必应图片';
+  // 「图片卡」标记：介绍页没搜到、只有搜图来的图，站点名固定为百度图片
+  var IMG_ONLY_TAG = '百度图片';
   // 「📍城市 · 距市中心直线X公里」信息行（行程类 App 风格），dist 没有就不给
   function locRow(n) {
     if (n.dist == null && !DATA.city) { return ''; }

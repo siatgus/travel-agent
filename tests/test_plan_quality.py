@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import urllib.parse
 from datetime import date
 from pathlib import Path as _TA_PATH
 
@@ -1059,41 +1060,73 @@ def test_poi_info_cards() -> None:
           and not poi_links._img_trusted("zhihu.com")
           and not poi_links._img_trusted("www.sohu.com"))
 
-    # 图片搜索兜底：介绍页无缩略图 → 必应图片搜索补图
-    img_page = ('<html><body>'
-                '<div class="imgpt" m="{&quot;murl&quot;:&quot;https://x.com/a.svg&quot;,'
-                '&quot;turl&quot;:&quot;https://ts1.mm.bing.net/th?id=OIP.svg1&quot;}"></div>'
-                '<div class="imgpt" m="{&quot;murl&quot;:&quot;https://x.com/b.jpg&quot;,'
-                '&quot;turl&quot;:&quot;https://ts2.mm.bing.net/th?id=OIP.jpg2&quot;}"></div>'
-                '</body></html>')
-    got = poi_links._parse_image_page(img_page)
-    check("图片解析跳过 svg 取 jpg", got == "https://ts2.mm.bing.net/th?id=OIP.jpg2&w=480&h=320&c=7",
-          str(got))
-    check("无图页面解析为空", poi_links._parse_image_page("<html></html>") == "")
+    # 图片搜索兜底（百度图片）：变体阶梯 + 标题核心词/旅游站来源优先
+    def baidu_data(word_filter: dict) -> dict:
+        def fake(url, timeout=8):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            word = (q.get("word") or [""])[0]
+            if word in word_filter:
+                return word_filter[word]
+            return {"data": []}
+        return fake
+
+    orig_fj = poi_links._fetch_json
+    try:
+        poi_links._fetch_json = baidu_data({
+            # 全名查不到（模拟冷门景点）、父地标命中实拍
+            "响堂山石窟艺术博物馆": {"data": []},
+            "响堂山石窟": {"data": [
+                {"thumbURL": "https://img0.baidu.com/it/u=1,2&f=JPEG?w=500",
+                 "fromPageTitle": "响堂山石窟实拍", "fromURLHost": "x.com",
+                 "is_gif": "0"}]},
+        })
+        got_img = poi_links._baidu_image_search("响堂山石窟艺术博物馆", 6)
+        check("全名查不到落到父地标变体",
+              got_img == "https://img0.baidu.com/it/u=1,2&f=JPEG?w=500", str(got_img))
+        poi_links._fetch_json = lambda url, timeout=8: {"data": [
+            {"thumbURL": "https://img1.baidu.com/it/u=3,4&f=JPEG?w=500",
+             "fromPageTitle": "某景点无关游记", "fromURLHost": "x.com", "is_gif": "0"},
+            {"thumbURL": "https://img2.baidu.com/it/u=5,6&f=JPEG?w=500",
+             "fromPageTitle": "宽窄巷子<em>攻略</em>", "fromURLHost": "you.ctrip.com",
+             "is_gif": "0"},
+            {"thumbURL": "https://img3.baidu.com/x.gif", "fromPageTitle": "动图",
+             "fromURLHost": "x.com", "is_gif": "1"},
+        ]}
+        got2 = poi_links._baidu_image_search("宽窄巷子", 6)
+        check("标题核心词+旅游站来源优先、动图跳过",
+              got2 == "https://img2.baidu.com/it/u=5,6&f=JPEG?w=500", str(got2))
+        poi_links._fetch_json = lambda url, timeout=8: (_ for _ in ()).throw(
+            IOError("断网"))
+        check("搜图断网返回空串", poi_links._baidu_image_search("宽窄巷子", 6) == "")
+    finally:
+        poi_links._fetch_json = orig_fj
 
     orig_fetch = poi_links.websearch._fetch
+    img_stub = lambda url, timeout=8: {"data": [
+        {"thumbURL": "https://img0.baidu.com/it/u=9,9&f=JPEG?w=500",
+         "fromPageTitle": "实拍", "fromURLHost": "x.com", "is_gif": "0"}]}
     try:
         poi_links.websearch._fetch = lambda url, timeout=8: page
         poi_links._cache.pop("成都|宽窄巷子", None)
         info = poi_links.fetch_one("宽窄巷子", "成都")
         check("fetch_one 拿到知乎链接", bool(info) and "zhihu.com" in info["url"],
               str(info and info["url"]))
-        # 介绍页有链接但无缩略图 → 二次图片搜索补图
+        # 介绍页有链接但无缩略图 → 二次搜图补图（百度图片）
         poi_links._cache.pop("成都|鹤鸣茶社", None)
-        poi_links.websearch._fetch = lambda url, timeout=8: (
-            img_page if "/images/search" in url else page)
+        poi_links._fetch_json = img_stub
+        poi_links.websearch._fetch = lambda url, timeout=8: page
         info2 = poi_links.fetch_one("鹤鸣茶社", "成都")
         check("无图卡片自动补搜图片", bool(info2) and info2.get("img", "").startswith(
-            "https://ts"), str(info2 and info2.get("img", ""))[:80])
-        # 介绍页宁缺毋滥没搜到 → 出「图片卡」，站点标记为必应图片
+            "https://img"), str(info2 and info2.get("img", ""))[:80])
+        # 介绍页宁缺毋滥没搜到 → 出「图片卡」，站点标记为百度图片
         nohit_page = ('<html><body><li class="b_algo"><h2><a href="https://a.com/x">'
                       '完全无关</a></h2><p>别的</p></li></body></html>')
         poi_links._cache.pop("成都|无名山", None)
-        poi_links.websearch._fetch = lambda url, timeout=8: (
-            img_page if "/images/search" in url else nohit_page)
+        poi_links.websearch._fetch = lambda url, timeout=8: nohit_page
         info3 = poi_links.fetch_one("无名山", "成都")
-        check("介绍页缺失时出图片卡", bool(info3) and info3.get("site") == "必应图片"
-              and info3.get("img", "").startswith("https://ts"),
+        check("介绍页缺失时出图片卡", bool(info3) and info3.get("site") == "百度图片"
+              and info3.get("img", "").startswith("https://img")
+              and "image.baidu.com" in info3.get("url", ""),
               str(info3 and info3.get("site")))
         # 来源不可信（知乎）：块内缩略图是文章头图、可能完全无关
         # （景山公园卡片配动漫图的事故），必须换成专用图片搜索结果
@@ -1102,11 +1135,10 @@ def test_poi_info_cards() -> None:
                      '<p>景山公园俯瞰故宫全景…</p>'
                      '<img class="rms_img" src="//th.bing.com/th?id=ANIME"></li></body></html>')
         poi_links._cache.pop("北京|景山公园", None)
-        poi_links.websearch._fetch = lambda url, timeout=8: (
-            img_page if "/images/search" in url else zhihu_img)
+        poi_links.websearch._fetch = lambda url, timeout=8: zhihu_img
         info4 = poi_links.fetch_one("景山公园", "北京")
         check("知乎来源块内图换成图片搜索结果",
-              bool(info4) and info4.get("img", "").startswith("https://ts")
+              bool(info4) and info4.get("img", "").startswith("https://img")
               and "ANIME" not in info4.get("img", ""),
               str(info4 and info4.get("img"))[:80])
         # 可信来源（百科）：块内缩略图就是实体照片，直接保留、不多发请求
@@ -1115,18 +1147,22 @@ def test_poi_info_cards() -> None:
                      '<p>北海公园位于北京市西城区…</p>'
                      '<img class="rms_img" src="//th.bing.com/th?id=BAIKE"></li></body></html>')
         poi_links._cache.pop("北京|北海公园", None)
-        poi_links.websearch._fetch = lambda url, timeout=8: (
-            img_page if "/images/search" in url else baike_img)
+        poi_links.websearch._fetch = lambda url, timeout=8: baike_img
+        fj_calls: list[str] = []
+        poi_links._fetch_json = lambda url, timeout=8: fj_calls.append(url)
         info5 = poi_links.fetch_one("北海公园", "北京")
         check("百科来源保留块内图（可信不多发请求）",
-              bool(info5) and "BAIKE" in info5.get("img", ""),
+              bool(info5) and "BAIKE" in info5.get("img", "") and not fj_calls,
               str(info5 and info5.get("img"))[:80])
         poi_links._cache.pop("成都|都江堰", None)
         poi_links.websearch._fetch = lambda url, timeout=8: (_ for _ in ()).throw(
             IOError("断网"))
+        poi_links._fetch_json = lambda url, timeout=8: (_ for _ in ()).throw(
+            IOError("断网"))
         check("断网时返回 None 不抛异常", poi_links.fetch_one("都江堰", "成都") is None)
     finally:
         poi_links.websearch._fetch = orig_fetch
+        poi_links._fetch_json = orig_fj
 
     plan, _ = _compose()
     orig_fo = poi_links.fetch_one
@@ -1195,11 +1231,12 @@ def test_poi_info_cards() -> None:
           "&pid=15.1&w=480" in imgv and "<" not in imgv and '"' not in imgv,
           imgv)
 
-    # 图片卡（site=必应图片）：来源行与按钮换成图片文案
+    # 图片卡（site=百度图片）：来源行与按钮换成图片文案
     res3 = _fake_result(days_plan=plan)
     res3["poi_links"] = {"宽窄巷子": {
-        "url": "https://cn.bing.com/images/search?q=%E5%AE%BD%E7%AA%84%E5%B7%B7%E5%AD%90",
-        "site": "必应图片", "snippet": "", "img": "https://ts1.mm.bing.net/th?id=OIP.9"}}
+        "url": "https://image.baidu.com/search/index?tn=baiduimage&ie=utf-8"
+               "&word=%E5%AE%BD%E7%AA%84%E5%B7%B7%E5%AD%90",
+        "site": "百度图片", "snippet": "", "img": "https://img0.baidu.com/x.jpg"}}
     h3 = render_html.build_html(res3, "成都4天")
     check("图片卡按钮显示「查看更多图片」", "查看更多图片" in h3, "按钮文案缺失")
     check("图片卡来源行显示「图片来源」", "图片来源：" in h3)
