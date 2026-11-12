@@ -3,8 +3,11 @@
 数据来源：必应国内版（cn.bing.com）搜索「<景点> 攻略」选介绍页：
 - 链接优先选知乎、百度百科、马蜂窝、携程等介绍页，都没有就取第一条；
 - 缩略图优先用介绍页结果里的 rms_img（th.bing.com 代理，境内可直连热链）；
-- 没图的再单独搜必应图片「<景点> 风景」补一张；介绍页宁缺毋滥没搜到的，
-  也出「图片卡」（点击跳必应图片搜索结果页），不让景点光秃秃没图。
+- 没图的再单独搜必应图片「<景点> 风景」补一张，**图片来源优先旅游网站**
+  （携程/去哪儿/马蜂窝/同程/点评/百科，按原图所在页 purl 判断）——
+  旅游站的景点图是本尊实拍，杂图概率低；
+- 介绍页宁缺毋滥没搜到的，也出「图片卡」（点击跳图片搜索结果页），
+  不让景点光秃秃没图。
 
 工程约束：
 - 零依赖：抓取与解析复用 websearch 的标准库实现；
@@ -67,9 +70,18 @@ _IMG = re.compile(r'<img[^>]+class="[^"]*rms_img[^"]*"[^>]+src="([^"]+)"', re.S)
 
 # 必应图片搜索：结果 JSON 藏在 m="{&quot;...&quot;}" 属性里，引号是 HTML 转义的
 # turl 域名有两套：th.bing.com（国际版）/ ts*.mm.bing.net（国内版），都可热链
+# purl = 原图所在网页，用来判断图片来源是不是旅游网站
 _IMG_PAGE_M = re.compile(r' m="([^"]+)"', re.S)
 _IMG_MURL = re.compile(r'"murl":"(https?:[^"]+)"')
 _IMG_TURL = re.compile(r'"turl":"(https?://(?:th\.bing\.com|ts\d*\.mm\.bing\.net)[^"]+)"')
+_IMG_PURL = re.compile(r'"purl":"(https?:[^"]+)"')
+
+# 图片优先取自旅游网站（携程/去哪儿/马蜂窝/同程/大众点评/百科）：
+# 这些站的景点图是「本尊实拍」，搜索引擎聚合成 RSS 头像/表情包的概率低。
+# 图本身仍走必应 turl 代理热链（原图防盗链），purl 只用来挑来源。
+_IMG_SRC_PREF = ("you.ctrip.com", "ctrip.com", "piao.qunar.com", "qunar.com",
+                 "mafengwo.cn", "tuniu.com", "goto.ly.com", "dianping.com",
+                 "baike.baidu.com")
 
 
 def enabled() -> bool:
@@ -155,9 +167,13 @@ def _parse_image_page(page: str) -> str:
 
     - 优先 turl（th.bing.com 代理，境内直连、无防盗链），murl 原图多有
       referer 防护，热链常 403，只用来兜底确认存在；
+    - **来源优先旅游网站**（携程/去哪儿/马蜂窝/同程/点评/百科，见
+      _IMG_SRC_PREF）：按 purl（原图所在网页）判断，先遍历完候选挑旅游站
+      的图，一条都没有才退回任意来源——用户明确要求景点图出自旅游网站；
     - 把缩略图尺寸参数放大到 w=480（卡片背景 cover，480 够清晰）；
     - 只要 jpg/png/webp，跳过 svg/gif 动图。
     """
+    cands: list[tuple[bool, str]] = []          # (是否旅游站来源, turl)
     for m in _IMG_PAGE_M.finditer(page):
         data = m.group(1).replace("&quot;", '"').replace("&amp;", "&")
         mt = _IMG_TURL.search(data)
@@ -167,6 +183,12 @@ def _parse_image_page(page: str) -> str:
         mm = _IMG_MURL.search(data)
         if mm and re.search(r"\.(svg|gif)(\?|$)", mm.group(1), re.I):
             continue                      # 跳过动图/矢量图
+        mp = _IMG_PURL.search(data)
+        host = ""
+        if mp:
+            purl = mp.group(1).replace("\\/", "/")
+            host = websearch.host_of(urllib.parse.unquote(purl))
+        from_travel = any(_site_is(host, h) for h in _IMG_SRC_PREF)
         # 统一放大到卡片够用的尺寸（无参数的补上，有参数的改写）
         if "?" not in turl:
             turl += "?w=480&h=320&c=7"
@@ -175,8 +197,11 @@ def _parse_image_page(page: str) -> str:
             turl = re.sub(r"([?&])h=\d+", r"\1h=320", turl)
             if "w=" not in turl:
                 turl += "&w=480&h=320&c=7"
-        return turl
-    return ""
+        cands.append((from_travel, turl))
+    for from_travel, turl in cands:           # 旅游站来源优先
+        if from_travel:
+            return turl
+    return cands[0][1] if cands else ""
 
 
 def _search_image(name: str, timeout: int) -> str:

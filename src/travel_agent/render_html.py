@@ -170,6 +170,14 @@ def route_map_data(result: dict) -> dict:
     前端 imgCss 还会再剥一遍括号/引号/空白，双保险。
     """
     links = result.get("poi_links") or {}
+    # 城市中心：算「距市中心直线 X 公里」用（弹窗信息卡按行程类 App 风格）
+    dest = str((result.get("slots") or {}).get("destination") or "").strip()
+    center = None
+    try:
+        from .real_tools import resolve_geo
+        center = resolve_geo(dest)
+    except Exception:
+        center = None
     days = []
     for d in result["days_plan"]:
         nodes = []
@@ -179,7 +187,19 @@ def route_map_data(result: dict) -> dict:
             node = {"name": esc(n["name"]), "time": n["time"],
                     "lat": n["geo"][0], "lng": n["geo"][1],
                     "type": n["type"],
+                    "day": d["day"],
                     "uncertain": bool(n.get("geo_uncertain"))}
+            # 距市中心直线距离（弹窗第二行），城市中心拿不到就不给
+            if center:
+                node["dist"] = round(haversine_km(n["geo"], center), 1)
+            # 门票口径与 uncertain_ticket_notes 一致：
+            # 已核实 cost=0 → 免费；估算点 cost>0 → 「约」；估算点 cost=0 → 未核实
+            if n["type"] == "attraction":
+                c = n.get("cost") or 0
+                if n.get("geo_uncertain"):
+                    node["price"] = f"门票约 ¥{c}/人" if c > 0 else "门票未核实"
+                else:
+                    node["price"] = "免费" if c == 0 else f"门票 ¥{c}/人"
             if n["type"] == "attraction":
                 info = links.get(n["name"])
                 if info and info.get("url"):
@@ -192,7 +212,7 @@ def route_map_data(result: dict) -> dict:
             nodes.append(node)
         days.append({"day": d["day"], "nodes": nodes})
     home = (result["hotel"].get("items") or [{}])[0].get("geo")
-    return {"days": days, "home": home, "colors": DAY_COLORS}
+    return {"days": days, "home": home, "colors": DAY_COLORS, "city": esc(dest)}
 
 
 # 天地图 JS API 4.0（国家地理信息公共服务平台，合规底图）。
@@ -579,12 +599,19 @@ ROUTE_MAP_JS = """
       + darken(color, 0.75) + ';">' + tag + '</span>'
       + (n.time ? '<span>' + n.time + '</span>' : '')
       + '</div>'
+      + locRow(n)
       + (note ? '<div class="rt-mini-note">' + note + '</div>' : '')
       + '</div>';
   }
   // 景点介绍卡片（效仿行程类 App 的 hover 大卡）：图 + 名 + 来源 + 摘要 + 跳转
   // 「图片卡」标记：介绍页没搜到、只有搜索来的图，站点名固定为必应图片
   var IMG_ONLY_TAG = '必应图片';
+  // 「📍城市 · 距市中心直线X公里」信息行（行程类 App 风格），dist 没有就不给
+  function locRow(n) {
+    if (n.dist == null && !DATA.city) { return ''; }
+    return '<div class="rt-poi-loc">📍 ' + (DATA.city || '')
+      + (n.dist != null ? ' · 距市中心直线' + n.dist + '公里' : '') + '</div>';
+  }
   function poiCard(n) {
     var L = n.link || {};
     // CSS url() 不带引号，危险字符直接剥掉（缩略图 URL 本来也不含这些）
@@ -594,14 +621,20 @@ ROUTE_MAP_JS = """
       : '<div class="rt-card-img rt-card-noimg">' + String(n.name).slice(0, 1) + '</div>';
     return '<div class="rt-card" onmouseenter="RThover.stay()" onmouseleave="RThover.leave()">' + img
       + '<div class="rt-card-body"><div class="rt-card-name">' + n.name + '</div>'
+      + '<div class="rt-poi-row"><span class="rt-poi-day">第' + n.day + '天</span>'
+      + '<span>已添加至行程</span>'
+      + (n.price ? '<span class="rt-poi-price">' + n.price + '</span>' : '')
+      + '</div>'
       + (L.site ? '<div class="rt-card-src">' + (L.site == IMG_ONLY_TAG
         ? '图片来源：' + L.site : '介绍来源：' + L.site
         + ' · 点击下方链接查看完整攻略') + '</div>' : '')
       + (L.snippet ? '<div class="rt-card-snip">' + L.snippet + '</div>' : '')
+      + locRow(n)
       + '</div>'
       + (L.url ? '<a class="rt-card-link" href="' + L.url
         + '" target="_blank" rel="noopener">'
-        + (L.site == IMG_ONLY_TAG ? '查看更多图片 ↗' : '查看介绍 ↗') + '</a>' : '')
+        + (L.site == IMG_ONLY_TAG ? '查看更多图片 ↗' : '查看介绍 ↗') + '</a>'
+        : '<div class="rt-card-link">✓ 已添加</div>')
       + '</div>';
   }
   function addLabel(text, pos, dx) {
@@ -1062,6 +1095,12 @@ def render_route_map(result: dict) -> str:
         f'background:#2b5fe0;color:#FFFFFF!important;border-radius:7px;font-size:13px;'
         f'font-weight:bold;letter-spacing:.05em;text-decoration:none!important;}}'
         f'.rt-card-link:hover{{background:#1e4fd0;color:#FFFFFF!important;}}'
+        f'.rt-poi-row{{display:flex;align-items:center;gap:7px;margin-top:5px;'
+        f'font-size:11.5px;color:#3c4358;flex-wrap:wrap;}}'
+        f'.rt-poi-day{{background:#2b5fe0;color:#FFFFFF;border-radius:4px;'
+        f'padding:1.5px 7px;font-size:11px;font-weight:600;flex:none;}}'
+        f'.rt-poi-price{{color:#B26A00;}}'
+        f'.rt-poi-loc{{font-size:11px;color:#7a8299;margin-top:5px;}}'
         f'</style>'
         f'{tabs}'
         f'<div class="rt-wrap">'
