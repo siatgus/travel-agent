@@ -491,6 +491,64 @@ def is_stay_question(text: str) -> bool:
     return any(w in t for w in _STAY_KW) and bool(_CAT_ASK_RE.search(t))
 
 
+# ---------------------------------------------------------------- 周边问句
+# 「宽窄巷子附近有什么好吃的」是找餐厅、「附近有什么酒店」是找住处、
+# 「从宽窄巷子怎么去锦里」是问路线——都不是问「宽窄巷子是什么地方」。
+# 这类必须抢在景点点名拦截之前分流，否则点名一命中就按景点作答，
+# 周边查询提前结束（实测）。
+_NEARBY_SPOT_RE = re.compile(r"([\u4e00-\u9fa5]{2,12}?)(?:附近|周边|周围|旁边|隔壁)")
+_ROUTE_Q_RE = re.compile(
+    r"^从(.{2,12}?)(?:怎么|如何|开车|打车|坐车|自驾|步行|走路|地铁|公交)*"
+    r"(?:去|到|走)(.{2,12}?)(?:怎么|如何|开车|打车|坐车|自驾|步行|走路|地铁|公交)*"
+    r"(?:去|到|走)?(?:有多远|远不远|要多久|多久|多长时间)?[？?。！!，,]*$")
+
+
+def nearby_anchor(text: str, city: str | None = None) -> str | None:
+    """「宽窄巷子附近有什么好吃的」→「宽窄巷子」。剥出 附近/周边 前面的点名。"""
+    t = (text or "").strip("？?。！!，, 　~")
+    m = _NEARBY_SPOT_RE.search(t)
+    if not m:
+        return None
+    cand = m.group(1)
+    if city and city in cand:
+        cand = cand.replace(city, "", 1)
+    cand = re.sub(r"^(?:请问|想知道|帮[我忙]|帮忙|从|在|去|到|离|问)+", "", cand)
+    cand = cand.strip("的了呀呢吧这那，, ")
+    return cand if len(cand) >= 2 else None
+
+
+def is_nearby_food_question(text: str) -> bool:
+    """「宽窄巷子附近有什么好吃的/有餐厅吗」→ 找真实餐厅，不是问景点。"""
+    t = text or ""
+    if nearby_anchor(t) is None:
+        return False
+    return (is_food_question(t)
+            or bool(re.search(r"好吃|吃的|餐厅|餐馆|饭馆|菜馆|馆子|吃饭"
+                              r"|午餐|晚餐|宵夜", t)))
+
+
+def is_nearby_hotel_question(text: str) -> bool:
+    """「宽窄巷子附近有什么酒店/住宿」→ 找住处，不是问景点。"""
+    t = text or ""
+    return nearby_anchor(t) is not None and any(w in t for w in _STAY_KW)
+
+
+def nearby_route_ends(text: str) -> tuple[str, str] | None:
+    """「从宽窄巷子怎么去锦里」→（宽窄巷子, 锦里）。
+
+    只做句式判断，两端是否真收录由调用方查库定——查不到就交回普通流程。
+    「从邯郸出发去成都玩3天」这类规划句在这层就先排除。
+    """
+    t = (text or "").strip("？?。！! 　~")
+    m = _ROUTE_Q_RE.match(t)
+    if not m:
+        return None
+    a, b = m.group(1), m.group(2)
+    if a.endswith(("出发", "开始")) or b.endswith(("玩", "旅游", "旅行", "度假")):
+        return None
+    return a, b
+
+
 def classify(text: str) -> str:
     """返回 weather / poi / transport / plan / plan_qa / smalltalk / other。
 

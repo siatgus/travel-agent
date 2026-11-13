@@ -577,6 +577,166 @@ class Session:
         answers = [self._spot_qa(city, core) for core in hits[:3]]
         return "\n\n".join(answers)
 
+    # -------------------------------------------------- 周边问句分流
+
+    def _nearby_gate(self, utterance: str) -> str | None:
+        """周边问句独立分流（放在景点点名拦截之前）：
+
+        「宽窄巷子附近有什么好吃的」→ 餐厅搜索；「附近有什么酒店」→ 酒店搜索；
+        「从宽窄巷子怎么去锦里」→ 两点路线。都不是「宽窄巷子是什么地方」。
+
+        分流以「锚点/两端真的在库里且带坐标」为闸：查不到一律交回普通流程
+        （改方案的指令句也交回），绝不凭空答。
+        """
+        # 改行程的指令绝不拦：「把宽窄巷子附近的餐厅排进第二天」是改方案
+        if re.search(r"不想去|换[成掉]|删|去掉|不要|排除|加[进上到]|改成|必去"
+                     r"|排进|重排|加一天|多住", utterance):
+            return None
+        if intent.classify(utterance) in ("plan", "plan_qa"):
+            return None
+        city = (intent.city_in(utterance) or self.slots.get("destination")
+                or self.last_city or self.trip_dest)
+        if not city:
+            return None
+
+        def strip_city(s: str) -> str:
+            s2 = s.replace(city, "").strip("的了呀呢吧，, 　")
+            return s2 or s
+
+        # 1) 两点路线：「从X怎么去Y」
+        ends = intent.nearby_route_ends(utterance)
+        if ends:
+            pa = self._resolve_spot(city, strip_city(ends[0]))
+            pb = self._resolve_spot(city, strip_city(ends[1]))
+            if pa and pb and (pa.get("name") or ends[0]) != (pb.get("name") or ends[1]):
+                return self._route_qa(ends[0], ends[1], pa, pb)
+            return None          # 两端没查全：多半是城际/规划句，交回普通流程
+        # 2) 锚点周边：找吃的 / 找住的（「XX附近有什么」泛问留给景点周边）
+        if not (intent.is_nearby_food_question(utterance)
+                or intent.is_nearby_hotel_question(utterance)):
+            return None
+        anchor = intent.nearby_anchor(utterance, city) or ""
+        base = self._resolve_spot(city, anchor)
+        if not (base and base.get("geo")):
+            return None          # 锚点没收录：交回普通景点/餐厅流程
+        if intent.is_nearby_food_question(utterance):
+            return self._restaurant_nearby_qa(city, utterance, anchor, base)
+        return self._hotel_nearby_qa(city, utterance, anchor, base)
+
+    def _resolve_spot(self, city: str, name: str) -> dict | None:
+        """按名字查库里的 POI（要带坐标）；查不到返回 None，调用方交回普通流程。"""
+        if not name or len(name) < 2:
+            return None
+        r = agent.dispatch("search_poi", {"city": city, "keyword": name,
+                                          "limit": 3})
+        items = (r.get("items") or []) if r.get("ok") else []
+        for p in items:
+            nm = p.get("name") or ""
+            if p.get("geo") and (name in nm or nm in name):
+                return p
+        for p in items:          # 放宽：keyword 命中即认，取第一个带坐标的
+            if p.get("geo"):
+                return p
+        return None
+
+    @staticmethod
+    def _within(lat: float, lon: float, items: list[dict],
+                center: str, radius_km: float) -> list[dict]:
+        """筛出离（lat, lon）radius_km 公里内、按距离由近到远排序的条目。"""
+        out = []
+        for p in items:
+            geo = p.get("geo")
+            if not geo or not (geo[0] or geo[1]):
+                continue
+            nm = p.get("name") or ""
+            if nm == center or nm in center or center in nm:
+                continue          # 圆心自己不算"周边"
+            km = haversine_km((lat, lon), geo)
+            if km <= radius_km:
+                out.append({**p, "_km": round(km, 1)})
+        out.sort(key=lambda p: p["_km"])
+        return out
+
+    def _restaurant_nearby_qa(self, city: str, utterance: str,
+                              anchor: str, base: dict) -> str:
+        """「宽窄巷子附近有什么好吃的」：以点名景点为圆心搜真实餐厅。"""
+        kw = intent.food_keyword(utterance, city)
+        disp = base.get("name") or anchor
+        lat, lon = base["geo"][0], base["geo"][1]
+        args = {"city": city, "category": "restaurant", "limit": 200}
+        r = agent.dispatch("search_poi", args)
+        items = (r.get("items") or []) if r.get("ok") else []
+        if not items:
+            # 整座城市没收录餐厅：先走一次在线补库再答
+            self._coverage(city)
+            r = agent.dispatch("search_poi", args)
+            items = (r.get("items") or []) if r.get("ok") else []
+        pool = items
+        if kw:
+            hit = [p for p in items
+                   if kw in (p.get("name") or "")
+                   or any(kw in t for t in (p.get("tags") or []))]
+            pool = hit or pool   # 品类词不在招牌上时放宽（与餐厅搜索同策略）
+        for radius in (3, 10):
+            near = self._within(lat, lon, pool, disp, radius)
+            if not near:
+                continue
+            label = f"{disp}周边·{kw}" if kw else f"{disp}周边美食"
+            text = intent.recommend_answer(city, label, near[:6],
+                                           client=self.client)
+            if radius > 3:
+                text += (f"\n\n> 「{disp}」3 公里内暂无收录餐厅，"
+                         f"以上是 {radius} 公里内由近到远的。")
+            return text
+        return (f"「{disp}」周边的餐厅我收录得还不够，不敢瞎报名字。\n"
+                f"可以问「{city}有什么好吃的」，或排行程时让我安排用餐。")
+
+    def _hotel_nearby_qa(self, city: str, utterance: str,
+                         anchor: str, base: dict) -> str:
+        """「宽窄巷子附近有什么酒店」：以点名景点为圆心由近到远报在售酒店。"""
+        disp = base.get("name") or anchor
+        lat, lon = base["geo"][0], base["geo"][1]
+        din = (self.today + timedelta(days=1)).isoformat()
+        dout = (self.today + timedelta(days=2)).isoformat()
+        guests = int(self.slots.get("party_size") or 2)
+        args = {"city": city, "check_in": din, "check_out": dout,
+                "guests": guests}
+        hotels, note = self._hotels_with_fetch(city, args)
+        for radius in (3, 10):
+            near = self._within(lat, lon, hotels, disp, radius)
+            if not near:
+                continue
+            text = intent.stay_answer(city, near[:5], client=self.client,
+                                      note=note)
+            head = f"以「{disp}」为中心由近到远：\n\n"
+            tail = "" if radius <= 3 else \
+                (f"\n\n> 「{disp}」3 公里内暂无收录酒店，"
+                 f"以上是 {radius} 公里内最近的。")
+            return head + text + tail
+        return (f"「{disp}」周边的酒店我收录得还不够，不敢瞎报名字和价格。\n"
+                f"可以问「{city}有什么酒店」，或排行程时按住宿片区帮你选。")
+
+    def _route_qa(self, a: str, b: str, pa: dict, pb: dict) -> str:
+        """「从宽窄巷子怎么去锦里」：两点都在库里 → 真实路网给距离与耗时。"""
+        disp_a = pa.get("name") or a
+        disp_b = pb.get("name") or b
+        km = haversine_km(pa["geo"], pb["geo"])
+        mode, mins = real_tools.transit_estimate(km, pa["geo"], pb["geo"])
+        km_txt = f"{km:.1f} 公里" if km >= 1 else f"{int(km * 1000)} 米"
+        facts = {"起点": disp_a, "终点": disp_b, "直线距离": km_txt,
+                 "方式": mode, "约几分钟": mins}
+        said = intent._speak(self.client, "route", facts, f"从{a}怎么去{b}",
+                             [mode, mins])
+        tail = ("距离与耗时按地图路网估算，实际以实时路况为准；"
+                "公交换乘未核实，不敢瞎报。")
+        if said:
+            return f"{said}\n\n> {tail}"
+        if mode == "步行":
+            return (f"「{disp_a}」离「{disp_b}」很近（约 {km_txt}），"
+                    f"步行约 {mins} 分钟就能到。\n\n> {tail}")
+        return (f"「{disp_a}」到「{disp_b}」直线约 {km_txt}，"
+                f"{mode}约 {mins} 分钟。\n\n> {tail}")
+
     def _turn_impl(self, utterance: str,
                    history_text: str | None = None) -> Reply:
         self.turn_no += 1
@@ -584,6 +744,16 @@ class Session:
                              "content": history_text or utterance})
         # 说话层/闲聊层带最近几轮（分类、抽取、校验层不读它，见 llm.attach_history）
         llm.attach_history(self.client, self._llm_history())
+
+        # ---- 周边问句分流：找吃的/找住的/两点路线，抢在景点点名拦截之前 ----
+        # 「宽窄巷子附近有什么好吃的」一旦被当成「问宽窄巷子这个景点」，
+        # 周边查询就提前结束；「从X怎么去Y」的「怎么去」还会撞上行程点名拦截。
+        nearby = self._nearby_gate(utterance)
+        if nearby is not None:
+            self.history.append({"role": "agent", "content": nearby})
+            return Reply(mode="answer", turn_no=self.turn_no,
+                         ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                         render=nearby)
 
         # ---- 点名行程里的店/景点问细节：抢在意图分类前接住 ----
         gated = self._plan_spot_gate(utterance)
@@ -1673,6 +1843,15 @@ class Session:
         guests = int(self.slots.get("party_size") or 2)
         args = {"city": city, "check_in": din, "check_out": dout,
                 "guests": guests}
+        hotels, note = self._hotels_with_fetch(city, args)
+        return intent.stay_answer(city, hotels, client=self.client, note=note)
+
+    def _hotels_with_fetch(self, city: str,
+                           args: dict) -> tuple[list[dict], str]:
+        """查在售酒店；空了先在线补库一次（每城一次）。
+
+        返回（酒店列表, 补录说明）——说明非空表示数据是刚抓的，只能报参考价。
+        """
         r = agent.dispatch("search_hotel", args)
         hotels = (r.get("items") or []) if r.get("ok") else []
         note = ""
@@ -1687,7 +1866,7 @@ class Session:
                     note = (f"{city}原先没有酒店数据，已按在线地图补录 "
                             f"{res.get('hotels', 0)} 家；房价为星级估算的参考价，"
                             f"未验证实时房态，预订前请以预订平台实时价格与房态为准")
-        return intent.stay_answer(city, hotels, client=self.client, note=note)
+        return hotels, note
 
     def _general_answer(self, utterance: str) -> str | None:
         """通用旅行问题：先联网检索，再让模型组织；没模型就渲染带来源的摘要列表。

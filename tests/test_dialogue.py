@@ -1604,6 +1604,49 @@ def test_stay_question_lists_hotels_not_replan() -> None:
           r.render[:160])
 
 
+def test_nearby_food_hotel_route_split() -> None:
+    """周边问句独立分流（2026-11-13）：「宽窄巷子附近有什么好吃的」是找餐厅，
+    「附近有什么酒店」是找住处、「从X怎么去Y」是问路线——都不能被景点
+    点名拦截提前吃掉（实测景点一命中就按景点作答，周边查询提前结束）。"""
+    from travel_agent.llm import ScriptedClient
+
+    # 1) 周边餐饮：报真实餐厅，不是景点介绍
+    c1 = ScriptedClient(["古城里的两家：石井私房菜本地味，梅子井酒家老字号。"])
+    s1 = Session(today=TODAY, client=c1)
+    s1.slots["destination"] = "大理"
+    r1 = s1.turn("大理古城附近有什么好吃的")
+    check("周边餐饮按问答处理", r1.mode == "answer", f"mode={r1.mode}")
+    check("报的是真实餐厅", "石井私房菜" in r1.render, r1.render[:160])
+    check("不是景点介绍", "门票" not in r1.render.split(">")[0], r1.render[:160])
+
+    # 2) 周边酒店：以景点为圆心由近到远报在售酒店
+    s2 = Session(today=TODAY, client=None)
+    s2.slots["destination"] = "大理"
+    r2 = s2.turn("大理古城附近有什么酒店")
+    check("周边酒店按问答处理", r2.mode == "answer", f"mode={r2.mode}")
+    check("以景点为中心报酒店",
+          "以「大理古城" in r2.render and "青青客栈" in r2.render,
+          r2.render[:160])
+    check("没有整单重排",
+          "出行概要" not in r2.render and "行程日期" not in r2.render,
+          r2.render[:160])
+
+    # 3) 两点路线：两点都在库里 → 距离 + 耗时
+    s3 = Session(today=TODAY, client=None)
+    s3.slots["destination"] = "大理"
+    r3 = s3.turn("从大理古城怎么去喜洲古镇")
+    check("路线问句按问答处理", r3.mode == "answer", f"mode={r3.mode}")
+    check("给出距离与耗时",
+          "公里" in r3.render and "分钟" in r3.render, r3.render[:160])
+    check("注明估算口径", "估算" in r3.render, r3.render[-160:])
+
+    # 4) 改方案的指令句不被周边分流拦下
+    s4 = Session(today=TODAY, client=None)
+    s4.slots["destination"] = "大理"
+    check("改方案指令不进周边分流",
+          s4._nearby_gate("把大理古城附近的餐厅加进必去") is None)
+
+
 def test_stay_question_triggers_hotel_autofill() -> None:
     """「有什么酒店」→ 库里没酒店先在线补库再答，补到要注明非实时报价（2026-11-13）。"""
     from travel_agent import autofetch as af
@@ -1760,6 +1803,7 @@ def main() -> int:
                test_restaurant_question_lists_shops,
                test_day_change_keeps_days_and_places_spot,
                test_stay_question_lists_hotels_not_replan,
+               test_nearby_food_hotel_route_split,
                test_stay_question_triggers_hotel_autofill,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):
