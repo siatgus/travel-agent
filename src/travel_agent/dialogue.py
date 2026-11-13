@@ -453,15 +453,14 @@ class Session:
                 return (f"{city}的资料里我还没收录「{label}」这类地方，不敢瞎报名字。\n"
                         f"可以说个具体名字，我查到就给你介绍；或者说清想玩什么，"
                         f"排行程时我按这个挑点。")
-            # 「还有什么特色美食」问的是吃：报库里收录的馆子，别拿景点清单凑数
-            # （实测这句回了一串广府古城、娲皇宫）。
+            # 吃问句拆两路（2026-11-13）：「特色美食」问的是菜品文化（火锅、
+            # 担担面这类知识答），走 food_knowledge 表；「火锅店/川菜馆」
+            # 找的是真实商家，走 restaurant POI。原先一把抓查餐厅库——
+            # 问文化给店名单、库里没店就干瞪眼，两头都错。
             if intent.is_food_question(utterance):
-                r = agent.dispatch("search_poi", {"city": city,
-                                                  "category": "restaurant",
-                                                  "limit": 6})
-                items = (r.get("items") or []) if r.get("ok") else []
-                return intent.recommend_answer(city, "特色美食", items,
-                                               client=self.client)
+                if intent.food_question_kind(utterance) == "restaurant":
+                    return self._answer_restaurant(city, utterance)
+                return self._answer_food(city, utterance)
             # 「有什么酒店」问的是住：报库里的在售酒店（起价口径），不是新规划
             # 需求——实测这句被当成要排行程，回了一份全新 5 天行程。
             if intent.is_stay_question(utterance):
@@ -1587,6 +1586,76 @@ class Session:
         if budget.get("total"):
             lines.append(f"- 预算合计约 {budget['total']} 元")
         return "\n".join(lines)
+
+    def _answer_food(self, city: str, utterance: str) -> str:
+        """美食知识答：「有什么特色美食/火锅有什么特色」——菜品文化，不查商家。
+
+        数据来自 .kb.db 的 food_knowledge 表（与真实餐厅 POI 分表存放）；
+        问的品类库里有就答，没有转联网检索并标注来源；都拿不到才如实说没收录。
+        """
+        from . import kb as kb_mod
+        rows = None
+        db = kb_mod.get_kb()
+        if db is not None:
+            try:
+                rows = db.list_food(city)
+            except Exception:
+                rows = None
+        kw = intent.food_keyword(utterance, city)
+        if rows and kw:
+            hit = [r for r in rows if kw in r["name"] or kw in r["category"]
+                   or kw in r["intro"] or kw in r["features"]]
+            rows = hit or None          # 问的品类知识库没有 → 转联网
+        if not rows:
+            said = self._general_answer(f"{city}特色美食{kw or ''}".strip())
+            if said:
+                return said
+            return (f"{city}的美食知识我还没收录，不敢瞎编菜品故事。\n"
+                    f"想找具体馆子可以说「{city}有哪些好吃的火锅店」，"
+                    f"我按库里的真实餐厅答。")
+        facts = {"城市": city,
+                 "问的": f"{city}特色美食" + (f"·{kw}" if kw else ""),
+                 "菜品": [{"名称": r["name"],
+                          "类别": r["category"] or "美食",
+                          "介绍": r["intro"],
+                          "特色": r["features"]} for r in rows[:6]]}
+        said = intent._speak(self.client, "poi", facts,
+                             utterance, [r["name"] for r in rows[:2]])
+        if said:
+            return said
+        lines = [f"{city}的特色美食，给你介绍几个代表："]
+        for r in rows[:6]:
+            cat = r["category"] or "美食"
+            lines.append(f"- **{r['name']}**（{cat}）：{r['intro']} {r['features']}")
+        return "\n".join(lines)
+
+    def _answer_restaurant(self, city: str, utterance: str) -> str:
+        """餐厅搜索答：「火锅店/川菜馆/春熙路附近的馆子」——真实商家 POI。
+
+        带品类词（火锅/川菜）和片区词（春熙路）就按条件筛；品类词不在店名里
+        （「川菜」未必写在招牌上）自动放宽再试；城市没数据先触发在线补库。
+        """
+        kw = intent.food_keyword(utterance, city)
+        near = intent.food_area(utterance)
+        args: dict = {"city": city, "category": "restaurant", "limit": 6}
+        if kw:
+            args["keyword"] = kw
+        if near:
+            args["near"] = near
+        r = agent.dispatch("search_poi", args)
+        items = (r.get("items") or []) if r.get("ok") else []
+        if not items:
+            # 库里没有餐厅：可能是整座城市没收录——先走一次在线补库再答
+            self._coverage(city)
+            r = agent.dispatch("search_poi", args)
+            items = (r.get("items") or []) if r.get("ok") else []
+        if not items and kw:
+            r2 = agent.dispatch("search_poi", {k: v for k, v in args.items()
+                                               if k != "keyword"})
+            items = (r2.get("items") or []) if r2.get("ok") else []
+        label = (f"{near}·{kw}" if (near and kw) else
+                 (kw or (f"{near}附近的餐厅" if near else "特色餐厅")))
+        return intent.recommend_answer(city, label, items, client=self.client)
 
     def _stay_answer(self, city: str, utterance: str) -> str:
         """「有什么酒店/住哪」：按明晚入住、当前人数查在售酒店作答。

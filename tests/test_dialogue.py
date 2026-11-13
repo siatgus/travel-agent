@@ -1562,15 +1562,24 @@ def test_poi_category_no_local_hit_goes_online() -> None:
         ws.search = orig
 
 
-def test_food_question_lists_restaurants() -> None:
-    """「还有什么特色美食」→ 报收录的馆子，不拿景点清单凑数（实测答成古城石窟）。"""
-    from travel_agent.llm import ScriptedClient
-
-    c = ScriptedClient(["本地值得吃的就是这几家老店，都在市区。"])
-    s = Session(today=TODAY, client=c)
+def test_food_knowledge_answers() -> None:
+    """「还有什么特色美食」→ 美食知识答（菜品文化），不拿景点或店名单凑数。"""
+    s = Session(today=TODAY, client=None)
     s.slots["destination"] = "邯郸"
     r = s.turn("邯郸还有什么特色美食")
-    check("美食问句按问答处理", r.mode == "answer", f"mode={r.mode}")
+    check("美食知识问按问答处理", r.mode == "answer", f"mode={r.mode}")
+    check("报的是地方菜品", "二毛烧鸡" in r.render, r.render[:160])
+    check("不拿景点凑数",
+          "娲皇宫" not in r.render and "广府古城" not in r.render,
+          r.render[:160])
+
+
+def test_restaurant_question_lists_shops() -> None:
+    """「好吃的馆子/火锅店」→ 搜真实餐厅 POI，不是菜品知识（2026-11-13 拆分）。"""
+    s = Session(today=TODAY, client=None)
+    s.slots["destination"] = "邯郸"
+    r = s.turn("邯郸有什么好吃的馆子")
+    check("找店问句按问答处理", r.mode == "answer", f"mode={r.mode}")
     check("报的是馆子",
           "驴肉火烧" in r.render and "水饺" in r.render, r.render[:160])
     check("不拿景点凑数",
@@ -1708,7 +1717,8 @@ def main() -> int:
                test_meta_question_answered,
                test_comparison_question_not_generic_list,
                test_poi_category_question_filters_by_type,
-               test_food_question_lists_restaurants,
+               test_food_knowledge_answers,
+               test_restaurant_question_lists_shops,
                test_day_change_keeps_days_and_places_spot,
                test_stay_question_lists_hotels_not_replan,
                test_poi_category_no_local_hit_goes_online,

@@ -427,14 +427,62 @@ def parse_day_target(text: str) -> int | None:
 # 5 天行程。与品类问句同一防线：必须带问法词，改需求句式（「酒店要五星的」
 # 「想吃辣的」）不拦，照旧走方案修改。
 _FOOD_KW = ("美食", "小吃", "好吃的", "特色菜", "名吃", "餐馆", "餐厅",
-            "饭店", "吃的", "好吃的馆子")
+            "饭店", "吃的", "好吃的馆子", "火锅", "菜馆", "饭馆", "菜品",
+            "菜系", "饮食", "地方菜")
 _STAY_KW = ("酒店", "宾馆", "民宿", "住宿", "住哪")
+
+# 店面词：句子里带这些是「找真实商家/店铺」，不带是「问美食知识」。
+# 「成都有什么特色美食」→ 知识答（火锅、担担面…）；「有哪些好吃的火锅店」
+# 「春熙路附近有哪些川菜馆」→ 搜真实餐厅 POI。
+_FOOD_SHOP_KW = ("餐厅", "餐馆", "饭店", "饭馆", "菜馆", "馆子", "店")
 
 
 def is_food_question(text: str) -> bool:
     """在问「有什么吃的/特色美食」吗（改口味偏好的句子不算）。"""
     t = text or ""
     return any(w in t for w in _FOOD_KW) and bool(_CAT_ASK_RE.search(t))
+
+
+def food_question_kind(text: str) -> str | None:
+    """美食问句细分：'restaurant' 找真实店铺 / 'knowledge' 问菜品文化。
+
+    店面词（火锅店/川菜馆）或推荐句式（推荐/哪家）→ 找店；
+    纯问菜品（什么特色美食/火锅有什么特色）→ 知识答。
+    """
+    t = text or ""
+    if not is_food_question(t):
+        return None
+    if any(w in t for w in _FOOD_SHOP_KW) or re.search(r"推荐|哪家好", t):
+        return "restaurant"
+    return "knowledge"
+
+
+def food_keyword(text: str, city: str | None = None) -> str | None:
+    """剥出美食问句里的品类词：「成都有哪些好吃的火锅店」→「火锅」。"""
+    cand = (text or "").strip("？?。！!，, 　~")
+    if city and city in cand:
+        cand = cand.replace(city, "", 1)
+    area = food_area(text)
+    if area and area in cand:
+        cand = cand.replace(area, "", 1)     # 「春熙路附近的川菜馆」别把片区当菜系
+    for w in ("有哪些", "有没有", "有什么", "推荐几家", "推荐", "几家", "附近",
+              "周边", "周围", "一带", "特色", "美食", "小吃", "名吃", "菜品",
+              "菜系", "饮食", "好吃的", "哪个", "哪里", "什么", "些", "介绍",
+              "想", "找", "查", "知道"):
+        cand = cand.replace(w, " ")
+    cand = re.sub(r"\s+", "", cand)
+    cand = re.sub(r"(餐厅|餐馆|饭店|饭馆|馆子|的名菜|名菜)+$", "", cand)
+    cand = re.sub(r"[馆店]$", "", cand)     # 「川菜馆」剥店后缀保住「川菜」
+    cand = cand.strip("的了呀啊呢吧，, ")
+    if len(cand) < 2 or len(cand) > 6:
+        return None
+    return cand
+
+
+def food_area(text: str) -> str | None:
+    """「春熙路附近有哪些川菜馆」→「春熙路」。剥出商圈/片区词。"""
+    m = re.search(r"([\u4e00-\u9fa5]{2,6})(?:附近|周边|周围|一带|旁边)", text or "")
+    return m.group(1) if m else None
 
 
 def is_stay_question(text: str) -> bool:

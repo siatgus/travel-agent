@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import paths
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()   # 可重入：seed 循环持锁时会再调 upsert_food
 _DB: "KnowledgeBase | None" = None
 _DB_PATH: Path | None = None
 
@@ -101,6 +101,12 @@ class KnowledgeBase:
           duration_min INTEGER DEFAULT 0, price REAL DEFAULT 0, note TEXT DEFAULT '',
           source TEXT DEFAULT 'seed', updated_at TEXT,
           PRIMARY KEY(code, from_city, to_city));
+        CREATE TABLE IF NOT EXISTS food_knowledge(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT NOT NULL,
+          name TEXT NOT NULL, category TEXT DEFAULT '',
+          intro TEXT DEFAULT '', features TEXT DEFAULT '',
+          source TEXT DEFAULT 'seed', updated_at TEXT);
+        CREATE INDEX IF NOT EXISTS idx_food_city ON food_knowledge(city);
         CREATE TABLE IF NOT EXISTS sync_log(
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, city TEXT,
           source TEXT, status TEXT, added INTEGER DEFAULT 0,
@@ -111,8 +117,8 @@ class KnowledgeBase:
     # ------------------------------------------------------------ 播种
     def seed_if_empty(self) -> dict[str, int]:
         """从 real_tools 核实数据播种；只补空缺，不覆盖已有记录（幂等）。"""
-        from .real_tools import POIS_DB, HOTELS_DB, ROUTES_DB
-        counts = {"pois": 0, "hotels": 0, "schedules": 0}
+        from .real_tools import POIS_DB, HOTELS_DB, ROUTES_DB, FOOD_KB
+        counts = {"pois": 0, "hotels": 0, "schedules": 0, "food": 0}
         with _LOCK:
             for city, items in POIS_DB.items():
                 self.conn.execute(
@@ -144,6 +150,14 @@ class KnowledgeBase:
                     if cur.rowcount:
                         counts["schedules"] += 1
                         self._fill_schedule(a, b, s)
+            for city, items in FOOD_KB.items():
+                for f in items:
+                    have = self.conn.execute(
+                        "SELECT 1 FROM food_knowledge WHERE city=? AND name=?",
+                        (city, f["name"])).fetchone()
+                    if not have:
+                        self.upsert_food(city, f, source="seed")
+                        counts["food"] += 1
             self.conn.commit()
         return counts
 
@@ -319,6 +333,47 @@ class KnowledgeBase:
     def delete_hotel(self, hotel_id: str) -> bool:
         with _LOCK:
             cur = self.conn.execute("DELETE FROM hotels WHERE hotel_id=?", (hotel_id,))
+            self.conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------ 美食知识
+    def list_food(self, city: str) -> list[dict] | None:
+        """城市美食知识（菜品/文化，非商家）；无数据返回 None。"""
+        rows = self.conn.execute(
+            "SELECT * FROM food_knowledge WHERE city=? ORDER BY id",
+            (city,)).fetchall()
+        if not rows:
+            return None
+        return [{"id": r["id"], "name": r["name"], "category": r["category"],
+                 "intro": r["intro"], "features": r["features"],
+                 "source": r["source"]} for r in rows]
+
+    def upsert_food(self, city: str, f: dict, source: str = "manual") -> int:
+        """新增/更新一条美食知识（按 城市+菜名 去重）。返回行 id。"""
+        with _LOCK:
+            cur = self.conn.execute(
+                "SELECT id FROM food_knowledge WHERE city=? AND name=?",
+                (city, f["name"])).fetchone()
+            if cur:
+                self.conn.execute(
+                    "UPDATE food_knowledge SET category=?, intro=?, features=?,"
+                    " source=?, updated_at=? WHERE id=?",
+                    (f.get("category", ""), f.get("intro", ""),
+                     f.get("features", ""), source, NOW(), cur["id"]))
+                rid = cur["id"]
+            else:
+                cur = self.conn.execute(
+                    "INSERT INTO food_knowledge(city,name,category,intro,"
+                    " features,source,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (city, f["name"], f.get("category", ""), f.get("intro", ""),
+                     f.get("features", ""), source, NOW()))
+                rid = cur.lastrowid
+            self.conn.commit()
+        return rid
+
+    def delete_food(self, fid: int) -> bool:
+        with _LOCK:
+            cur = self.conn.execute("DELETE FROM food_knowledge WHERE id=?", (fid,))
             self.conn.commit()
         return cur.rowcount > 0
 

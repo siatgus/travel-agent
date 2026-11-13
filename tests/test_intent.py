@@ -385,6 +385,33 @@ def test_food_stay_questions() -> None:
           and intent.classify("有什么酒店") == "poi")
 
 
+def test_food_question_split() -> None:
+    """美食问句拆两路：问菜品文化 vs 找真实店铺，不能混（2026-11-13 修）。"""
+    check("特色美食是知识问",
+          intent.food_question_kind("成都有什么特色美食") == "knowledge")
+    check("菜品特色是知识问",
+          intent.food_question_kind("成都火锅有什么特色") == "knowledge")
+    check("火锅店是找店",
+          intent.food_question_kind("成都有哪些好吃的火锅店") == "restaurant")
+    check("片区菜馆是找店",
+          intent.food_question_kind("春熙路附近有哪些川菜馆") == "restaurant")
+    check("推荐句式算找店",
+          intent.food_question_kind("推荐火锅") == "restaurant")
+    check("非美食问句不细分",
+          intent.food_question_kind("想吃辣的") is None
+          and intent.food_question_kind("有什么酒店") is None)
+    check("品类词剥取：火锅店",
+          intent.food_keyword("成都有哪些好吃的火锅店", "成都") == "火锅")
+    check("品类词剥取：菜系保字",
+          intent.food_keyword("春熙路附近有哪些川菜馆") == "川菜")
+    check("品类词剥取：火锅特色",
+          intent.food_keyword("成都火锅有什么特色", "成都") == "火锅")
+    check("纯美食泛问剥不出品类",
+          intent.food_keyword("成都有什么特色美食", "成都") is None)
+    check("片区词剥取", intent.food_area("春熙路附近有哪些川菜馆") == "春熙路")
+    check("无片区词返回 None", intent.food_area("成都有什么特色美食") is None)
+
+
 def test_nearby_answer_template() -> None:
     """周边问答的模板路径：有数据按距离列、没数据如实说。"""
     pois = [{"name": "崇圣寺三塔", "area": "古城北", "cost": 75,
@@ -426,6 +453,7 @@ def main() -> int:
                test_spot_answer_template, test_poi_answer_autofetch,
                test_smalltalk, test_identity_variants, test_comparison_question, test_poi_category_question,
                test_food_stay_questions,
+               test_food_question_split,
                test_question_shape,
                test_nearby_answer_template,
                test_no_destination_no_plan,

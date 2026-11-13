@@ -37,13 +37,31 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 mem = KnowledgeBase(Path(":memory:"))
 first = mem.seed_if_empty()
-check("种子导入：POI/酒店/班次均有数据",
-      first["pois"] >= 10 and first["hotels"] >= 3 and first["schedules"] >= 5,
+check("种子导入：POI/酒店/班次/美食均有数据",
+      first["pois"] >= 10 and first["hotels"] >= 3 and first["schedules"] >= 5
+      and first["food"] >= 5,
       str(first))
 
 second = mem.seed_if_empty()
-check("种子幂等：二次播种补入 0 条", second == {"pois": 0, "hotels": 0, "schedules": 0},
+check("种子幂等：二次播种补入 0 条",
+      second == {"pois": 0, "hotels": 0, "schedules": 0, "food": 0},
       str(second))
+
+# —— 美食知识表：与真实餐厅 POI 分开（2026-11-13）——
+food = mem.list_food("成都")
+check("美食知识：成都种子入库", food is not None and len(food) >= 5, str(food and len(food)))
+check("美食知识：字段齐全",
+      all({"name", "category", "intro", "features"} <= set(r) for r in food))
+check("美食知识：无数据城市返回 None", mem.list_food("消亡城") is None)
+fid = mem.upsert_food("测试城", {"name": "过桥米线", "category": "小吃",
+                                "intro": "汤烫生片", "features": "先荤后素"})
+check("美食知识：手工 upsert 返回 id", fid > 0)
+fid2 = mem.upsert_food("测试城", {"name": "过桥米线", "category": "小吃",
+                                 "intro": "汤烫生片·更新", "features": "先荤后素"})
+check("美食知识：同名去重更新不新增", fid2 == fid
+      and len(mem.list_food("测试城")) == 1)
+check("美食知识：删除", mem.delete_food(fid)
+      and mem.list_food("测试城") is None)
 
 from travel_agent.real_tools import POIS_DB, HOTELS_DB
 
