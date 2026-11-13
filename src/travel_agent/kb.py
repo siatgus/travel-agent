@@ -111,6 +111,11 @@ class KnowledgeBase:
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, city TEXT,
           source TEXT, status TEXT, added INTEGER DEFAULT 0,
           updated INTEGER DEFAULT 0, message TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS data_source_log(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, data_type TEXT NOT NULL,
+          city TEXT, source TEXT NOT NULL, success INTEGER NOT NULL,
+          fetched_at TEXT NOT NULL, error_code TEXT, error_message TEXT);
+        CREATE INDEX IF NOT EXISTS idx_dsl_type ON data_source_log(data_type, city);
         """)
         self.conn.commit()
 
@@ -457,6 +462,42 @@ class KnowledgeBase:
                    added: int = 0, updated: int = 0, message: str = "") -> None:
         """对外日志入口（自动补全等模块写 sync_log 用）。"""
         self._log(city, source, status, added, updated, message)
+
+    def record_data_log(self, data_type: str, city: str, source: str,
+                        success: bool, error_code: str | None = None,
+                        error_message: str | None = None) -> None:
+        """数据来源日志（data_source_log）：DataService 每次补库/外部调用落一条。
+
+        用途：数据来源记录、API 成功率统计、自动补全失败排查、城市覆盖分析。
+        日志失败不抛出——记录本身绝不能影响数据查询主链路。
+        """
+        try:
+            with _LOCK:
+                self.conn.execute(
+                    "INSERT INTO data_source_log(data_type,city,source,success,"
+                    " fetched_at,error_code,error_message) VALUES(?,?,?,?,?,?,?)",
+                    (data_type, city, source, int(bool(success)), NOW(),
+                     error_code, error_message))
+                self.conn.commit()
+        except Exception:
+            pass
+
+    def data_logs(self, limit: int = 100, data_type: str = "",
+                  city: str = "") -> list[dict]:
+        rows = []
+        sql = "SELECT * FROM data_source_log"
+        where, args = [], []
+        if data_type:
+            where.append("data_type=?")
+            args.append(data_type)
+        if city:
+            where.append("city=?")
+            args.append(city)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, min(1000, int(limit))))
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
 
     def upsert_city(self, name: str, geo: list[float] | None = None,
                     bbox: tuple | None = None) -> None:

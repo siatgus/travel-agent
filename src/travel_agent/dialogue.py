@@ -33,6 +33,7 @@ from . import llm
 from . import real_tools
 from . import websearch
 from .composer import name_hit   # 点名/排除与 POI 名的双向匹配（与编排器同源）
+from .services import get_data_service
 from .tools import haversine_km
 
 
@@ -1190,25 +1191,25 @@ class Session:
         """
         kw = intent.food_keyword(utterance, city)
         near = intent.food_area(utterance)
-        args: dict = {"city": city, "category": "restaurant", "limit": 6}
-        if kw:
-            args["keyword"] = kw
-        if near:
-            args["near"] = near
-        r = agent.dispatch("search_poi", args)
-        items = (r.get("items") or []) if r.get("ok") else []
+        svc = get_data_service()
+        # 数据走 DataService（统一 DataResult 协议）；补库去重仍留在会话级
+        # （每城一次），autofetch 模块自己的失败缓存/熔断照常生效
+        res = svc.get_restaurants(city, keyword=kw, near=near, limit=6,
+                                  autofetch=False)
+        items = res.items
         if not items and city not in self._rest_fetched:
             # 库里没有餐厅：可能是整座城市没收录——按餐饮标签定向补库再答
             # （ensure_city 看景点 covered 就短路，补不了餐厅）
-            res = autofetch.ensure_city_data(city, "restaurant")
-            self._rest_fetched[city] = res
-            if res.get("status") == "fetched":
-                r = agent.dispatch("search_poi", args)
-                items = (r.get("items") or []) if r.get("ok") else []
+            res_af = svc.ensure(city, "restaurant")
+            self._rest_fetched[city] = res_af
+            if res_af.get("status") == "fetched":
+                res = svc.get_restaurants(city, keyword=kw, near=near, limit=6,
+                                          autofetch=False)
+                items = res.items
         if not items and kw:
-            r2 = agent.dispatch("search_poi", {k: v for k, v in args.items()
-                                               if k != "keyword"})
-            items = (r2.get("items") or []) if r2.get("ok") else []
+            res2 = svc.get_restaurants(city, keyword=None, near=near, limit=6,
+                                       autofetch=False)
+            items = res2.items
         label = (f"{near}·{kw}" if (near and kw) else
                  (kw or (f"{near}附近的餐厅" if near else "特色餐厅")))
         return intent.recommend_answer(city, label, items, client=self.client)
@@ -1235,20 +1236,26 @@ class Session:
         """查在售酒店；空了先在线补库一次（每城一次）。
 
         返回（酒店列表, 补录说明）——说明非空表示数据是刚抓的，只能报参考价。
+        数据走 DataService（统一 DataResult 协议），补库去重留在会话级。
         """
-        r = agent.dispatch("search_hotel", args)
-        hotels = (r.get("items") or []) if r.get("ok") else []
+        svc = get_data_service()
+        res = svc.get_hotels(city, check_in=args["check_in"],
+                             check_out=args["check_out"],
+                             guests=args["guests"], autofetch=False)
+        hotels = res.items
         note = ""
         if not hotels and city not in self._hotel_fetched:
             # 在线补库：只按住宿标签抓真实门店，抓不到不硬编
-            res = autofetch.ensure_city_data(city, "hotel")
-            self._hotel_fetched[city] = res
-            if res.get("status") == "fetched":
-                r = agent.dispatch("search_hotel", args)
-                hotels = (r.get("items") or []) if r.get("ok") else []
+            res_af = svc.ensure(city, "hotel")
+            self._hotel_fetched[city] = res_af
+            if res_af.get("status") == "fetched":
+                res = svc.get_hotels(city, check_in=args["check_in"],
+                                     check_out=args["check_out"],
+                                     guests=args["guests"], autofetch=False)
+                hotels = res.items
                 if hotels:
                     note = (f"{city}原先没有酒店数据，已按在线地图补录 "
-                            f"{res.get('hotels', 0)} 家；房价为星级估算的参考价，"
+                            f"{res_af.get('hotels', 0)} 家；房价为星级估算的参考价，"
                             f"未验证实时房态，预订前请以预订平台实时价格与房态为准")
         return hotels, note
 
