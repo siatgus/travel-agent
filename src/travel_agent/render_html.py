@@ -918,6 +918,21 @@ ROUTE_MAP_JS = """
     });
   }
 
+  // ---------- 缩放：手机上没有滚轮，双指捏合又不好按，给一对显式 +/− ----------
+  function bindZoom() {
+    var wrap = document.getElementById('rt-zoom');
+    var zin = document.getElementById('rt-zoom-in');
+    var zout = document.getElementById('rt-zoom-out');
+    if (!wrap || !zin || !zout) { return; }
+    wrap.style.display = 'flex';
+    zin.addEventListener('click', function () {
+      try { map.setZoom(Math.min(18, (map.getZoom() || 12) + 1)); } catch (e) {}
+    });
+    zout.addEventListener('click', function () {
+      try { map.setZoom(Math.max(3, (map.getZoom() || 12) - 1)); } catch (e) {}
+    });
+  }
+
   function init() {
     if (typeof T === 'undefined') { showFallback(); return; }
     var days = DATA.days || [];
@@ -998,6 +1013,7 @@ ROUTE_MAP_JS = """
     if (fb) fb.style.display = 'none';
     bindTabs();
     bindLocate();
+    bindZoom();
 
     // 逐天把直线占位换成真实道路走线；全失败也不影响页面可用
     var pending = dayRecs.filter(function (r) { return r.chain.length >= 2; }).length;
@@ -1735,6 +1751,22 @@ AMAP_ROUTE_JS = """
       } catch (e) { fail('定位失败：当前浏览器不支持定位'); }
     });
   }
+
+  // ---------- 缩放：手机上没有滚轮，双指捏合又不好按，给一对显式 +/− ----------
+  function bindZoom() {
+    var wrap = document.getElementById('rt-zoom');
+    var zin = document.getElementById('rt-zoom-in');
+    var zout = document.getElementById('rt-zoom-out');
+    if (!wrap || !zin || !zout) { return; }
+    wrap.style.display = 'flex';
+    zin.addEventListener('click', function () {
+      try { map.setZoom(Math.min(20, (map.getZoom() || 12) + 1)); } catch (e) {}
+    });
+    zout.addEventListener('click', function () {
+      try { map.setZoom(Math.max(3, (map.getZoom() || 12) - 1)); } catch (e) {}
+    });
+  }
+
   function init() {
     if (typeof AMap === 'undefined') { showFallback(); return; }
     var days = DATA.days || [];
@@ -1809,6 +1841,7 @@ AMAP_ROUTE_JS = """
     if (fb) fb.style.display = 'none';
     bindTabs();
     bindLocate();
+    bindZoom();
     // 逐天把直线占位换成真实道路走线；全失败也不影响页面可用
     var pending = dayRecs.filter(function (r) { return r.chain.length >= 2; }).length;
     var doneDays = 0, okSegs = 0, allSegs = 0;
@@ -1963,6 +1996,15 @@ def render_route_map(result: dict) -> str:
         f'font-size:12px;color:#2c3550;background:rgba(255,255,255,.92);'
         f'padding:2px 9px;border-radius:10px;max-width:74%;line-height:1.5;}}'
         f'#rt-locate-tip:empty{{display:none;}}'
+        # 缩放按钮：手机上没有滚轮、双指捏合又难按中，给一对显式 +/−
+        # （40px 圆钮，触屏友好；SVG 回落模式保持隐藏）
+        f'.rt-zoom{{position:absolute;right:10px;bottom:14px;z-index:20;display:none;'
+        f'flex-direction:column;gap:8px;}}'
+        f'.rt-zoom button{{width:40px;height:40px;border:1px solid #e6eaf5;'
+        f'background:rgba(255,255,255,.95);color:#2b5fe0;font-size:20px;font-weight:bold;'
+        f'border-radius:50%;cursor:pointer;font-family:inherit;line-height:1;padding:0;'
+        f'box-shadow:0 1px 4px rgba(0,0,0,.15);}}'
+        f'.rt-zoom button:active{{background:#eef2ff;}}'
         # 景点介绍卡片（hover 图钉弹出，效仿行程类 App 的大卡）
         f'.rt-card{{width:238px;font-family:inherit;}}'
         f'/* 迷你卡自带白底会跟 InfoWindow 的白色气泡叠成「框外框」，'
@@ -2000,6 +2042,10 @@ def render_route_map(result: dict) -> str:
         f'<div id="route-map" style="height:620px;border-radius:8px;display:none;"></div>'
         f'<button id="rt-locate" type="button" title="定位到我的当前位置">◎ 我的位置</button>'
         f'<div id="rt-locate-tip"></div>'
+        f'<div id="rt-zoom" class="rt-zoom">'
+        f'<button id="rt-zoom-in" type="button" title="放大地图">＋</button>'
+        f'<button id="rt-zoom-out" type="button" title="缩小地图">－</button>'
+        f'</div>'
         f'</div>'
         f'<div id="route-fallback">{svg}</div>'
         f'<div style="font-size:12px;color:#a0a8bd;margin-top:8px;">'
