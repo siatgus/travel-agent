@@ -370,6 +370,21 @@ def test_poi_category_question() -> None:
                                ("温泉",)) == [])
 
 
+def test_food_stay_questions() -> None:
+    """吃住问句是问答不是规划：「有什么酒店」不能触发整单重排（实测回了全新行程）。"""
+    check("特色美食认成吃的",
+          intent.is_food_question("邯郸还有什么特色美食")
+          and intent.is_food_question("这有什么好吃的"))
+    check("有什么酒店认成住宿",
+          intent.is_stay_question("有什么酒店")
+          and intent.is_stay_question("邯郸有什么酒店"))
+    check("提住宿要求不算问句", not intent.is_stay_question("酒店要五星的"))
+    check("改口味不算问句", not intent.is_food_question("想吃辣的"))
+    check("吃住问句进 poi 意图",
+          intent.classify("邯郸还有什么特色美食") == "poi"
+          and intent.classify("有什么酒店") == "poi")
+
+
 def test_nearby_answer_template() -> None:
     """周边问答的模板路径：有数据按距离列、没数据如实说。"""
     pois = [{"name": "崇圣寺三塔", "area": "古城北", "cost": 75,
@@ -410,6 +425,7 @@ def main() -> int:
                test_reco_routing,
                test_spot_answer_template, test_poi_answer_autofetch,
                test_smalltalk, test_identity_variants, test_comparison_question, test_poi_category_question,
+               test_food_stay_questions,
                test_question_shape,
                test_nearby_answer_template,
                test_no_destination_no_plan,

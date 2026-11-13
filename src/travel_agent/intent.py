@@ -391,6 +391,27 @@ def is_category_question(text: str) -> bool:
     return poi_category(text) is not None and bool(_CAT_ASK_RE.search(text or ""))
 
 
+# 吃住问句：「还有什么特色美食」「有什么酒店」问的是吃/住，不是「这城市有什么
+# 景点」，更不是新规划需求——实测「有什么酒店」被当成要排行程，回了一份全新
+# 5 天行程。与品类问句同一防线：必须带问法词，改需求句式（「酒店要五星的」
+# 「想吃辣的」）不拦，照旧走方案修改。
+_FOOD_KW = ("美食", "小吃", "好吃的", "特色菜", "名吃", "餐馆", "餐厅",
+            "饭店", "吃的", "好吃的馆子")
+_STAY_KW = ("酒店", "宾馆", "民宿", "住宿", "住哪")
+
+
+def is_food_question(text: str) -> bool:
+    """在问「有什么吃的/特色美食」吗（改口味偏好的句子不算）。"""
+    t = text or ""
+    return any(w in t for w in _FOOD_KW) and bool(_CAT_ASK_RE.search(t))
+
+
+def is_stay_question(text: str) -> bool:
+    """在问「有什么酒店/住哪」吗（提住宿要求不算，那是改方案）。"""
+    t = text or ""
+    return any(w in t for w in _STAY_KW) and bool(_CAT_ASK_RE.search(t))
+
+
 def classify(text: str) -> str:
     """返回 weather / poi / transport / plan / plan_qa / smalltalk / other。
 
@@ -410,7 +431,8 @@ def classify(text: str) -> str:
             return "plan"
     if any(k in t for k in WEATHER_KW):
         return "weather"
-    if any(k in t for k in POI_KW) or _RECO_RE.search(t) or is_category_question(t):
+    if any(k in t for k in POI_KW) or _RECO_RE.search(t) or is_category_question(t) \
+            or is_food_question(t) or is_stay_question(t):
         return "poi"
     if any(k in t for k in TRANSPORT_KW):
         return "transport"
@@ -851,6 +873,45 @@ def recommend_answer(city: str, keyword: str, pois: list[dict],
         nt = f" —— {p['note']}" if p.get("note") else ""
         lines.append(f"- **{p['name']}**{tail}{nt}")
     lines.append("\n想把哪一家排进行程，直接说「我想去XX」。")
+    return "\n".join(lines)
+
+
+def stay_answer(city: str, hotels: list[dict] | None, client=None) -> str:
+    """回答「有什么酒店」：列库里的在售酒店（起价口径），不是要重排行程。"""
+    if not hotels:
+        return (f"{city}的酒店数据我还没收录，不敢瞎报名字和价格。\n"
+                f"排行程时会按你的预算和片区选酒店；想了解具体一家，说个名字"
+                f"我帮你查。")
+    def _fact(h: dict) -> dict:
+        price = h.get("price")
+        if isinstance(price, float) and price.is_integer():
+            price = int(price)
+        d = {"名称": h.get("name"), "片区": h.get("area"),
+             "每晚起价元": price,
+             "距市中心公里": h.get("dist_to_core_km")}
+        if h.get("star"):
+            d["星级"] = h["star"]
+        if h.get("cancel_free"):
+            d["可免费取消"] = "是"
+        return d
+
+    facts = {"城市": city, "问的": "有什么酒店",
+             "口径": "在营房源起价，节假日上浮 30%~50%",
+             "结果": [_fact(h) for h in hotels[:5]]}
+    said = _speak(client, "poi", facts, "有什么酒店",
+                  [h.get("name") for h in hotels[:2]])
+    if said:
+        return said
+    lines = [f"{city}收录了在售酒店（起价，节假日会上浮 30%~50%）："]
+    for h in hotels[:5]:
+        star = f"{h['star']}星 " if h.get("star") else ""
+        free = "，可免费取消" if h.get("cancel_free") else ""
+        price = h.get("price")
+        if isinstance(price, float) and price.is_integer():
+            price = int(price)
+        lines.append(f"- **{h.get('name')}**：{star}每晚约 {price} 元"
+                     f"（距市中心 {h.get('dist_to_core_km')} 公里{free}）")
+    lines.append("\n定了日期和人数，排行程时我会按预算和片区帮你选。")
     return "\n".join(lines)
 
 

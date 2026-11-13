@@ -1540,6 +1540,39 @@ def test_poi_category_no_local_hit_goes_online() -> None:
         ws.search = orig
 
 
+def test_food_question_lists_restaurants() -> None:
+    """「还有什么特色美食」→ 报收录的馆子，不拿景点清单凑数（实测答成古城石窟）。"""
+    from travel_agent.llm import ScriptedClient
+
+    c = ScriptedClient(["本地值得吃的就是这几家老店，都在市区。"])
+    s = Session(today=TODAY, client=c)
+    s.slots["destination"] = "邯郸"
+    r = s.turn("邯郸还有什么特色美食")
+    check("美食问句按问答处理", r.mode == "answer", f"mode={r.mode}")
+    check("报的是馆子",
+          "驴肉火烧" in r.render and "水饺" in r.render, r.render[:160])
+    check("不拿景点凑数",
+          "娲皇宫" not in r.render and "广府古城" not in r.render,
+          r.render[:160])
+
+
+def test_stay_question_lists_hotels_not_replan() -> None:
+    """「有什么酒店」→ 报在售酒店，绝不触发整单重排（实测回了一份全新 5 天行程）。"""
+    from travel_agent.llm import ScriptedClient
+
+    c = ScriptedClient(["能订的有四家，丛台大酒店 260 起，尚客优精选 110 起，"
+                        "都在市中心附近。"])
+    s = Session(today=TODAY, client=c)
+    s.slots["destination"] = "邯郸"
+    r = s.turn("邯郸有什么酒店")
+    check("住宿问句按问答处理", r.mode == "answer", f"mode={r.mode}")
+    check("报的是酒店与价格",
+          "酒店" in r.render and "每晚" in r.render, r.render[:160])
+    check("没有整单重排",
+          "出行概要" not in r.render and "行程日期" not in r.render,
+          r.render[:160])
+
+
 def test_meta_question_answered() -> None:
     """问助手本人的话（「你是什么模型」「你是做什么的」）必须答得上，不许回「行程已经在上面了」。
 
@@ -1653,6 +1686,8 @@ def main() -> int:
                test_meta_question_answered,
                test_comparison_question_not_generic_list,
                test_poi_category_question_filters_by_type,
+               test_food_question_lists_restaurants,
+               test_stay_question_lists_hotels_not_replan,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):
         fn()

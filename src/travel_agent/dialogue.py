@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 from . import agent
 from . import autofetch
@@ -453,6 +453,19 @@ class Session:
                 return (f"{city}的资料里我还没收录「{label}」这类地方，不敢瞎报名字。\n"
                         f"可以说个具体名字，我查到就给你介绍；或者说清想玩什么，"
                         f"排行程时我按这个挑点。")
+            # 「还有什么特色美食」问的是吃：报库里收录的馆子，别拿景点清单凑数
+            # （实测这句回了一串广府古城、娲皇宫）。
+            if intent.is_food_question(utterance):
+                r = agent.dispatch("search_poi", {"city": city,
+                                                  "category": "restaurant",
+                                                  "limit": 6})
+                items = (r.get("items") or []) if r.get("ok") else []
+                return intent.recommend_answer(city, "特色美食", items,
+                                               client=self.client)
+            # 「有什么酒店」问的是住：报库里的在售酒店（起价口径），不是新规划
+            # 需求——实测这句被当成要排行程，回了一份全新 5 天行程。
+            if intent.is_stay_question(utterance):
+                return self._stay_answer(city, utterance)
             # 「推荐几家驴肉火烧」：问的是这一类里有什么，不是点名单个店。
             # 之前落到别的分支被当成改行程整单重排（实测）。
             kw = intent.reco_keyword(utterance, city)
@@ -1538,6 +1551,20 @@ class Session:
         if budget.get("total"):
             lines.append(f"- 预算合计约 {budget['total']} 元")
         return "\n".join(lines)
+
+    def _stay_answer(self, city: str, utterance: str) -> str:
+        """「有什么酒店/住哪」：按明晚入住、当前人数查在售酒店作答。
+
+        日期没定就按明晚起价口径（facts 里写明），不拿这个当排行程信号——
+        这句是问答，不是新规划需求。
+        """
+        din = (self.today + timedelta(days=1)).isoformat()
+        dout = (self.today + timedelta(days=2)).isoformat()
+        guests = int(self.slots.get("party_size") or 2)
+        r = agent.dispatch("search_hotel", {"city": city, "check_in": din,
+                                            "check_out": dout, "guests": guests})
+        hotels = (r.get("items") or []) if r.get("ok") else []
+        return intent.stay_answer(city, hotels, client=self.client)
 
     def _general_answer(self, utterance: str) -> str | None:
         """通用旅行问题：先联网检索，再让模型组织；没模型就渲染带来源的摘要列表。
