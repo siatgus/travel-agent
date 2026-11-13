@@ -403,97 +403,24 @@ class Session:
 
         配了模型时，工具查到的事实会交给模型组织成人话（intent 里做）；
         没配模型或模型输出跑偏，返回的就是模板——两条路的事实完全一致。
+
+        意图分发表（2026-11-13 拆分）：kind 仍是 classify 的粗分类
+        （规则优先 + LLM 兜底，规则没推翻）；poi 类再经 intent.refine_intent
+        细分成景点/美食/餐厅/酒店/路线等子意图，各自独立方法，分支不再互相
+        堆在一个函数里。城市解析与会话状态（last_city/轮次计数）留在这里。
         """
         # 城市判定顺序：本句里的城市 > 当前行程目的地 > 最近提到的城市。
         # 「天安门广场周边有什么」一句里未必带"北京"，但行程本身在北京。
         city = (intent.city_in(utterance) or self.slots.get("destination")
                 or self.last_city or self.trip_dest)
         if kind == "weather":
-            if not city:
-                return intent.weather_answer("", utterance)
-            self.last_city = city
-            first = self.weather_rounds == 0
-            self.weather_rounds += 1
-            return intent.weather_answer(city, utterance, with_hint=first,
-                                         client=self.client)
+            return self._weather_answer(city, utterance)
         if kind == "poi":
-            if not city:
-                return intent.poi_answer("")
-            self.last_city = city
-            # 「邯郸有没有像迪士尼一样的地方」问的是「按类型找同类」，
-            # 不是「这城市有什么景点」：库里没有类型标签，套本地清单会
-            # 答成古城石窟（实测答非所问）。这类交给模型 + 联网检索，
-            # 检索/模型都不可用才退回本地清单。
-            if intent.is_comparison_question(utterance):
-                said = self._general_answer(utterance)
-                if said:
-                    return said
-            # 「上海迪士尼门票多少钱」是问具体景点，不是问「上海有什么好玩的」。
-            # 先按名字查库；库里没有就联网/问模型补一条入库再答——而不是把
-            # 具体点名当成泛推荐，回一串不相干的热门景点。
-            spot = intent.spot_mention(utterance, city)
-            if spot:
-                if re.search(r"周边|附近|周围", utterance):
-                    return self._nearby_qa(city, spot)
-                return self._spot_qa(city, spot)
-            # 问的是「某个品类」（游乐园/动物园/温泉…）：库里没有类型标签，
-            # 泛推荐会把广府古城、娲皇宫端上来（实测「中小型游乐园」就这么答的）。
-            # 先按品类词筛本地收录：有就只报这些；没有再去联网/问模型；
-            # 最后才如实说这类没收录——绝不拿不相干的景点凑数。
-            cat = intent.poi_category(utterance)
-            if cat:
-                label, words = cat
-                allr = agent.dispatch("search_poi", {"city": city, "limit": 200})
-                allp = (allr.get("items") or []) if allr.get("ok") else []
-                hit = intent.category_pois(allp, words)
-                if hit:
-                    return intent.recommend_answer(city, label, hit[:5],
-                                                   client=self.client)
-                said = self._general_answer(f"{city}有没有{label}")
-                if said:
-                    return said
-                return (f"{city}的资料里我还没收录「{label}」这类地方，不敢瞎报名字。\n"
-                        f"可以说个具体名字，我查到就给你介绍；或者说清想玩什么，"
-                        f"排行程时我按这个挑点。")
-            # 吃问句拆两路（2026-11-13）：「特色美食」问的是菜品文化（火锅、
-            # 担担面这类知识答），走 food_knowledge 表；「火锅店/川菜馆」
-            # 找的是真实商家，走 restaurant POI。原先一把抓查餐厅库——
-            # 问文化给店名单、库里没店就干瞪眼，两头都错。
-            if intent.is_food_question(utterance):
-                if intent.food_question_kind(utterance) == "restaurant":
-                    return self._answer_restaurant(city, utterance)
-                return self._answer_food(city, utterance)
-            # 「有什么酒店」问的是住：报库里的在售酒店（起价口径），不是新规划
-            # 需求——实测这句被当成要排行程，回了一份全新 5 天行程。
-            if intent.is_stay_question(utterance):
-                return self._stay_answer(city, utterance)
-            # 「推荐几家驴肉火烧」：问的是这一类里有什么，不是点名单个店。
-            # 之前落到别的分支被当成改行程整单重排（实测）。
-            kw = intent.reco_keyword(utterance, city)
-            if kw:
-                r = agent.dispatch("search_poi",
-                                   {"city": city, "keyword": kw, "limit": 5})
-                items = (r.get("items") or []) if r.get("ok") else []
-                if not items and len(kw) >= 4:
-                    # 用户常记错店名头一个字（「老驴肉火烧」≠「老驴头驴肉火烧」）：
-                    # 掉首字再试一次，别急着说没收录
-                    r2 = agent.dispatch("search_poi",
-                                        {"city": city, "keyword": kw[1:],
-                                         "limit": 5})
-                    items = (r2.get("items") or []) if r2.get("ok") else []
-                return intent.recommend_answer(city, kw, items,
-                                               client=self.client)
-            return intent.poi_answer(city, client=self.client)
+            return self._poi_answer(city, utterance)
         if kind == "transport":
-            origin, dest = agent._extract_route(utterance)
-            origin = origin or self.slots.get("origin")
-            dest = dest or self.slots.get("destination") or None
-            if dest:
-                self.last_city = dest
-            return intent.transport_answer(utterance, origin, dest,
-                                           client=self.client)
+            return self._transport_answer(city, utterance)
         if kind == "smalltalk":
-            return intent.smalltalk_answer(utterance, client=self.client)
+            return self._smalltalk_answer(utterance)
         if kind == "plan_qa":
             # 没出过方案就不拦：这句可能是在闲聊，交回排行程流程正常处理
             if not (self.plan_made and self.last_plan):
@@ -502,6 +429,147 @@ class Session:
         if kind == "general":
             return self._general_answer(utterance)
         return None
+
+    def _weather_answer(self, city: str | None, utterance: str) -> str:
+        """天气问句：真实预报优先，超出窗口自动用历史同期均值。"""
+        if not city:
+            return intent.weather_answer("", utterance)
+        self.last_city = city
+        first = self.weather_rounds == 0
+        self.weather_rounds += 1
+        return intent.weather_answer(city, utterance, with_hint=first,
+                                     client=self.client)
+
+    def _transport_answer(self, city: str | None, utterance: str) -> str:
+        """城际交通问句：班次/时刻/票价来自真实班次库。"""
+        origin, dest = agent._extract_route(utterance)
+        origin = origin or self.slots.get("origin")
+        dest = dest or self.slots.get("destination") or None
+        if dest:
+            self.last_city = dest
+        return intent.transport_answer(utterance, origin, dest,
+                                       client=self.client)
+
+    def _smalltalk_answer(self, utterance: str) -> str:
+        """闲聊/身份问句：带人设的自由作答（不冒充商业型号、不编数字）。"""
+        return intent.smalltalk_answer(utterance, client=self.client)
+
+    def _poi_answer(self, city: str, utterance: str) -> str:
+        """poi 粗分类下的细分分流。
+
+        refine_intent 只决定「先试哪一路」；某一路没接住（返回 None，比如
+        联网失败）就按原链路继续往后试，兜底仍是泛推荐——拆分前后行为一致。
+        """
+        if not city:
+            return intent.poi_answer("")
+        self.last_city = city
+        chain = (("general", self._comparison_answer),
+                 ("route_query", self._route_answer),
+                 ("attraction_search", self._attraction_answer),
+                 ("food_query", self._food_answer),
+                 ("restaurant_search", self._restaurant_answer),
+                 ("hotel_search", self._hotel_answer))
+        fine = intent.refine_intent(utterance, city)
+        names = [n for n, _ in chain]
+        start = names.index(fine) if fine in names else 0
+        for _, fn in chain[start:]:
+            said = fn(city, utterance)
+            if said:
+                return said
+        return intent.poi_answer(city, client=self.client)
+
+    def _comparison_answer(self, city: str, utterance: str) -> str | None:
+        """类比问句（「有没有像迪士尼一样的地方」）→ 联网检索。
+
+        库里没有类型标签，套本地清单会答成古城石窟（实测答非所问）；
+        联网没接住返回 None，交回链路继续。
+        """
+        if not intent.is_comparison_question(utterance):
+            return None
+        return self._general_answer(utterance)
+
+    def _attraction_answer(self, city: str, utterance: str) -> str | None:
+        """景点咨询三路：点名景点（含周边泛问）、品类问句、按关键词推荐。"""
+        # 「上海迪士尼门票多少钱」是问具体景点，不是问「上海有什么好玩的」。
+        # 先按名字查库；库里没有就联网/问模型补一条入库再答——而不是把
+        # 具体点名当成泛推荐，回一串不相干的热门景点。
+        spot = intent.spot_mention(utterance, city)
+        if spot:
+            if re.search(r"周边|附近|周围", utterance):
+                return self._nearby_qa(city, spot)
+            return self._spot_qa(city, spot)
+        # 问的是「某个品类」（游乐园/动物园/温泉…）：库里没有类型标签，
+        # 泛推荐会把广府古城、娲皇宫端上来（实测「中小型游乐园」就这么答的）。
+        # 先按品类词筛本地收录：有就只报这些；没有再去联网/问模型；
+        # 最后才如实说这类没收录——绝不拿不相干的景点凑数。
+        cat = intent.poi_category(utterance)
+        if cat:
+            label, words = cat
+            allr = agent.dispatch("search_poi", {"city": city, "limit": 200})
+            allp = (allr.get("items") or []) if allr.get("ok") else []
+            hit = intent.category_pois(allp, words)
+            if hit:
+                return intent.recommend_answer(city, label, hit[:5],
+                                               client=self.client)
+            said = self._general_answer(f"{city}有没有{label}")
+            if said:
+                return said
+            return (f"{city}的资料里我还没收录「{label}」这类地方，不敢瞎报名字。\n"
+                    f"可以说个具体名字，我查到就给你介绍；或者说清想玩什么，"
+                    f"排行程时我按这个挑点。")
+        # 「推荐几家驴肉火烧」：问的是这一类里有什么，不是点名单个店。
+        # 之前落到别的分支被当成改行程整单重排（实测）。
+        kw = intent.reco_keyword(utterance, city)
+        if kw:
+            r = agent.dispatch("search_poi",
+                               {"city": city, "keyword": kw, "limit": 5})
+            items = (r.get("items") or []) if r.get("ok") else []
+            if not items and len(kw) >= 4:
+                # 用户常记错店名头一个字（「老驴肉火烧」≠「老驴头驴肉火烧」）：
+                # 掉首字再试一次，别急着说没收录
+                r2 = agent.dispatch("search_poi",
+                                    {"city": city, "keyword": kw[1:],
+                                     "limit": 5})
+                items = (r2.get("items") or []) if r2.get("ok") else []
+            return intent.recommend_answer(city, kw, items,
+                                           client=self.client)
+        return None
+
+    def _food_answer(self, city: str, utterance: str) -> str | None:
+        """美食知识问句（「有什么特色美食/火锅有什么特色」）→ 菜品文化。"""
+        if not (intent.is_food_question(utterance)
+                and intent.food_question_kind(utterance) != "restaurant"):
+            return None
+        return self._food_knowledge_answer(city, utterance)
+
+    def _restaurant_answer(self, city: str, utterance: str) -> str | None:
+        """餐厅搜索问句（「火锅店/川菜馆/春熙路附近的馆子」）→ 真实商家。"""
+        if not (intent.is_food_question(utterance)
+                and intent.food_question_kind(utterance) == "restaurant"):
+            return None
+        return self._restaurant_poi_answer(city, utterance)
+
+    def _hotel_answer(self, city: str, utterance: str) -> str | None:
+        """住宿问句（「有什么酒店」）→ 报在售酒店（起价口径），不是新规划。"""
+        if not intent.is_stay_question(utterance):
+            return None
+        return self._stay_answer(city, utterance)
+
+    def _route_answer(self, city: str, utterance: str) -> str | None:
+        """市内两点路线（「从X怎么去Y」）：两端都在库里才接，否则交回链路。"""
+        ends = intent.nearby_route_ends(utterance)
+        if not ends:
+            return None
+
+        def strip_city(s: str) -> str:
+            s2 = s.replace(city, "").strip("的了呀呢吧，, 　")
+            return s2 or s
+
+        pa = self._resolve_spot(city, strip_city(ends[0]))
+        pb = self._resolve_spot(city, strip_city(ends[1]))
+        if not (pa and pb) or (pa.get("name") or ends[0]) == (pb.get("name") or ends[1]):
+            return None
+        return self._route_qa(ends[0], ends[1], pa, pb)
 
     def _llm_history(self, limit: int = 6, per_msg: int = 240,
                      total: int = 800) -> list[dict]:
@@ -1759,7 +1827,7 @@ class Session:
             lines.append(f"- 预算合计约 {budget['total']} 元")
         return "\n".join(lines)
 
-    def _answer_food(self, city: str, utterance: str) -> str:
+    def _food_knowledge_answer(self, city: str, utterance: str) -> str:
         """美食知识答：「有什么特色美食/火锅有什么特色」——菜品文化，不查商家。
 
         数据来自 .kb.db 的 food_knowledge 表（与真实餐厅 POI 分表存放）；
@@ -1801,7 +1869,7 @@ class Session:
             lines.append(f"- **{r['name']}**（{cat}）：{r['intro']} {r['features']}")
         return "\n".join(lines)
 
-    def _answer_restaurant(self, city: str, utterance: str) -> str:
+    def _restaurant_poi_answer(self, city: str, utterance: str) -> str:
         """餐厅搜索答：「火锅店/川菜馆/春熙路附近的馆子」——真实商家 POI。
 
         带品类词（火锅/川菜）和片区词（春熙路）就按条件筛；品类词不在店名里

@@ -549,6 +549,37 @@ def nearby_route_ends(text: str) -> tuple[str, str] | None:
     return a, b
 
 
+# 细分意图（poi 粗分类之下）：规则判定，不调模型——分类仍走「规则优先、
+# LLM 兜底」，这里只是把原 poi 分支里的 if 链显式成意图名。
+FINE_POI_KINDS = ("general", "attraction_search", "food_query",
+                  "restaurant_search", "hotel_search", "route_query")
+
+
+def refine_intent(text: str, city: str | None = None) -> str:
+    """poi 类句子的细分意图，返回 FINE_POI_KINDS 之一。
+
+    判定顺序与对话层 poi 分支的拦截链一致：类比问句 > 市内路线 > 点名景点
+    > 品类 > 吃 > 住 > 泛推荐。路线放点名之前，否则「从大理古城到喜洲古镇」
+    永远被点名抢成景点问答——路线接不住（两端没收录）时对话层会按链路
+    继续落到景点问答，行为不变。
+    """
+    t = text or ""
+    if is_comparison_question(t):
+        return "general"
+    if nearby_route_ends(t):
+        return "route_query"
+    if spot_mention(t, city):
+        return "attraction_search"
+    if poi_category(t):
+        return "attraction_search"
+    if is_food_question(t):
+        return ("restaurant_search" if food_question_kind(t) == "restaurant"
+                else "food_query")
+    if is_stay_question(t):
+        return "hotel_search"
+    return "attraction_search"
+
+
 def classify(text: str) -> str:
     """返回 weather / poi / transport / plan / plan_qa / smalltalk / other。
 

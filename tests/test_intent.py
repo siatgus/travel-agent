@@ -457,6 +457,24 @@ def test_nearby_question_routing() -> None:
           intent.nearby_route_ends("从邯郸出发去成都玩3天") is None)
 
 
+def test_refine_intent() -> None:
+    """poi 粗分类下的细分意图：规则判定，顺序与对话层拦截链一致。"""
+    check("类比问句 → general",
+          intent.refine_intent("邯郸有没有像迪士尼一样的地方") == "general")
+    check("点名景点 → attraction_search",
+          intent.refine_intent("上海迪士尼门票多少钱") == "attraction_search")
+    check("美食知识 → food_query",
+          intent.refine_intent("成都有什么特色美食") == "food_query")
+    check("找店 → restaurant_search",
+          intent.refine_intent("成都有哪些好吃的火锅店") == "restaurant_search")
+    check("住宿 → hotel_search",
+          intent.refine_intent("有什么酒店") == "hotel_search")
+    check("市内路线 → route_query",
+          intent.refine_intent("从大理古城到喜洲古镇有多远") == "route_query")
+    check("泛问兜底 → attraction_search",
+          intent.refine_intent("大理有什么好玩的") == "attraction_search")
+
+
 def test_trim_optional_intent() -> None:
     """「把可去可不去的删掉」要识别成泛指删点，而不是当景点名抽取（冒烟实测）。"""
     yes = ("还是有点赶，把可去可不去的删掉", "删掉一些景点",
@@ -489,6 +507,7 @@ def main() -> int:
                test_question_shape,
                test_nearby_answer_template,
                test_nearby_question_routing,
+               test_refine_intent,
                test_no_destination_no_plan,
                test_trim_optional_intent):
         fn()
