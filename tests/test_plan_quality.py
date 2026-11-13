@@ -1816,6 +1816,28 @@ def test_day_target_not_total_days() -> None:
           .get("days") == 4)
 
 
+def test_origin_not_leaked_into_destination() -> None:
+    """「从邯郸出发」（没提目的地）：出发地不能漏成目的地。
+
+    实测：先排好成都行程，再说「从邯郸出发」，兜底「任意已知城市」把
+    邯郸捡成目的地，整单被改排成邯郸行程。规则与 LLM 两条路径都要挡。
+    """
+    for q in ("从邯郸出发", "从邯郸市出发", "我想从邯郸出发"):
+        s = agent.extract_slots_rules(q, today=date(2026, 11, 13))
+        check(f"「{q}」出发地成立", s.get("origin") is not None,
+              str(s.get("origin")))
+        check(f"「{q}」目的地为空", s.get("destination") is None,
+              str(s.get("destination")))
+    s2 = agent.extract_slots_rules("从邯郸出发去成都", today=date(2026, 11, 13))
+    check("带上目的地照常抽", s2.get("origin") == "邯郸"
+          and s2.get("destination") == "成都",
+          f"{s2.get('origin')}→{s2.get('destination')}")
+    s3 = agent.extract_slots_rules("成都到邯郸", today=date(2026, 11, 13))
+    check("A到B 双向不受影响", s3.get("origin") == "成都"
+          and s3.get("destination") == "邯郸",
+          f"{s3.get('origin')}→{s3.get('destination')}")
+
+
 def test_day_target_spot_placed_on_day() -> None:
     """「第N天要去X」：X 排进那一天，别的天不再捞走它。"""
     slots = dict(SLOTS, days=4,
@@ -1901,7 +1923,8 @@ def main() -> int:
                test_pace_noop_is_honest,
                test_uncertain_spot_owns_a_day, test_day_sight_cap,
                test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice,
-               test_day_target_not_total_days, test_day_target_spot_placed_on_day,
+               test_day_target_not_total_days, test_origin_not_leaked_into_destination,
+               test_day_target_spot_placed_on_day,
                test_stay_nodes_per_night):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)

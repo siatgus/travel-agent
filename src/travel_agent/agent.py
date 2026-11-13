@@ -515,6 +515,11 @@ def extract_slots(text: str, today: date | None = None,
         _d = slots.get("destination")
         if _d and (_BAD_POI_RE.search(_d) or _QUANT_RE.fullmatch(_d)):
             slots["destination"] = None
+        # 模型也会把「从邯郸出发」的出发地回成目的地（与规则路径同一道闸：
+        # 出发地≠目的地，指向同一地方时目的地作废，否则整单改排到出发地）
+        if slots.get("destination") and slots.get("origin") \
+                and name_hit(slots["destination"], slots["origin"]):
+            slots["destination"] = None
         # 模型给的必去/排除同样要过景点名校验：城市串、时刻碎片、省份名
         # 一旦留下来，autofetch 会把它当"未收录景点"落库并长期污染
         for key in ("must_visit", "avoid"):
@@ -592,6 +597,12 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
                 and not re.search(r"时间|时刻|改为|改成|改到|提前|推迟|班次|车次|航班|高铁", dest) \
                 and not re.match(r"^[几多少什么哪]", dest):
             slots["destination"] = dest
+        # 「从邯郸出发」（整句没提目的地）：出发地绝不能漏成目的地——
+        # 兜底「任意已知城市」会把它捡回来，方案已有时这句会把整趟行程
+        # 改排到出发地（实测「去成都的行程，从邯郸出发」排成邯郸行程）
+        if slots["destination"] and slots["origin"] \
+                and name_hit(slots["destination"], slots["origin"]):
+            slots["destination"] = None
 
     if m := re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]", text):
         month, day = int(m.group(1)), int(m.group(2))
