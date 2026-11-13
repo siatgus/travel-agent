@@ -59,6 +59,18 @@ def stay_text(days) -> str:
     return f"{d} 天 {n} 晚" if n else f"{d} 天 · 当日往返"
 
 
+def _stay_card(result: dict, days: int) -> str:
+    """概要卡里的「住宿」一格：具体到选中的酒店与每晚起价；没有就如实说。"""
+    h = ((result.get("hotel") or {}).get("items") or [{}])[0] if days > 1 else {}
+    if not h.get("name"):
+        return "按均价估算" if days > 1 else "当日往返不住宿"
+    star = f"{h['star']}星 · " if h.get("star") else ""
+    price = h.get("price")
+    if isinstance(price, float) and price.is_integer():
+        price = int(price)
+    return f"{esc(h['name'])}（{star}约¥{price}/晚起）"
+
+
 def project(points: list[list[float]], w: int, h: int, pad: int = 28):
     """经纬度 → 画布坐标，带纬度校正与边界扩展。"""
     lats = [p[0] for p in points]
@@ -2254,6 +2266,7 @@ def build_html(result: dict, utterance: str) -> str:
         fact("行程天数", stay_text(s['days'])),
         fact("出行人数", (f"{s['party_size']} 人（{esc(s['party_detail'])}）"
                           if s.get("party_detail") else f"{s['party_size']} 人")),
+        fact("住宿", _stay_card(result, s["days"])),
         fact("预算目标", f"¥{b['target']:,.0f}" if b.get("target") else "未设定"),
         fact("节奏 / 硬性偏好", f"{pace} / {esc(prefs)}"),
         fact("首日天气",

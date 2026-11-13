@@ -1343,6 +1343,8 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
                              if m not in must_report["placed"]
                              and m not in must_report["unresolved"]]
 
+    _append_stay_nodes(days_plan, hotel, nights, rooms, room_label)
+
     return {"slots": slots, "origin": origin, "has_origin": has_origin,
             "weather": weather, "pois": pois, "hotel": hotel,
             "outbound": outbound, "inbound": inbound,
@@ -1703,6 +1705,56 @@ def _no_transport_reason(result: dict) -> str:
     return "、".join(legs) + " 的班次票价没查到"
 
 
+def _day_end(nodes: list[dict]) -> str:
+    """一天最后一个节点的结束时刻（HH:MM）；解析不了就按 21:00。"""
+    if not nodes:
+        return "21:00"
+    last = nodes[-1]
+    try:
+        hh, mm = (int(x) for x in str(last.get("time") or "21:00").split(":")[:2])
+        end = hh * 60 + mm + int(last.get("duration_min") or 0)
+    except (ValueError, TypeError):
+        return "21:00"
+    return f"{end // 60 % 24:02d}:{end % 60:02d}"
+
+
+def _stay_tip(h: dict, nights: int, rooms: int, room_label: str) -> str:
+    bits = [f"全程住同一家，{nights} 晚 × {rooms} {room_label}"]
+    if h.get("star"):
+        bits.append(f"{h['star']}星")
+    if h.get("price"):
+        bits.append(f"约 {round(h['price'])} 元/晚")
+    bits.append("可免费取消" if h.get("cancel_free") else "取消政策以平台为准")
+    if h.get("area"):
+        bits.append(f"在{h['area']}")
+    return "，".join(bits)
+
+
+def _append_stay_nodes(days_plan: list[dict], hotel: dict, nights: int,
+                       rooms: int, room_label: str) -> None:
+    """每个过夜日的末尾补一条「入住：XX」节点。
+
+    用户实测反馈「行程都没安排具体在哪里住宿」：酒店此前只活在预算明细
+    那行小字里，每天日程看不到住哪。cost 置 0——住宿费在预算明细里已按
+    整趟计，节点再带金额会双重收费。最后一天返程不住宿，不补。
+    """
+    _h = (hotel.get("items") or [{}])[0] if nights and hotel.get("items") else {}
+    if not _h.get("name"):
+        return
+    for d in days_plan[:-1]:
+        d["nodes"].append({
+            "time": _day_end(d["nodes"]), "name": f"入住：{_h['name']}",
+            "type": "hotel", "duration_min": 30, "transit": "",
+            "tip": _stay_tip(_h, nights, rooms, room_label), "cost": 0,
+            "booking_required": False, "poi_id": None,
+            "geo": _h.get("geo") or None, "interests": [],
+            "geo_uncertain": False})
+    # 抵达日本来就有一条「抵达 + 入住」：把酒店名带上，别让人以为到了再找房
+    for n in days_plan[0]["nodes"]:
+        if n["type"] == "transit" and "入住" in n["name"]:
+            n["name"] = f"抵达 + 入住（{_h['name']}）"
+
+
 def summary_lines(result: dict) -> list[str]:
     """方案开头的「出行概要」：出发地、日期、天数、人数、预算。
 
@@ -1746,12 +1798,25 @@ def summary_lines(result: dict) -> list[str]:
     else:
         budget += "；你没说预算，下面按三档给参考"
 
+    # 住哪一家必须写进概要：预算明细里那行「住宿」用户根本翻不到
+    # （实测反馈「行程都没安排具体在哪里住宿」）。
+    _h = ((result.get("hotel") or {}).get("items") or [{}])[0] if nights else {}
+    if _h.get("name"):
+        _star = f"{_h['star']}星 " if _h.get("star") else ""
+        stay_line = (f"- **住宿**：{_h['name']}（{_star}约 "
+                     f"{round(_h['price'])} 元/晚 × {nights} 晚，全程同一家不换房）")
+    elif nights:
+        stay_line = "- **住宿**：暂无报价，按常见均价估算（订房前以实际房价为准）"
+    else:
+        stay_line = None
+
     return [
         f"- **出发地 → 目的地**：{origin_disp} → {dest}",
         f"- **行程日期**：{start.isoformat()} 至 {end.isoformat()}"
         f"（{_stay}）",
         f"- **出行人数**：{_party}　|　**节奏**：{pace}"
         + (f"　|　**硬性偏好**：{prefs}" if prefs else ""),
+        *([stay_line] if stay_line else []),
         budget,
     ]
 

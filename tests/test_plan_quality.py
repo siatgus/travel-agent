@@ -1800,6 +1800,52 @@ def test_render_narrative_layout() -> None:
     check("单日方案住宿行写当日往返", "当天往返，不用订房" in t1)
 
 
+def test_stay_nodes_per_night() -> None:
+    """每晚住哪要写在日程里（用户实测反馈「行程都没安排具体在哪里住宿」）。
+
+    酒店此前只活在预算明细那行小字里：概要不写、每天日程末尾也不写，
+    用户根本不知道自己住哪。
+    """
+    plan, _ = _compose()
+    hotel = {"items": [{"name": "成都空气酒店", "star": 3, "price": 260.0,
+                        "area": "春熙路", "cancel_free": True,
+                        "geo": [30.65, 104.06]}]}
+    agent._append_stay_nodes(plan, hotel, nights=3, rooms=1, room_label="间")
+    for d in plan[:-1]:
+        last = d["nodes"][-1]
+        check(f"Day{d['day']} 末尾是入住节点",
+              last["type"] == "hotel" and "成都空气酒店" in last["name"],
+              f"{last['time']} {last['name']}")
+        check(f"Day{d['day']} 入住节点不重复计费", last["cost"] == 0,
+              f"cost={last['cost']}")
+    check("返程日不住宿", plan[-1]["nodes"][-1]["type"] != "hotel",
+          f"{plan[-1]['nodes'][-1]['name']}")
+    check("入住节点带酒店坐标", plan[0]["nodes"][-1]["geo"] == [30.65, 104.06])
+    arr = next((n for n in plan[0]["nodes"]
+                if n["type"] == "transit" and "入住" in n["name"]), None)
+    check("抵达节点写明酒店",
+          arr is not None and "成都空气酒店" in arr["name"],
+          f"{arr and arr['name']}")
+
+    result = {"slots": SLOTS, "origin": None, "hotel": hotel,
+              "budget": {"total": 4104.0, "per_person": 2052.0, "target": 8000}}
+    stay = next((x for x in agent.summary_lines(result)
+                 if x.startswith("- **住宿**")), "")
+    check("概要写明酒店与单价",
+          "成都空气酒店" in stay and "260" in stay and "3 晚" in stay, stay)
+    result2 = {"slots": SLOTS, "origin": None, "hotel": {"items": []},
+               "budget": {"total": 4104.0, "per_person": 2052.0}}
+    stay2 = next((x for x in agent.summary_lines(result2)
+                  if x.startswith("- **住宿**")), "")
+    check("暂无报价如实说按均价估算", "均价估算" in stay2, stay2)
+    # 单日行程没有住宿行
+    result3 = {"slots": dict(SLOTS, days=1), "origin": None,
+               "hotel": hotel,
+               "budget": {"total": 300.0, "per_person": 150.0}}
+    check("单日行程不写住宿",
+          not any(x.startswith("- **住宿**") for x in agent.summary_lines(result3)))
+
+
 def main() -> int:
     for fn in (test_no_time_overlap, test_uncertain_geo_no_fake_route,
                test_interests_landed, test_interest_is_explainable,
@@ -1825,7 +1871,8 @@ def main() -> int:
                test_render_budget_and_weather, test_render_narrative_layout,
                test_pace_noop_is_honest,
                test_uncertain_spot_owns_a_day, test_day_sight_cap,
-               test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice):
+               test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice,
+               test_stay_nodes_per_night):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
