@@ -933,55 +933,36 @@ ROUTE_MAP_JS = """
     });
   }
 
-  // ---------- 全屏：地图一键铺满整屏（含 iOS Safari 仿全屏兜底） ----------
+  // ---------- 全屏：只做页面内铺满，不走浏览器原生全屏 ----------
+  // （原生全屏连浏览器界面一起盖掉，观感突兀；fixed 铺满视口就够用，
+  //   iOS Safari 也不支持 div 原生全屏，索性统一仿全屏）
   function bindFullscreen() {
     var btn = document.getElementById('rt-fs');
     var wrap = document.getElementById('rt-map-wrap');
     if (!btn || !wrap) { return; }
     btn.style.display = 'block';
-    var isFs = function () {
-      return document.fullscreenElement === wrap ||
-             document.webkitFullscreenElement === wrap ||
-             (' ' + wrap.className + ' ').indexOf(' rt-full ') >= 0;
-    };
+    var on = false;
     var settle = function () {
-      // 容器尺寸变了，让底图重新量一遍；不支持的方法直接吞掉
+      // 容器尺寸变了，让底图按新尺寸重排；顺带广播 resize 事件
+      // （高德监听 window resize，天地图用 checkResize）
       setTimeout(function () {
         try { if (map.checkResize) { map.checkResize(); } } catch (e) {}
+        try { window.dispatchEvent(new Event('resize')); } catch (e) {}
       }, 350);
     };
-    var setIcon = function (on) {
-      btn.textContent = on ? '✕' : '⛶';
-      btn.title = on ? '退出全屏' : '全屏显示地图';
-    };
-    var leave = function () {
-      if (document.fullscreenElement || document.webkitFullscreenElement) {
-        var ex = document.exitFullscreen || document.webkitExitFullscreen;
-        try { if (ex) { ex.call(document); } } catch (e) {}
+    btn.addEventListener('click', function () {
+      on = !on;
+      if (on) {
+        wrap.classList.add('rt-full');
+        document.body.classList.add('rt-lock');
       } else {
         wrap.classList.remove('rt-full');
         document.body.classList.remove('rt-lock');
-        settle();
       }
-    };
-    var fakeFs = function () {
-      // iPhone Safari 不允许 div 原生全屏：fixed 铺满视口顶一个够用
-      wrap.classList.add('rt-full');
-      document.body.classList.add('rt-lock');
+      btn.textContent = on ? '✕' : '⛶';
+      btn.title = on ? '退出全屏' : '全屏显示地图';
       settle();
-    };
-    btn.addEventListener('click', function () {
-      if (isFs()) { leave(); return; }
-      var req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
-      if (!req) { fakeFs(); return; }
-      try {
-        var p = req.call(wrap);
-        if (p && p.catch) { p.catch(function () { fakeFs(); }); }
-      } catch (e) { fakeFs(); }
     });
-    var sync = function () { setIcon(isFs()); settle(); };
-    document.addEventListener('fullscreenchange', sync);
-    document.addEventListener('webkitfullscreenchange', sync);
   }
 
   function init() {
@@ -1819,55 +1800,36 @@ AMAP_ROUTE_JS = """
     });
   }
 
-  // ---------- 全屏：地图一键铺满整屏（含 iOS Safari 仿全屏兜底） ----------
+  // ---------- 全屏：只做页面内铺满，不走浏览器原生全屏 ----------
+  // （原生全屏连浏览器界面一起盖掉，观感突兀；fixed 铺满视口就够用，
+  //   iOS Safari 也不支持 div 原生全屏，索性统一仿全屏）
   function bindFullscreen() {
     var btn = document.getElementById('rt-fs');
     var wrap = document.getElementById('rt-map-wrap');
     if (!btn || !wrap) { return; }
     btn.style.display = 'block';
-    var isFs = function () {
-      return document.fullscreenElement === wrap ||
-             document.webkitFullscreenElement === wrap ||
-             (' ' + wrap.className + ' ').indexOf(' rt-full ') >= 0;
-    };
+    var on = false;
     var settle = function () {
-      // 容器尺寸变了，让底图重新量一遍；不支持的方法直接吞掉
+      // 容器尺寸变了，让底图按新尺寸重排；顺带广播 resize 事件
+      // （高德监听 window resize，天地图用 checkResize）
       setTimeout(function () {
         try { if (map.checkResize) { map.checkResize(); } } catch (e) {}
+        try { window.dispatchEvent(new Event('resize')); } catch (e) {}
       }, 350);
     };
-    var setIcon = function (on) {
-      btn.textContent = on ? '✕' : '⛶';
-      btn.title = on ? '退出全屏' : '全屏显示地图';
-    };
-    var leave = function () {
-      if (document.fullscreenElement || document.webkitFullscreenElement) {
-        var ex = document.exitFullscreen || document.webkitExitFullscreen;
-        try { if (ex) { ex.call(document); } } catch (e) {}
+    btn.addEventListener('click', function () {
+      on = !on;
+      if (on) {
+        wrap.classList.add('rt-full');
+        document.body.classList.add('rt-lock');
       } else {
         wrap.classList.remove('rt-full');
         document.body.classList.remove('rt-lock');
-        settle();
       }
-    };
-    var fakeFs = function () {
-      // iPhone Safari 不允许 div 原生全屏：fixed 铺满视口顶一个够用
-      wrap.classList.add('rt-full');
-      document.body.classList.add('rt-lock');
+      btn.textContent = on ? '✕' : '⛶';
+      btn.title = on ? '退出全屏' : '全屏显示地图';
       settle();
-    };
-    btn.addEventListener('click', function () {
-      if (isFs()) { leave(); return; }
-      var req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
-      if (!req) { fakeFs(); return; }
-      try {
-        var p = req.call(wrap);
-        if (p && p.catch) { p.catch(function () { fakeFs(); }); }
-      } catch (e) { fakeFs(); }
     });
-    var sync = function () { setIcon(isFs()); settle(); };
-    document.addEventListener('fullscreenchange', sync);
-    document.addEventListener('webkitfullscreenchange', sync);
   }
 
   function init() {
@@ -2110,8 +2072,8 @@ def render_route_map(result: dict) -> str:
         f'box-shadow:0 1px 4px rgba(0,0,0,.15);}}'
         f'.rt-zoom button:active{{background:#eef2ff;}}'
         # 全屏按钮：手机上 620px 的地图在长页面里太小，一键铺满整屏
-        # （支持 Fullscreen API 的浏览器走原生全屏；iOS Safari 不支持
-        # div 全屏，退化为 fixed 定位铺满视口的仿全屏；SVG 回落保持隐藏）
+        # （只做页面内铺满，不调浏览器原生全屏——原生会把浏览器界面一起
+        #   盖掉，观感突兀；SVG 回落保持隐藏）
         f'.rt-fs{{position:absolute;top:46px;right:10px;z-index:20;display:none;'
         f'width:40px;height:40px;border:1px solid #e6eaf5;'
         f'background:rgba(255,255,255,.95);color:#2b5fe0;font-size:19px;'
