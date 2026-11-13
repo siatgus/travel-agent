@@ -87,6 +87,12 @@ _PLAN_EDIT_RE = re.compile(
     r"加上|加个|加一个|去掉|删掉|不要去|避开|换成")
 # 明确的"动手排"动词：句子里有它才算规划请求
 _PLAN_VERB_RE = re.compile(r"排|规划|安排|做.{0,3}攻略|做.{0,3}行程|定制")
+# 「成都三天怎么玩」是规划请求：N天+怎么玩/玩什么/怎么安排——没有排/规划
+# 字眼，但语义毫不含糊（实测被分类成 poi 走了泛推荐）。「第N天怎么玩」不算：
+# 那是在问已有行程的某一天，前面有「第」字挡住。
+_PLAN_HOW_RE = re.compile(
+    r"(?<!第)(?:[一二三四五六七八九十\d]+\s*天|几\s*天)[^，。？?！!]{0,4}"
+    r"(?:怎么玩|玩什么|怎么安排|该怎么玩)")
 # 分钟级精确时刻：15:20 / 15点20(分) / 3点半。只有带分钟的才算——
 # 「下午3点出发」这种整点常是班次/到站信息，交给对应问答处理
 _CLOCK_PRECISE_RE = re.compile(
@@ -319,6 +325,25 @@ def looks_like_question(text: str) -> bool:
     if not t or len(t) > 60:
         return False
     return bool(_QUESTION_RE.search(t))
+
+
+# 点名景点问答的问法：「宽窄巷子是什么地方」「XX怎么样」「门票多少钱」。
+# other 意图里命中这个句式且剥得出景点名时，直接按景点问答处理——
+# 无模型时实测「宽窄巷子是什么地方」落进补槽位流程，被追问「想去哪儿」。
+_SPOT_ASK_RE = re.compile(
+    r"是什么地方|是什么|是哪里|怎么样|好不好玩|好玩吗|值得去吗|值得玩吗"
+    r"|门票|开放时间|介绍|简介|历史悠久吗|出名吗")
+
+
+def is_spot_qa(text: str, city: str | None = None) -> bool:
+    """在问某个具体景点的情况吗（而非提改行程要求）。"""
+    t = text or ""
+    if not looks_like_question(t) or not _SPOT_ASK_RE.search(t):
+        return False
+    # 改行程的指令句不拦：「把宽窄巷子加进必去」没有问法词，天然挡住
+    if re.search(r"加[进上到]|排进|删|去掉|不要|避开|换成|改成|必去", t):
+        return False
+    return spot_mention(t, city) is not None
 
 
 # 类比问句：「邯郸有没有像迪士尼一样的地方」「类似西湖这种」「跟丽江差不多的」
@@ -589,6 +614,10 @@ def classify(text: str) -> str:
     t = text or ""
     if is_plan_qa(t):
         return "plan_qa"
+    # 「成都三天怎么玩」这类句式就是规划请求，没有排/规划字眼也要拦进
+    # 规划流程——判错代价不对称：规划类宁可规则先拦，不让它漏成问答。
+    if _PLAN_HOW_RE.search(t):
+        return "plan"
     has_plan = (any(k in t for k in PLAN_KW)
                 or re.search(r"玩\s*[一二三四五六七八九十\d]+\s*天", t) is not None
                 or re.search(r"去.{2,6}(玩|旅游|旅行|度假)", t) is not None)
@@ -879,6 +908,9 @@ _SPOT_EDGE = ("门票多少钱", "门票多少", "门票贵吗", "门票要钱�
               "多少钱", "多少", "需要预约吗", "需要预约", "要预约吗", "预约",
               "想问问", "想知道", "想了解", "想去", "想去逛", "想逛", "请问",
               "问一下", "问下", "告诉我", "查一下", "查下", "看看", "一下", "听说",
+              # 「宽窄巷子是什么地方」：定义式问法也要剥干净，否则候选带着
+              # 「是什么地方」被疑问词防线整条拒掉，景点问答落空
+              "是个什么地方", "是什么地方", "是哪里", "是什么",
               "周边有什么", "附近有什么", "周围有什么", "周边", "附近", "周围",
               # 位置类问法：「老驴头驴肉火烧在哪里」曾整个当名字查库，
               # 查不到就落进泛推荐，答一串不相干景点（实测驴头不对马嘴）
@@ -932,6 +964,11 @@ def spot_mention(text: str, city: str | None = None) -> str | None:
             cand, changed = trimmed, True
     cand = cand.strip("的了呀啊呢吧，, ")
     if len(cand) < 2 or len(cand) > 10:
+        return None
+    # 剥边后还带疑问词的候选是残句不是地名：「成都火锅有什么特色」剥成
+    # 「火锅有什么特色」，拿去查库/在线补景点全是浪费——疑问词挡掉。
+    # （真景点名不可能含什么/怎么/哪里。）
+    if re.search(r"什么|怎么|哪[里儿个]|多少|为什么|吗", cand):
         return None
     if _SPOT_START_RE.match(cand):
         return None

@@ -554,7 +554,33 @@ class Session:
         """住宿问句（「有什么酒店」）→ 报在售酒店（起价口径），不是新规划。"""
         if not intent.is_stay_question(utterance):
             return None
+        # 出过方案时先看是不是在问这份行程安排的住宿：「之前安排的酒店在哪
+        # 里」问的是方案里的入住节点，回一张全城酒店清单是答非所问。
+        if (self.plan_made and self.last_plan
+                and re.search(r"酒店|住宿|住处|住哪", utterance)
+                and re.search(r"之前|刚才|行程|安排的|订的|定的|已订", utterance)):
+            stay = self._plan_stay_answer()
+            if stay:
+                return stay
         return self._stay_answer(city, utterance)
+
+    def _plan_stay_answer(self) -> str | None:
+        """回答「之前安排的酒店在哪里」：列出方案里的入住节点。"""
+        rows: list[str] = []
+        names: list[str] = []
+        for i, d in enumerate((self.last_plan or {}).get("days_plan") or [], 1):
+            for n in d.get("nodes") or []:
+                if n.get("type") == "hotel" and n.get("name"):
+                    rows.append(f"- 第 {i} 天晚上：{n['name']}"
+                                + (f"（{n['tip']}）" if n.get("tip") else ""))
+                    core = re.sub(r"^入住：", "", n["name"])
+                    if core not in names:
+                        names.append(core)
+        if not rows:
+            return None
+        return ("这趟行程安排的住宿：" + "、".join(names) + "。\n"
+                + "\n".join(rows)
+                + "\n\n要换酒店的话，说个预算或片区，我重新按它排。")
 
     def _route_answer(self, city: str, utterance: str) -> str | None:
         """市内两点路线（「从X怎么去Y」）：两端都在库里才接，否则交回链路。"""
@@ -846,10 +872,36 @@ class Session:
             if alt in ("weather", "poi", "transport", "plan_qa", "smalltalk",
                        "general"):
                 kind = alt
+        # 规则层兜底：other 且点名了收录景点在问细节（「宽窄巷子是什么地方」）
+        # → 按景点问答处理。无模型时实测这句落进补槽位流程，被追问「想去哪儿」。
+        if kind == "other" and intent.is_spot_qa(utterance) and (
+                intent.city_in(utterance) or self.slots.get("destination")
+                or self.last_city or self.trip_dest):
+            text = self._answer("poi", utterance)
+            if text is not None:
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode="answer", turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                             render=text)
         if kind in ("weather", "poi", "transport", "smalltalk",
                     "plan_qa", "general"):
             text = self._answer(kind, utterance)
             if text is not None:
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode="answer", turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds, slots=dict(self.slots),
+                             render=text)
+
+        # 出过方案后回看住宿安排（「之前安排的酒店在哪里」）：问的是方案
+        # 内容，不是新规划请求——实测被分类成 plan 走了重排追问日期。
+        if (self.plan_made and self.last_plan
+                and kind in ("plan", "plan_qa")
+                and re.search(r"酒店|住宿|住处|住哪", utterance)
+                and re.search(r"之前|刚才|行程|安排的|订的|定的|已订", utterance)
+                and not re.search(r"重新|重排|换[成掉]|改成|改一下|调整"
+                                  r"|加[进上]|删|去掉|不要", utterance)):
+            text = self._plan_stay_answer()
+            if text:
                 self.history.append({"role": "agent", "content": text})
                 return Reply(mode="answer", turn_no=self.turn_no,
                              ask_rounds=self.ask_rounds, slots=dict(self.slots),
