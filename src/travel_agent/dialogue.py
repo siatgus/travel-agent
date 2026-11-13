@@ -321,6 +321,8 @@ class Session:
         self.weather_rounds = 0               # 连续问天气的轮数（避免每轮重复同一段引导）
         self.fetched: dict[str, dict] = {}    # 自动补全过的城市 → 结果（会话内去重）
         self.max_autofetch = 3                # 一次会话最多为几个新城市联网抓数据
+        # 酒店定向补库记录：城市 → ensure_hotels 结果（住宿问答用，与景点补全分开）
+        self._hotel_fetched: dict[str, dict] = {}
         # 人数是否被用户明确说过。party_size 默认就是 1，光看槽位分不清
         # "用户说了一个人" 和 "用户压根没提"，后者要问一次再排。
         self.party_stated = False
@@ -1662,14 +1664,30 @@ class Session:
 
         日期没定就按明晚起价口径（facts 里写明），不拿这个当排行程信号——
         这句是问答，不是新规划需求。
+        库里没酒店先走一次在线补库（ensure_hotels 只看酒店表，城市"有景点
+        没酒店"时 ensure_city 会短路）；补到就报参考价并注明来源，补不到
+        才如实说没收录。
         """
         din = (self.today + timedelta(days=1)).isoformat()
         dout = (self.today + timedelta(days=2)).isoformat()
         guests = int(self.slots.get("party_size") or 2)
-        r = agent.dispatch("search_hotel", {"city": city, "check_in": din,
-                                            "check_out": dout, "guests": guests})
+        args = {"city": city, "check_in": din, "check_out": dout,
+                "guests": guests}
+        r = agent.dispatch("search_hotel", args)
         hotels = (r.get("items") or []) if r.get("ok") else []
-        return intent.stay_answer(city, hotels, client=self.client)
+        note = ""
+        if not hotels and city not in self._hotel_fetched:
+            # 在线补库：只按住宿标签抓真实门店，抓不到不硬编
+            res = autofetch.ensure_hotels(city)
+            self._hotel_fetched[city] = res
+            if res.get("status") == "fetched":
+                r = agent.dispatch("search_hotel", args)
+                hotels = (r.get("items") or []) if r.get("ok") else []
+                if hotels:
+                    note = (f"{city}原先没有酒店数据，已按在线地图补录 "
+                            f"{res.get('hotels', 0)} 家；房价为星级估算的参考价，"
+                            f"未验证实时房态，预订前请以预订平台实时价格与房态为准")
+        return intent.stay_answer(city, hotels, client=self.client, note=note)
 
     def _general_answer(self, utterance: str) -> str | None:
         """通用旅行问题：先联网检索，再让模型组织；没模型就渲染带来源的摘要列表。

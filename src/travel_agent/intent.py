@@ -955,12 +955,19 @@ def recommend_answer(city: str, keyword: str, pois: list[dict],
     return "\n".join(lines)
 
 
-def stay_answer(city: str, hotels: list[dict] | None, client=None) -> str:
-    """回答「有什么酒店」：列库里的在售酒店（起价口径），不是要重排行程。"""
+def stay_answer(city: str, hotels: list[dict] | None, client=None,
+                note: str = "") -> str:
+    """回答「有什么酒店」：列库里的在售酒店（起价口径），不是要重排行程。
+
+    note 非空说明数据是刚在线补录的：只能报参考价，绝不冒充实时房态。
+    """
     if not hotels:
-        return (f"{city}的酒店数据我还没收录，不敢瞎报名字和价格。\n"
+        text = (f"{city}的酒店数据我还没收录，不敢瞎报名字和价格。\n"
                 f"排行程时会按你的预算和片区选酒店；想了解具体一家，说个名字"
                 f"我帮你查。")
+        if note:
+            text += f"\n\n> 数据说明：{note}"
+        return text
     def _fact(h: dict) -> dict:
         price = h.get("price")
         if isinstance(price, float) and price.is_integer():
@@ -980,6 +987,8 @@ def stay_answer(city: str, hotels: list[dict] | None, client=None) -> str:
     said = _speak(client, "poi", facts, "有什么酒店",
                   [h.get("name") for h in hotels[:2]])
     if said:
+        if note:
+            said += f"\n\n> 数据说明：{note}"
         return said
     lines = [f"{city}收录了在售酒店（起价，节假日会上浮 30%~50%）："]
     for h in hotels[:5]:
@@ -991,6 +1000,8 @@ def stay_answer(city: str, hotels: list[dict] | None, client=None) -> str:
         lines.append(f"- **{h.get('name')}**：{star}每晚约 {price} 元"
                      f"（距市中心 {h.get('dist_to_core_km')} 公里{free}）")
     lines.append("\n定了日期和人数，排行程时我会按预算和片区帮你选。")
+    if note:
+        lines.append(f"\n> 数据说明：{note}")
     return "\n".join(lines)
 
 

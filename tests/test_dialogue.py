@@ -1604,6 +1604,45 @@ def test_stay_question_lists_hotels_not_replan() -> None:
           r.render[:160])
 
 
+def test_stay_question_triggers_hotel_autofill() -> None:
+    """「有什么酒店」→ 库里没酒店先在线补库再答，补到要注明非实时报价（2026-11-13）。"""
+    from travel_agent import autofetch as af
+    from travel_agent import kb as kb_mod
+
+    calls = {"n": 0}
+    orig = af.ensure_hotels
+
+    def fake(city, **kw):
+        calls["n"] += 1
+        kb_mod.get_kb().upsert_hotel(city, {
+            "name": f"{city}补录大酒店", "area": "市中心", "star": 4,
+            "price": 520, "geo": [30.02, 120.01], "cancel_free": True,
+            "dist_to_core_km": 1.2, "rating": 4.6,
+            "note": "房价为星级估算，非实时报价"})
+        return {"status": "fetched", "city": city, "source": "osm",
+                "pois": 0, "hotels": 1, "message": "在线抓取 1 家住宿并入库"}
+
+    af.ensure_hotels = fake
+    try:
+        s = Session(today=TODAY, client=None)
+        s.slots["destination"] = "酒店补库城"
+        r = s.turn("酒店补库城有什么酒店")
+        check("没酒店触发一次在线补库", calls["n"] == 1, f"calls={calls['n']}")
+        check("补库后报出酒店名", "补录大酒店" in r.render, r.render[:160])
+        check("注明数据来源与口径", "数据说明" in r.render
+              and "未验证实时房态" in r.render, r.render[-200:])
+        # 库里已有数据：换一个会话再问，直接报库里的，不再触发补库
+        s2 = Session(today=TODAY, client=None)
+        s2.slots["destination"] = "酒店补库城"
+        r2 = s2.turn("酒店补库城有什么酒店")
+        check("再次询问不再重复补库", calls["n"] == 1, f"calls={calls['n']}")
+        check("第二次同样报出酒店", "补录大酒店" in r2.render, r2.render[:160])
+    finally:
+        af.ensure_hotels = orig
+        for h in kb_mod.get_kb().list_hotels("酒店补库城") or []:
+            kb_mod.get_kb().delete_hotel(h["hotel_id"])
+
+
 def test_meta_question_answered() -> None:
     """问助手本人的话（「你是什么模型」「你是做什么的」）必须答得上，不许回「行程已经在上面了」。
 
@@ -1721,6 +1760,7 @@ def main() -> int:
                test_restaurant_question_lists_shops,
                test_day_change_keeps_days_and_places_spot,
                test_stay_question_lists_hotels_not_replan,
+               test_stay_question_triggers_hotel_autofill,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):
         fn()

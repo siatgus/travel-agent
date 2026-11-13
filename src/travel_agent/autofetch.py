@@ -378,6 +378,122 @@ def ensure_city(city: str, *, db=None, fetcher=None, client=None,
     return res
 
 
+# ---------------------------------------------------------------- 酒店定向补全
+#
+# ensure_city 看景点 covered 就短路（返回 exists），城市"有景点没酒店"
+# （实测成都：餐厅 5 家、酒店 0 家）的住宿永远补不上。ensure_hotels 只看
+# 酒店表，专门给住宿问答用：查本地 → 缺就按 Overpass 住宿标签抓一遍 →
+# 入库 → 调用方重新查询。模型路径产不出酒店（discover_pois 只有景点），
+# 所以这里不走 LLM，只认真实地图数据；抓不到就如实说，绝不编酒店。
+# 房价为星级估算价（_STAR_PRICE），入库时 note 已写明"非实时报价"。
+
+_HOTEL_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _remember_hotel(city: str, res: dict) -> None:
+    with _CACHE_LOCK:
+        _HOTEL_CACHE[city] = (time.time(), dict(res))
+
+
+def fetch_hotels(city: str, center: list[float]) -> list[dict]:
+    """只取住宿的 Overpass 查询（与 fetch_city 分流，供住宿问答补库）。"""
+    s, w, n, e = _bbox(center)
+    lodging = "|".join(_LODGING)
+    q = (f'[out:json][timeout:{int(TIMEOUT)}];'
+         f'('
+         f'node["tourism"~"^({lodging})$"]["name"]({s},{w},{n},{e});'
+         f'way["tourism"~"^({lodging})$"]["name"]({s},{w},{n},{e});'
+         f');out center {MAX_HOTELS};')
+    data = _overpass(q)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        name = (tags.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        c = el.get("center") or {}
+        lat = el.get("lat", c.get("lat"))
+        lon = el.get("lon", c.get("lon"))
+        if lat is None or lon is None:
+            continue
+        seen.add(name)
+        out.append(_hotel(name, tags, center, float(lat), float(lon)))
+    return out
+
+
+def ensure_hotels(city: str, *, db=None, fetcher=None,
+                  force: bool = False) -> dict:
+    """保证城市有酒店数据；缺就按住宿标签在线抓一次并入库。
+
+    返回字段与 ensure_city 一致：exists / fetched / empty / unresolved /
+    no_kb / disabled / skip / failed（命中失败缓存时多一个 cached=True）。
+    """
+    city = (city or "").strip()
+    if not city:
+        return {"status": "empty", "city": "", "pois": 0, "hotels": 0,
+                "message": "没有城市名"}
+    db = db or kb.get_kb()
+    if db is None:
+        return {"status": "no_kb", "city": city, "pois": 0, "hotels": 0,
+                "message": "知识库不可用"}
+    if db.list_hotels(city):
+        return {"status": "exists", "city": city, "pois": 0, "hotels": 0,
+                "message": "知识库已有该城市酒店"}
+    if not ENABLED and not force:
+        return {"status": "disabled", "city": city, "pois": 0, "hotels": 0,
+                "message": "自动补全已关闭（TRAVEL_AUTOFETCH=0）"}
+    if not plausible_city(city) and not force:
+        return {"status": "skip", "city": city, "pois": 0, "hotels": 0,
+                "message": "不像具体城市名，不抓取"}
+
+    with _CACHE_LOCK:
+        hit = _HOTEL_CACHE.get(city)
+        if hit and time.time() - hit[0] < FAIL_TTL_SEC:
+            return {**hit[1], "cached": True}
+
+    center = _resolve_center(city)
+    if not center:
+        res = {"status": "unresolved", "city": city, "pois": 0, "hotels": 0,
+               "message": f"地名「{city}」解析不到坐标"}
+        _remember_hotel(city, res)
+        _log(db, city, "unresolved", res["message"])
+        return res
+
+    try:
+        if fetcher is not None:
+            rows = fetcher(city, center)
+        else:
+            rows = fetch_hotels(city, center)
+    except Exception as e:                        # 网络/上游异常：降级，不阻塞对话
+        msg = f"{type(e).__name__}: {str(e)[:150]}"
+        res = {"status": "failed", "city": city, "pois": 0, "hotels": 0,
+               "message": msg}
+        _remember_hotel(city, res)
+        _log(db, city, "failed", msg)
+        return res
+
+    if not rows:
+        res = {"status": "empty", "city": city, "pois": 0, "hotels": 0,
+               "message": "上游没有返回可用住宿"}
+        _remember_hotel(city, res)
+        _log(db, city, "empty", res["message"])
+        return res
+
+    try:
+        db.upsert_city(city, center, _bbox(center))
+    except Exception:
+        pass
+    for h in rows[:MAX_HOTELS]:
+        db.upsert_hotel(city, h, source="auto-fetch")
+    res = {"status": "fetched", "city": city, "source": "osm",
+           "pois": 0, "hotels": len(rows[:MAX_HOTELS]),
+           "message": f"在线抓取 {len(rows)} 家住宿并入库"}
+    _remember_hotel(city, res)
+    _log(db, city, "success", "osm: " + res["message"])
+    return res
+
+
 # ---------------------------------------------------------------- 点名景点补全
 #
 # 「我想去上海迪士尼」而库里只有外滩/豫园时，编排器匹配不到这个 POI，
@@ -845,4 +961,5 @@ def reset_cache() -> None:
     global _OSM_DOWN_UNTIL
     with _CACHE_LOCK:
         _CACHE.clear()
+        _HOTEL_CACHE.clear()
     _OSM_DOWN_UNTIL = 0.0

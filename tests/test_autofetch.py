@@ -508,6 +508,70 @@ def test_llm_en_name_plumbed_to_refine() -> None:
           r["status"] == "fetched" and abs(geo[0] - 34.1182) < 1e-6, f"geo={geo}")
 
 
+def test_ensure_hotels_directed() -> None:
+    """酒店定向补全：城市有景点没酒店时 ensure_city 会短路，ensure_hotels 只看酒店表。"""
+    autofetch.reset_cache()
+    calls = {"n": 0}
+
+    def hotel_fetcher(city, center):
+        calls["n"] += 1
+        return [{"name": f"{city}大酒店", "area": "市中心", "star": 4,
+                 "price": 520, "geo": [30.02, 120.01], "cancel_free": True,
+                 "dist_to_core_km": 1.2, "rating": 4.6,
+                 "note": "房价为星级估算，非实时报价"}]
+
+    restore = _patch_center(CENTER)
+    try:
+        r1 = autofetch.ensure_hotels("无酒店城", fetcher=hotel_fetcher)
+        r2 = autofetch.ensure_hotels("无酒店城", fetcher=hotel_fetcher)
+        r3 = autofetch.ensure_hotels("无酒店城", fetcher=hotel_fetcher)
+        # 已有酒店的城市绝不重复抓取
+        def boom(*_a, **_k):
+            raise AssertionError("已有酒店数据不该触发抓取")
+        r4 = autofetch.ensure_hotels("邯郸", fetcher=boom)
+    finally:
+        restore()
+    check("无酒店城市抓取成功", r1["status"] == "fetched" and r1["hotels"] == 1,
+          f"{r1}")
+    check("酒店写入知识库",
+          any(h["name"] == "无酒店城大酒店"
+              for h in kb.get_kb().list_hotels("无酒店城") or []))
+    check("二次调用命中 exists 不重复抓", r2["status"] == "exists"
+          and calls["n"] == 1, f"r2={r2} calls={calls['n']}")
+    check("入库后的酒店带非实时报价标注",
+          "非实时报价" in (kb.get_kb().list_hotels("无酒店城") or [{}])[0]["note"])
+    check("入库后再次调用仍为 exists", r3["status"] == "exists", f"{r3}")
+    check("已有酒店城市返回 exists", r4["status"] == "exists", f"{r4}")
+
+
+def test_ensure_hotels_failure_and_empty() -> None:
+    """补库失败/上游没住宿：如实返回，不编酒店；失败短期不重试。"""
+    autofetch.reset_cache()
+    calls = {"n": 0}
+
+    def broken(city, center):
+        calls["n"] += 1
+        raise ConnectionError("上游超时")
+
+    def empty(city, center):
+        return []
+
+    restore = _patch_center(CENTER)
+    try:
+        f1 = autofetch.ensure_hotels("失败酒店城", fetcher=broken)
+        f2 = autofetch.ensure_hotels("失败酒店城", fetcher=broken)
+        e1 = autofetch.ensure_hotels("空住宿城", fetcher=empty)
+    finally:
+        restore()
+    check("抓取失败如实返回 failed", f1["status"] == "failed"
+          and "上游超时" in f1["message"], f"{f1}")
+    check("失败结果缓存不重试", calls["n"] == 1 and f2.get("cached") is True,
+          f"calls={calls['n']} f2={f2}")
+    check("上游没住宿返回 empty", e1["status"] == "empty", f"{e1}")
+    check("失败/空结果不写酒店", not (kb.get_kb().list_hotels("失败酒店城")
+                                      or kb.get_kb().list_hotels("空住宿城")))
+
+
 def main() -> int:
     # 默认关掉真实地理编码：单测不打外网（专项测试自己临时替换桩）
     autofetch.tdt_geocode = lambda *a, **k: None
@@ -516,6 +580,8 @@ def main() -> int:
     test_fetch_and_store()
     test_second_call_is_noop()
     test_failure_and_cache()
+    test_ensure_hotels_directed()
+    test_ensure_hotels_failure_and_empty()
     test_unresolved_and_disabled()
     test_field_mapping()
     test_llm_fallback_filters_hallucination()
