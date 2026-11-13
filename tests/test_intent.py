@@ -338,6 +338,38 @@ def test_comparison_question() -> None:
         check(f"非类比问句：{q}", not intent.is_comparison_question(q))
 
 
+def test_poi_category_question() -> None:
+    """品类问句（游乐园/温泉…）要认出品类，并按品类词筛本地景点。
+
+    实测（2026-11-13）：「本地或周边的中小型游乐园有哪些」回了广府古城、
+    娲皇宫、丛台公园，而库里明明有「邯郸方特国色春秋」。
+    """
+    cat = intent.poi_category("本地或周边的中小型游乐园有哪些")
+    check("认出「游乐园」品类", cat is not None and cat[0] == "游乐园", f"{cat}")
+    check("水上乐园优先于游乐园",
+          (intent.poi_category("附近有水世界吗") or ("",))[0] == "水上乐园")
+    check("温泉/博物馆也认", (intent.poi_category("邯郸有温泉吗") or ("",))[0] == "温泉"
+          and (intent.poi_category("北京有哪些博物馆") or ("",))[0] == "博物馆")
+    for q in ("北京有什么好玩的", "推荐几家驴肉火烧", "帮我排邯郸2天行程"):
+        check(f"泛问不算品类：{q}", intent.poi_category(q) is None,
+              f"{intent.poi_category(q)}")
+    check("品类词进 poi 意图",
+          intent.classify("邯郸有温泉吗") == "poi")
+    check("提要求带品类词不算问品类",
+          not intent.is_category_question("我一定要去喜洲古镇")
+          and intent.classify("我一定要去喜洲古镇") != "poi",
+          f"{intent.is_category_question('我一定要去喜洲古镇')}")
+
+    pois = [{"name": "邯郸方特国色春秋", "category": "attraction"},
+            {"name": "广府古城（永年）", "category": "attraction"},
+            {"name": "一篓油水饺（中华大街店）", "category": "restaurant"}]
+    hit = intent.category_pois(pois, cat[1])
+    check("只留同品类", [p["name"] for p in hit] == ["邯郸方特国色春秋"], f"{hit}")
+    check("饭馆不掺进品类",
+          intent.category_pois([{"name": "温泉火锅", "category": "restaurant"}],
+                               ("温泉",)) == [])
+
+
 def test_nearby_answer_template() -> None:
     """周边问答的模板路径：有数据按距离列、没数据如实说。"""
     pois = [{"name": "崇圣寺三塔", "area": "古城北", "cost": 75,
@@ -377,7 +409,7 @@ def main() -> int:
                test_poi_answer_no_invent, test_spot_mention,
                test_reco_routing,
                test_spot_answer_template, test_poi_answer_autofetch,
-               test_smalltalk, test_identity_variants, test_comparison_question,
+               test_smalltalk, test_identity_variants, test_comparison_question, test_poi_category_question,
                test_question_shape,
                test_nearby_answer_template,
                test_no_destination_no_plan,

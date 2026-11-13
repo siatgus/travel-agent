@@ -1492,6 +1492,54 @@ def test_comparison_question_not_generic_list() -> None:
         ws.search = orig
 
 
+def test_poi_category_question_filters_by_type() -> None:
+    """「中小型游乐园有哪些」→ 只报同品类，不甩古城石窟（实测答非所问）。
+
+    库里确实有「邯郸方特国色春秋」，之前却被当成「邯郸有什么好玩的」，
+    回了广府古城、娲皇宫、丛台公园——问题类型没识别，清单凑数。
+    """
+    from travel_agent.llm import ScriptedClient
+
+    c = ScriptedClient(["邯郸方特国色春秋是本地唯一的主题乐园，"
+                        "其余多是古城、石窟这类人文景点。"])
+    s = Session(today=TODAY, client=c)
+    r = s.turn("邯郸本地或周边的中小型游乐园有哪些")
+    check("品类问句按问答处理", r.mode == "answer", f"mode={r.mode}")
+    check("只报同品类", "方特" in r.render, r.render[:160])
+    check("不拿古城石窟凑数",
+          "娲皇宫" not in r.render and "丛台公园" not in r.render, r.render[:160])
+
+
+def test_poi_category_no_local_hit_goes_online() -> None:
+    """本地没有这个品类 → 联网作答；联网也没有才如实说没收录。"""
+    from travel_agent.llm import ScriptedClient
+    import travel_agent.websearch as ws
+
+    orig = ws.search
+    try:
+        ws.search = lambda q, **k: {"ok": True, "note": "联网检索完成",
+            "results": [{"title": "邯郸周边温泉",
+                         "url": "https://example.cn/hd-wq",
+                         "snippet": "邯郸市区没有温泉，周边涉县、武安一带有几处",
+                         "site": "example.cn"}]}
+        c = ScriptedClient(["邯郸 温泉",
+                            "邯郸市区没有温泉，涉县、武安一带有，得自驾过去。"])
+        s = Session(today=TODAY, client=c)
+        r = s.turn("邯郸有温泉吗")
+        check("没有同品类时走联网", r.mode == "answer" and "涉县" in r.render,
+              f"mode={r.mode} {r.render[:120]}")
+        check("不拿不相干景点凑数", "娲皇宫" not in r.render, r.render[:120])
+
+        # 连联网都没有：如实说没收录，不编名字
+        c2 = ScriptedClient(["邯郸 温泉"])
+        ws.search = lambda q, **k: {"ok": False, "note": "检索失败", "results": []}
+        s2 = Session(today=TODAY, client=c2)
+        r2 = s2.turn("邯郸有温泉吗")
+        check("查不到就说不收录", "没收录" in r2.render, r2.render[:120])
+    finally:
+        ws.search = orig
+
+
 def test_meta_question_answered() -> None:
     """问助手本人的话（「你是什么模型」「你是做什么的」）必须答得上，不许回「行程已经在上面了」。
 
@@ -1604,6 +1652,8 @@ def main() -> int:
                test_day_then_month_not_overridden,
                test_meta_question_answered,
                test_comparison_question_not_generic_list,
+               test_poi_category_question_filters_by_type,
+               test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):
         fn()
 

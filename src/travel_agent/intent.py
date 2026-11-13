@@ -336,6 +336,61 @@ def is_comparison_question(text: str) -> bool:
     return bool(_COMPARE_RE.search(text or ""))
 
 
+# 品类问句：「本地或周边的中小型游乐园有哪些」「邯郸有温泉吗」问的是一个**品类**，
+# 不是「这城市有什么景点」。库里没有类型标签、只有名字，所以只能按名字里的品类词
+# 判定：命中就只报这些，没命中再去联网，绝不能拿热门景点凑数——实测「中小型游乐园」
+# 回了广府古城、娲皇宫，而库里其实躺着「邯郸方特国色春秋」。
+POI_CATEGORIES = (
+    # (品类名, 用户问法里的词, 景点名里的词)
+    ("水上乐园", ("水上乐园", "水世界", "水公园"), ("水上乐园", "水世界", "水公园")),
+    ("游乐园", ("游乐园", "游乐场", "乐园", "主题公园", "欢乐谷", "方特", "过山车"),
+     ("乐园", "游乐", "欢乐谷", "方特", "主题公园")),
+    ("动物园", ("动物园", "野生动物园"), ("动物园",)),
+    ("海洋馆", ("海洋馆", "水族馆", "海底世界"), ("海洋馆", "水族馆", "海底世界")),
+    ("植物园", ("植物园",), ("植物园",)),
+    ("滑雪场", ("滑雪场", "滑雪"), ("滑雪",)),
+    ("温泉", ("温泉",), ("温泉",)),
+    ("博物馆", ("博物馆", "博物院"), ("博物馆", "博物院")),
+    ("古镇古城", ("古镇", "古城"), ("古镇", "古城")),
+    ("演出", ("演出", "表演", "话剧", "音乐剧"), ("剧场", "剧院", "演出")),
+)
+
+
+def poi_category(text: str) -> tuple[str, tuple[str, ...]] | None:
+    """问的是一个品类吗？返回 (品类名, 景点名匹配词)；泛问返回 None。
+
+    顺序有意义：「水上乐园」必须先于「游乐园」，否则水世界会被当成乐园。
+    """
+    t = text or ""
+    for label, ask_words, name_words in POI_CATEGORIES:
+        if any(w in t for w in ask_words):
+            return label, name_words
+    return None
+
+
+def category_pois(pois: list[dict] | None, name_words: tuple[str, ...]) -> list[dict]:
+    """从本地景点里筛出这个品类的条目：按名字匹配，饭馆不掺进来。"""
+    hit = []
+    for p in pois or []:
+        if p.get("category") == "restaurant":
+            continue
+        name = p.get("name") or ""
+        if any(w in name for w in name_words):
+            hit.append(p)
+    return hit
+
+
+# 品类词出现在句子里不等于在问品类：「我一定要去喜洲古镇」是改行程句式，
+# 带「古镇」两字，不能被当成「有哪些古镇」抢走（实测会答成景点介绍、不重排）。
+_CAT_ASK_RE = re.compile(r"有哪些|有没有|有什么|哪[里儿个家]|推荐|附近|周边|周围"
+                         r"|吗|呢|[?？]")
+
+
+def is_category_question(text: str) -> bool:
+    """在问某个品类有没有/有哪些（而不是在点名某个地方或提要求）。"""
+    return poi_category(text) is not None and bool(_CAT_ASK_RE.search(text or ""))
+
+
 def classify(text: str) -> str:
     """返回 weather / poi / transport / plan / plan_qa / smalltalk / other。
 
@@ -355,7 +410,7 @@ def classify(text: str) -> str:
             return "plan"
     if any(k in t for k in WEATHER_KW):
         return "weather"
-    if any(k in t for k in POI_KW) or _RECO_RE.search(t):
+    if any(k in t for k in POI_KW) or _RECO_RE.search(t) or is_category_question(t):
         return "poi"
     if any(k in t for k in TRANSPORT_KW):
         return "transport"

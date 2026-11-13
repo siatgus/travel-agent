@@ -434,6 +434,25 @@ class Session:
                 if re.search(r"周边|附近|周围", utterance):
                     return self._nearby_qa(city, spot)
                 return self._spot_qa(city, spot)
+            # 问的是「某个品类」（游乐园/动物园/温泉…）：库里没有类型标签，
+            # 泛推荐会把广府古城、娲皇宫端上来（实测「中小型游乐园」就这么答的）。
+            # 先按品类词筛本地收录：有就只报这些；没有再去联网/问模型；
+            # 最后才如实说这类没收录——绝不拿不相干的景点凑数。
+            cat = intent.poi_category(utterance)
+            if cat:
+                label, words = cat
+                allr = agent.dispatch("search_poi", {"city": city, "limit": 200})
+                allp = (allr.get("items") or []) if allr.get("ok") else []
+                hit = intent.category_pois(allp, words)
+                if hit:
+                    return intent.recommend_answer(city, label, hit[:5],
+                                                   client=self.client)
+                said = self._general_answer(f"{city}有没有{label}")
+                if said:
+                    return said
+                return (f"{city}的资料里我还没收录「{label}」这类地方，不敢瞎报名字。\n"
+                        f"可以说个具体名字，我查到就给你介绍；或者说清想玩什么，"
+                        f"排行程时我按这个挑点。")
             # 「推荐几家驴肉火烧」：问的是这一类里有什么，不是点名单个店。
             # 之前落到别的分支被当成改行程整单重排（实测）。
             kw = intent.reco_keyword(utterance, city)
