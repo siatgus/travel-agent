@@ -391,6 +391,37 @@ def is_category_question(text: str) -> bool:
     return poi_category(text) is not None and bool(_CAT_ASK_RE.search(text or ""))
 
 
+# 「把第2天的行程改成…」「Day 3 加个景点」：点的是某一天的行程，不是
+# 「整趟 N 天」。当成天数会把 4 天行程截成 2 天（用户实测：改第 2 天，
+# 重排后只剩 2 天，后面几天全没了）。
+_DAY_TARGET_RE = re.compile(
+    r"第\s*([一二两三四五六七八九十\d]{1,2})\s*天|[Dd]ay\s*([0-9]{1,2})")
+_CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+           "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _day_num(s: str) -> int | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s == "十":
+        return 10
+    if "十" in s:
+        a, _, b = s.partition("十")
+        return (_CN_NUM.get(a, 1) if a else 1) * 10 + (_CN_NUM.get(b, 0) if b else 0)
+    return _CN_NUM.get(s)
+
+
+def parse_day_target(text: str) -> int | None:
+    """这句话在点名「第 N 天 / Day N」吗？返回 1 起始的天序号，没有则 None。"""
+    m = _DAY_TARGET_RE.search(text or "")
+    if not m:
+        return None
+    return _day_num(m.group(1) or m.group(2))
+
+
 # 吃住问句：「还有什么特色美食」「有什么酒店」问的是吃/住，不是「这城市有什么
 # 景点」，更不是新规划需求——实测「有什么酒店」被当成要排行程，回了一份全新
 # 5 天行程。与品类问句同一防线：必须带问法词，改需求句式（「酒店要五星的」

@@ -707,6 +707,19 @@ class Session:
         # 这轮改动前的槽位：用来判断"用户要的调整是不是本来就已经满足"
         prev_slots = dict(self.slots or {})
 
+        # 「把第2天的行程改成…」：点名某一天。先验天数合法——超出方案天数
+        # 就如实说，不能把第 9 天硬塞进 4 天的行程里装没听见。
+        _day_no = intent.parse_day_target(utterance)
+        if self.plan_made and _day_no is not None:
+            _plan_days = len(((self.last_plan or {}).get("days_plan")) or [])
+            if _plan_days and _day_no > _plan_days:
+                text = (f"这份行程一共 {_plan_days} 天，改不了第 {_day_no} 天。\n\n"
+                        f"想加天先说「多玩一天」，我重排完你再点那一天的安排。")
+                self.history.append({"role": "agent", "content": text})
+                return Reply(mode="answer", turn_no=self.turn_no,
+                             ask_rounds=self.ask_rounds,
+                             slots=dict(self.slots), render=text)
+
         # 「加上都江堰，安排一天」不是"整趟 1 天"——是给新加的景点留一整天；
         # 「多住一天 / 延长两天 / 加一天」是顺延，不是"整趟 N 天"。
         # 规则层已挡一轮（agent.extract_slots），这里兜住 LLM 抽出来的结果。
@@ -827,6 +840,29 @@ class Session:
                 delta["avoid"] = [a for a in (delta.get("avoid") or [])
                                   if not any(name_hit(a, b) for b in back)]
                 explicit.add("must_visit")
+
+        # 点名「第N天」时，这轮新加的必去点归到那一天，不再全局撒——
+        # 全局必去在第一天就会被占位，「第3天去喜洲」实际会排到 Day 1。
+        if self.plan_made and _day_no is not None and delta.get("must_visit"):
+            _moved = [m for m in delta["must_visit"] if m]
+            delta = dict(delta)
+            delta["must_visit"] = []
+            explicit.discard("must_visit")
+            _dt = dict(delta.get("day_targets") or {})
+            _dt[str(_day_no)] = sorted(set(
+                (_dt.get(str(_day_no)) or []) + _moved))
+            delta["day_targets"] = _dt
+            explicit.add("day_targets")
+            # 老的必去清单里同名点也挪过去：留着的话它在别的天照样被当必去占位
+            if self.slots:
+                _old = [m0 for m0 in (self.slots.get("must_visit") or [])
+                        if any(name_hit(m0, mv) for mv in _moved)]
+                if _old:
+                    self.slots = dict(self.slots)
+                    self.slots["must_visit"] = [
+                        m0 for m0 in (self.slots.get("must_visit") or [])
+                        if m0 not in _old]
+            lead_notes.append(f"「{'、'.join(_moved)}」排进第 {_day_no} 天")
 
         if self.slots:
             self.slots, self.total_is_derived = merge_slots(

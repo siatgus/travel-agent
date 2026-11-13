@@ -639,7 +639,17 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         uncertain.append("date_range")
 
     _spot_day = None   # 「给X安排一天 / 安排一天去X」里要留整天的那个点
-    if m := re.search(r"([一二两三四五六七八九十\d]{1,3})\s*天", text):
+    _days_match = None
+    for _m in re.finditer(r"([一二两三四五六七八九十\d]{1,3})\s*天", text):
+        # 「第N天」点的是某一天（「把第2天改成…」），不是整趟 N 天——
+        # 当成天数会把 4 天行程截成 2 天（用户实测）。第几天由对话层的
+        # day_targets 承接，抽取这里跳过这个匹配。
+        if text[max(0, _m.start() - 1):_m.start()] == "第":
+            continue
+        _days_match = _m
+        break
+    if _days_match is not None:
+        m = _days_match
         n = cn_to_int(m.group(1))
         pre = text[max(0, m.start() - 2):m.start()]
         # 「安排/留/住 + N天」有两种常见含义，都不是"整趟 N 天"：

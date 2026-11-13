@@ -1018,6 +1018,28 @@ def test_plan_adds_must_visit_poi() -> None:
           f"added={added} noted={noted} before={sorted(names1)}")
 
 
+def test_day_change_keeps_days_and_places_spot() -> None:
+    """「把第2天的行程改成…」：4 天行程不能被截成 2 天（用户实测），
+    新点的点还要真落进第 2 天。"""
+    s = session()
+    r1 = s.turn("11月8号去大理玩4天，2人，预算6000")
+    check("前置：4 天方案", r1.mode == "plan"
+          and len(r1.plan["days_plan"]) == 4)
+    r2 = s.turn("把第2天的行程改成上午去洱海")
+    dp = (r2.plan or {}).get("days_plan") or []
+    check("改第2天后总天数仍是 4", r2.mode == "plan" and len(dp) == 4,
+          f"mode={r2.mode} days={len(dp)}")
+    hit = [i + 1 for i, d in enumerate(dp)
+           if any((n["type"] == "attraction"
+                   and ("洱海" in n["name"] or "洱海" in (n.get("tip") or "")))
+                  for n in d["nodes"])]
+    # 降水概率 >60% 时户外点会被换成室内替代（备注写明原计划），两种都算落位
+    check("洱海排进第 2 天", hit == [2], str(hit))
+    r3 = s.turn("改第9天的行程")
+    check("超出天数如实拒绝", r3.mode == "answer" and "改不了第 9 天" in r3.render,
+          r3.render[:60])
+
+
 def test_spot_qa_fetches_missing_spot() -> None:
     """问库里没有的具体景点 → 在线/模型补全入库后作答，而不是当泛推荐敷衍。"""
     import travel_agent.autofetch as af
@@ -1687,6 +1709,7 @@ def main() -> int:
                test_comparison_question_not_generic_list,
                test_poi_category_question_filters_by_type,
                test_food_question_lists_restaurants,
+               test_day_change_keeps_days_and_places_spot,
                test_stay_question_lists_hotels_not_replan,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):

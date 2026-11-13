@@ -627,7 +627,18 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             pool_remaining = [p for p in remaining if not _geo_uncertain(p)]
         else:
             pool_remaining = remaining
-        picked = _pick_chain(pool_remaining, slots, rain, home, day_cap, d, log, pref_rank)
+        # 「第N天要去X」：目标天的点只在那一天进池（别的天分数再高也不进，
+        # 否则会在更早的天被捞走、目标天落空），并在那一天按必去占位。
+        _dt = slots.get("day_targets") or {}
+        day_musts = [x for x in (_dt.get(str(i + 1)) or _dt.get(i + 1) or []) if x]
+        if _dt:
+            _other = [x for k, lst in _dt.items() if str(k) != str(i + 1)
+                      for x in (lst or [])]
+            if _other:
+                pool_remaining = [p for p in pool_remaining
+                                  if not any(name_hit(x, p["name"]) for x in _other)]
+        picked = _pick_chain(pool_remaining, slots, rain, home, day_cap, d, log,
+                             pref_rank, extra_musts=day_musts)
         # 紧迫度高（闭馆早、耗时长）的先占时段，同等紧迫度保持原有成团顺序
         picked = sorted(picked, key=lambda x: (_must_start(x), picked.index(x)))
         if days == 1:
@@ -941,8 +952,10 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
 
 def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float],
                 quota: int, d: date, log: dict,
-                pref_rank: dict[str, int] | None = None) -> list[dict]:
-    """锚点 + 就近成团，受单日移动时长上限约束。"""
+                pref_rank: dict[str, int] | None = None,
+                extra_musts: list[str] | None = None) -> list[dict]:
+    """锚点 + 就近成团，受单日移动时长上限约束。extra_musts：指定要排在
+    这一天的点（「第N天要去X」），与全局必去点同样优先占位。"""
     if quota <= 0:
         return []
     pool, blocked = [], []
@@ -979,6 +992,9 @@ def _pick_chain(remaining: list[dict], slots: dict, rain: int, home: list[float]
     # 只靠 +4.0 加分会被距离成本压掉（远处景点 -5 半径惩罚 + 线性距离惩罚），
     # 结果就是用户说"一定要去喜洲"，系统却因为 18km 而换了个近的。
     must_names = [m for m in (slots.get("must_visit") or []) if m]
+    for _em in (extra_musts or []):
+        if _em and not any(name_hit(_em, x) for x in must_names):
+            must_names.append(_em)
     must = []
     for m in must_names:
         hits = [p for p in pool if name_hit(m, p["name"])]

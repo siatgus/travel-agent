@@ -27,7 +27,7 @@ _TA_ROOT = _TA_PATH(__file__).resolve().parents[1]
 if str(_TA_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_TA_ROOT / "src"))
 
-from travel_agent import agent, composer
+from travel_agent import agent, composer, intent as ta_intent
 from travel_agent.dialogue import Session
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -1800,6 +1800,35 @@ def test_render_narrative_layout() -> None:
     check("单日方案住宿行写当日往返", "当天往返，不用订房" in t1)
 
 
+def test_day_target_not_total_days() -> None:
+    """「把第2天的行程改成…」点的是某一天，不是整趟 2 天。
+
+    实测：改第 2 天的行程，天数被抽成 2，4 天行程重排后只剩 2 天，
+    后面几天全被删了。第几天的语义由 intent.parse_day_target 承接。
+    """
+    s = agent.extract_slots_rules("把第2天的行程改成上午去洱海",
+                                  today=date(2026, 11, 13))
+    check("第N天不抽成整趟天数", s.get("days") is None, str(s.get("days")))
+    check("识别出目标天是第 2 天", ta_intent.parse_day_target(
+        "把第2天的行程改成上午去洱海") == 2)
+    check("整趟天数照常抽取",
+          agent.extract_slots_rules("去成都玩4天", today=date(2026, 11, 13))
+          .get("days") == 4)
+
+
+def test_day_target_spot_placed_on_day() -> None:
+    """「第N天要去X」：X 排进那一天，别的天不再捞走它。"""
+    slots = dict(SLOTS, days=4,
+                 date_range={"start": "2026-11-20", "end": "2026-11-23"},
+                 must_visit=[], day_targets={"2": ["武侯祠"]})
+    plan, _ = composer.compose(slots, {"items": CHENGDU}, WEATHER,
+                               "12:00", "18:00", [30.66, 104.06])
+    days_hit = [i + 1 for i, d in enumerate(plan)
+                if any(n["type"] == "attraction" and "武侯祠" in n["name"]
+                       for n in d["nodes"])]
+    check("指定点只出现在目标天", days_hit == [2], str(days_hit))
+
+
 def test_stay_nodes_per_night() -> None:
     """每晚住哪要写在日程里（用户实测反馈「行程都没安排具体在哪里住宿」）。
 
@@ -1872,6 +1901,7 @@ def main() -> int:
                test_pace_noop_is_honest,
                test_uncertain_spot_owns_a_day, test_day_sight_cap,
                test_multi_spot_list_extracted, test_same_spot_not_scheduled_twice,
+               test_day_target_not_total_days, test_day_target_spot_placed_on_day,
                test_stay_nodes_per_night):
         fn()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
