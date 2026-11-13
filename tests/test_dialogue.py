@@ -997,7 +997,11 @@ def test_plan_removes_excluded_poi() -> None:
         return
     r2 = s.turn(f"我不想去{target['name']}，换个别的")
     base_name = target["name"].split("（")[0]
-    names2 = {n["name"] for d in r2.plan["days_plan"] for n in d["nodes"]}
+    # 只看景点节点：酒店/餐厅名（如「入住：大理古城八月客栈」）天然包含
+    # 「大理古城」这类城市前缀，拿它们判 gone 会误报（RouteEngine 重排后
+    # 首个景点可能是带城市前缀的名字，实测暴露）
+    names2 = {n["name"] for d in r2.plan["days_plan"] for n in d["nodes"]
+              if n["type"] == "attraction"}
     gone = all(base_name not in n for n in names2)
     noted = any("已按你的要求避开" in a for a in r2.assumptions)
     check("方案后说「不想去X」→ 重排后X消失且明确告知",

@@ -844,12 +844,17 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         return valid_poi_name(frag) and frag not in known_set
 
     # 停止字符集让「想去大理古城逛逛」截成「大理古城」，而不是吞进"逛逛"。
+    # 全角/半角括号也是停止符：库里带括注的全名（大理古城（人民路·复兴路））
+    # 用户可能照抄全名说「不想去大理古城（人民路·复兴路）」——括号不在停止
+    # 集里时捕获组直接失配，avoid 静默丢失（RouteEngine 重排后首个景点
+    # 带括注，实测暴露）。截成核心名即可，veto/必去匹配走 name_hit 子串。
     # (?<![不别用]) 挡住"不想去/别去/不用去"——否则必去与排除会同时命中同一景点。
     # 「加上/增加」覆盖行程改不了的另一种说法："帮我加上迪士尼"。
     # 「顺便去/再去/也去」覆盖顺带点名："去上海顺便去迪士尼"——这类点名
     # 之前静默丢失。再去/也去要再挡"不想再去/别再去"（想/别紧贴动词前）；
     # 顺便类不用挡，"不顺便去"不是人话。
-    _MUST_VB = r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!\s]|$)"
+    _POI_STOP = r"[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!（(\s]|$"
+    _MUST_VB = r"([\u4e00-\u9fa5]{2,10}?)(?=" + _POI_STOP + r")"
     # 顿号并列：「想去大熊猫基地、人民公园、都江堰」是三个点名，不是一个。
     # 旧正则一路吃到标点才停，「大熊猫基地、人民公园、都江堰」被当成一个
     # 景点名，含「、」直接判非法——三个点名全丢，方案里一个都没排（实测）。
@@ -857,7 +862,7 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
             r"(?<![不别用])(?<![想])"
             r"(?:一定要去|必去|必须去|想去|要去|想逛|再去|也去)"
             r"([\u4e00-\u9fa5]{2,10}?(?:、[\u4e00-\u9fa5]{2,10}?)+)"
-            r"(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
+            r"(?=" + _POI_STOP + r")", text):
         for part in re.split(r"[、]", m.group(1)):
             frag = _poi_frag(part)
             if _valid_poi(frag) and frag not in slots["must_visit"]:
@@ -882,13 +887,13 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
                  r"排除|去掉|删掉|避开)")
     for m in re.finditer(
             _AVOID_VB + r"([\u4e00-\u9fa5]{2,10}?(?:、[\u4e00-\u9fa5]{2,10}?)+)"
-            r"(?=[玩旅逛吧呀啊呢哦嘛的之，。,；;！!\s]|$)", text):
+            r"(?=" + _POI_STOP + r")", text):
         for part in re.split(r"[、]", m.group(1)):
             frag = _poi_frag(part)
             if _valid_poi(frag) and frag not in slots["avoid"]:
                 slots["avoid"].append(frag)
     for m in re.finditer(
-            _AVOID_VB + r"([\u4e00-\u9fa5]{2,10}?)(?=[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!\s]|$)",
+            _AVOID_VB + r"([\u4e00-\u9fa5]{2,10}?)(?=" + _POI_STOP + r")",
             text):
         frag = _poi_frag(m.group(1))
         if _valid_poi(frag) and frag not in slots["avoid"]:

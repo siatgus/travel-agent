@@ -23,6 +23,7 @@ from collections.abc import Callable
 from datetime import date, timedelta
 
 from .tools import haversine_km, transit_estimate
+from .route_engine import optimize_order
 
 WEIGHTS = {
     "appeal": 2.0,          # 景点本身吸引力 1-5
@@ -650,6 +651,19 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 picked,
                 key=lambda x: (0 if any(name_hit(m, x["name"]) for m in _must) else 1,
                                -x["duration_min"]))
+
+        # RouteEngine（第三阶段）：对当日访问顺序做 2-opt + 时间窗口优化。
+        # 上面的启发式排序是初始解——优化成本不劣于初始解时保留原顺序，
+        # 所以最坏情况行为与第三阶段之前一致；TRAVEL_ROUTE_ENGINE=0 或
+        # 含位置估算点时直接原序返回（回滚通道见 route_engine.config）。
+        # 单日行程不启用：容量最紧张（返程截止线）、必去优先/大时长优先
+        # 的旧契约被质检与回归固化，重排收益小、顺延风险大（杭州实测教训）。
+        _re_algo = None
+        if days != 1:
+            picked, _re_algo = optimize_order(
+                picked, home_geo=home, start_min=start_min,
+                end_min=(ret_deadline if ret_deadline is not None
+                         else DAY_END_LATEST))
 
         # 时间轴装配
         # clock 必须从 start_min 起：返程日 09:00 已排了「早市/伴手礼」（60 分钟），
