@@ -323,6 +323,7 @@ class Session:
         self.max_autofetch = 3                # 一次会话最多为几个新城市联网抓数据
         # 酒店定向补库记录：城市 → ensure_hotels 结果（住宿问答用，与景点补全分开）
         self._hotel_fetched: dict[str, dict] = {}
+        self._rest_fetched: dict[str, dict] = {}
         # 人数是否被用户明确说过。party_size 默认就是 1，光看槽位分不清
         # "用户说了一个人" 和 "用户压根没提"，后者要问一次再排。
         self.party_stated = False
@@ -1884,11 +1885,14 @@ class Session:
             args["near"] = near
         r = agent.dispatch("search_poi", args)
         items = (r.get("items") or []) if r.get("ok") else []
-        if not items:
-            # 库里没有餐厅：可能是整座城市没收录——先走一次在线补库再答
-            self._coverage(city)
-            r = agent.dispatch("search_poi", args)
-            items = (r.get("items") or []) if r.get("ok") else []
+        if not items and city not in self._rest_fetched:
+            # 库里没有餐厅：可能是整座城市没收录——按餐饮标签定向补库再答
+            # （ensure_city 看景点 covered 就短路，补不了餐厅）
+            res = autofetch.ensure_city_data(city, "restaurant")
+            self._rest_fetched[city] = res
+            if res.get("status") == "fetched":
+                r = agent.dispatch("search_poi", args)
+                items = (r.get("items") or []) if r.get("ok") else []
         if not items and kw:
             r2 = agent.dispatch("search_poi", {k: v for k, v in args.items()
                                                if k != "keyword"})
@@ -1925,7 +1929,7 @@ class Session:
         note = ""
         if not hotels and city not in self._hotel_fetched:
             # 在线补库：只按住宿标签抓真实门店，抓不到不硬编
-            res = autofetch.ensure_hotels(city)
+            res = autofetch.ensure_city_data(city, "hotel")
             self._hotel_fetched[city] = res
             if res.get("status") == "fetched":
                 r = agent.dispatch("search_hotel", args)
@@ -2011,7 +2015,8 @@ class Session:
             return self._cov[dest]
         ok = bool(agent.dispatch("search_poi", {"city": dest}).get("ok"))
         if not ok and len(self.fetched) < self.max_autofetch:
-            res = autofetch.ensure_city(dest, client=self.client)
+            res = autofetch.ensure_city_data(dest, "attraction",
+                                             client=self.client)
             self.fetched[dest] = res
             # 以入库后重新查询为准：酒店有数据但景点为空的城市仍算"缺"
             ok = bool(agent.dispatch("search_poi", {"city": dest}).get("ok"))

@@ -1653,10 +1653,11 @@ def test_stay_question_triggers_hotel_autofill() -> None:
     from travel_agent import kb as kb_mod
 
     calls = {"n": 0}
-    orig = af.ensure_hotels
+    orig = af.ensure_city_data
 
-    def fake(city, **kw):
+    def fake(city, dtype, **kw):
         calls["n"] += 1
+        check("补库类型是 hotel", dtype == "hotel", dtype)
         kb_mod.get_kb().upsert_hotel(city, {
             "name": f"{city}补录大酒店", "area": "市中心", "star": 4,
             "price": 520, "geo": [30.02, 120.01], "cancel_free": True,
@@ -1665,7 +1666,7 @@ def test_stay_question_triggers_hotel_autofill() -> None:
         return {"status": "fetched", "city": city, "source": "osm",
                 "pois": 0, "hotels": 1, "message": "在线抓取 1 家住宿并入库"}
 
-    af.ensure_hotels = fake
+    af.ensure_city_data = fake
     try:
         s = Session(today=TODAY, client=None)
         s.slots["destination"] = "酒店补库城"
@@ -1681,7 +1682,7 @@ def test_stay_question_triggers_hotel_autofill() -> None:
         check("再次询问不再重复补库", calls["n"] == 1, f"calls={calls['n']}")
         check("第二次同样报出酒店", "补录大酒店" in r2.render, r2.render[:160])
     finally:
-        af.ensure_hotels = orig
+        af.ensure_city_data = orig
         for h in kb_mod.get_kb().list_hotels("酒店补库城") or []:
             kb_mod.get_kb().delete_hotel(h["hotel_id"])
 

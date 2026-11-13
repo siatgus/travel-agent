@@ -30,6 +30,7 @@ TIMEOUT = float(os.environ.get("TRAVEL_AUTOFETCH_TIMEOUT", "10"))
 SPOT_TIMEOUT = float(os.environ.get("TRAVEL_SPOT_TIMEOUT", "4"))
 MAX_POIS = int(os.environ.get("TRAVEL_AUTOFETCH_MAX_POIS", "60"))
 MAX_HOTELS = int(os.environ.get("TRAVEL_AUTOFETCH_MAX_HOTELS", "20"))
+MAX_REST = int(os.environ.get("TRAVEL_AUTOFETCH_MAX_REST", "30"))
 # 模型给的坐标离城市中心超过这个距离，就当作幻觉（或根本没在本市）丢弃
 LLM_MAX_KM = 60.0
 
@@ -296,6 +297,30 @@ def covered(city: str, db=None) -> bool:
     return bool(db.list_pois(city) or db.list_hotels(city))
 
 
+def _valid_row(data_type: str, row: dict) -> bool:
+    """入库前字段校验：三种类型结构不同，不能用一种数据冒充另一种。
+
+    公共要求：有名字、有合法坐标（两个数值）。类型特有要求：
+    attraction/restaurant 必须带对应 category（餐厅 cost 是人均、景点
+    cost 是门票，混着写就是冒充）；hotel 必须有非负数值价格。
+    校验不过的行整条丢弃，宁缺毋滥。
+    """
+    if not isinstance(row, dict) or not (row.get("name") or "").strip():
+        return False
+    geo = row.get("geo")
+    if not (isinstance(geo, (list, tuple)) and len(geo) == 2
+            and all(isinstance(x, (int, float)) and x == x for x in geo)):
+        return False
+    if data_type == "attraction":
+        return row.get("category") == "attraction"
+    if data_type == "restaurant":
+        return row.get("category") == "restaurant"
+    if data_type == "hotel":
+        return (isinstance(row.get("price"), (int, float))
+                and row["price"] >= 0)
+    return False
+
+
 def ensure_city(city: str, *, db=None, fetcher=None, client=None,
                 force: bool = False) -> dict:
     """保证这个城市有可排数据；缺就抓一次并入库。
@@ -352,6 +377,10 @@ def ensure_city(city: str, *, db=None, fetcher=None, client=None,
         _remember(city, res)
         _log(db, city, "failed", msg)
         return res
+
+    # 入库前字段校验：坏行整条丢弃（模型幻觉/上游残缺数据）
+    poi_rows = [p for p in poi_rows if _valid_row("attraction", p)]
+    hotel_rows = [h for h in hotel_rows if _valid_row("hotel", h)]
 
     if not poi_rows:
         res = {"status": "empty", "city": city, "pois": 0, "hotels": 0,
@@ -465,6 +494,7 @@ def ensure_hotels(city: str, *, db=None, fetcher=None,
             rows = fetcher(city, center)
         else:
             rows = fetch_hotels(city, center)
+        rows = [h for h in rows if _valid_row("hotel", h)]
     except Exception as e:                        # 网络/上游异常：降级，不阻塞对话
         msg = f"{type(e).__name__}: {str(e)[:150]}"
         res = {"status": "failed", "city": city, "pois": 0, "hotels": 0,
@@ -492,6 +522,189 @@ def ensure_hotels(city: str, *, db=None, fetcher=None,
     _remember_hotel(city, res)
     _log(db, city, "success", "osm: " + res["message"])
     return res
+
+
+# ---------------------------------------------------------------- 餐厅定向补全
+#
+# 餐厅与景点同存 POI 表但 category='restaurant'，字段语义不同：cost 在餐厅
+# 里是人均消费——OSM 上游几乎从不提供可靠人均，绝不按景点门票那样估算填充，
+# 没有就写 0 并在 note 说明；地址取 addr:* 标签。ensure_city 看景点 covered
+# 就短路，「有景点没餐厅」的城市要靠这里定向补。
+
+_CUISINE_ZH = {
+    "chinese": "中餐", "sichuan": "川菜", "cantonese": "粤菜", "hotpot": "火锅",
+    "noodle": "面食", "japanese": "日本菜", "sushi": "寿司", "korean": "韩国菜",
+    "italian": "意大利菜", "pizza": "披萨", "burger": "汉堡", "barbecue": "烧烤",
+    "seafood": "海鲜", "vegetarian": "素食", "dimsum": "点心", "ramen": "拉面",
+    "kebab": "烤肉", "chicken": "炸鸡", "sandwich": "简餐", "coffee": "咖啡",
+}
+_AMENITY_ZH = {"restaurant": "餐厅", "cafe": "咖啡馆", "fast_food": "快餐",
+               "food_court": "美食广场"}
+
+_REST_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _remember_rest(city: str, res: dict) -> None:
+    with _CACHE_LOCK:
+        _REST_CACHE[city] = (time.time(), dict(res))
+
+
+def _restaurant(name: str, tags: dict, center: list[float],
+                lat: float, lon: float) -> dict:
+    """餐厅行：名称/城市区域/坐标/类别/地址/来源时间，人均无可靠来源不填。"""
+    amenity = tags.get("amenity", "restaurant")
+    cats = [_AMENITY_ZH.get(amenity, "餐厅")]
+    for cu in re.split(r"[;,]", tags.get("cuisine") or ""):
+        cu = cu.strip().lower()
+        if cu and cu != "yes" and _CUISINE_ZH.get(cu, cu) not in cats:
+            cats.append(_CUISINE_ZH.get(cu, cu))
+    cuisine = cats[1] if len(cats) > 1 else cats[0]   # 有菜系标菜系，否则标业态
+    addr = "".join(t for t in (tags.get("addr:city"), tags.get("addr:street"),
+                               tags.get("addr:housenumber")) if t)
+    note = f"在线抓取（OSM）；类别：{cuisine}；人均未核实，以到店实际消费为准"
+    if addr:
+        note = f"地址：{addr}；{note}"
+    return {
+        "name": name,
+        "category": "restaurant",
+        "area": tags.get("addr:district") or tags.get("addr:suburb") or "",
+        "geo": [round(lat, 4), round(lon, 4)],
+        "cost": 0,
+        "open_hours": tags.get("opening_hours") or "营业时间未核实",
+        "tags": cats[:3],
+        "note": note,
+    }
+
+
+def fetch_restaurants(city: str, center: list[float]) -> list[dict]:
+    """只取餐饮的 Overpass 查询（供餐厅问答补库）。"""
+    s, w, n, e = _bbox(center)
+    food = "restaurant|cafe|fast_food|food_court"
+    q = (f'[out:json][timeout:{int(TIMEOUT)}];'
+         f'('
+         f'node["amenity"~"^({food})$"]["name"]({s},{w},{n},{e});'
+         f'way["amenity"~"^({food})$"]["name"]({s},{w},{n},{e});'
+         f');out center {MAX_REST};')
+    data = _overpass(q)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        name = (tags.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        c = el.get("center") or {}
+        lat = el.get("lat", c.get("lat"))
+        lon = el.get("lon", c.get("lon"))
+        if lat is None or lon is None:
+            continue
+        seen.add(name)
+        out.append(_restaurant(name, tags, center, float(lat), float(lon)))
+    return out
+
+
+def ensure_restaurants(city: str, *, db=None, fetcher=None,
+                       force: bool = False) -> dict:
+    """保证城市有餐厅数据；缺就按餐饮标签在线抓一次并入库。
+
+    本地判定只认 category='restaurant' 的 POI——城市有景点不代表有餐厅。
+    返回字段与 ensure_city 一致（餐厅条数记在 pois 里，因为它们就是 POI 行）。
+    """
+    city = (city or "").strip()
+    if not city:
+        return {"status": "empty", "city": "", "pois": 0, "hotels": 0,
+                "message": "没有城市名"}
+    db = db or kb.get_kb()
+    if db is None:
+        return {"status": "no_kb", "city": city, "pois": 0, "hotels": 0,
+                "message": "知识库不可用"}
+    if any((p.get("category") or "") == "restaurant"
+           for p in (db.list_pois(city) or [])):
+        return {"status": "exists", "city": city, "pois": 0, "hotels": 0,
+                "message": "知识库已有该城市餐厅"}
+    if not ENABLED and not force:
+        return {"status": "disabled", "city": city, "pois": 0, "hotels": 0,
+                "message": "自动补全已关闭（TRAVEL_AUTOFETCH=0）"}
+    if not plausible_city(city) and not force:
+        return {"status": "skip", "city": city, "pois": 0, "hotels": 0,
+                "message": "不像具体城市名，不抓取"}
+
+    with _CACHE_LOCK:
+        hit = _REST_CACHE.get(city)
+        if hit and time.time() - hit[0] < FAIL_TTL_SEC:
+            return {**hit[1], "cached": True}
+
+    center = _resolve_center(city)
+    if not center:
+        res = {"status": "unresolved", "city": city, "pois": 0, "hotels": 0,
+               "message": f"地名「{city}」解析不到坐标"}
+        _remember_rest(city, res)
+        _log(db, city, "unresolved", res["message"])
+        return res
+
+    try:
+        if fetcher is not None:
+            rows = fetcher(city, center)
+        else:
+            rows = fetch_restaurants(city, center)
+        rows = [p for p in rows if _valid_row("restaurant", p)]
+    except Exception as e:                        # 网络/上游异常：降级，不阻塞对话
+        msg = f"{type(e).__name__}: {str(e)[:150]}"
+        res = {"status": "failed", "city": city, "pois": 0, "hotels": 0,
+               "message": msg}
+        _remember_rest(city, res)
+        _log(db, city, "failed", msg)
+        return res
+
+    if not rows:
+        res = {"status": "empty", "city": city, "pois": 0, "hotels": 0,
+               "message": "上游没有返回可用餐厅"}
+        _remember_rest(city, res)
+        _log(db, city, "empty", res["message"])
+        return res
+
+    try:
+        db.upsert_city(city, center, _bbox(center))
+    except Exception:
+        pass
+    for p in rows[:MAX_REST]:
+        db.upsert_poi(city, p, source="auto-fetch")
+    res = {"status": "fetched", "city": city, "source": "osm",
+           "pois": len(rows[:MAX_REST]), "hotels": 0,
+           "message": f"在线抓取 {len(rows)} 家餐厅并入库"}
+    _remember_rest(city, res)
+    _log(db, city, "success", "osm: " + res["message"])
+    return res
+
+
+# ---------------------------------------------------------------- 统一补全入口
+
+DATA_TYPES = ("attraction", "restaurant", "hotel")
+
+
+def ensure_city_data(city: str, data_type: str, *, db=None, fetcher=None,
+                     client=None, force: bool = False) -> dict:
+    """统一补全入口：检查本地 → 查失败缓存 → 在线抓取 → 校验字段 → 写库 → 返回。
+
+    三种类型的数据结构与字段语义不同（景点 cost=门票、餐厅 cost=人均且上游
+    无可靠来源时不填、酒店 price=参考起价非实时房态），各自走定向抓取与字段
+    校验，绝不用一种数据冒充另一种：
+
+      attraction  景点（ensure_city：OSM → LLM 兜底）
+      restaurant  餐厅（ensure_restaurants：OSM 餐饮标签，不走 LLM）
+      hotel       酒店（ensure_hotels：OSM 住宿标签，不走 LLM）
+
+    返回 {"status", "city", "pois", "hotels", "message", ...}，status 取值
+    见 ensure_city。data_type 非法直接抛 ValueError（调用方 bug，不该静默）。
+    """
+    if data_type not in DATA_TYPES:
+        raise ValueError(f"未知数据类型 {data_type!r}，可选：{DATA_TYPES}")
+    if data_type == "attraction":
+        return ensure_city(city, db=db, fetcher=fetcher, client=client,
+                           force=force)
+    if data_type == "restaurant":
+        return ensure_restaurants(city, db=db, fetcher=fetcher, force=force)
+    return ensure_hotels(city, db=db, fetcher=fetcher, force=force)
 
 
 # ---------------------------------------------------------------- 点名景点补全
@@ -962,4 +1175,5 @@ def reset_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
         _HOTEL_CACHE.clear()
+        _REST_CACHE.clear()
     _OSM_DOWN_UNTIL = 0.0

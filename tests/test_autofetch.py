@@ -572,6 +572,68 @@ def test_ensure_hotels_failure_and_empty() -> None:
                                       or kb.get_kb().list_hotels("空住宿城")))
 
 
+def test_ensure_city_data_unified() -> None:
+    """统一补全入口：三类型各走各的抓取与字段校验，坏字段不入库，未知类型报错。"""
+    autofetch.reset_cache()
+
+    def rest_fetcher(city, center):
+        return [{"name": f"{city}老字号", "category": "restaurant",
+                 "area": "老城", "geo": [30.01, 120.02], "cost": 0,
+                 "tags": ["餐厅", "川菜"], "note": "人均未核实"},
+                {"name": "", "category": "restaurant", "geo": [30.01, 120.02]},
+                {"name": "无坐标餐厅", "category": "restaurant"},
+                {"name": "冒充餐厅", "category": "attraction",
+                 "geo": [30.01, 120.02]}]
+
+    def hotel_fetcher(city, center):
+        return [{"name": f"{city}宾馆", "star": 3, "price": 280,
+                 "geo": [30.02, 120.01]},
+                {"name": "无价酒店", "star": 3, "geo": [30.02, 120.01]},
+                {"name": "", "star": 3, "price": 280, "geo": [30.02, 120.01]}]
+
+    # 未知数据类型：调用方 bug，直接抛错不静默
+    try:
+        autofetch.ensure_city_data("补全校验城", "ticket")
+        check("未知数据类型直接报错", False)
+    except ValueError:
+        check("未知数据类型直接报错", True)
+
+    city_calls = []
+    orig_ensure_city = autofetch.ensure_city
+    autofetch.ensure_city = lambda c, **kw: (
+        city_calls.append(c), {"status": "exists", "city": c})[1]
+    restore = _patch_center(CENTER)
+    try:
+        r_at = autofetch.ensure_city_data("补全校验城", "attraction")
+        r_rest = autofetch.ensure_city_data("补全校验城", "restaurant",
+                                            fetcher=rest_fetcher)
+        r_hotel = autofetch.ensure_city_data("补全校验城", "hotel",
+                                             fetcher=hotel_fetcher)
+        r_rest2 = autofetch.ensure_city_data("补全校验城", "restaurant",
+                                             fetcher=rest_fetcher)
+    finally:
+        autofetch.ensure_city = orig_ensure_city
+        restore()
+
+    check("attraction 分发到 ensure_city", r_at["status"] == "exists"
+          and city_calls == ["补全校验城"], f"{r_at} {city_calls}")
+    check("餐厅补库走统一入口", r_rest["status"] == "fetched"
+          and r_rest["pois"] == 1, f"{r_rest}")
+    check("无名字/无坐标/类别冒充的餐厅不入库",
+          [p["name"] for p in (kb.get_kb().list_pois("补全校验城") or [])]
+          == ["补全校验城老字号"],
+          str(kb.get_kb().list_pois("补全校验城")))
+    check("入库餐厅带人均未核实标注",
+          "人均未核实" in (kb.get_kb().list_pois("补全校验城") or [{}])[0]["note"])
+    check("酒店补库走统一入口", r_hotel["status"] == "fetched"
+          and r_hotel["hotels"] == 1, f"{r_hotel}")
+    check("无价格/无名字酒店被校验拦下",
+          len(kb.get_kb().list_hotels("补全校验城") or []) == 1,
+          str(kb.get_kb().list_hotels("补全校验城")))
+    check("餐厅二次调用 exists 不重复抓", r_rest2["status"] == "exists",
+          f"{r_rest2}")
+
+
 def main() -> int:
     # 默认关掉真实地理编码：单测不打外网（专项测试自己临时替换桩）
     autofetch.tdt_geocode = lambda *a, **k: None
@@ -582,6 +644,7 @@ def main() -> int:
     test_failure_and_cache()
     test_ensure_hotels_directed()
     test_ensure_hotels_failure_and_empty()
+    test_ensure_city_data_unified()
     test_unresolved_and_disabled()
     test_field_mapping()
     test_llm_fallback_filters_hallucination()

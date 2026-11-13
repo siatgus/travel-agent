@@ -825,7 +825,7 @@ def poi_answer(city: str, client=None) -> str:
         # 主动补数据：这是「问一个没收录的城市」而不是「这城市真没景点」
         try:
             from . import autofetch
-            res = autofetch.ensure_city(city, client=client)
+            res = autofetch.ensure_city_data(city, "attraction", client=client)
             if res.get("status") == "fetched":
                 fetch_note = (f"\n\n> 数据说明：「{city}」原先不在我的资料库，"
                               f"刚在线检索了 {res.get('pois', 0)} 个景点入库；"
