@@ -1350,7 +1350,11 @@ def test_general_question_fallback() -> None:
         s = Session(today=TODAY, client=c)
         r = s.turn("去日本需要办签证吗")
         check("通用问题被 LLM 兜底接住", r.mode == "answer", f"mode={r.mode}")
-        check("回答注明联网来源", "example.cn" in r.render, r.render[:120])
+        # 2026-11-16 用户反馈：回答里不列来源站点（网页摘要是给模型的
+        # 原始材料，不是展示给用户的出处清单）
+        check("回答不带来源站点名", "example.cn" not in r.render, r.render[:120])
+        check("回答本体仍由模型组织",
+              "提前办理签证" in r.render or "递签" in r.render, r.render[:120])
         # 2) 检索失败但有模型 → 仍给回答（模型自答）
         ws.search = lambda q, **k: {"ok": False, "results": [],
                                     "note": "联网检索失败"}

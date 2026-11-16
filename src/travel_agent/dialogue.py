@@ -480,7 +480,7 @@ class Session:
         # 具体点名当成泛推荐，回一串不相干的热门景点。
         spot = intent.spot_mention(utterance, city)
         if spot:
-            if re.search(r"周边|附近|周围", utterance):
+            if re.search(r"周边|附近|周围|附件", utterance):
                 return self._nearby_qa(city, spot)
             return self._spot_qa(city, spot)
         # 问的是「某个品类」（游乐园/动物园/温泉…）：库里没有类型标签，
@@ -1243,12 +1243,17 @@ class Session:
         return hotels, note
 
     def _general_answer(self, utterance: str) -> str | None:
-        """通用旅行问题：先联网检索，再让模型组织；没模型就渲染带来源的摘要列表。
+        """通用旅行问题：先联网检索，再让模型组织；没模型就渲染摘要列表。
 
         检索词：模型改写 > websearch.keywords() 启发式。整句自然语言直接
         丢给搜索引擎会被稀释成前两个字，这一步决定检索质量。
         返回 None 表示连联网也没查到且没有模型可用——交回原流程，
         宁可被追问一句，也不编一段像模像样的假答案。
+
+        不列来源站点（2026-11-16 用户反馈）：网页摘要是给模型吃的原始
+        材料，不是要展示给用户的出处清单——回答里带一串 baike.baidu.com
+        只会显得答非所问。涉及价格/政策/时刻的兜底提醒保留，让用户知道
+        该去官方渠道核实。
         """
         q = websearch.keywords(utterance)
         if self.client is not None:
@@ -1263,17 +1268,12 @@ class Session:
                              "来源": x.get("site")} for x in results]}
         said = llm.compose_reply(self.client, "general", facts, utterance)
         if said:
-            sources = list(dict.fromkeys(
-                x.get("site") for x in results if x.get("site")))[:4]
-            if sources:
-                said += "\n\n> 信息来源：" + "、".join(sources) + "（联网检索）"
             return said
         if not results:
             return None
         lines = ["我在网上查了一下，摘几条供参考："]
         for x in results[:4]:
-            lines.append(f"- **{x.get('title')}**：{x.get('snippet')}"
-                         f"（{x.get('site')}）")
+            lines.append(f"- **{x.get('title')}**：{x.get('snippet')}")
         lines.append("\n以上是网页摘要；涉及价格、政策、时刻的，请以官方渠道为准。")
         return "\n".join(lines)
 

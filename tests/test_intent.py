@@ -495,6 +495,61 @@ def test_trim_optional_intent() -> None:
     check("指令碎片不进 must_visit", not s2.get("must_visit"), str(s2.get("must_visit")))
 
 
+def test_typo_nearby_word() -> None:
+    """「附件」错别字容错（2026-11-16 实测）。
+
+    用户问「天安门广场附件有什么吃的」，「附件」是「附近」的拼音错别字，
+    之前所有区位正则都不认，整句掉进联网检索，回了一串百度百科/政府
+    门户的网页摘要——推荐完全答非所问。容错后必须走周边餐饮链。
+    """
+    q = "天安门广场附件有什么吃的"
+    check("错别字句仍判美食问句", intent.is_food_question(q))
+    check("错别字句剥出锚点", intent.nearby_anchor(q) == "天安门广场",
+          str(intent.nearby_anchor(q)))
+    check("错别字句判周边餐饮", intent.is_nearby_food_question(q))
+    check("food_area 认错别字", intent.food_area(q) == "天安门广场")
+    check("品类词剥取不受错别字污染",
+          intent.food_keyword(q) is None or "附件" not in intent.food_keyword(q),
+          str(intent.food_keyword(q)))
+    check("酒店问句同样容错", intent.is_nearby_hotel_question(
+        "天安门广场附件有什么酒店"))
+    # 真词「附件」（邮件语境）在别的句式里不该被当成区位词误伤
+    check("普通名词附件不受影响",
+          intent.nearby_anchor("把附件里的酒店发我") is None,
+          str(intent.nearby_anchor("把附件里的酒店发我")))
+
+
+def test_general_answer_no_sources() -> None:
+    """通用问答不列来源站点（2026-11-16 用户反馈）。
+
+    网页摘要是给模型的原始材料，回答里带一串（baike.baidu.com）只会
+    显得答非所问。检索结果本身可以呈现，但站点名与「信息来源」尾巴
+    必须去掉。
+    """
+    from travel_agent import websearch
+    orig = websearch.search
+
+    def fake(q, **kw):
+        return {"results": [
+            {"title": "北京市,百度百科", "snippet": "元大都成为交通中心",
+             "site": "baike.baidu.com", "url": "https://baike.baidu.com/x"},
+            {"title": "北京旅游攻略 - 知乎", "snippet": "故宫于1420年建成",
+             "site": "zhuanlan.zhihu.com", "url": "https://zhuanlan.zhihu.com/x"},
+        ], "note": ""}
+
+    websearch.search = fake
+    try:
+        s = Session(today=date(2026, 10, 31), client=None)
+        said = s._general_answer("北京有什么好玩的")
+        check("无模型时联网摘要仍可作答", bool(said), str(said)[:80])
+        check("不列来源站点名", said and "baike.baidu.com" not in said
+              and "zhuanlan.zhihu.com" not in said, (said or "")[:120])
+        check("不出现信息来源尾巴", said and "信息来源" not in said, "")
+        check("保留官方渠道核实提醒", said and "官方渠道" in said, "")
+    finally:
+        websearch.search = orig
+
+
 def main() -> int:
     for fn in (test_classify, test_city_parsing, test_weather_answer_format,
                test_weather_never_becomes_plan, test_weather_then_plan_switch,
@@ -507,6 +562,8 @@ def main() -> int:
                test_question_shape,
                test_nearby_answer_template,
                test_nearby_question_routing,
+               test_typo_nearby_word,
+               test_general_answer_no_sources,
                test_refine_intent,
                test_no_destination_no_plan,
                test_trim_optional_intent):
