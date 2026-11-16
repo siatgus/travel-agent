@@ -38,6 +38,7 @@ except Exception:
 from . import kb
 from . import llm
 from . import auth
+from . import moderation
 
 HOST = "127.0.0.1"
 # 对话服务地址：后台用它确认「此刻真正在用的模型」，避免只展示配置文件里的话
@@ -180,6 +181,7 @@ PAGE = """<!DOCTYPE html>
     <a href="#/data"><span class="ic">◈</span>数据管理</a>
     <div class="nav-group">运营</div>
     <a href="#/users"><span class="ic">◍</span>用户与积分</a>
+    <a href="#/moderation"><span class="ic">⚠</span>内容审计</a>
     <a href="#/model"><span class="ic">✦</span>模型设置</a>
   </nav>
   <div class="foot">知识库 <code>.kb.db</code><br>账号库 <code>.app.db</code><br>仅监听 127.0.0.1</div>
@@ -321,6 +323,40 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div style="overflow-x:auto"><table id="usage-table"></table></div>
     <div class="pager" id="usage-pager"></div>
+  </section>
+</div>
+
+<div class="view" id="v-moderation">
+  <div class="view-head"><h1>内容审计</h1>
+    <div class="sub">内容安全双审的拦截记录 · 复查命中详情，误报可标记放行</div></div>
+  <section>
+    <h2>拦截记录 <span class="fresh" id="mod-count"></span></h2>
+    <div class="msg" id="mod-msg"></div>
+    <div class="filters">
+      <select id="flt-mod-dir" onchange="renderModeration()">
+        <option value="">全部方向</option>
+        <option value="input">用户输入</option>
+        <option value="output">模型输出</option>
+      </select>
+      <select id="flt-mod-cat" onchange="renderModeration()">
+        <option value="">全部类别</option>
+        <option value="political">political</option>
+        <option value="violence">violence</option>
+        <option value="porn">porn</option>
+        <option value="drugs">drugs</option>
+        <option value="gambling">gambling</option>
+        <option value="fraud">fraud</option>
+        <option value="abuse">abuse</option>
+        <option value="other">other</option>
+      </select>
+      <button onclick="loadModeration()">刷新</button>
+    </div>
+    <div style="overflow-x:auto"><table id="mod-table"></table></div>
+    <div class="pager" id="mod-pager"></div>
+    <div class="fresh" style="margin-top:8px">
+      词库：内置种子 + <code>data/sensitive_words.txt</code>（格式 <code>类别|词</code>，改完下一句话生效）；
+      云审核经环境变量 <code>TRAVEL_CLOUD_MODERATION</code> 接入。标记误报的记录不再显示，但保留可追溯。
+    </div>
   </section>
 </div>
 
@@ -1030,8 +1066,51 @@ function resetUsageFilter(){
   $('q-usage').value=''; $('q-usage-model').value=''; filterUsage(true);
 }
 
+// ---------------- 内容审计 ----------------
+let MODERATION=[];
+
+async function loadModeration(){
+  const r=await api('/api/moderation');
+  MODERATION=r.items||[];
+  $('mod-count').textContent='待复查 '+MODERATION.length+' 条';
+  renderModeration();
+}
+
+function renderModeration(){
+  const dir=$('flt-mod-dir').value, cat=$('flt-mod-cat').value;
+  const rows=MODERATION.filter(function(m){
+    if(dir && m.direction!==dir)return false;
+    if(cat && m.category!==cat)return false;
+    return true;
+  });
+  $('mod-count').textContent='命中 '+rows.length+' / '+MODERATION.length+' 条';
+  const dirName={input:'输入',output:'输出'};
+  const dispName={blocked:'已拒绝',masked:'已打码',fallback:'已换兜底'};
+  $('mod-table').innerHTML='<tr><th>时间</th><th>方向</th><th>类别</th><th>命中词</th>'
+    +'<th>内容摘录</th><th>用户</th><th>处置</th><th></th></tr>'
+    +(rows.length?rows.map(function(m){
+      return '<tr><td>'+esc(m.created_at)+'</td>'
+        +'<td>'+(dirName[m.direction]||m.direction)+'</td>'
+        +'<td><b>'+esc(m.category)+'</b></td>'
+        +'<td>'+esc((m.words||'').replace(/^"|"$/g,''))+'</td>'
+        +'<td style="max-width:260px;word-break:break-all;">'+esc(m.excerpt||'')+'</td>'
+        +'<td>'+(m.uid??'-')+'</td>'
+        +'<td>'+(dispName[m.disposition]||esc(m.disposition))+'</td>'
+        +'<td><button onclick="dismissHit('+m.id+')">误报放行</button></td></tr>';
+    }).join(''):'<tr><td colspan="8" class="empty">没有待复查的拦截记录</td></tr>');
+  $('mod-pager').innerHTML='';
+}
+
+async function dismissHit(id){
+  const r=await api('/api/moderation/dismiss',{id:id});
+  const m=$('mod-msg');
+  if(r.ok){ m.className='msg ok'; m.textContent='已标记误报（记录保留）'; }
+  else{ m.className='msg bad'; m.textContent=r.error||'操作失败'; }
+  loadModeration();
+}
+
 // ---------------- 左侧导航 / 视图切换 ----------------
-const VIEWS=['overview','data','users','model'];
+const VIEWS=['overview','data','users','moderation','model'];
 
 function showView(v){
   if(VIEWS.indexOf(v)<0)v='overview';
@@ -1043,6 +1122,7 @@ function showView(v){
   if(v==='overview') loadStats();
   else if(v==='data') loadPois().then(loadLogs);
   else if(v==='users'){ loadUsers(); loadUsage(); }
+  else if(v==='moderation') loadModeration();
   else if(v==='model') loadLlm();
   window.scrollTo({top:0});
 }
@@ -1165,6 +1245,10 @@ class Handler(BaseHTTPRequestHandler):
             uid = int(q["uid"][0]) if q.get("uid") else None
             self._json({"ok": True, "usage": auth.list_usage(uid)})
             return
+        if path == "/api/moderation":
+            self._json({"ok": True, "items": moderation.list_hits(),
+                        "stats": moderation.stats()})
+            return
         db = kb.get_kb()
         if db is None:
             self._json({"ok": False, "error": "知识库不可用"}, 500)
@@ -1220,6 +1304,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok,
                         "error": None if ok else "用户不存在或扣减后余额为负"},
                         200 if ok else 400)
+            return
+        if path == "/api/moderation/dismiss":
+            try:
+                hid = int(data.get("id") or 0)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "id 应为整数"}, 400)
+                return
+            ok = moderation.dismiss(hid, str(data.get("note") or ""))
+            self._json({"ok": ok, "error": None if ok else "记录不存在"},
+                       200 if ok else 404)
             return
         db = kb.get_kb()
         if db is None:

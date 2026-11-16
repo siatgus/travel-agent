@@ -1,7 +1,7 @@
 @echo off
 rem Travel Agent local launcher (Windows)
 rem Python absolute path (no system Python required on PATH)
-set "PY=C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+set "PY=C:\Users\23126\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 
 rem LLM fallback (DeepSeek, OpenAI-compatible). Delete these lines to go rule-only.
 rem Note: settings saved in admin console (port 8788) take priority over these.

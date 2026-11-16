@@ -57,7 +57,9 @@ except Exception:
 from . import auth
 from . import conversations
 from . import llm as llm_layer
+from . import moderation
 from . import paths
+from . import ratelimit
 from . import progress
 from .dialogue import Session, PreferenceMemory
 from .render_html import build_html, get_amap_key, get_tdt_key, map_mode
@@ -2126,6 +2128,11 @@ class Handler(BaseHTTPRequestHandler):
         必须走服务端：SDK 的 T.DrivingRoute 走 HTTPS，而天地图 HTTPS /drive
         挂死不响应（HTTP 正常，实测），前端直调 HTTP 会被 CORS 拦。
         页面是 CGCS2000 坐标，天地图路径服务同为 CGCS2000，直接可用。"""
+        ok, retry = ratelimit.hit(ratelimit.client_ip(self), "proxy_ip")
+        if not ok:
+            self._json({"ok": False, "error": "rate_limited",
+                        "message": f"请求太频繁，{retry} 秒后再试"}, 429)
+            return
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         o = _ok_pt((q.get("orig") or [""])[0])
         d = _ok_pt((q.get("dest") or [""])[0])
@@ -2139,6 +2146,11 @@ class Handler(BaseHTTPRequestHandler):
 
         走服务端的原因见 amap_drive_fetch——浏览器端 AMap.Driving 插件
         没配安全密钥会全挂，而 REST 直连用现有 Key 即成功（实测）。"""
+        ok, retry = ratelimit.hit(ratelimit.client_ip(self), "proxy_ip")
+        if not ok:
+            self._json({"ok": False, "error": "rate_limited",
+                        "message": f"请求太频繁，{retry} 秒后再试"}, 429)
+            return
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         o = _ok_pt((q.get("o") or [""])[0])
         d = _ok_pt((q.get("d") or [""])[0])
@@ -2150,13 +2162,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
         data = self._body()
+        ip = ratelimit.client_ip(self)     # 限流主键之一（业务代码之前的中间件）
 
-        # ---- 账号接口（无需登录） ----
+        # ---- 账号接口（无需登录，按 IP + 手机号双桶限流防刷） ----
         if path == "/api/auth/send_code":
-            r = auth.send_code(str(data.get("phone") or ""))
+            phone = str(data.get("phone") or "")
+            for key, bucket in ((phone, "send_code_phone"), (ip, "send_code_ip")):
+                ok, retry = ratelimit.hit(key, bucket)
+                if not ok:
+                    self._json({"ok": False, "error": "rate_limited",
+                                "retry_after": retry,
+                                "message": f"验证码发送太频繁，{retry} 秒后再试"}, 429)
+                    return
+            r = auth.send_code(phone)
             self._json(r, 200 if r.get("ok") else 400)
             return
         if path == "/api/auth/login":
+            ok, retry = ratelimit.hit(ip, "login_ip")
+            if not ok:
+                self._json({"ok": False, "error": "rate_limited",
+                            "retry_after": retry,
+                            "message": f"尝试太频繁，{retry} 秒后再试"}, 429)
+                return
             r = auth.login(str(data.get("phone") or ""), str(data.get("code") or ""))
             self._json(r, 200 if r.get("ok") else 401)
             return
@@ -2176,6 +2203,25 @@ class Handler(BaseHTTPRequestHandler):
             msg = str(data.get("message") or "").strip()
             if not sid or not msg or len(msg) > 2000:
                 self._json({"ok": False, "error": "需要 sid 与 message（≤2000 字）"}, 400)
+                return
+            # 限流：按用户主桶 + IP 兜底桶（免费/付费不同阈值接运营配置后再分档）
+            for key, bucket in ((f"u{uid}", "chat_user"), (ip, "chat_ip")):
+                ok, retry = ratelimit.hit(key, bucket)
+                if not ok:
+                    self._json({"ok": False, "error": "rate_limited",
+                                "retry_after": retry,
+                                "message": f"消息发得太快了，{retry} 秒后再试"}, 429)
+                    return
+            # 内容安全 · 输入侧：命中不进 LLM、不扣积分，直接给兜底话术
+            v_in = moderation.scan(msg)
+            if not v_in.ok:
+                moderation.log("input", v_in, uid=uid, sid=sid,
+                               disposition="blocked", excerpt=msg)
+                self._json({"ok": True, "mode": "chat", "text": moderation.fallback_reply(v_in.category),
+                            "turn_no": 0, "ask_rounds": 0, "assumptions": [],
+                            "tool_calls": 0, "has_plan": False, "plan": None,
+                            "credits_left": auth.get_balance(uid),
+                            "moderated": True})
                 return
             # 额度预检：余额低到连一次规划都不够时，直接明说，别让用户白等
             # （不限额测试账号跳过这道，否则余额用完会被拦在门口）
@@ -2198,6 +2244,14 @@ class Handler(BaseHTTPRequestHandler):
                     finally:
                         s.on_phase = None
                         progress.finish(sid)
+                    # 内容安全 · 输出侧：硬拦类别整条换兜底话术，其余命中就地
+                    # 打码。必须在存档/落 LAST_PLAN 之前补——存下去的就是干净文本。
+                    reply.render, v_out = moderation.sanitize_output(reply.render)
+                    if not v_out.ok:
+                        hard = v_out.category in moderation.HARD_BLOCK_CATEGORIES
+                        moderation.log("output", v_out, uid=uid, sid=sid,
+                                       disposition="fallback" if hard else "masked",
+                                       excerpt=msg)
                     if reply.mode == "plan" and reply.plan:
                         # 景点介绍卡片：搜介绍页（知乎/百科/攻略站）+ 缩略图，
                         # 行程页 hover 图钉显示、点击跳原网页。锦上添花，失败不影响方案。
