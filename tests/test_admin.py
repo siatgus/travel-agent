@@ -314,6 +314,39 @@ def test_users_http(base: str, tmp: Path) -> None:
     check("用量流水接口 200", status == 200 and j.get("ok") is True)
 
 
+def test_query_params_http(base: str) -> None:
+    """条件查询的数据源：四个列表接口要能吃 days/limit 参数。
+
+    前端是"取足量数据再本地筛"，接口若把 limit 写死（原来 usage/orders 只有
+    50 条、日志 50 条），筛出来的结果就只是窗口里那几条，条件查询等于摆设。
+    """
+    status, j = _get(base, "/api/finance?days=7&limit=500")
+    check("财务接口支持 days/limit", status == 200 and j.get("days") == 7
+          and len(j.get("orders") or []) >= 0, f"status={status}")
+    check("财务接口回传套餐表（前端下拉用）",
+          isinstance(j.get("plans"), list) and len(j["plans"]) >= 4
+          and all("plan_id" in p and "title" in p for p in j["plans"]),
+          str(j.get("plans"))[:200])
+    check("统计窗口按 days 收窄",
+          len(j["stats"]["daily_revenue"]) <= 7
+          and len(j["stats"]["daily_usage"]) <= 7,
+          f"{len(j['stats']['daily_revenue'])}")
+
+    status, j = _get(base, "/api/usage?limit=500")
+    check("用量接口支持 limit", status == 200 and j.get("ok") is True)
+
+    status, j = _get(base, "/api/moderation?limit=500")
+    check("内容审计接口支持 limit", status == 200 and j.get("ok") is True)
+
+    status, j = _get(base, "/api/logs?limit=500")
+    check("日志接口支持 limit", status == 200 and j.get("ok") is True)
+
+    # 非法参数不能把接口打挂（负数/超大值都应被夹到合法区间）
+    status, j = _get(base, "/api/finance?days=-5&limit=999999")
+    check("非法 days/limit 被夹到合法区间",
+          status == 200 and j.get("days", 0) >= 1, f"status={status}")
+
+
 def test_search_ui() -> None:
     p = admin.PAGE
     check("POI 条件搜索控件齐全",
@@ -324,6 +357,38 @@ def test_search_ui() -> None:
     check("用量与日志搜索控件齐全",
           all(k in p for k in ('id="q-usage"', 'id="q-usage-model"',
                                'id="q-log"', 'id="flt-log-status"')))
+    # 条件查询补全（2026-11-16）：原来财务看板/内容审计/用户/用量/日志
+    # 只有个别维度，筛选不出"某个状态某段时间的某类记录"
+    check("财务看板订单条件查询齐全",
+          all(k in p for k in ('id="flt-ord-status"', 'id="flt-ord-plan"',
+                               'id="q-ord"', 'id="ord-min"', 'id="ord-max"',
+                               'id="ord-from"', 'id="ord-to"',
+                               'id="fin-days"', 'function filterOrders',
+                               'function resetOrderFilter')))
+    check("财务看板订单表有筛选合计与分页",
+          'id="ord-sum"' in p and 'id="ord-pager"' in p
+          and "pagerHtml('fin'" in p)
+    check("内容审计条件查询齐全（处置/用户/关键词/日期）",
+          all(k in p for k in ('id="flt-mod-disp"', 'id="q-mod-uid"',
+                               'id="q-mod-kw"', 'id="mod-from"', 'id="mod-to"',
+                               'function resetModFilter')))
+    check("用户列表条件查询齐全（档位/余额区间/注册时间/排序）",
+          all(k in p for k in ('id="flt-paid"', 'id="flt-max"',
+                               'id="user-from"', 'id="user-to"',
+                               'id="sort-user"')))
+    check("用量流水条件查询齐全（任务/日期/积分下限）",
+          all(k in p for k in ('id="q-usage-task"', 'id="usage-from"',
+                               'id="usage-to"', 'id="usage-min"')))
+    check("同步日志条件查询齐全（来源/时间）",
+          all(k in p for k in ('id="flt-log-src"', 'id="log-from"',
+                               'id="log-to"')))
+    check("概览新鲜度条件查询齐全（城市/来源/POI 量/更新时间）",
+          all(k in p for k in ('id="q-fresh"', 'id="flt-fresh-src"',
+                               'id="flt-fresh-poi"', 'id="fresh-from"',
+                               'id="fresh-to"', 'function filterFresh',
+                               'function resetFreshFilter')))
+    check("日期段比较统一走 dayOf（兼容多种时间格式）",
+          'function dayOf' in p and p.count('dayOf(') >= 5)
     check("表格行内编辑已接线",
           all(k in p for k in ('function startEdit', 'function saveRow',
                                'function cancelRow', 'id="e-name"', 'id="e-lat"')))
@@ -482,6 +547,7 @@ def main() -> int:
     test_poi_search_http(base)
     test_inline_edit_http(base)
     test_users_http(base, tmp)
+    test_query_params_http(base)
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

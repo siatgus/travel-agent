@@ -195,7 +195,24 @@ PAGE = """<!DOCTYPE html>
     <div class="sub">知识库与账号体系整体状态 · 数据改动对对话服务即时生效</div></div>
   <div class="cards" id="cards"></div>
   <section>
-    <h2>各城市数据新鲜度</h2>
+    <h2>各城市数据新鲜度 <span class="fresh" id="fresh-count"></span></h2>
+    <div class="filters">
+      <input id="q-fresh" placeholder="城市关键词" size="14" oninput="filterFresh(true)">
+      <select id="flt-fresh-src" onchange="filterFresh(true)">
+        <option value="">全部来源</option>
+      </select>
+      <select id="flt-fresh-poi" onchange="filterFresh(true)">
+        <option value="">POI 数量不限</option>
+        <option value="zero">无 POI（待补）</option>
+        <option value="lt50">少于 50 条</option>
+        <option value="ge50">50 条以上</option>
+      </select>
+      <span style="font-size:12.5px;color:#8a8a82">最近更新</span>
+      <input id="fresh-from" type="date" onchange="filterFresh(true)" title="起始日期">
+      <span style="font-size:12.5px;color:#8a8a82">至</span>
+      <input id="fresh-to" type="date" onchange="filterFresh(true)" title="截止日期">
+      <button onclick="resetFreshFilter()">重置</button>
+    </div>
     <div style="overflow-x:auto"><table id="fresh-table"></table></div>
     <div class="pager" id="fresh-pager"></div>
   </section>
@@ -266,7 +283,7 @@ PAGE = """<!DOCTYPE html>
 </section>
 
 <section>
-  <h2>同步日志（最近 50 条）</h2>
+  <h2>同步日志</h2>
   <div class="filters">
     <input id="q-log" placeholder="城市 / 来源 / 说明 关键词" size="22" oninput="filterLogs(true)">
     <select id="flt-log-status" onchange="filterLogs(true)">
@@ -274,6 +291,13 @@ PAGE = """<!DOCTYPE html>
       <option value="success">success</option>
       <option value="failed">failed</option>
     </select>
+    <select id="flt-log-src" onchange="filterLogs(true)">
+      <option value="">全部来源</option>
+    </select>
+    <span style="font-size:12.5px;color:#8a8a82">抓取时间</span>
+    <input id="log-from" type="date" onchange="filterLogs(true)" title="起始日期">
+    <span style="font-size:12.5px;color:#8a8a82">至</span>
+    <input id="log-to" type="date" onchange="filterLogs(true)" title="截止日期">
     <button onclick="resetLogFilter()">重置</button>
     <span class="fresh" id="log-count"></span>
   </div>
@@ -296,6 +320,23 @@ PAGE = """<!DOCTYPE html>
         <option value="disabled">disabled</option>
       </select>
       <input id="flt-min" type="number" placeholder="余额 ≥" size="8" oninput="filterUsers(true)">
+      <input id="flt-max" type="number" placeholder="余额 ≤" size="8" oninput="filterUsers(true)">
+      <select id="flt-paid" onchange="filterUsers(true)">
+        <option value="">全部档位</option>
+        <option value="paid">付费中</option>
+        <option value="free">免费档</option>
+        <option value="unlimited">不限额</option>
+      </select>
+      <span style="font-size:12.5px;color:#8a8a82">注册</span>
+      <input id="user-from" type="date" onchange="filterUsers(true)" title="注册起始日期">
+      <span style="font-size:12.5px;color:#8a8a82">至</span>
+      <input id="user-to" type="date" onchange="filterUsers(true)" title="注册截止日期">
+      <select id="sort-user" onchange="filterUsers(true)" title="排序">
+        <option value="id">ID ↑</option>
+        <option value="balance">余额 ↓</option>
+        <option value="used">累计消耗 ↓</option>
+        <option value="new">注册时间 ↓</option>
+      </select>
       <button onclick="resetUserFilter()">重置</button>
       <span class="fresh" id="user-count"></span>
     </div>
@@ -316,10 +357,16 @@ PAGE = """<!DOCTYPE html>
     </details>
   </section>
   <section>
-    <h2>LLM 用量流水（最近 50 条）</h2>
+    <h2>LLM 用量流水</h2>
     <div class="filters">
       <input id="q-usage" placeholder="用户 ID" size="10" oninput="filterUsage(true)">
       <input id="q-usage-model" placeholder="模型关键词" size="16" oninput="filterUsage(true)">
+      <input id="q-usage-task" placeholder="任务关键词，如 rerank" size="18" oninput="filterUsage(true)">
+      <span style="font-size:12.5px;color:#8a8a82">日期</span>
+      <input id="usage-from" type="date" onchange="filterUsage(true)" title="起始日期">
+      <span style="font-size:12.5px;color:#8a8a82">至</span>
+      <input id="usage-to" type="date" onchange="filterUsage(true)" title="截止日期">
+      <input id="usage-min" type="number" placeholder="积分 ≥" size="8" oninput="filterUsage(true)">
       <button onclick="resetUsageFilter()">重置</button>
       <span class="fresh" id="usage-count"></span>
     </div>
@@ -333,16 +380,49 @@ PAGE = """<!DOCTYPE html>
     <div class="sub">订单与积分流水 · 收入曲线来自订单账本，消耗曲线来自模型计量</div></div>
   <div class="cards" id="fin-cards"></div>
   <section>
-    <h2>每日收入（最近 14 天）</h2>
+    <div class="filters">
+      <span style="font-size:13px;color:#55554f">统计窗口</span>
+      <select id="fin-days" onchange="loadFinance()">
+        <option value="7">近 7 天</option>
+        <option value="14" selected>近 14 天</option>
+        <option value="30">近 30 天</option>
+        <option value="90">近 90 天</option>
+      </select>
+      <span class="fresh" id="fin-window"></span>
+    </div>
+  </section>
+  <section>
+    <h2>每日收入</h2>
     <div style="overflow-x:auto"><table id="fin-rev"></table></div>
   </section>
   <section>
-    <h2>每日积分消耗（最近 14 天）</h2>
+    <h2>每日积分消耗</h2>
     <div style="overflow-x:auto"><table id="fin-usage"></table></div>
   </section>
   <section>
-    <h2>最近订单（50 条）</h2>
+    <h2>订单明细 <span class="fresh" id="ord-count"></span></h2>
+    <div class="filters">
+      <select id="flt-ord-status" onchange="filterOrders(true)">
+        <option value="">全部状态</option>
+        <option value="paid">已支付</option>
+        <option value="created">待支付</option>
+      </select>
+      <select id="flt-ord-plan" onchange="filterOrders(true)">
+        <option value="">全部套餐</option>
+      </select>
+      <input id="q-ord" placeholder="订单号 / 手机号 / 用户 ID" size="20" oninput="filterOrders(true)">
+      <input id="ord-min" type="number" placeholder="金额 ≥" size="8" oninput="filterOrders(true)">
+      <input id="ord-max" type="number" placeholder="金额 ≤" size="8" oninput="filterOrders(true)">
+      <span style="font-size:12.5px;color:#8a8a82">下单</span>
+      <input id="ord-from" type="date" onchange="filterOrders(true)" title="下单日期（起）">
+      <span style="font-size:12.5px;color:#8a8a82">至</span>
+      <input id="ord-to" type="date" onchange="filterOrders(true)" title="下单日期（止）">
+      <button onclick="resetOrderFilter()">重置</button>
+      <span class="fresh" id="ord-sum"></span>
+    </div>
+    <div class="msg" id="ord-msg"></div>
     <div style="overflow-x:auto"><table id="fin-orders"></table></div>
+    <div class="pager" id="ord-pager"></div>
   </section>
 </div>
 
@@ -369,7 +449,20 @@ PAGE = """<!DOCTYPE html>
         <option value="abuse">abuse</option>
         <option value="other">other</option>
       </select>
+      <select id="flt-mod-disp" onchange="renderModeration()">
+        <option value="">全部处置</option>
+        <option value="blocked">已拒绝 blocked</option>
+        <option value="masked">已打码 masked</option>
+        <option value="fallback">已换兜底 fallback</option>
+      </select>
+      <input id="q-mod-uid" placeholder="用户 ID" size="10" oninput="renderModeration()">
+      <input id="q-mod-kw" placeholder="命中词 / 摘录关键词" size="18" oninput="renderModeration()">
+      <span style="font-size:12.5px;color:#8a8a82">记录时间</span>
+      <input id="mod-from" type="date" onchange="renderModeration()" title="起始日期">
+      <span style="font-size:12.5px;color:#8a8a82">至</span>
+      <input id="mod-to" type="date" onchange="renderModeration()" title="截止日期">
       <button onclick="loadModeration()">刷新</button>
+      <button onclick="resetModFilter()">重置</button>
     </div>
     <div style="overflow-x:auto"><table id="mod-table"></table></div>
     <div class="pager" id="mod-pager"></div>
@@ -489,6 +582,8 @@ PAGE = """<!DOCTYPE html>
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+// 各种时间是不同格式（YYYY-MM-DD / ISO / 带时分）：条件查询一律按日期段比较
+function dayOf(v){var t=String(v==null?'':v);return t.slice(0,10);}
 function escq(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function show(ok,text){const m=$('msg');m.className='msg '+(ok?'ok':'bad');m.textContent=text;}
 
@@ -508,8 +603,21 @@ async function loadStats(){
   rebuildCascade();
   const ft=$('fresh-table');
   if(ft){
-    FRESH_ROWS=(s.freshness||[]);
-    renderFresh();
+    FRESH_ALL=(s.freshness||[]);
+    // 来源下拉按实际出现过的来源生成（seed/overpass/manual 混用时不用改前端）
+    const sel=$('flt-fresh-src');
+    if(sel){
+      const cur=sel.value, srcs=[];
+      FRESH_ALL.forEach(function(f){
+        String(f.sources||'').split(/[,\\s]+/).forEach(function(x){
+          if(x && srcs.indexOf(x)<0)srcs.push(x);});
+      });
+      srcs.sort();
+      sel.innerHTML='<option value="">全部来源</option>'
+        +srcs.map(function(x){return '<option value="'+escq(x)+'">'+esc(x)+'</option>';}).join('');
+      sel.value=(srcs.indexOf(cur)>=0)?cur:'';
+    }
+    filterFresh();
   }
   return s;
 }
@@ -570,6 +678,38 @@ function onCity(){
   }).catch(function(){ $('area-sel').innerHTML='<option value="*">全部区县</option>'; loadPois(); });
 }
 
+let FRESH_ALL=[];   // 新鲜度全量（筛选前）
+
+function filterFresh(reset){
+  if(reset)PAGES.fresh=1;
+  const q=$('q-fresh').value.trim().toLowerCase();
+  const src=$('flt-fresh-src').value;
+  const bucket=$('flt-fresh-poi').value;
+  const from=$('fresh-from').value, to=$('fresh-to').value;
+  FRESH_ROWS=FRESH_ALL.filter(function(f){
+    if(q && String(f.city||'').toLowerCase().indexOf(q)<0)return false;
+    if(src && String(f.sources||'').indexOf(src)<0)return false;
+    const n=f.pois||0;
+    if(bucket==='zero' && n!==0)return false;
+    if(bucket==='lt50' && !(n>0 && n<50))return false;
+    if(bucket==='ge50' && n<50)return false;
+    const d=dayOf(f.last_update);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
+    return true;
+  });
+  const cnt=$('fresh-count');
+  if(cnt)cnt.textContent='命中 '+FRESH_ROWS.length+' / '+FRESH_ALL.length+' 城';
+  renderFresh();
+}
+
+function resetFreshFilter(){
+  $('q-fresh').value=''; $('flt-fresh-src').value='';
+  $('flt-fresh-poi').value='';
+  $('fresh-from').value=''; $('fresh-to').value='';
+  filterFresh(true);
+}
+
 function renderFresh(){
   const ft=$('fresh-table'); if(!ft)return;
   const size=getPageSize('fresh');
@@ -586,7 +726,7 @@ function renderFresh(){
 
 // ---------------- 通用分页 ----------------
 const PAGE_SIZES=[10,20,50,100];
-const PAGES={fresh:1,poi:1,log:1,user:1,usage:1};   // 各表当前页码
+const PAGES={fresh:1,poi:1,log:1,user:1,usage:1,ord:1,mod:1,fin:1};   // 各表当前页码
 let FRESH_ROWS=[];
 let REGIONS=[];                                     // 国家→省→城市级联树（/api/stats）
 let CASCADE_SIG='';                                 // 上次重建时的树签名（防 loadPois↔loadStats 递归环）
@@ -624,6 +764,8 @@ function gotoPage(k,p){
   else if(k==='user')renderUsers();
   else if(k==='usage')renderUsage();
   else if(k==='fresh')renderFresh();
+  else if(k==='fin')renderOrders();
+  else if(k==='mod')renderModeration();
 }
 
 function jumpPage(k,v){
@@ -822,8 +964,20 @@ let LOGS=[];
 let LOG_ROWS=[];
 
 async function loadLogs(){
-  const r=await api('/api/logs');
+  const r=await api('/api/logs?limit=500');
   LOGS=r.logs||[];
+  // 来源下拉按实际出现过的来源生成，避免写死一套和同步实现脱节
+  const sel=$('flt-log-src');
+  if(sel){
+    const cur=sel.value;
+    const srcs=[];
+    LOGS.forEach(function(l){
+      if(l.source && srcs.indexOf(l.source)<0)srcs.push(l.source);});
+    srcs.sort();
+    sel.innerHTML='<option value="">全部来源</option>'
+      +srcs.map(function(x){return '<option value="'+escq(x)+'">'+esc(x)+'</option>';}).join('');
+    sel.value=(srcs.indexOf(cur)>=0)?cur:'';
+  }
   filterLogs();
 }
 
@@ -831,12 +985,19 @@ function filterLogs(reset){
   if(reset)PAGES.log=1;
   const q=$('q-log').value.trim().toLowerCase();
   const st=$('flt-log-status').value;
+  const src=$('flt-log-src').value;
+  const from=$('log-from').value, to=$('log-to').value;
   LOG_ROWS=LOGS.filter(function(l){
     if(st && l.status!==st)return false;
+    if(src && l.source!==src)return false;
+    const d=dayOf(l.ts);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
     if(!q)return true;
     return ((l.city||'')+' '+(l.source||'')+' '+(l.message||'')).toLowerCase().indexOf(q)>=0;
   });
-  $('log-count').textContent='命中 '+LOG_ROWS.length+' / '+LOGS.length+' 条';
+  const added=LOG_ROWS.reduce(function(a,l){return a+(l.added||0);},0);
+  $('log-count').textContent='命中 '+LOG_ROWS.length+' / '+LOGS.length+' 条 · 合计新增 '+added;
   renderLogs();
 }
 
@@ -855,7 +1016,7 @@ function renderLogs(){
   $('log-pager').innerHTML=pagerHtml('log',page,pages,total);
 }
 
-function resetLogFilter(){$('q-log').value='';$('flt-log-status').value='';filterLogs(true);}
+function resetLogFilter(){$('q-log').value='';$('flt-log-status').value='';$('flt-log-src').value='';$('log-from').value='';$('log-to').value='';filterLogs(true);}
 
 function delAllCheck(){
   showView('data');
@@ -1038,15 +1199,33 @@ function filterUsers(reset){
   if(reset)PAGES.user=1;
   const q=$('q-user').value.trim();
   const st=$('flt-status').value;
-  const mv=$('flt-min').value;
-  const min=mv===''?-Infinity:Number(mv);
+  const paid=$('flt-paid').value;
+  const mn=$('flt-min').value, mx=$('flt-max').value;
+  const lo=mn===''?-Infinity:Number(mn), hi=mx===''?Infinity:Number(mx);
+  const from=$('user-from').value, to=$('user-to').value;
   USER_ROWS=USERS.filter(function(u){
     if(st && u.status!==st)return false;
-    if((u.balance||0)<min)return false;
+    const bal=u.balance||0;
+    if(bal<lo||bal>hi)return false;
+    if(paid==='paid' && !u.paid)return false;
+    if(paid==='free' && (u.paid||u.is_unlimited))return false;
+    if(paid==='unlimited' && !u.is_unlimited)return false;
+    const d=dayOf(u.created_at);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
     if(!q)return true;
     return String(u.id).indexOf(q)>=0 || (u.phone||'').indexOf(q)>=0;
   });
-  $('user-count').textContent='命中 '+USER_ROWS.length+' / '+USERS.length+' 人';
+  const sort=$('sort-user').value;
+  if(sort==='balance')USER_ROWS.sort(function(a,b){return (b.balance||0)-(a.balance||0);});
+  else if(sort==='used')USER_ROWS.sort(function(a,b){return (b.used||0)-(a.used||0);});
+  else if(sort==='new')USER_ROWS.sort(function(a,b){
+    return String(b.created_at||'').localeCompare(String(a.created_at||''));});
+  else USER_ROWS.sort(function(a,b){return a.id-b.id;});
+  const sumUsed=USER_ROWS.reduce(function(a,u){return a+(u.used||0);},0);
+  const sumBal=USER_ROWS.reduce(function(a,u){return a+(u.balance||0);},0);
+  $('user-count').textContent='命中 '+USER_ROWS.length+' / '+USERS.length+' 人'
+    +' · 余额合计 '+sumBal+' · 消耗合计 '+sumUsed;
   renderUsers();
 }
 
@@ -1098,7 +1277,10 @@ async function applyRowAdjust(uid){
 }
 
 function resetUserFilter(){
-  $('q-user').value=''; $('flt-status').value=''; $('flt-min').value='';
+  $('q-user').value=''; $('flt-status').value=''; $('flt-paid').value='';
+  $('flt-min').value=''; $('flt-max').value='';
+  $('user-from').value=''; $('user-to').value='';
+  $('sort-user').value='id';
   filterUsers(true);
 }
 
@@ -1118,7 +1300,7 @@ function showUsage(uid){
 }
 
 async function loadUsage(uid){
-  const r=await api('/api/usage'+(uid?('?uid='+uid):''));
+  const r=await api('/api/usage?limit=500'+(uid?('&uid='+uid):''));
   if(!r.ok)return;
   USAGE=r.usage||[];
   if(uid)$('q-usage').value=uid;
@@ -1130,12 +1312,23 @@ function filterUsage(reset){
   if(reset)PAGES.usage=1;
   const uid=$('q-usage').value.trim();
   const m=$('q-usage-model').value.trim().toLowerCase();
+  const tk=$('q-usage-task').value.trim().toLowerCase();
+  const from=$('usage-from').value, to=$('usage-to').value;
+  const mv=$('usage-min').value;
+  const min=mv===''?-Infinity:Number(mv);
   USAGE_ROWS=USAGE.filter(function(u){
     if(uid && String(u.user_id).indexOf(uid)<0)return false;
     if(m && (u.model||'').toLowerCase().indexOf(m)<0)return false;
+    if(tk && (u.task||'').toLowerCase().indexOf(tk)<0)return false;
+    if((u.credits||0)<min)return false;
+    const d=dayOf(u.created_at);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
     return true;
   });
-  $('usage-count').textContent='命中 '+USAGE_ROWS.length+' / '+USAGE.length+' 条';
+  const sum=USAGE_ROWS.reduce(function(a,u){return a+(u.credits||0);},0);
+  $('usage-count').textContent='命中 '+USAGE_ROWS.length+' / '+USAGE.length
+    +' 条 · 积分合计 '+sum;
   renderUsage();
 }
 
@@ -1157,66 +1350,160 @@ function renderUsage(){
 }
 
 function resetUsageFilter(){
-  $('q-usage').value=''; $('q-usage-model').value=''; filterUsage(true);
+  $('q-usage').value=''; $('q-usage-model').value=''; $('q-usage-task').value='';
+  $('usage-from').value=''; $('usage-to').value=''; $('usage-min').value='';
+  filterUsage(true);
 }
 
 // ---------------- 财务看板 ----------------
+let ORDERS=[];      // 订单全量（服务端已按窗口取足）
+let ORD_ROWS=[];    // 当前条件过滤结果
+
 async function loadFinance(){
-  const r = await api('/api/finance');
-  if(!r.ok) return;
-  const st = r.stats || {};
-  const cards = $('fin-cards');
-  if(cards) cards.innerHTML = [
-    ['累计收入', '¥'+(st.revenue_yuan_total||0).toFixed(2)],
-    ['已付订单', st.orders_paid_total||0],
-    ['今日收入', '¥'+((st.revenue_cents_today||0)/100).toFixed(2)],
-    ['订阅中用户', st.active_subs||0],
-    ['今日积分消耗', st.credits_used_today||0],
-    ['支付通道', st.pay_mode==='mock'?'演示':'微信']
+  const daysEl=$('fin-days');
+  const days=daysEl?daysEl.value:'14';
+  const r=await api('/api/finance?days='+days+'&limit=500');
+  if(!r.ok){
+    const m=$('ord-msg');
+    if(m){m.className='msg bad';m.textContent='加载失败：'+(r.error||'未知错误');}
+    return;
+  }
+  const st=r.stats||{};
+  const cards=$('fin-cards');
+  if(cards) cards.innerHTML=[
+    ['累计收入','¥'+(st.revenue_yuan_total||0).toFixed(2)],
+    ['已付订单',st.orders_paid_total||0],
+    ['今日收入','¥'+((st.revenue_cents_today||0)/100).toFixed(2)],
+    ['订阅中用户',st.active_subs||0],
+    ['今日积分消耗',st.credits_used_today||0],
+    ['支付通道',st.pay_mode==='mock'?'演示':'微信']
   ].map(c=>'<div class="card"><b>'+c[1]+'</b><span>'+c[0]+'</span></div>').join('');
-  const rev = st.daily_revenue || [];
-  $('fin-rev').innerHTML = '<tr><th>日期</th><th>收入</th><th>订单数</th></tr>'
+
+  const win=$('fin-window');
+  if(win) win.textContent='（收入与消耗按天聚合，各取最近 '+days+' 天）';
+
+  const rev=st.daily_revenue||[];
+  $('fin-rev').innerHTML='<tr><th>日期</th><th>收入</th><th>订单数</th></tr>'
     +(rev.length?rev.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>¥'
       +d.yuan.toFixed(2)+'</b></td><td>'+d.orders+'</td></tr>').join('')
-      :'<tr><td colspan="3" class="empty">还没有已支付订单</td></tr>');
-  const us = st.daily_usage || [];
-  $('fin-usage').innerHTML = '<tr><th>日期</th><th>消耗积分</th><th>调用次数</th></tr>'
+      :'<tr><td colspan="3" class="empty">窗口内还没有已支付订单</td></tr>');
+  const us=st.daily_usage||[];
+  $('fin-usage').innerHTML='<tr><th>日期</th><th>消耗积分</th><th>调用次数</th></tr>'
     +(us.length?us.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>'+d.credits
       +'</b></td><td>'+d.calls+'</td></tr>').join('')
-      :'<tr><td colspan="3" class="empty">暂无用量</td></tr>');
-  const od = r.orders || [];
-  $('fin-orders').innerHTML = '<tr><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th>'
-    +'<th>状态</th><th>支付时间</th></tr>'
-    +(od.length?od.map(o=>'<tr><td>'+esc(o.order_no)+'</td><td>'+esc(o.phone||o.uid)
-      +'</td><td>'+esc(o.title)+'</td><td>¥'+(o.amount_cents/100).toFixed(2)+'</td>'
-      +'<td>'+(o.status==='paid'?'<b>已支付</b>':'待支付')+'</td>'
-      +'<td>'+esc(o.paid_str||'-')+'</td></tr>').join('')
-      :'<tr><td colspan="6" class="empty">还没有订单</td></tr>');
+      :'<tr><td colspan="3" class="empty">窗口内暂无用量</td></tr>');
+
+  // 套餐下拉：从服务端配置来，别在前端写死定价表
+  const sel=$('flt-ord-plan');
+  if(sel){
+    const cur=sel.value;
+    sel.innerHTML='<option value="">全部套餐</option>'
+      +((r.plans||[]).map(p=>'<option value="'+escq(p.plan_id)+'">'+esc(p.title)
+        +'</option>').join(''));
+    sel.value=cur||'';
+  }
+  ORDERS=r.orders||[];
+  filterOrders();
+}
+
+function filterOrders(reset){
+  if(reset)PAGES.ord=1;
+  const st=$('flt-ord-status').value;
+  const plan=$('flt-ord-plan').value;
+  const q=$('q-ord').value.trim().toLowerCase();
+  const mn=$('ord-min').value, mx=$('ord-max').value;
+  const lo=mn===''?-Infinity:Number(mn), hi=mx===''?Infinity:Number(mx);
+  const from=$('ord-from').value, to=$('ord-to').value;
+  ORD_ROWS=ORDERS.filter(function(o){
+    if(st && o.status!==st)return false;
+    if(plan && o.plan_id!==plan)return false;
+    const yuan=(o.amount_cents||0)/100;
+    if(yuan<lo||yuan>hi)return false;
+    const d=dayOf(o.created_str||o.paid_str);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
+    if(!q)return true;
+    return ((o.order_no||'')+' '+(o.phone||'')+' '+(o.uid||'')+' '+(o.title||''))
+      .toLowerCase().indexOf(q)>=0;
+  });
+  const cnt=$('ord-count');
+  if(cnt)cnt.textContent='命中 '+ORD_ROWS.length+' / '+ORDERS.length+' 单';
+  const sum=ORD_ROWS.reduce(function(a,o){
+    return a+(o.status==='paid'?(o.amount_cents||0):0);},0);
+  const sm=$('ord-sum');
+  if(sm)sm.textContent='筛选内已付合计 ¥'+(sum/100).toFixed(2);
+  renderOrders();
+}
+
+function renderOrders(){
+  const size=getPageSize('fin');
+  const total=ORD_ROWS.length;
+  const pages=Math.max(1,Math.ceil(total/size));
+  let page=PAGES.ord||1; if(page>pages)page=pages; PAGES.ord=page;
+  const slice=ORD_ROWS.slice((page-1)*size,(page-1)*size+size);
+  $('fin-orders').innerHTML='<tr><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th>'
+    +'<th>状态</th><th>下单时间</th><th>支付时间</th></tr>'
+    +(slice.length?slice.map(function(o){
+      const uname=o.phone?(esc(o.phone)+' <span class="fresh">#'+o.uid+'</span>'):('# '+o.uid);
+      return '<tr><td>'+esc(o.order_no)+'</td><td>'+uname+'</td>'
+        +'<td>'+esc(o.title)+'</td><td>¥'+(o.amount_cents/100).toFixed(2)+'</td>'
+        +'<td>'+(o.status==='paid'?'<b style="color:var(--ok)">已支付</b>'
+          :'<span style="color:#8a8a82">待支付</span>')+'</td>'
+        +'<td>'+esc(o.created_str||'-')+'</td><td>'+esc(o.paid_str||'-')+'</td></tr>';
+    }).join(''):'<tr><td colspan="7" class="empty">没有符合条件的订单</td></tr>');
+  $('ord-pager').innerHTML=pagerHtml('fin',page,pages,total);
+}
+
+function resetOrderFilter(){
+  $('flt-ord-status').value=''; $('flt-ord-plan').value='';
+  $('q-ord').value=''; $('ord-min').value=''; $('ord-max').value='';
+  $('ord-from').value=''; $('ord-to').value='';
+  filterOrders(true);
 }
 
 // ---------------- 内容审计 ----------------
 let MODERATION=[];
 
 async function loadModeration(){
-  const r=await api('/api/moderation');
+  const r=await api('/api/moderation?limit=500');
   MODERATION=r.items||[];
-  $('mod-count').textContent='待复查 '+MODERATION.length+' 条';
+  PAGES.mod=1;
   renderModeration();
 }
 
-function renderModeration(){
+function modRows(){
   const dir=$('flt-mod-dir').value, cat=$('flt-mod-cat').value;
-  const rows=MODERATION.filter(function(m){
+  const disp=$('flt-mod-disp').value;
+  const uid=$('q-mod-uid').value.trim();
+  const kw=$('q-mod-kw').value.trim().toLowerCase();
+  const from=$('mod-from').value, to=$('mod-to').value;
+  return MODERATION.filter(function(m){
     if(dir && m.direction!==dir)return false;
     if(cat && m.category!==cat)return false;
-    return true;
+    if(disp && m.disposition!==disp)return false;
+    if(uid && String(m.uid==null?'':m.uid).indexOf(uid)<0)return false;
+    const d=dayOf(m.created_at);
+    if(from && (!d || d<from))return false;
+    if(to && (!d || d>to))return false;
+    if(!kw)return true;
+    return ((m.words||'')+' '+(m.excerpt||'')+' '+(m.category||''))
+      .toLowerCase().indexOf(kw)>=0;
   });
+}
+
+function renderModeration(){
+  const rows=modRows();
   $('mod-count').textContent='命中 '+rows.length+' / '+MODERATION.length+' 条';
+  const size=getPageSize('mod');
+  const total=rows.length;
+  const pages=Math.max(1,Math.ceil(total/size));
+  let page=PAGES.mod||1; if(page>pages)page=pages; PAGES.mod=page;
+  const slice=rows.slice((page-1)*size,(page-1)*size+size);
   const dirName={input:'输入',output:'输出'};
   const dispName={blocked:'已拒绝',masked:'已打码',fallback:'已换兜底'};
   $('mod-table').innerHTML='<tr><th>时间</th><th>方向</th><th>类别</th><th>命中词</th>'
     +'<th>内容摘录</th><th>用户</th><th>处置</th><th></th></tr>'
-    +(rows.length?rows.map(function(m){
+    +(slice.length?slice.map(function(m){
       return '<tr><td>'+esc(m.created_at)+'</td>'
         +'<td>'+(dirName[m.direction]||m.direction)+'</td>'
         +'<td><b>'+esc(m.category)+'</b></td>'
@@ -1225,8 +1512,16 @@ function renderModeration(){
         +'<td>'+(m.uid??'-')+'</td>'
         +'<td>'+(dispName[m.disposition]||esc(m.disposition))+'</td>'
         +'<td><button onclick="dismissHit('+m.id+')">误报放行</button></td></tr>';
-    }).join(''):'<tr><td colspan="8" class="empty">没有待复查的拦截记录</td></tr>');
-  $('mod-pager').innerHTML='';
+    }).join(''):'<tr><td colspan="8" class="empty">没有符合条件的拦截记录</td></tr>');
+  $('mod-pager').innerHTML=pagerHtml('mod',page,pages,total);
+}
+
+function resetModFilter(){
+  $('flt-mod-dir').value=''; $('flt-mod-cat').value=''; $('flt-mod-disp').value='';
+  $('q-mod-uid').value=''; $('q-mod-kw').value='';
+  $('mod-from').value=''; $('mod-to').value='';
+  PAGES.mod=1;
+  renderModeration();
 }
 
 async function dismissHit(id){
@@ -1363,7 +1658,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "settings": summary})
             return
         if path == "/api/users":
-            users = auth.list_users()
+            users = auth.list_users(limit=500)
             self._json({"ok": True, "total": len(users), "users": users,
                         "bonus": auth.BONUS_CREDITS,
                         "daily_cap": auth.DAILY_CAP_CREDITS})
@@ -1372,14 +1667,27 @@ class Handler(BaseHTTPRequestHandler):
             import urllib.parse
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             uid = int(q["uid"][0]) if q.get("uid") else None
-            self._json({"ok": True, "usage": auth.list_usage(uid)})
+            # 条件查询在前端做：一次多取一些，避免筛完只剩窗口里那几条
+            limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
+            self._json({"ok": True, "usage": auth.list_usage(uid, limit=limit)})
             return
         if path == "/api/finance":
-            self._json({"ok": True, "stats": billing.finance_stats(),
-                        "orders": billing.list_orders(limit=50)})
+            import urllib.parse
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            days = min(max(int(q["days"][0]) if q.get("days") else 14, 1), 365)
+            limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
+            self._json({"ok": True, "stats": billing.finance_stats(days),
+                        "orders": billing.list_orders(limit=limit),
+                        "plans": [{"plan_id": k, "title": v["title"],
+                                   "kind": v.get("kind", "pack")}
+                                  for k, v in billing.PLANS.items()],
+                        "days": days})
             return
         if path == "/api/moderation":
-            self._json({"ok": True, "items": moderation.list_hits(),
+            import urllib.parse
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
+            self._json({"ok": True, "items": moderation.list_hits(limit=limit),
                         "stats": moderation.stats()})
             return
         db = kb.get_kb()
@@ -1407,7 +1715,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True,
                             "areas": db.city_areas((qs.get("city") or [""])[0])})
             elif path == "/api/logs":
-                self._json({"ok": True, "logs": db.logs()})
+                import urllib.parse
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
+                self._json({"ok": True, "logs": db.logs(limit)})
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
         except Exception as e:
