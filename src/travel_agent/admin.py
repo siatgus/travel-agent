@@ -1048,6 +1048,9 @@ function applyPreset(){
 
 function showLlm(ok,text){
   const m=$('llm-msg');m.className='msg '+(ok?'ok':'bad');m.textContent=text;
+  // 失败提示必须滚到眼前：保存按钮在表单中部，提示条挂在区块顶部，
+  // 不滚动的话用户只会觉得"点了没反应"（2026-11-16 实测反馈）
+  if(!ok && m.scrollIntoView) m.scrollIntoView({behavior:'smooth',block:'center'});
 }
 
 // ---------------- 当前生效模型卡片 ----------------
@@ -1155,26 +1158,35 @@ async function loadLlm(){
 }
 
 async function saveLlm(){
-  const r=await api('/api/llm/settings',{enabled:$('llm-enabled').checked,
-    provider:$('llm-provider').value, base_url:$('llm-base').value.trim(),
-    model:$('llm-model').value.trim(), timeout:Number($('llm-timeout').value)||60,
-    api_key:$('llm-key').value.trim(),
-    tdt_key:$('llm-tdtkey').value.trim(),
-    amap_key:$('llm-amapkey').value.trim(),
-    amap_security:$('llm-amapsecurity').value.trim(),
-    amap_web_key:$('llm-amapwebkey').value.trim(),
-    fallback_enabled:$('llm-fb-enabled').checked,
-    fallback_provider:$('llm-fb-provider').value,
-    fallback_base_url:$('llm-fb-base').value.trim(),
-    fallback_model:$('llm-fb-model').value.trim(),
-    fallback_api_key:$('llm-fb-key').value.trim(),
-    light_enabled:$('llm-light-enabled').checked,
-    light_provider:$('llm-light-provider').value,
-    light_base_url:$('llm-light-base').value.trim(),
-    light_model:$('llm-light-model').value.trim(),
-    light_api_key:$('llm-light-key').value.trim(),
-    light_tasks:$('llm-light-tasks').value.trim()});
-  showLlm(r.ok, r.ok?'已保存 —— 对话服务下一句话即刻生效':('保存失败：'+(r.error||'未知错误')));
+  let r;
+  try {
+    r = await api('/api/llm/settings',{enabled:$('llm-enabled').checked,
+      provider:$('llm-provider').value, base_url:$('llm-base').value.trim(),
+      model:$('llm-model').value.trim(), timeout:Number($('llm-timeout').value)||60,
+      api_key:$('llm-key').value.trim(),
+      tdt_key:$('llm-tdtkey').value.trim(),
+      amap_key:$('llm-amapkey').value.trim(),
+      amap_security:$('llm-amapsecurity').value.trim(),
+      amap_web_key:$('llm-amapwebkey').value.trim(),
+      fallback_enabled:$('llm-fb-enabled').checked,
+      fallback_provider:$('llm-fb-provider').value,
+      fallback_base_url:$('llm-fb-base').value.trim(),
+      fallback_model:$('llm-fb-model').value.trim(),
+      fallback_api_key:$('llm-fb-key').value.trim(),
+      light_enabled:$('llm-light-enabled').checked,
+      light_provider:$('llm-light-provider').value,
+      light_base_url:$('llm-light-base').value.trim(),
+      light_model:$('llm-light-model').value.trim(),
+      light_api_key:$('llm-light-key').value.trim(),
+      light_tasks:$('llm-light-tasks').value.trim()});
+  } catch(e) {
+    showLlm(false,'保存请求失败：'+e.message+'（请确认管理后台进程还在运行）');
+    return;
+  }
+  showLlm(!!r.ok, r.ok
+    ? (r.warning ? (r.warning+' 刷新后字段会显示「已保存」占位。')
+                 : '已保存 —— 对话服务下一句话即刻生效')
+    : ('保存失败：'+(r.error||'未知错误')));
   loadLlm();
 }
 
@@ -1808,27 +1820,21 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._json({"ok": False, "error": "超时秒数应为数字"}, 400)
             return
-        if enabled and not model:
-            self._json({"ok": False, "error": "启用 LLM 需要填写模型名"}, 400)
-            return
-        if enabled and not base_url.startswith("http"):
-            self._json({"ok": False, "error": "Base URL 需以 http(s) 开头"}, 400)
-            return
 
-        cfg = {"enabled": enabled,
-               "provider": str(data.get("provider") or "custom")[:40],
-               "base_url": base_url,
-               "model": model,
-               "timeout": timeout}
+        # Key 类字段先验先存，与 LLM 启用校验解耦（2026-11-16 用户实测：
+        # 只想保存底图/POI 的 Key，却被「启用 LLM 需要填写模型名」整单
+        # 拦下，而提示条挂在区块顶部、离保存按钮很远——看起来就是
+        # "填好了不能保存"。Key 与 LLM 启用是两件事。）
+        cfg: dict = {"provider": str(data.get("provider") or "custom")[:40],
+                     "timeout": timeout}
+        saved_keys: list[str] = []
         key = str(data.get("api_key") or "").strip()
         if key:
             if len(key) < 8:
                 self._json({"ok": False, "error": "API Key 长度异常（至少 8 位）"}, 400)
                 return
             cfg["api_key"] = key
-        elif enabled and not llm.load_settings().get("api_key"):
-            self._json({"ok": False, "error": "启用 LLM 需要先填写 API Key"}, 400)
-            return
+            saved_keys.append("API Key")
         # 天地图 Key（行程页备用底图），选填；留空表示不修改
         tdt_key = str(data.get("tdt_key") or "").strip()
         if tdt_key:
@@ -1838,6 +1844,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "console.tianditu.gov.cn「应用管理」可查）"}, 400)
                 return
             cfg["tdt_key"] = tdt_key
+            saved_keys.append("天地图 Key")
         # 高德 JS API Key（行程页首选底图），选填；留空表示不修改
         amap_key = str(data.get("amap_key") or "").strip()
         if amap_key:
@@ -1847,6 +1854,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "lbs.amap.com「应用管理」可查）"}, 400)
                 return
             cfg["amap_key"] = amap_key
+            saved_keys.append("高德 Key")
         # 高德安全密钥 securityJsCode（2021-12 后申请的 Key 必配），选填
         amap_sec = str(data.get("amap_security") or "").strip()
         if amap_sec:
@@ -1855,6 +1863,7 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "高德安全密钥格式异常（通常为 32 位字母数字）"}, 400)
                 return
             cfg["amap_security"] = amap_sec
+            saved_keys.append("高德安全密钥")
         # 高德「Web 服务」Key（POI 检索首选源，与上面画图的 JS API Key 是
         # 不同类型，混用会返回 INVALID_USER_KEY），选填；留空表示不修改
         amap_web = str(data.get("amap_web_key") or "").strip()
@@ -1866,6 +1875,7 @@ class Handler(BaseHTTPRequestHandler):
                            400)
                 return
             cfg["amap_web_key"] = amap_web
+            saved_keys.append("高德 Web 服务 Key")
         # ---- LLM 网关：备用供应商与轻任务便宜档（均可选，不配=单供应商直连） ----
         cfg["fallback_enabled"] = bool(data.get("fallback_enabled"))
         cfg["light_enabled"] = bool(data.get("light_enabled"))
@@ -1875,21 +1885,21 @@ class Handler(BaseHTTPRequestHandler):
             if pfx == "light_" and not cfg["light_enabled"]:
                 continue
             base = str(data.get(pfx + "base_url") or "").strip()
-            model = str(data.get(pfx + "model") or "").strip()
-            if not base.startswith("http") or not model:
+            model2 = str(data.get(pfx + "model") or "").strip()
+            if not base.startswith("http") or not model2:
                 self._json({"ok": False,
                             "error": f"启用{label}需填写 Base URL（http 开头）与模型名"}, 400)
                 return
             cfg[pfx + "provider"] = str(data.get(pfx + "provider") or "")[:40]
             cfg[pfx + "base_url"] = base
-            cfg[pfx + "model"] = model
-            key = str(data.get(pfx + "api_key") or "").strip()
-            if key:
-                if len(key) < 8:
+            cfg[pfx + "model"] = model2
+            k2 = str(data.get(pfx + "api_key") or "").strip()
+            if k2:
+                if len(k2) < 8:
                     self._json({"ok": False,
                                 "error": f"{label} API Key 长度异常（至少 8 位）"}, 400)
                     return
-                cfg[pfx + "api_key"] = key
+                cfg[pfx + "api_key"] = k2
             elif not llm.load_settings().get(pfx + "api_key"):
                 self._json({"ok": False,
                             "error": f"启用{label}需先填写 API Key"}, 400)
@@ -1897,6 +1907,29 @@ class Handler(BaseHTTPRequestHandler):
         if cfg.get("light_enabled"):
             tasks = str(data.get("light_tasks") or "").strip()
             cfg["light_tasks"] = tasks or llm.DEFAULT_LIGHT_TASKS
+
+        # ---- 主 LLM 启用校验：不合法但本次存了 Key → 只存 Key，不动启用状态
+        llm_bad = None
+        if enabled and not model:
+            llm_bad = "启用 LLM 需要填写模型名"
+        elif enabled and not base_url.startswith("http"):
+            llm_bad = "Base URL 需以 http(s) 开头"
+        elif enabled and not cfg.get("api_key") \
+                and not llm.load_settings().get("api_key"):
+            llm_bad = "启用 LLM 需要先填写 API Key"
+        if llm_bad:
+            if saved_keys:
+                # cfg 不带 enabled/base_url/model，合并保存即保留原启用状态
+                llm.save_settings(cfg)
+                self._json({"ok": True,
+                            "warning": f"{'、'.join(saved_keys)}已保存；{llm_bad}，"
+                                       f"本次未改动启用状态。"})
+                return
+            self._json({"ok": False, "error": llm_bad}, 400)
+            return
+        cfg["enabled"] = enabled
+        cfg["base_url"] = base_url
+        cfg["model"] = model
         llm.save_settings(cfg)
         self._json({"ok": True})
 
