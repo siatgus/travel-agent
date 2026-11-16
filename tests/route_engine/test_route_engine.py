@@ -157,6 +157,42 @@ def test_optimize_order_poi_dicts() -> None:
           and [p["poi_id"] for p in out3] == ["P1", "P1"])
 
 
+def test_max_visits_and_window() -> None:
+    """max_visits 真裁剪 + 约束检查按请求时间窗判（缺陷修复回归）。"""
+    eng = RouteEngine()
+    a = _n("A", 30.66, 104.088, 120, required=True)
+    b = _n("B", 30.66, 104.020, 90)
+    c = _n("C", 30.66, 104.0893, 90)
+    # optimize=True 时 max_visits 同样生效（旧实现只报违规不裁剪）
+    r = eng.plan(RouteRequest(nodes=[a, b, c], max_visits=2, start_geo=HOME))
+    check("max_visits：优化模式下裁到 2 个且成功",
+          r.success and len(r.order) == 2 and "A" in r.order, str(r.errors))
+    check("max_visits：被裁的点写进 warnings",
+          any("未纳入" in w for w in r.warnings), str(r.warnings))
+    # 必去超限：保必去，如实报不可行，不静默丢必去点
+    d = _n("D", 30.65, 104.00, 90, required=True)
+    r2 = eng.plan(RouteRequest(nodes=[a, b, d], max_visits=1, start_geo=HOME))
+    check("max_visits：必去超限不丢必去点，如实报违规",
+          {x for x in r2.order if x in ("A", "D")} == {"A", "D"}
+          and not r2.success, str(r2.order))
+    # checker 按请求时间窗判：14:00-16:00 的窗口就该按 120 分钟算
+    e = _n("E", 30.66, 104.07, 150)
+    r3 = eng.plan(RouteRequest(nodes=[e], start_geo=HOME,
+                               start_time="14:00", end_time="16:00",
+                               optimize=False))
+    check("时间窗：净游玩超窗按请求口径告警",
+          any("超过当日窗口" in w and "120" in w for w in r3.warnings),
+          str(r3.warnings))
+    # 闭馆整点到达：不再伪造可行（成功且只给软警告），而是如实报不可入
+    f = _n("F", 30.66, 104.05, 60, hours="09:00-17:00")
+    r4 = eng.plan(RouteRequest(nodes=[f], start_geo=HOME,
+                               start_time="17:00", end_time="20:00",
+                               optimize=False))
+    check("闭馆整点：到达即闭馆，成功且有冲突说明",
+          r4.success and any("已闭馆" in w for w in r4.warnings),
+          f"success={r4.success} warn={r4.warnings}")
+
+
 def test_switch_disabled() -> None:
     """回滚开关：TRAVEL_ROUTE_ENGINE=0 时原样返回。"""
     import importlib
@@ -190,5 +226,6 @@ if __name__ == "__main__":
     test_osrm_down_degrades()
     test_infeasible_reports()
     test_optimize_order_poi_dicts()
+    test_max_visits_and_window()
     test_switch_disabled()
     finish("RouteEngine 链路")

@@ -659,11 +659,18 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         # 单日行程不启用：容量最紧张（返程截止线）、必去优先/大时长优先
         # 的旧契约被质检与回归固化，重排收益小、顺延风险大（杭州实测教训）。
         _re_algo = None
-        if days != 1:
+        # 用户口语顺序（「先去A再去B」）作为 preferred_order 硬约束传入：
+        # 引擎的骨架插入与 2-opt 重罚都会遵守，改动失败自动原序回退。
+        _vo = [x for x in (slots.get("visit_order") or []) if x]
+        # 单日行程默认沿用旧的「必去优先/大时长优先」契约（质检与回归固化，
+        # 返程截止线容量最紧张，第三阶段实测教训）——但用户显式给了顺序时
+        # 例外：点名顺序是硬约束，优先级高于内部启发式（设计文档场景七）。
+        if days != 1 or _vo:
             picked, _re_algo = optimize_order(
                 picked, home_geo=home, start_min=start_min,
                 end_min=(ret_deadline if ret_deadline is not None
-                         else DAY_END_LATEST))
+                         else DAY_END_LATEST),
+                preferred_names=_vo or None)
 
         # 时间轴装配
         # clock 必须从 start_min 起：返程日 09:00 已排了「早市/伴手礼」（60 分钟），
@@ -939,6 +946,9 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             "rainy_plan": "已按降雨概率调整" if rain > 60 else "户外优先",
             # 当天有点位坐标不可靠：前端/文案据此标注"位置待确认"
             "geo_uncertain": any(_geo_uncertain(p) for p in used_pois),
+            # 路线引擎观测点：当日访问顺序用了哪种算法（None=未启用/
+            # input=原序/nearest_neighbor/2-opt），后台与排查用，前端忽略
+            "route_algo": _re_algo,
         })
         if dropped:
             log.setdefault("deferred", []).extend(dropped)

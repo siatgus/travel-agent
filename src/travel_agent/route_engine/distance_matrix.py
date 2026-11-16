@@ -67,7 +67,14 @@ class DistanceMatrix:
             road_km, drive_min = _osrm_drive(ga, gb) or (None, None)
             if road_km is not None:
                 self.osrm_calls += 1
-                return {"km": road_km, "min": int(drive_min),
+                # 耗时口径与 tools.transit_estimate 对齐（步行阈值 + 等车
+                # 缓冲）：优化目标用的分钟数和 composer 最终展示的分钟数
+                # 必须同源同义，否则"按 A 优化、按 B 展示"两套口径。
+                if road_km <= 0.8:
+                    tmin = int(road_km / 4.5 * 60) + 1
+                else:
+                    tmin = int(drive_min) + 6
+                return {"km": road_km, "min": tmin,
                         "source": "osrm", "estimated": False}
         self.estimated_calls += 1
         mode, tmin = _transit_estimate(km, ga, gb)

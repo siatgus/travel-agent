@@ -23,6 +23,7 @@ def test_is_open_and_wait() -> None:
     n = _n("09:00-17:00")
     check("营业判定：窗口内", w.is_open(n, 9 * 60))
     check("营业判定：闭馆后不算营业", not w.is_open(n, 17 * 60 + 1))
+    check("营业判定：闭馆整点已停止入园", not w.is_open(n, 17 * 60))
     check("等待：早到 30 分钟", w.calculate_wait(n, 8 * 60 + 30) == 30)
     check("等待：已开门无等待", w.calculate_wait(n, 10 * 60) == 0)
     check("等待：全天开放无等待", w.calculate_wait(_n(None), 7 * 60) == 0)
@@ -34,6 +35,8 @@ def test_next_available() -> None:
     check("入场：早到等到开门", w.find_next_available(n, 8 * 60) == (9 * 60, 60))
     check("入场：营业中直接进", w.find_next_available(n, 10 * 60) == (10 * 60, 0))
     check("入场：已闭馆返回 None", w.find_next_available(n, 18 * 60) is None)
+    check("入场：闭馆整点到达也进不去",
+          w.find_next_available(n, 17 * 60) is None)
     check("入场：全天开放即到即进",
           w.find_next_available(_n(None), 7 * 60) == (7 * 60, 0))
 

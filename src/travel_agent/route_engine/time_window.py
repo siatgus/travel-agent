@@ -25,11 +25,15 @@ class TimeWindow:
         return parse_open_hours(node.opening_time)
 
     def is_open(self, node: RouteNode, arrival_min: int) -> bool:
-        """到达时刻是否在营业窗口内（恰好等于闭馆时刻算营业）。"""
+        """到达时刻是否在营业窗口内（左闭右开：闭馆整点已停止入园）。
+
+        「场馆开着门」≠「还能进去玩」——能否入场游玩以 find_next_available
+        为准，那里要求严格早于闭馆时刻。
+        """
         w = self.window(node)
         if w is None:
             return True
-        return w[0] <= arrival_min <= w[1]
+        return w[0] <= arrival_min < w[1]
 
     def calculate_wait(self, node: RouteNode, arrival_min: int) -> int:
         """早到需要等待的分钟数（营业后才放行）；已营业返回 0。"""
@@ -42,12 +46,15 @@ class TimeWindow:
                             arrival_min: int) -> tuple[int, int] | None:
         """返回 (可入场时刻, 等待分钟)；全天开放返回 (arrival, 0)。
 
-        到达时刻已闭馆返回 None——这一天进不去了，上层要么换顺序要么换天。
+        到达时刻不在闭馆之前返回 None——这一天进不去了，上层要么换顺序
+        要么换天。恰好等于闭馆时刻也算进不去：游玩时长恒为正，闭馆整点
+        进去等于一分钟都玩不上，旧实现把这种顺序判成可行还标 success，
+        是在伪造可行路线（文档 §13.2 场景八）。
         """
         w = self.window(node)
         if w is None:
             return arrival_min, 0
-        if arrival_min > w[1]:
+        if arrival_min >= w[1]:
             return None
         if arrival_min < w[0]:
             return w[0], w[0] - arrival_min

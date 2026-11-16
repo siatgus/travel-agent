@@ -47,6 +47,12 @@ class RouteOptimizer:
         if any(not n.has_geo() for n in nodes):
             return list(nodes), "input"
         base = self._complete(list(initial or nodes), nodes)
+        # 输入序可能本身违反 preferred_order（composer 的启发式不知道用户
+        # 口语顺序）——拿违约序当基准，"优化不劣于原序"的比较会保住一个
+        # 违约解。先把 pinned 按指定相对顺序归位（自由点原地不动），得到
+        # 一个可行基准，再谈改进。
+        if any(n.preferred_order is not None for n in base):
+            base = self._respect_order(base)
         base_cost = self.route_cost(base)
         nn, _ = self.nearest_neighbor(nodes)
         best, best_cost, algo = base, base_cost, "input"
@@ -193,6 +199,13 @@ class RouteOptimizer:
         seq = [pos[nid] for _, nid in pinned]
         return sum(1 for i in range(len(seq))
                    for j in range(i + 1, len(seq)) if seq[i] > seq[j])
+
+    def _respect_order(self, order: list[RouteNode]) -> list[RouteNode]:
+        """把 pinned 节点按 preferred_order 归位（自由点保持原位），产出可行排列。"""
+        pinned = sorted((n for n in order if n.preferred_order is not None),
+                        key=lambda n: n.preferred_order)
+        it = iter(pinned)
+        return [next(it) if n.preferred_order is not None else n for n in order]
 
     # ------------------------------------------------------------ 工具
     def _complete(self, order: list[RouteNode],

@@ -548,6 +548,8 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         "party_size": 1, "budget_total": None, "budget_per_person": None,
         "hard_prefs": [], "pace": "moderate",
         "must_visit": [], "avoid": [], "stay_pref": None,
+        # 「先去A再去B」的先后顺序（硬约束，composer 经 RouteEngine 执行）
+        "visit_order": [],
         # 人数构成：「2大1小（3岁）」里的大人/孩子拆开存，儿童票、家庭房、
         # 午休安排都要用。party_size 永远是总人数（含孩子）。
         "adults": None, "children": None, "child_age": None,
@@ -687,6 +689,14 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
                 slots["days_extend"] = n
             else:
                 slots["days"] = n
+    # 「一日游/两日游」：口语里最常见的天数说法不带"天"字——上面的正则
+    # 认不出，天数落到缺省假设，「上海一日游」被排成 4 天（实测）。
+    # 显式「N天」优先；半日游按 1 天走（时长口径由编排层压缩）。
+    if slots.get("days") is None:
+        _dm2 = re.search(r"(半日|一日|两日|二日|三日|四日|五日)游", text)
+        if _dm2:
+            slots["days"] = {"半日": 1, "一日": 1, "两日": 2, "二日": 2,
+                             "三日": 3, "四日": 4, "五日": 5}[_dm2.group(1)]
     # ---- 人数：支持「2大1小（3岁）」「一家三口」「我和老婆带5岁的娃」----
     # 旧实现只认「N个人/我和老婆/孩子」三种句式，"2大1小"四个字全都不匹配，
     # 孩子被整个丢掉：餐饮、市内交通、门票全按大人的人数估，预算系统性低估。
@@ -915,6 +925,31 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         frag = _trim_stop(_poi_frag(m.group(1)))
         if _valid_poi(frag) and frag not in slots["must_visit"]:
             slots["must_visit"].append(frag)
+
+    # 「先去外滩再去豫园」：顺序本身是硬约束（设计文档 §9 preferred_order、
+    # §13.2 场景七）。旧实现动词表只有「再去」，「先去」的点直接丢掉、先后
+    # 关系也丢掉——用户得到的必去清单只剩最后一个点（上海实测）。按顺序
+    # 动词出现次序收集点名；每个点同时进 must_visit（保证进行程），先后
+    # 关系存 visit_order，由 composer 经 RouteEngine 的 preferred_order
+    # 骨架执行（贪心骨架插入 + 2-opt 违约重罚，顺序绝不被优化破坏）。
+    _ORDER_VB = (r"(?:先去|先逛|先玩|再去|然后去|然后逛|接着去|接着逛|"
+                 r"最后去|最后逛|后去|后逛)")
+    # 顺序名的停止环视要额外挡住下一个顺序动词：「先去外滩再去豫园」的
+    # 名字必须停在「再」前——共享 _POI_STOP 不含"再/然后/接着/最后"，
+    # 非贪婪会一路吞成「外滩再去豫园」。
+    _ORDER_STOP = (r"(?=" + _POI_STOP + r"|再去|然后去|然后逛|接着去|"
+                   r"接着逛|最后去|最后逛|后去|后逛)")
+    _order_names: list[str] = []
+    for m in re.finditer(r"(?<![不别用])(?<![想])" + _ORDER_VB
+                         + r"([\u4e00-\u9fa5]{2,10}?)" + _ORDER_STOP, text):
+        frag = _poi_frag(m.group(1))
+        if _valid_poi(frag) and frag not in _order_names:
+            _order_names.append(frag)
+    if _order_names:
+        slots["visit_order"] = _order_names
+        for frag in _order_names:
+            if _valid_poi(frag) and frag not in slots["must_visit"]:
+                slots["must_visit"].append(frag)
 
     # 两个清单都出现同一景点时，排除赢（veto 先于必去占位，保持一致）
     slots["must_visit"] = [m for m in slots["must_visit"] if m not in slots["avoid"]]

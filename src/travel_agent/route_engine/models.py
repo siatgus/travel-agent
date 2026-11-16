@@ -105,7 +105,14 @@ class RouteRequest:
         self.excluded = [e for e in (self.excluded or []) if e]
         if self.max_visits is not None and self.max_visits < 0:
             raise ValueError("max_visits 不能为负")
-        ids = {n.id for n in self.nodes}
+        # id 唯一性必须在这里拦住：距离矩阵与 _match_back 都按 id 建索引，
+        # 重复 id 会让后一条覆盖前一条——实测表现为某个景点静默消失、
+        # 总距离算出 0，违反「排列不变性，绝不丢点」的承诺。宁可在入口炸。
+        ids = [n.id for n in self.nodes]
+        dups = sorted({i for i in ids if ids.count(i) > 1})
+        if dups:
+            raise ValueError(f"节点 id 重复：{'、'.join(dups)}")
+        ids = set(ids)
         for m in self.must_visit:
             if m not in ids:
                 raise ValueError(f"必去节点 {m!r} 不在 nodes 里")

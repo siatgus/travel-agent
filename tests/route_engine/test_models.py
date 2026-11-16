@@ -88,6 +88,15 @@ def test_route_request() -> None:
     check("请求：空字符串/None 的约束项被过滤",
           r2.must_visit == [] and r2.excluded == [])
 
+    # 重复 id：距离矩阵按 id 建索引，重复会让景点静默消失——入口必须拦
+    a2 = RouteNode(id="A", name="A2", latitude=30.70, longitude=104.10)
+    try:
+        RouteRequest(nodes=[a, a2])
+        ok = False
+    except ValueError:
+        ok = True
+    check("请求：重复 id 被拒（不再静默丢点）", ok)
+
 
 def test_route_result() -> None:
     a = RouteNode(id="A", name="A", latitude=30.66, longitude=104.05)

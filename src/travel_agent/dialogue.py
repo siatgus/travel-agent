@@ -214,6 +214,8 @@ def _explicit_fields(text: str, delta: dict) -> set[str]:
         got.add("must_visit")
     if delta.get("avoid"):
         got.add("avoid")
+    if delta.get("visit_order"):
+        got.add("visit_order")
     if re.search(r"不想太赶|轻松|躺平|休闲|特种兵|尽量多|打卡", text):
         got.add("pace")
     if delta.get("stay_pref"):
@@ -403,34 +405,15 @@ class Session:
     def _answer(self, kind: str, utterance: str) -> str | None:
         """信息类问题的直接回答；返回 None 表示交回排行程流程处理。
 
-        配了模型时，工具查到的事实会交给模型组织成人话（intent 里做）；
-        没配模型或模型输出跑偏，返回的就是模板——两条路的事实完全一致。
-
-        意图分发表（2026-11-13 拆分）：kind 仍是 classify 的粗分类
-        （规则优先 + LLM 兜底，规则没推翻）；poi 类再经 intent.refine_intent
-        细分成景点/美食/餐厅/酒店/路线等子意图，各自独立方法，分支不再互相
-        堆在一个函数里。城市解析与会话状态（last_city/轮次计数）留在这里。
+        2026-11-16 Orchestrator 第二阶段：问答分发已迁入
+        orchestrator/handlers/（Weather/Transport/Smalltalk/PlanQA/
+        General/POI 各自独立 Handler）。本方法保留为委托入口——
+        业务实现仍在 Session 各 *_answer 方法上，Handler 复用它们；
+        编排层现在直接走 QA_HANDLERS，不再经过这里。
         """
-        # 城市判定顺序：本句里的城市 > 当前行程目的地 > 最近提到的城市。
-        # 「天安门广场周边有什么」一句里未必带"北京"，但行程本身在北京。
-        city = (intent.city_in(utterance) or self.slots.get("destination")
-                or self.last_city or self.trip_dest)
-        if kind == "weather":
-            return self._weather_answer(city, utterance)
-        if kind == "poi":
-            return self._poi_answer(city, utterance)
-        if kind == "transport":
-            return self._transport_answer(city, utterance)
-        if kind == "smalltalk":
-            return self._smalltalk_answer(utterance)
-        if kind == "plan_qa":
-            # 没出过方案就不拦：这句可能是在闲聊，交回排行程流程正常处理
-            if not (self.plan_made and self.last_plan):
-                return None
-            return self._plan_qa_answer(utterance)
-        if kind == "general":
-            return self._general_answer(utterance)
-        return None
+        from .orchestrator.handlers import QA_HANDLERS
+        handler = QA_HANDLERS.get(kind)
+        return handler.handle(self, utterance) if handler else None
 
     def _weather_answer(self, city: str | None, utterance: str) -> str:
         """天气问句：真实预报优先，超出窗口自动用历史同期均值。"""
