@@ -356,7 +356,11 @@ def ensure_city(city: str, *, db=None, fetcher=None, client=None,
     with _CACHE_LOCK:
         hit = _CACHE.get(city)
         if hit and time.time() - hit[0] < FAIL_TTL_SEC:
-            return {**hit[1], "cached": True}
+            if not force:
+                return {**hit[1], "cached": True}
+            # 用户点名坚持（「就排北京」）：失败缓存必须让路，否则对话层
+            # 承诺的"再试一次"拿到的是 6 小时前的失败，口令变成死循环。
+            _CACHE.pop(city, None)
 
     db = db or kb.get_kb()
     if db is None:
@@ -494,7 +498,9 @@ def ensure_hotels(city: str, *, db=None, fetcher=None,
     with _CACHE_LOCK:
         hit = _HOTEL_CACHE.get(city)
         if hit and time.time() - hit[0] < FAIL_TTL_SEC:
-            return {**hit[1], "cached": True}
+            if not force:
+                return {**hit[1], "cached": True}
+            _HOTEL_CACHE.pop(city, None)      # 点名坚持：推翻失败缓存重试
 
     center = _resolve_center(city)
     if not center:
@@ -656,7 +662,9 @@ def ensure_restaurants(city: str, *, db=None, fetcher=None,
     with _CACHE_LOCK:
         hit = _REST_CACHE.get(city)
         if hit and time.time() - hit[0] < FAIL_TTL_SEC:
-            return {**hit[1], "cached": True}
+            if not force:
+                return {**hit[1], "cached": True}
+            _REST_CACHE.pop(city, None)       # 点名坚持：推翻失败缓存重试
 
     center = _resolve_center(city)
     if not center:

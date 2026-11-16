@@ -1316,13 +1316,19 @@ class Session:
         force=True：用户点名坚持要这个城市（「就排北京」）——网络抖动是很常见的
         失败原因，之前失败结果被缓存后就永远不再试，用户照提示再说一遍口令
         却永远排不了（实测死循环）。强制重试绕过缓存，允许越过 max_autofetch。
+
+        缓存只信"有"不信"没有"（2026-11-16 实测）：本会话第一次补库失败后
+        _cov[dest]=False 被永久缓存，之后库里已经有数据了（别的会话补的、
+        后台录的、重开服务后重试成功的），这一会话仍然每轮回"没补到"——
+        用户把同一句话重发了四遍，四次全被拒。False 时每轮先廉价复查一次
+        本地库（一次 SQLite 查询，毫秒级），真没有再谈在线补库。
         """
-        if not force and dest in self._cov:
-            return self._cov[dest]
+        if not force and self._cov.get(dest):
+            return True
         ok = bool(agent.dispatch("search_poi", {"city": dest}).get("ok"))
         if not ok and (force or len(self.fetched) < self.max_autofetch):
             res = autofetch.ensure_city_data(dest, "attraction",
-                                             client=self.client)
+                                             client=self.client, force=force)
             self.fetched[dest] = res
             # 以入库后重新查询为准：酒店有数据但景点为空的城市仍算"缺"
             ok = bool(agent.dispatch("search_poi", {"city": dest}).get("ok"))

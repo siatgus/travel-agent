@@ -32,6 +32,10 @@ from ...dialogue import (
 
 # 用户点名坚持要排某个城市：触发对失败补库的强制重试（见 needs_city 分支）
 _INSIST_RE = re.compile(r"就排|就要排|偏要排|再试|再补|还是.{0,4}排|硬排|非要")
+# 用户原样重发规划请求（「11月18号去北京玩7天」再说一遍）也算坚持——
+# 实测（2026-11-16）：第一次补库遇到网络抖动失败后，用户把同一句话重发了
+# 四遍，每遍都收到"说「就排北京」我会再试"，可他就是在排北京，凭什么要背口令。
+_PLAN_REQUEST_RE = re.compile(r"去.{1,8}玩|到.{1,8}玩|在.{1,8}玩|旅游|度假")
 
 
 class PlanHandler:
@@ -264,7 +268,8 @@ class PlanHandler:
         # 失败：网络抖动是很常见的失败原因，而失败结果被 _coverage 缓存后
         # 永远不再试——提示语让用户「再说就排X」，结果每轮都回天气，实测
         # 死循环。点名坚持就强制重试一次，补到了照常出方案。
-        if needs_city and dest and _INSIST_RE.search(utterance or ""):
+        if needs_city and dest and (_INSIST_RE.search(utterance or "")
+                                    or _PLAN_REQUEST_RE.search(utterance or "")):
             session._cov.pop(dest, None)
             if session._coverage(dest, force=True):
                 needs_city = False
