@@ -78,10 +78,49 @@ class DataService:
 
         near 是片区词（如「春熙路」）——旧 search_poi 的 area 优先排序语义；
         坐标级周边检索用 get_restaurants_near。
+
+        关键词（烤鸭/火锅/川菜）本地库无命中时，回落高德 place/text 的
+        keywords 在线检索——具体菜品词只有真实地图数据能命中（本地池子
+        多为「饭店/宾馆」，招牌上未必带菜名）。
         """
-        return self._query_catalogue(
+        res = self._query_catalogue(
             city, data_type="restaurant", category="restaurant",
             keyword=keyword, near=near, limit=limit, autofetch=autofetch)
+        if keyword and not res.items:
+            rows = self._amap_keyword_fallback(city, keyword, limit)
+            if rows:
+                res = DataResult.success(rows, source=SOURCE_API)
+                res.metadata["origin_source"] = "amap_keyword"
+        return res
+
+    def _amap_keyword_fallback(self, city: str, keyword: str,
+                               limit: int) -> list[dict]:
+        """高德关键词检索回落：菜品词本地无命中时搜真实门店。
+
+        需要城市中心坐标（_resolve_center 同源）。任何异常都返回 []，
+        不把在线检索失败解释成「有结果」——调用方继续走原失败语义。
+        """
+        try:
+            from .. import poi_sources
+            from ..autofetch import _resolve_center
+            center = _resolve_center(city)
+            if not center:
+                center = self._city_center_fallback(city)
+            if not center:
+                return []
+            return poi_sources.search_amap_keyword(
+                city, center, keyword, kind="restaurant", limit=max(limit, 6))
+        except Exception:
+            return []
+
+    @staticmethod
+    def _city_center_fallback(city: str) -> list[float] | None:
+        """city_center 拿不到时，退回 real_tools 的城市坐标表。"""
+        try:
+            from ..real_tools import CITY_GEO
+            return list(CITY_GEO.get(city, [])) or None
+        except Exception:
+            return None
 
     def get_restaurants_near(self, city: str, anchor_geo: list[float],
                              keyword: str | None = None,

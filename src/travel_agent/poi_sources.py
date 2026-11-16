@@ -322,6 +322,44 @@ def search_amap(city: str, center: list[float], kind: str = "attraction",
     return out
 
 
+def search_amap_keyword(city: str, center: list[float], keyword: str,
+                        kind: str = "restaurant", *,
+                        limit: int = 10, timeout: float = 6.0) -> list[dict]:
+    """高德关键词检索：按「烤鸭/火锅/川菜」这类词搜真实门店。
+
+    与 search_amap（按 types 分类拉全城）不同，这里走 place/text 的
+    keywords 参数——具体菜品/品类词（烤鸭、生煎、日料）只有它能命中。
+    关键词检索不传 types（会互相打架），只限 citylimit 保证不跨城。
+    """
+    key = amap_key()
+    if not key or not keyword or not city or not center:
+        return []
+    params = urllib.parse.urlencode({
+        "key": key, "keywords": keyword, "city": city, "citylimit": "true",
+        "offset": str(min(limit, 25)), "page": "1",
+        "extensions": "all", "output": "json",
+    })
+    try:
+        data = _http_json(f"https://restapi.amap.com/v3/place/text?{params}",
+                          timeout=timeout)
+    except Exception:
+        _mark_down("amap")
+        return []
+    if str(data.get("status")) != "1":
+        info = str(data.get("info") or "")
+        if "LIMIT" in info or "KEY" in info or "QUOTA" in info:
+            _mark_down("amap")
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in data.get("pois") or []:
+        row = _amap_row(p, kind, city, center)
+        if row and row["name"] not in seen:
+            seen.add(row["name"])
+            out.append(row)
+    return out
+
+
 def find_spot(city: str, name: str, center: list[float],
               *, timeout: float = 6.0) -> dict | None:
     """按名字在高德找单个景点（用户点名补全用）。

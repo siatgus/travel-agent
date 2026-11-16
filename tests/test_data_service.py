@@ -280,6 +280,52 @@ def test_restaurant_capability() -> None:
     DB.conn.commit()
 
 
+def test_restaurant_keyword_amap_fallback() -> None:
+    """关键词本地无命中时，回落高德 keywords 在线检索真实门店。
+
+    「推荐一家有烤鸭的餐厅」本地库搜不到「烤鸭」（池子里是饭店/宾馆），
+    必须把关键词透传给高德才能命中全聚德这类店——否则如实说「没收录」
+    是漏答（数据其实拿得到）。
+    """
+    svc = _svc()
+    city = "关键词回落城"
+    DB.upsert_poi(city, dict(REST), source="seed")  # 池子里只有「测试火锅店」
+
+    # 模拟高德关键词检索返回烤鸭店；同时 stub 城市坐标（测试城不在 CITY_GEO）
+    from travel_agent import poi_sources, autofetch
+    orig_kw = poi_sources.search_amap_keyword
+    orig_ct = autofetch._resolve_center
+    poi_sources.search_amap_keyword = lambda c, ct, kw, kind="restaurant", limit=6: [
+        {"name": "全聚德烤鸭(前门店)", "category": "restaurant", "area": "东城区",
+         "geo": [39.90, 116.40], "cost": 150, "tags": ["烤鸭店"],
+         "note": "高德地图"}]
+    autofetch._resolve_center = lambda c: [39.9042, 116.4074]
+    try:
+        r = svc.get_restaurants(city, keyword="烤鸭", limit=6, autofetch=False)
+    finally:
+        poi_sources.search_amap_keyword = orig_kw
+        autofetch._resolve_center = orig_ct
+    check("关键词无本地命中 → 高德关键词回落补上真实门店",
+          r.ok and [p["name"] for p in r.items] == ["全聚德烤鸭(前门店)"],
+          str([p["name"] for p in r.items]))
+    check("回落结果标 external_api 来源 + amap_keyword 元数据",
+          r.source == SOURCE_API
+          and r.metadata.get("origin_source") == "amap_keyword",
+          f"source={r.source} meta={r.metadata.get('origin_source')}")
+    # 回落也拿不到（无 Key/网络失败）→ 保持空列表，不报失败
+    poi_sources.search_amap_keyword = lambda c, ct, kw, kind="restaurant", limit=6: []
+    autofetch._resolve_center = lambda c: [39.9042, 116.4074]
+    try:
+        r2 = svc.get_restaurants(city, keyword="烤鸭", limit=6, autofetch=False)
+    finally:
+        poi_sources.search_amap_keyword = orig_kw
+        autofetch._resolve_center = orig_ct
+    check("回落也空 → 成功空列表（非失败）",
+          r2.ok and r2.items == [] and r2.error_code is None)
+    DB.conn.execute("DELETE FROM pois WHERE city=?", (city,))
+    DB.conn.commit()
+
+
 # ================================================================ 天气/班次/知识
 
 def test_weather_transport_food() -> None:
@@ -333,6 +379,7 @@ if __name__ == "__main__":
     test_autofetch_on_empty()
     test_param_error_no_autofetch()
     test_restaurant_capability()
+    test_restaurant_keyword_amap_fallback()
     test_weather_transport_food()
     test_singleton_and_legacy_compat()
     total, bad = len(RESULTS), sum(1 for _, ok, _ in RESULTS if not ok)

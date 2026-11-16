@@ -198,6 +198,52 @@ def test_amap_needs_key() -> None:
         ps.amap_key = old_key
 
 
+def test_amap_keyword_search() -> None:
+    """高德关键词检索：按菜品/品类词（烤鸭）搜真实门店，走 keywords 参数。"""
+    ps.reset_cache()
+    ps._DOWN.clear()
+    calls: list[str] = []
+
+    def stub_kw(url, *, timeout, headers=None):
+        calls.append(url)
+        return {"status": "1", "pois": [
+            {"name": "全聚德烤鸭(前门店)", "location": "116.399,39.900",
+             "type": "餐饮服务;烤鸭店", "biz_ext": {"cost": "150",
+             "opentime2": "10:00-21:00"}, "adname": "东城区",
+             "address": "前门大街", "tel": "010-12345678",
+             "typecode": "050000"},
+            {"name": "便宜坊烤鸭(鲜鱼口店)", "location": "116.402,39.899",
+             "type": "餐饮服务;烤鸭店", "biz_ext": {"cost": "120"},
+             "adname": "东城区", "address": "鲜鱼口街", "typecode": "050000"},
+        ]}
+
+    old = with_stub(stub_kw)
+    old_key = ps.amap_key
+    ps.amap_key = lambda: "0" * 32
+    try:
+        rows = ps.search_amap_keyword("北京", CENTER, "烤鸭", kind="restaurant",
+                                      limit=6)
+    finally:
+        ps.amap_key = old_key
+        ps._http_json = old
+    check("关键词检索带 keywords 参数（不走 types 分类）",
+          calls and "keywords=" in calls[0], calls[0] if calls else "no call")
+    check("关键词检索不传 types（keywords 与 types 互斥）",
+          calls and "types=" not in calls[0], calls[0] if calls else "")
+    check("返回真实烤鸭店行", len(rows) == 2 and rows[0]["name"] == "全聚德烤鸭(前门店)",
+          f"{[r['name'] for r in rows]}")
+    check("餐厅行带人均与标签", rows[0]["cost"] == 150 and "烤鸭" in rows[0]["tags"][0],
+          f"{rows[0]}")
+    # 无关键词/无 Key 直接空
+    check("无关键词返回空", ps.search_amap_keyword("北京", CENTER, "") == [])
+    old_key2 = ps.amap_key
+    ps.amap_key = lambda: ""
+    try:
+        check("无 Key 返回空", ps.search_amap_keyword("北京", CENTER, "烤鸭") == [])
+    finally:
+        ps.amap_key = old_key2
+
+
 # ------------------------------------------------------------------ 维基导游
 
 WIKITEXT = """== 观光 ==
@@ -400,7 +446,8 @@ def test_describe() -> None:
 
 def main() -> int:
     for fn in (test_coord_transform, test_amap_parsing, test_amap_quota_and_pages,
-               test_amap_needs_key, test_wikivoyage_parsing,
+               test_amap_needs_key, test_amap_keyword_search,
+               test_wikivoyage_parsing,
                test_wikivoyage_lang_fallback, test_wikivoyage_cache,
                test_chain_order, test_cache_and_down, test_describe):
         fn()

@@ -410,6 +410,25 @@ def test_food_question_split() -> None:
           intent.food_keyword("成都有什么特色美食", "成都") is None)
     check("片区词剥取", intent.food_area("春熙路附近有哪些川菜馆") == "春熙路")
     check("无片区词返回 None", intent.food_area("成都有什么特色美食") is None)
+    # 按菜品/品类找店：没有「有什么/推荐」问法词的句式也要接住
+    # （实测「推荐一家有烤鸭的餐厅」曾被当景点名查库，答「没收录」）
+    check("有烤鸭的餐厅是找店",
+          intent.food_question_kind("推荐一家有烤鸭的餐厅") == "restaurant")
+    check("找家烤鸭店是找店",
+          intent.food_question_kind("找家烤鸭店") == "restaurant")
+    check("菜品词剥取：烤鸭",
+          intent.food_keyword("推荐一家有烤鸭的餐厅") == "烤鸭")
+    check("菜品词剥取：找家烤鸭店",
+          intent.food_keyword("找家烤鸭店") == "烤鸭")
+    check("想吃有火锅的餐厅剥火锅",
+          intent.food_keyword("想吃有火锅的餐厅") == "火锅")
+    check("找店句式抢在景点点名前",
+          intent.refine_intent("推荐一家有烤鸭的餐厅", "北京") == "restaurant_search")
+    check("周边美食仍走餐厅搜索",
+          intent.refine_intent("春熙路附近的川菜馆", "成都") == "restaurant_search")
+    check("酒店不被误判成找餐馆",
+          intent.food_question_kind("有什么酒店") is None
+          and intent.refine_intent("有什么酒店", "北京") == "hotel_search")
 
 
 def test_nearby_answer_template() -> None:

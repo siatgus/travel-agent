@@ -469,6 +469,26 @@ def is_food_question(text: str) -> bool:
     return any(w in t for w in _FOOD_KW) and bool(_CAT_ASK_RE.search(t))
 
 
+# 「有烤鸭的餐厅」「找家烤鸭店」「带烤鸭的馆子」——没有「有什么/推荐」问法词，
+# 但「有X的餐厅/找家X店」句式本身就是找店。用独立正则补判，避免放宽
+# _CAT_ASK_RE 误伤「酒店要五星的」这类改需求句式。
+# 「有什么酒店」里「酒店」含「店」字，若把「店」当店后缀会误判成找餐馆——
+# 用 (?<!酒)(?<!宾) 负向后行断言挡住「酒店/宾馆」的「店」。
+_DISH_SHOP_RE = re.compile(
+    r"(?:有|带|卖|找|想吃|想吃有)(.{1,6}?)的?(?:餐厅|餐馆|饭店|饭馆|馆子|店)"
+    r"|找(?:家|个|一家|几家)(.{1,6}?)(?:店|馆|餐厅|饭馆)")
+
+
+def _is_dish_shop(text: str) -> bool:
+    """「有X的餐厅/找家X店」找店句式，且不是「酒店/宾馆」等住宿店。"""
+    if not _DISH_SHOP_RE.search(text or ""):
+        return False
+    # 「有什么酒店」「附近有什么宾馆」是找住处，不是找餐馆
+    if any(w in (text or "") for w in ("酒店", "宾馆", "民宿", "住哪")):
+        return False
+    return True
+
+
 def food_question_kind(text: str) -> str | None:
     """美食问句细分：'restaurant' 找真实店铺 / 'knowledge' 问菜品文化。
 
@@ -476,9 +496,10 @@ def food_question_kind(text: str) -> str | None:
     纯问菜品（什么特色美食/火锅有什么特色）→ 知识答。
     """
     t = text or ""
-    if not is_food_question(t):
+    if not is_food_question(t) and not _is_dish_shop(t):
         return None
-    if any(w in t for w in _FOOD_SHOP_KW) or re.search(r"推荐|哪家好", t):
+    if any(w in t for w in _FOOD_SHOP_KW) or re.search(r"推荐|哪家好", t) \
+            or _is_dish_shop(t):
         return "restaurant"
     return "knowledge"
 
@@ -491,15 +512,19 @@ def food_keyword(text: str, city: str | None = None) -> str | None:
     area = food_area(text)
     if area and area in cand:
         cand = cand.replace(area, "", 1)     # 「春熙路附近的川菜馆」别把片区当菜系
-    for w in ("有哪些", "有没有", "有什么", "推荐几家", "推荐", "几家", "附近",
-              "附件",  # 「附件」是「附近」的高频错别字（拼音输入），一并剥掉
+    for w in ("有哪些", "有没有", "有什么", "推荐几家", "推荐", "几家",
+              "一家", "几家",  # 量词：「推荐一家有烤鸭的餐厅」别把「一家」当菜名
+              "好吃的", "好吃",  # 先剥「好吃的」再剥「吃」，避免「好吃」被拆成「好」
+              "有", "带", "卖", "吃", "想吃",  # 动词：「有/带/卖/吃烤鸭」剥动词留菜名
+              "附近", "附件",  # 「附件」是「附近」的高频错别字（拼音输入），一并剥掉
               "周边", "周围", "一带", "特色", "美食", "小吃", "名吃", "菜品",
-              "菜系", "饮食", "好吃的", "哪个", "哪里", "什么", "些", "介绍",
-              "想", "找", "查", "知道"):
+              "菜系", "饮食", "哪个", "哪里", "什么", "些", "介绍",
+              "想", "找", "查", "知道", "家"):
         cand = cand.replace(w, " ")
     cand = re.sub(r"\s+", "", cand)
     cand = re.sub(r"(餐厅|餐馆|饭店|饭馆|馆子|的名菜|名菜)+$", "", cand)
     cand = re.sub(r"[馆店]$", "", cand)     # 「川菜馆」剥店后缀保住「川菜」
+    cand = re.sub(r"^的", "", cand)         # 「一家有烤鸭的餐厅」剥「的」留「烤鸭」
     cand = cand.strip("的了呀啊呢吧，, ")
     if len(cand) < 2 or len(cand) > 6:
         return None
@@ -600,6 +625,12 @@ def refine_intent(text: str, city: str | None = None) -> str:
         return "general"
     if nearby_route_ends(t):
         return "route_query"
+    # 找店句式（「有烤鸭的餐厅」「找家烤鸭店」）与周边美食（「春熙路附近的
+    # 川菜馆」）必须抢在景点点名之前判定：spot_mention 会把这些整句当景点名
+    # 剥出来（实测「推荐一家有烤鸭的餐厅」被剥成「一家有烤鸭的餐厅」当景点
+    # 查库，答「没收录」），先拦进餐厅搜索。
+    if _is_dish_shop(t) or is_nearby_food_question(t):
+        return "restaurant_search"
     if spot_mention(t, city):
         return "attraction_search"
     if poi_category(t):
@@ -636,7 +667,7 @@ def classify(text: str) -> str:
     if any(k in t for k in WEATHER_KW):
         return "weather"
     if any(k in t for k in POI_KW) or _RECO_RE.search(t) or is_category_question(t) \
-            or is_food_question(t) or is_stay_question(t):
+            or is_food_question(t) or _is_dish_shop(t) or is_stay_question(t):
         return "poi"
     if any(k in t for k in TRANSPORT_KW):
         return "transport"
