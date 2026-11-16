@@ -525,6 +525,12 @@ PAGE = """<!DOCTYPE html>
       <span style="font-size:12px;color:#8A8A82;align-self:center;">
         行程页备用底图（没配高德时用） · console.tianditu.gov.cn 免费申请（应用类型选「浏览器端」）</span>
     </div>
+    <div class="row">
+      <input id="llm-amapwebkey" type="password" placeholder="高德 Web 服务 Key（选填，景点数据源）" size="34">
+      <span style="font-size:12px;color:#8A8A82;align-self:center;">
+        POI 检索首选源（景点/餐饮/住宿）· 与上面的底图 Key 是<b>不同类型</b>，
+        需在 lbs.amap.com 另建一个「Web服务」Key；不填则用维基导游（免 Key）</span>
+    </div>
     <details style="margin-top:10px">
       <summary>备用供应商与轻任务模型（LLM 网关）</summary>
       <div class="row" style="margin-top:10px">
@@ -1124,6 +1130,9 @@ async function loadLlm(){
   $('llm-amapsecurity').value='';
   $('llm-amapsecurity').placeholder=s.has_amap_security
     ?('已保存 '+s.amapsec_masked+'（留空则不修改）'):'高德安全密钥（选填）';
+  $('llm-amapwebkey').value='';
+  $('llm-amapwebkey').placeholder=s.has_amap_web_key
+    ?('已保存 '+s.amapweb_masked+'（留空则不修改）'):'高德 Web 服务 Key（选填，景点数据源）';
   $('llm-fb-enabled').checked=!!s.fallback_enabled;
   $('llm-fb-provider').value=s.fallback_provider||'fallback';
   $('llm-fb-base').value=s.fallback_base_url||'';
@@ -1153,6 +1162,7 @@ async function saveLlm(){
     tdt_key:$('llm-tdtkey').value.trim(),
     amap_key:$('llm-amapkey').value.trim(),
     amap_security:$('llm-amapsecurity').value.trim(),
+    amap_web_key:$('llm-amapwebkey').value.trim(),
     fallback_enabled:$('llm-fb-enabled').checked,
     fallback_provider:$('llm-fb-provider').value,
     fallback_base_url:$('llm-fb-base').value.trim(),
@@ -1845,6 +1855,17 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "高德安全密钥格式异常（通常为 32 位字母数字）"}, 400)
                 return
             cfg["amap_security"] = amap_sec
+        # 高德「Web 服务」Key（POI 检索首选源，与上面画图的 JS API Key 是
+        # 不同类型，混用会返回 INVALID_USER_KEY），选填；留空表示不修改
+        amap_web = str(data.get("amap_web_key") or "").strip()
+        if amap_web:
+            if not amap_web.isalnum() or not 16 <= len(amap_web) <= 64:
+                self._json({"ok": False,
+                            "error": "高德 Web 服务 Key 格式异常（通常为 32 位字母数字；"
+                                     "lbs.amap.com 新建 Key 时「服务平台」必须选「Web服务」）"},
+                           400)
+                return
+            cfg["amap_web_key"] = amap_web
         # ---- LLM 网关：备用供应商与轻任务便宜档（均可选，不配=单供应商直连） ----
         cfg["fallback_enabled"] = bool(data.get("fallback_enabled"))
         cfg["light_enabled"] = bool(data.get("light_enabled"))

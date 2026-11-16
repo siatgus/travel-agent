@@ -552,14 +552,20 @@ class KnowledgeBase:
 
     def sync_city(self, city: str, bbox: tuple | None = None,
                   fetcher=None) -> dict:
-        """实时同步：默认 Overpass 抓取器（主站+镜像轮询）。
+        """实时同步：高德/维基导游优先，Overpass 兜底。
+
+        后台手动补库走的是同一条链：Overpass 在国内常态超时（实测两个
+        官方镜像都要 21 秒才放弃），管理员点一次"同步"等半分钟还没结果是
+        最糟的体验；先问有真实数据的源，拿不到再退 Overpass。
 
         返回 {status: success|failed|empty, added, updated, message}，全程落日志。
         """
-        source = "overpass"
+        source = "online"
         try:
-            fetcher = fetcher or _fetch_overpass
-            items = fetcher(city, bbox)
+            if fetcher is not None:
+                items = fetcher(city, bbox)
+            else:
+                items, source = _fetch_online(city, bbox)
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)[:160]}"
             self._log(city, source, "failed", 0, 0, msg)
@@ -573,9 +579,27 @@ class KnowledgeBase:
             if pid:
                 added += 1
         self._log(city, source, "success", added, updated,
-                  f"同步 {len(items)} 条 attraction")
+                  f"同步 {len(items)} 条 attraction（{source}）")
         return {"status": "success", "added": added, "updated": updated,
-                "message": f"同步 {len(items)} 条"}
+                "source": source, "message": f"同步 {len(items)} 条（{source}）"}
+
+
+def _fetch_online(city: str, bbox: tuple | None) -> tuple[list[dict], str]:
+    """多源抓取：高德（有 Key）→ 维基导游 → Overpass。"""
+    from . import poi_sources
+    try:
+        center = _city_center(city)
+    except Exception:
+        center = None
+    if center:
+        try:
+            rows, src = poi_sources.search(city, [float(center[0]), float(center[1])],
+                                           "attraction", limit=200)
+        except Exception:
+            rows, src = [], ""
+        if rows:
+            return rows, src or "online"
+    return _fetch_overpass(city, bbox), "overpass"
 
 
 def _fetch_overpass(city: str, bbox: tuple | None) -> list[dict]:

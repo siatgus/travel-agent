@@ -26,8 +26,10 @@ travel-agent/
 │   ├── llm.py                 大模型接入层：结构化校验 + 修复重问 + 静默降级
 │   ├── auth.py                手机验证码登录 + 积分预扣-结算 + 不限额账号
 │   ├── conversations.py       对话持久化：一次对话 = 一条行程记录（自动保存/回看/续聊）
-│   ├── kb.py                  SQLite 知识库：POI/酒店/班次 + 种子 + Overpass 同步 + 日志
-│   ├── autofetch.py           陌生城市自动补全：Overpass → 模型兜底 → 入库（坐标校验）
+│   ├── kb.py                  SQLite 知识库：POI/酒店/班次 + 种子 + 在线同步 + 日志
+│   ├── poi_sources.py         多源 POI 检索：高德（GCJ-02→WGS-84）→ 维基导游（免 Key）
+│   ├── autofetch.py           陌生城市自动补全：多源 → 模型兜底 → Overpass → 入库（坐标校验）
+│   ├── overseas.py            城市中文名 → 地图服务英文检索名（境外城市定位用）
 │   ├── server.py              本地 Web 服务（8787）：浏览器聊天 + 历史行程 + 行程页
 │   ├── admin.py               数据管理后端（8788）：看板 / CRUD / 批量导入 / 一键同步
 │   └── __main__.py            python -m travel_agent 入口
@@ -93,7 +95,7 @@ python scripts/start_admin.bat    # Windows（双击也行）
 - **看板**：城市/POI/酒店/班次总量，各城市数据新鲜度（来源 + 最近更新时间）
 - **POI / 酒店 / 班次管理**：增删改，保存后对话服务**立即生效，无需重启**
 - **批量导入**：粘贴 JSON 数组走校验通道（缺 name/geo 的条目被拒并报告）
-- **实时同步**：一键 Overpass 抓取（主站+镜像轮询），OSM 真实景点入库；失败原因落日志
+- **实时同步**：一键在线抓取（高德/维基导游 → Overpass 兜底），真实景点入库；失败原因落日志
 - **同步日志**：最近 50 条，可追溯每次同步/导入
 
 ### 测试账号（不限额）
@@ -118,17 +120,24 @@ PYTHONPATH=src python -m travel_agent.auth --revoke 19900000000           # 撤�
 - 库文件 `data/.kb.db`，纯标准库 sqlite3，零依赖；首次启动自动从核实数据播种（幂等）
 - 工具层 `search_poi / search_hotel / search_transport` 与 `serviceable_cities`
   **优先读知识库**，库不可用（只读 .pyz、文件损坏）时静默回落静态数据，规划能力不降级
-- 每条数据带 `source`（seed / manual / overpass / auto-fetch / auto-fetch-llm）与 `updated_at`，看板展示新鲜度
+- 每条数据带 `source`（seed / manual / amap / wikivoyage / overpass / auto-fetch / auto-fetch-llm）与 `updated_at`，看板展示新鲜度
 - 管理后端新增一个城市的 POI 后，智能体立刻能对它出完整行程（交通/住宿缺数据时如实标注假设）
 
 ### 陌生城市自动补全（autofetch.py）
 
 用户说的城市不在库里时，不再回一句"我这边没有数据"：
 
-1. **Overpass（真实 OSM）**：按城市包围盒抓景点与住宿，写库（`source=auto-fetch`），门票按 `fee` 标签、酒店价按星级估算
-2. **模型兜底**：Overpass 不可达时，让模型列出该城市景点及坐标，**坐标离城市中心超过 60km 一律丢弃**（防幻觉），写库（`source=auto-fetch-llm`）
-3. **补不到才降级**：地名解析不出、上游无返回 → 如实说明并列出可服务城市，绝不排空行程
-4. 方案末尾附 `> 数据说明：` 写清哪些是刚补的、哪些是估算值；`/api/chat` 同时在 `fetched` 字段返回补全结果
+数据源按「真实性与速度」排队，前一个拿不到才走下一个（`poi_sources.py`）：
+
+1. **高德 Web 服务**（配了 `amap_web_key` 时）：按分类抓景点/餐饮/住宿，带评分与营业时间；
+   返回 GCJ-02，入口统一反算成 WGS-84 与库内点位同系（不纠偏会整体偏 300~500 米）
+2. **维基导游 Wikivoyage**（免 Key）：城市页的 `see/do/eat/sleep` 条目，带简介/门票/开放时间/地址；
+   实测坐标覆盖率高（上海 47/49、成都 28/28），条目顺序即推荐顺序，直接当热度用
+3. **模型兜底**：上面都没结果时，让模型列出该城市景点及坐标，**坐标离城市中心超过 60km 一律丢弃**（防幻觉），写库（`source=auto-fetch-llm`）
+4. **Overpass（OSM）**：只作最后兜底。国内两个官方镜像实测常年超时（20 秒级），
+   预算压到 4 秒，拿不到就降级，不再让用户干等
+5. **补不到才降级**：地名解析不出、上游无返回 → 如实说明并列出可服务城市，绝不排空行程
+6. 方案末尾附 `> 数据说明：` 写清哪些是刚补的、哪些是估算值；`/api/chat` 同时在 `fetched` 字段返回补全结果
 
 约束与开关：省份/大区（云南、新疆、华北）不算城市，只追问具体城市；同一城市只抓一次，
 失败结果与 Overpass 熔断各缓存一段时间（避免每次说话都等一遍超时）。
@@ -136,7 +145,9 @@ PYTHONPATH=src python -m travel_agent.auth --revoke 19900000000           # 撤�
 ```bash
 TRAVEL_AUTOFETCH=0              # 关闭自动补全（离线演示/CI）
 TRAVEL_AUTOFETCH_TIMEOUT=15     # 整次抓取总预算（秒），超时即换下一档数据源
+TRAVEL_OSM_BUDGET=4             # Overpass 兜底预算（秒），它只是最后一档
 TRAVEL_AUTOFETCH_MAX_POIS=60    # 单城最多入库景点数
+AMAP_WEB_KEY=xxxxxxxx          # 高德「Web服务」Key（也可在管理后台「模型设置」里填）
 ```
 
 ### 打包分发

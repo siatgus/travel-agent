@@ -1291,7 +1291,7 @@ def settings_path() -> Path:
 # 主密钥还在原机」——完整方案（KMS/DPAPI）留给容器化部署时替换。
 
 SECRET_FIELDS = ("api_key", "tdt_key", "amap_key", "amap_security",
-                 "fallback_api_key", "light_api_key")
+                 "amap_web_key", "fallback_api_key", "light_api_key")
 _ENC_PREFIX = "enc:v1:"
 _master_cache: bytes | None = None
 
@@ -1456,6 +1456,9 @@ def settings_summary() -> dict:
         "amap_masked": mask_key(s.get("amap_key")),
         "has_amap_security": bool(s.get("amap_security")),
         "amapsec_masked": mask_key(s.get("amap_security")),
+        # 高德 Web 服务 Key：POI 检索（景点/餐饮/住宿）首选源，与画图 Key 不同类型
+        "has_amap_web_key": bool(s.get("amap_web_key")),
+        "amapweb_masked": mask_key(s.get("amap_web_key")),
         # 备用供应商（主供应商故障时自动切换）与轻任务供应商（便宜档跑抽取类任务）
         "fallback_enabled": bool(s.get("fallback_enabled")),
         "fallback_provider": str(s.get("fallback_provider") or ""),

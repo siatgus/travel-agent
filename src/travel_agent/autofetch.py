@@ -21,11 +21,14 @@ import urllib.parse
 import urllib.request
 
 from . import kb
+from . import poi_sources
 
 # 关闭开关：离线演示/CI 里不想因为一句"去XX"卡十几秒，设 TRAVEL_AUTOFETCH=0 即可
 ENABLED = os.environ.get("TRAVEL_AUTOFETCH", "1") != "0"
 # 整次抓取的总预算（含多镜像重试）：用户在聊天里等，不能让 Overpass 拖到一分钟
 TIMEOUT = float(os.environ.get("TRAVEL_AUTOFETCH_TIMEOUT", "10"))
+# Overpass 现在只是兜底（实测国内镜像常态超时），给它的小预算：拿不到就交给下一档
+OSM_BUDGET = float(os.environ.get("TRAVEL_OSM_BUDGET", "4"))
 # 单个景点的定向搜索预算：夹在一次对话中间，宁可早点交给下一档
 SPOT_TIMEOUT = float(os.environ.get("TRAVEL_SPOT_TIMEOUT", "4"))
 MAX_POIS = int(os.environ.get("TRAVEL_AUTOFETCH_MAX_POIS", "60"))
@@ -394,8 +397,11 @@ def ensure_city(city: str, *, db=None, fetcher=None, client=None,
         db.upsert_city(city, center, bbox)
     except Exception:
         pass
+    # 只有模型整理的数据标 auto-fetch-llm（要提示"坐标为近似值"），
+    # 高德/维基导游/OSM 都是真实点位，统一标 auto-fetch
+    poi_tag = "auto-fetch-llm" if source == "llm" else "auto-fetch"
     for p in poi_rows[:MAX_POIS]:
-        db.upsert_poi(city, p, source="auto-fetch" if source == "osm" else "auto-fetch-llm")
+        db.upsert_poi(city, p, source=poi_tag)
     for h in hotel_rows[:MAX_HOTELS]:
         db.upsert_hotel(city, h, source="auto-fetch")
 
@@ -425,7 +431,16 @@ def _remember_hotel(city: str, res: dict) -> None:
 
 
 def fetch_hotels(city: str, center: list[float]) -> list[dict]:
-    """只取住宿的 Overpass 查询（与 fetch_city 分流，供住宿问答补库）。"""
+    """取住宿：高德/维基导游优先，Overpass 兜底（供住宿问答补库）。"""
+    return _fetch_hotels_src(city, center)[0]
+
+
+def _fetch_hotels_src(city: str, center: list[float]
+                      ) -> tuple[list[dict], str]:
+    """同 fetch_hotels，但把实际生效的源一并返回，供日志与后台标注。"""
+    rows, src = _sources(city, center, "hotel", MAX_HOTELS)
+    if rows:
+        return rows, src
     s, w, n, e = _bbox(center)
     lodging = "|".join(_LODGING)
     q = (f'[out:json][timeout:{int(TIMEOUT)}];'
@@ -433,7 +448,7 @@ def fetch_hotels(city: str, center: list[float]) -> list[dict]:
          f'node["tourism"~"^({lodging})$"]["name"]({s},{w},{n},{e});'
          f'way["tourism"~"^({lodging})$"]["name"]({s},{w},{n},{e});'
          f');out center {MAX_HOTELS};')
-    data = _overpass(q)
+    data = _overpass(q, budget=OSM_BUDGET)
     out: list[dict] = []
     seen: set[str] = set()
     for el in data.get("elements", []):
@@ -448,7 +463,7 @@ def fetch_hotels(city: str, center: list[float]) -> list[dict]:
             continue
         seen.add(name)
         out.append(_hotel(name, tags, center, float(lat), float(lon)))
-    return out
+    return out, "osm"
 
 
 def ensure_hotels(city: str, *, db=None, fetcher=None,
@@ -491,9 +506,9 @@ def ensure_hotels(city: str, *, db=None, fetcher=None,
 
     try:
         if fetcher is not None:
-            rows = fetcher(city, center)
+            rows, src = fetcher(city, center), "custom"
         else:
-            rows = fetch_hotels(city, center)
+            rows, src = _fetch_hotels_src(city, center)
         rows = [h for h in rows if _valid_row("hotel", h)]
     except Exception as e:                        # 网络/上游异常：降级，不阻塞对话
         msg = f"{type(e).__name__}: {str(e)[:150]}"
@@ -516,11 +531,11 @@ def ensure_hotels(city: str, *, db=None, fetcher=None,
         pass
     for h in rows[:MAX_HOTELS]:
         db.upsert_hotel(city, h, source="auto-fetch")
-    res = {"status": "fetched", "city": city, "source": "osm",
+    res = {"status": "fetched", "city": city, "source": src,
            "pois": 0, "hotels": len(rows[:MAX_HOTELS]),
            "message": f"在线抓取 {len(rows)} 家住宿并入库"}
     _remember_hotel(city, res)
-    _log(db, city, "success", "osm: " + res["message"])
+    _log(db, city, "success", f"{src}: " + res["message"])
     return res
 
 
@@ -577,7 +592,16 @@ def _restaurant(name: str, tags: dict, center: list[float],
 
 
 def fetch_restaurants(city: str, center: list[float]) -> list[dict]:
-    """只取餐饮的 Overpass 查询（供餐厅问答补库）。"""
+    """取餐饮：高德优先，维基导游 eat 条目补充，Overpass 兜底。"""
+    return _fetch_restaurants_src(city, center)[0]
+
+
+def _fetch_restaurants_src(city: str, center: list[float]
+                           ) -> tuple[list[dict], str]:
+    """同 fetch_restaurants，附带实际生效的源。"""
+    rows, src = _sources(city, center, "restaurant", MAX_REST)
+    if rows:
+        return rows, src
     s, w, n, e = _bbox(center)
     food = "restaurant|cafe|fast_food|food_court"
     q = (f'[out:json][timeout:{int(TIMEOUT)}];'
@@ -585,7 +609,7 @@ def fetch_restaurants(city: str, center: list[float]) -> list[dict]:
          f'node["amenity"~"^({food})$"]["name"]({s},{w},{n},{e});'
          f'way["amenity"~"^({food})$"]["name"]({s},{w},{n},{e});'
          f');out center {MAX_REST};')
-    data = _overpass(q)
+    data = _overpass(q, budget=OSM_BUDGET)
     out: list[dict] = []
     seen: set[str] = set()
     for el in data.get("elements", []):
@@ -600,7 +624,7 @@ def fetch_restaurants(city: str, center: list[float]) -> list[dict]:
             continue
         seen.add(name)
         out.append(_restaurant(name, tags, center, float(lat), float(lon)))
-    return out
+    return out, "osm"
 
 
 def ensure_restaurants(city: str, *, db=None, fetcher=None,
@@ -644,9 +668,9 @@ def ensure_restaurants(city: str, *, db=None, fetcher=None,
 
     try:
         if fetcher is not None:
-            rows = fetcher(city, center)
+            rows, src = fetcher(city, center), "custom"
         else:
-            rows = fetch_restaurants(city, center)
+            rows, src = _fetch_restaurants_src(city, center)
         rows = [p for p in rows if _valid_row("restaurant", p)]
     except Exception as e:                        # 网络/上游异常：降级，不阻塞对话
         msg = f"{type(e).__name__}: {str(e)[:150]}"
@@ -669,11 +693,11 @@ def ensure_restaurants(city: str, *, db=None, fetcher=None,
         pass
     for p in rows[:MAX_REST]:
         db.upsert_poi(city, p, source="auto-fetch")
-    res = {"status": "fetched", "city": city, "source": "osm",
+    res = {"status": "fetched", "city": city, "source": src,
            "pois": len(rows[:MAX_REST]), "hotels": 0,
            "message": f"在线抓取 {len(rows)} 家餐厅并入库"}
     _remember_rest(city, res)
-    _log(db, city, "success", "osm: " + res["message"])
+    _log(db, city, "success", f"{src}: " + res["message"])
     return res
 
 
@@ -843,9 +867,17 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
                     "message": f"补到「{hit['name']}」"}
 
     global _OSM_DOWN_UNTIL
-    # 顺序上把模型放在 OSM 前面：这一步夹在一次对话中间，用户正在等方案。
-    # OSM 在本机常常整体不可达（每个镜像都要等到超时），而模型 2~4 秒就能给出
-    # 名字+坐标，坐标再用 60km 校验兜住幻觉——比让用户干等 4 秒以上更划算。
+    # 顺序：高德按名搜（有 Key 时最准最快，0.3s）→ 模型（2~4s）→ OSM。
+    # OSM 在本机常常整体不可达（每个镜像都要等到超时），排最后而不是最前。
+    amap_hit = poi_sources.find_spot(city, name, center)
+    if amap_hit:
+        pid = db.upsert_poi(city, amap_hit, source="auto-fetch")
+        amap_hit["poi_id"] = pid
+        db.record_log(city, "auto-fetch", "success", 1, 0,
+                      f"点名景点补全（高德）：{name} → {amap_hit['name']}")
+        return {**base, "status": "fetched", "poi": amap_hit, "source": "amap",
+                "message": f"补到「{amap_hit['name']}」"}
+
     if client is not None:
         try:
             from . import llm as llm_layer
@@ -921,19 +953,36 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
             "message": f"「{name}」没有收录，按你点名的景点排进行程（信息待核实）"}
 
 
+def _sources(city: str, center: list[float], kind: str,
+             limit: int) -> tuple[list[dict], str]:
+    """走多源检索层（高德 → 维基导游）；拿不到就返回空，交给下一档。"""
+    try:
+        rows, source = poi_sources.search(city, center, kind, limit=limit)
+    except Exception:                             # 多源层内部已兜异常，这里是双保险
+        return [], ""
+    return rows, source
+
+
 def _load(city: str, center: list[float], fetcher=None,
           client=None) -> tuple[list[dict], list[dict], str]:
-    """按数据源优先级取数：注入的 fetcher > 模型整理 > Overpass。
+    """按数据源优先级取数：注入的 fetcher > 高德/维基导游 > 模型整理 > Overpass。
 
-    模型放在 OSM 前面：这一步夹在一次对话中间，用户正在等回复。本机到
-    Overpass 常整体不可达（每个镜像都等超时，10 秒起），而模型 2~4 秒就能
-    给出景点名+坐标，坐标再用 60km 校验兜住幻觉——比让用户干等更划算。
+    排序依据是「真实性与速度」，不是「接入顺序」：
+      高德（<0.5s，真实 POI，带营业时间）→ 维基导游（1.5s，指南级景点清单）
+      → 模型（2~4s，坐标需 60km 校验兜幻觉）→ Overpass（国内镜像实测 21s 超时，仅兜底）。
+    前两档都空时才用模型，是不想拿"看起来很像"的编造内容盖掉真实数据。
     """
     global _OSM_DOWN_UNTIL
     if fetcher is not None:
         pois, hotels = fetcher(city, center)
         return pois, hotels, "custom"
     err: Exception | None = None
+
+    pois, source = _sources(city, center, "attraction", MAX_POIS)
+    if pois:
+        hotels, _hsrc = _sources(city, center, "hotel", MAX_HOTELS)
+        return pois, hotels, source
+
     if client is not None:
         try:
             pois, _hotels = fetch_city_llm(client, city, center)
@@ -998,7 +1047,9 @@ def fetch_city_llm(client, city: str, center: list[float]
 # ------------------------------------------------------------------ 抓取实现
 
 
-def fetch_city(city: str, center: list[float]) -> tuple[list[dict], list[dict]]:
+def fetch_city(city: str, center: list[float],
+               budget: float | None = OSM_BUDGET
+               ) -> tuple[list[dict], list[dict]]:
     """一次 Overpass 请求同时取景点与住宿，按标签分流。"""
     s, w, n, e = _bbox(center)
     q = (f'[out:json][timeout:{int(TIMEOUT)}];'
@@ -1011,7 +1062,7 @@ def fetch_city(city: str, center: list[float]) -> tuple[list[dict], list[dict]]:
          f'('
          f'node["tourism"~"^({"|".join(_LODGING)})$"]["name"]({s},{w},{n},{e});'
          f');out center {MAX_HOTELS};')
-    data = _overpass(q)
+    data = _overpass(q, budget=budget)
     pois: list[dict] = []
     hotels: list[dict] = []
     seen_p: set[str] = set()
@@ -1118,6 +1169,11 @@ def _resolve_center(city: str) -> list[float] | None:
 
     地理编码只认"人口聚居地"（Open-Meteo 的 feature_code 以 PPL 开头，或有人口数）：
     省/国家/地区返回的是 ADM1/PCLI，拿它的中心点抓一圈景点，会把整个省拼成一座城。
+
+    境外城市必须换英文名查：中文名在 Open-Meteo 里会命中国内同名小地名
+    （实测「东京」→ 江苏镇江一个 PPL 村庄），照单全收就排出"东京在镇江"的
+    行程。英文名查到的还要是首都/省会级或有大人口，否则宁可返回 None
+    让对话层说"定位不到"——诚实降级远好于跨省排行程。
     """
     if not plausible_city(city):
         return None
@@ -1127,15 +1183,24 @@ def _resolve_center(city: str) -> list[float] | None:
             return CITY_GEO[city]
     except Exception:
         pass
+    from .overseas import en_name, is_overseas
+    overseas = is_overseas(city)
+    query = en_name(city) if overseas else city
     try:
         url = ("https://geocoding-api.open-meteo.com/v1/search?count=5&language=zh"
-               f"&format=json&name={urllib.parse.quote(city)}")
+               f"&format=json&name={urllib.parse.quote(query)}")
         req = urllib.request.Request(url, headers={"User-Agent": "travel-agent/1.0"})
         with urllib.request.urlopen(req, timeout=min(TIMEOUT, 12)) as r:
             data = json.loads(r.read())
         for row in (data or {}).get("results") or []:
             fc = str(row.get("feature_code") or "")
-            if fc.startswith("PPL") or row.get("population"):
+            pop = row.get("population") or 0
+            if overseas:
+                # 首都/省会/大城市才收；普通村庄同名的概率太高
+                if fc in ("PPLC", "PPLA", "PPLA2", "PPLA3") or pop >= 200000:
+                    return [float(row["latitude"]), float(row["longitude"])]
+                continue
+            if fc.startswith("PPL") or pop:
                 return [float(row["latitude"]), float(row["longitude"])]
     except Exception:
         return None
