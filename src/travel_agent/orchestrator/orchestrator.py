@@ -39,6 +39,9 @@ from .guard import GuardPipeline
 from .intent_router import IntentRouter, QA_KINDS
 from .result import answer_reply
 
+# 用户点名坚持要排某个城市：触发对失败补库的强制重试（见 needs_city 分支）
+_INSIST_RE = re.compile(r"就排|就要排|偏要排|再试|再补|还是.{0,4}排|硬排|非要")
+
 
 class Orchestrator:
     """单轮流程调度。Handler 复用 Session 既有业务方法（第一阶段）。"""
@@ -326,6 +329,14 @@ class Orchestrator:
         needs_city = bool(dest) and not city_like and agent.looks_like_spot(dest)
         if dest and not needs_city:
             needs_city = not session._coverage(dest)
+        # 用户点名坚持要这个城市（「就排北京」「再试试北京」）且第一遍补库
+        # 失败：网络抖动是很常见的失败原因，而失败结果被 _coverage 缓存后
+        # 永远不再试——提示语让用户「再说就排X」，结果每轮都回天气，实测
+        # 死循环。点名坚持就强制重试一次，补到了照常出方案。
+        if needs_city and dest and _INSIST_RE.search(utterance or ""):
+            session._cov.pop(dest, None)
+            if session._coverage(dest, force=True):
+                needs_city = False
         # 记住最近有效的目的地：降级时"接着你刚才聊的城市排"，而不是按字典序随便挑
         if dest and not needs_city:
             session.last_good_dest = dest
@@ -411,11 +422,19 @@ class Orchestrator:
                             f"我把它安排进去。")
             elif "destination" in session.asked_fields:
                 # 已经说过一次没有数据了，别复读同一句：能定位就给天气，定位不了
-                # （省份、拼错的地名）就直接把可服务城市摊开，别绕弯
-                weather = (intent.weather_answer(dest, "未来三天", client=session.client)
+                # （省份、拼错的地名）就直接把可服务城市摊开，别绕弯。
+                # with_hint=False：weather_answer 的默认尾巴是「直接说就排X我就
+                # 现场联网补」——补库已经失败过一次还这么承诺，用户照做只会
+                # 再收到一遍天气（实测死循环）。这里换成带重试约定的诚实话术。
+                weather = (intent.weather_answer(dest, "未来三天", with_hint=False,
+                                                 client=session.client)
                            if real_tools.resolve_geo(dest) else "")
                 if weather and "没找到" not in weather:
-                    question = weather
+                    question = (weather
+                                + f"\n\n（{dest}的景点和住宿数据我还是没补到，"
+                                  f"所以行程暂时排不了。）再说一句「就排{dest}」"
+                                  f"我会再试一次在线补数据；想马上出方案的话，"
+                                  f"能直接排的是 {cities}。")
                 else:
                     question = (f"「{dest}」我这边确实定位不到、也排不了行程。{why}"
                                 f"\n能排出具体行程的是 {cities}；"
@@ -426,7 +445,8 @@ class Orchestrator:
                 question = (f"「{dest}」我这边没有景点和酒店数据，硬排会给你一份空行程，所以先不排。"
                             f"{why}"
                             f"\n{alt}能排出具体行程的是 {cities}；"
-                            f"{dest}的天气和班次我倒是可以查。")
+                            f"{dest}的天气和班次我倒是可以查。"
+                            f"\n实在想要{dest}，说「就排{dest}」，我会再试一次在线补数据。")
         else:
             # 已经出过方案时，"重新排一下"是改现有行程，不是从零开始：
             # 已确认的目的地/天数/日期都还在，不该当缺口重问一遍。

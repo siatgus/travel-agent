@@ -34,7 +34,7 @@ if str(_TA_ROOT / "src") not in sys.path:
 _tmp = Path(tempfile.mkdtemp(prefix="travel_orch_test_"))
 os.environ["TRAVEL_KB_DB"] = str(_tmp / "kb.db")   # 必须在 import kb 之前设置
 
-from travel_agent import kb                                        # noqa: E402
+from travel_agent import kb, intent                               # noqa: E402
 from travel_agent.dialogue import Session                          # noqa: E402
 from travel_agent.orchestrator import (                            # noqa: E402
     GuardPipeline, IntentResult, IntentRouter, Orchestrator, TurnContext,
@@ -201,12 +201,94 @@ def test_orchestrator_plan_state_preserved() -> None:
                      default=str) == snap)
 
 
+def test_insist_autofetch_retry() -> None:
+    """用户坚持要没收录的城市（「就排北京」）：强制重试补库，成功则出方案。
+
+    回归 2026-11-16 实测死循环：北京不在资料库、第一次在线补库失败后被
+    缓存，之后每轮都回天气并复读「直接说就排北京」——而「就排」根本
+    不在 PLAN_KW、补库也永远不重试。三处修复：就排进规划词、_coverage
+    支持 force 重试、坚持时绕过缓存重试并给诚实话术。
+    """
+    from travel_agent import agent, autofetch
+
+    calls = {"n": 0}
+    orig_ensure = autofetch.ensure_city_data
+    orig_dispatch = agent.dispatch
+
+    def flaky_ensure(city, kind, **kw):
+        if city == "北京":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"status": "failed", "pois": 0, "hotels": 0}
+            return {"status": "fetched", "pois": 6, "hotels": 2, "source": "osm"}
+        return orig_ensure(city, kind, **kw)
+
+    def mk(i: int) -> dict:
+        return {"poi_id": f"BJ-{i}", "name": f"故宫{i}", "category": "attraction",
+                "area": "市中心", "geo": [39.9 + i * 0.01, 116.4], "appeal": 4,
+                "duration_min": 120, "cost": 40 + i * 10,
+                "open_hours": "08:30-17:00", "open_days": "每天",
+                "need_booking": False, "tags": ["历史"], "intensity": "medium",
+                "indoor_alternative": "国家博物馆"}
+
+    def dispatch_ok_on_retry(tool, params, *a, **kw):
+        if tool == "search_poi" and params.get("city") == "北京":
+            if calls["n"] >= 2:
+                return {"ok": True, "items": [mk(i) for i in range(6)]}
+            return {"ok": False, "error": {"message": "NO_POI"}}
+        return orig_dispatch(tool, params, *a, **kw)
+
+    autofetch.ensure_city_data = flaky_ensure
+    agent.dispatch = dispatch_ok_on_retry
+    try:
+        s = Session(today=TODAY, client=None)
+        r1 = s.turn("从邯郸出发，11月19号去北京")
+        check("首败轮提示就排重试口令", "就排北京" in r1.render, r1.render[:80])
+        r2 = s.turn("就排北京")
+        check("坚持后不再回天气", "天气" not in (r2.render or "")
+              and r2.mode == "clarify", f"{r2.mode}")
+        check("坚持触发了第二次补库", calls["n"] == 2, str(calls["n"]))
+        r3 = s.turn("玩3天，2个人")
+        check("补库成功后坚持路径能出方案",
+              r3.mode == "plan" and s.plan_made, f"{r3.mode}")
+    finally:
+        autofetch.ensure_city_data = orig_ensure
+        agent.dispatch = orig_dispatch
+
+    # 场景2：补库始终失败——不再复读同一句，天气+诚实的重试约定
+    def always_fail(city, kind, **kw):
+        return {"status": "failed", "pois": 0, "hotels": 0}
+
+    def dispatch_never(tool, params, *a, **kw):
+        if tool == "search_poi" and params.get("city") == "北京":
+            return {"ok": False, "error": {"message": "NO_POI"}}
+        return orig_dispatch(tool, params, *a, **kw)
+
+    autofetch.ensure_city_data = always_fail
+    agent.dispatch = dispatch_never
+    try:
+        s2 = Session(today=TODAY, client=None)
+        ra = s2.turn("从邯郸出发，11月19号去北京")
+        rb = s2.turn("就排北京")
+        check("始终失败时不再复读同一句", rb.render != ra.render, "")
+        check("始终失败时说明重试约定", "还是没补到" in rb.render
+              and "就排北京" in rb.render, rb.render[:100])
+    finally:
+        autofetch.ensure_city_data = orig_ensure
+        agent.dispatch = orig_dispatch
+
+    # 场景3：「就排X」必须被判为规划意图（就排进 PLAN_KW）
+    check("「就排北京」判为规划意图", intent.classify("就排北京") == "plan",
+          intent.classify("就排北京"))
+
+
 def main() -> int:
     test_turn_context()
     test_intent_router()
     test_guard_pipeline()
     test_orchestrator_routing()
     test_orchestrator_plan_state_preserved()
+    test_insist_autofetch_retry()
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} "
           f"条 Orchestrator 架构断言通过")

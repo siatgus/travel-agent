@@ -1323,17 +1323,21 @@ class Session:
                     f"可以问「{city}有什么好玩的」，或者直接让我排一份{city}的行程。")
         return intent.nearby_answer(city, spot_disp, near[:5], client=self.client)
 
-    def _coverage(self, dest: str) -> bool:
+    def _coverage(self, dest: str, force: bool = False) -> bool:
         """目的地是否有可排数据；没有就先在线查一次并入库（每城一次）。
 
         旧行为是查到 NO_POI 就直接回"我这边没有数据"，把用户推走。真实产品不该这样：
         城市是公开信息，在线有 OSM 这类数据源，查一次存下来，下次（包括别的用户）
         直接就有的用。抓不到才退回原来的"没有数据"追问——绝不静默排空行程。
+
+        force=True：用户点名坚持要这个城市（「就排北京」）——网络抖动是很常见的
+        失败原因，之前失败结果被缓存后就永远不再试，用户照提示再说一遍口令
+        却永远排不了（实测死循环）。强制重试绕过缓存，允许越过 max_autofetch。
         """
-        if dest in self._cov:
+        if not force and dest in self._cov:
             return self._cov[dest]
         ok = bool(agent.dispatch("search_poi", {"city": dest}).get("ok"))
-        if not ok and len(self.fetched) < self.max_autofetch:
+        if not ok and (force or len(self.fetched) < self.max_autofetch):
             res = autofetch.ensure_city_data(dest, "attraction",
                                              client=self.client)
             self.fetched[dest] = res
