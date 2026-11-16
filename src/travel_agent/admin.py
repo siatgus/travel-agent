@@ -38,6 +38,7 @@ except Exception:
 from . import kb
 from . import llm
 from . import auth
+from . import billing
 from . import moderation
 
 HOST = "127.0.0.1"
@@ -181,6 +182,7 @@ PAGE = """<!DOCTYPE html>
     <a href="#/data"><span class="ic">◈</span>数据管理</a>
     <div class="nav-group">运营</div>
     <a href="#/users"><span class="ic">◍</span>用户与积分</a>
+    <a href="#/finance"><span class="ic">￥</span>财务看板</a>
     <a href="#/moderation"><span class="ic">⚠</span>内容审计</a>
     <a href="#/model"><span class="ic">✦</span>模型设置</a>
   </nav>
@@ -323,6 +325,24 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div style="overflow-x:auto"><table id="usage-table"></table></div>
     <div class="pager" id="usage-pager"></div>
+  </section>
+</div>
+
+<div class="view" id="v-finance">
+  <div class="view-head"><h1>财务看板</h1>
+    <div class="sub">订单与积分流水 · 收入曲线来自订单账本，消耗曲线来自模型计量</div></div>
+  <div class="cards" id="fin-cards"></div>
+  <section>
+    <h2>每日收入（最近 14 天）</h2>
+    <div style="overflow-x:auto"><table id="fin-rev"></table></div>
+  </section>
+  <section>
+    <h2>每日积分消耗（最近 14 天）</h2>
+    <div style="overflow-x:auto"><table id="fin-usage"></table></div>
+  </section>
+  <section>
+    <h2>最近订单（50 条）</h2>
+    <div style="overflow-x:auto"><table id="fin-orders"></table></div>
   </section>
 </div>
 
@@ -1140,6 +1160,40 @@ function resetUsageFilter(){
   $('q-usage').value=''; $('q-usage-model').value=''; filterUsage(true);
 }
 
+// ---------------- 财务看板 ----------------
+async function loadFinance(){
+  const r = await api('/api/finance');
+  if(!r.ok) return;
+  const st = r.stats || {};
+  const cards = $('fin-cards');
+  if(cards) cards.innerHTML = [
+    ['累计收入', '¥'+(st.revenue_yuan_total||0).toFixed(2)],
+    ['已付订单', st.orders_paid_total||0],
+    ['今日收入', '¥'+((st.revenue_cents_today||0)/100).toFixed(2)],
+    ['订阅中用户', st.active_subs||0],
+    ['今日积分消耗', st.credits_used_today||0],
+    ['支付通道', st.pay_mode==='mock'?'演示':'微信']
+  ].map(c=>'<div class="card"><b>'+c[1]+'</b><span>'+c[0]+'</span></div>').join('');
+  const rev = st.daily_revenue || [];
+  $('fin-rev').innerHTML = '<tr><th>日期</th><th>收入</th><th>订单数</th></tr>'
+    +(rev.length?rev.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>¥'
+      +d.yuan.toFixed(2)+'</b></td><td>'+d.orders+'</td></tr>').join('')
+      :'<tr><td colspan="3" class="empty">还没有已支付订单</td></tr>');
+  const us = st.daily_usage || [];
+  $('fin-usage').innerHTML = '<tr><th>日期</th><th>消耗积分</th><th>调用次数</th></tr>'
+    +(us.length?us.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>'+d.credits
+      +'</b></td><td>'+d.calls+'</td></tr>').join('')
+      :'<tr><td colspan="3" class="empty">暂无用量</td></tr>');
+  const od = r.orders || [];
+  $('fin-orders').innerHTML = '<tr><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th>'
+    +'<th>状态</th><th>支付时间</th></tr>'
+    +(od.length?od.map(o=>'<tr><td>'+esc(o.order_no)+'</td><td>'+esc(o.phone||o.uid)
+      +'</td><td>'+esc(o.title)+'</td><td>¥'+(o.amount_cents/100).toFixed(2)+'</td>'
+      +'<td>'+(o.status==='paid'?'<b>已支付</b>':'待支付')+'</td>'
+      +'<td>'+esc(o.paid_str||'-')+'</td></tr>').join('')
+      :'<tr><td colspan="6" class="empty">还没有订单</td></tr>');
+}
+
 // ---------------- 内容审计 ----------------
 let MODERATION=[];
 
@@ -1184,7 +1238,7 @@ async function dismissHit(id){
 }
 
 // ---------------- 左侧导航 / 视图切换 ----------------
-const VIEWS=['overview','data','users','moderation','model'];
+const VIEWS=['overview','data','users','finance','moderation','model'];
 
 function showView(v){
   if(VIEWS.indexOf(v)<0)v='overview';
@@ -1196,6 +1250,7 @@ function showView(v){
   if(v==='overview') loadStats();
   else if(v==='data') loadPois().then(loadLogs);
   else if(v==='users'){ loadUsers(); loadUsage(); }
+  else if(v==='finance') loadFinance();
   else if(v==='moderation') loadModeration();
   else if(v==='model') loadLlm();
   window.scrollTo({top:0});
@@ -1318,6 +1373,10 @@ class Handler(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             uid = int(q["uid"][0]) if q.get("uid") else None
             self._json({"ok": True, "usage": auth.list_usage(uid)})
+            return
+        if path == "/api/finance":
+            self._json({"ok": True, "stats": billing.finance_stats(),
+                        "orders": billing.list_orders(limit=50)})
             return
         if path == "/api/moderation":
             self._json({"ok": True, "items": moderation.list_hits(),

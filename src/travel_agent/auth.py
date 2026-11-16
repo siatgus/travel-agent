@@ -35,6 +35,7 @@ PHONE_RE = re.compile(r"^1\d{10}$")
 
 BONUS_CREDITS = 500          # 新用户注册赠送
 DAILY_CAP_CREDITS = 300      # 免费档每日消耗上限（约 3-6 次完整规划）
+PAID_DAILY_CAP_CREDITS = 1500  # 付费档每日上限（约 15-30 次，防滥用不封死）
 MIN_BALANCE = 40             # 低于此余额拒绝发起（一次规划的成本量级）
 ACCESS_TTL = 1800            # access token 30 分钟
 REFRESH_TTL = 30 * 86400     # refresh token 30 天
@@ -127,6 +128,13 @@ def _conn() -> sqlite3.Connection:
             if "is_unlimited" not in cols:
                 c.execute("ALTER TABLE users ADD COLUMN is_unlimited"
                           " INTEGER NOT NULL DEFAULT 0")
+            # 付费层级（M2）：free/paid，plan_expires 为订阅到期时间戳
+            if "plan" not in cols:
+                c.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL"
+                          " DEFAULT 'free'")
+            if "plan_expires" not in cols:
+                c.execute("ALTER TABLE users ADD COLUMN plan_expires"
+                          " REAL NOT NULL DEFAULT 0")
         _INITED = True
     return c
 
@@ -298,6 +306,18 @@ def is_unlimited(uid: int) -> bool:
         return bool(r and r["is_unlimited"])
 
 
+def is_paid_user(uid: int) -> bool:
+    """付费档：订阅在有效期内（billing 负责写入 plan/plan_expires，这里只读判定）。
+
+    放在 auth 是为了 freeze 的每日上限分档——billing import auth，
+    auth 反向 import 会成环。到期自动回落免费档，无需定时任务。
+    """
+    with _conn() as c:
+        r = c.execute("SELECT plan, plan_expires FROM users WHERE id=?",
+                      (uid,)).fetchone()
+        return bool(r and r["plan"] == "paid" and r["plan_expires"] > time.time())
+
+
 def get_balance(uid: int) -> int:
     return get_account(uid)["balance"]
 
@@ -327,12 +347,17 @@ def freeze(uid: int, credits: int, ref: str) -> int:
         if not unlimited:
             if bal < credits:
                 raise QuotaError("insufficient", bal, f"积分不足：需要约 {credits}，余额 {bal}")
+            # 限流精细化：免费/付费不同每日上限（订阅到期自动回落免费档）
+            u = c.execute("SELECT plan, plan_expires FROM users WHERE id=?",
+                          (uid,)).fetchone()
+            paid = bool(u and u["plan"] == "paid" and u["plan_expires"] > time.time())
+            cap = PAID_DAILY_CAP_CREDITS if paid else DAILY_CAP_CREDITS
             used = c.execute(
                 "SELECT COALESCE(SUM(credits),0) AS n FROM usage"
                 " WHERE user_id=? AND created_at>=?", (uid, date.today().isoformat())).fetchone()["n"]
-            if used + credits > DAILY_CAP_CREDITS:
+            if used + credits > cap:
                 raise QuotaError("daily_cap", bal,
-                                 f"今日免费额度已用完（{DAILY_CAP_CREDITS} 积分/日），明天再来或充值")
+                                 f"今日额度已用完（{cap} 积分/日），明天再来或充值")
         c.execute("UPDATE credits SET balance=balance-?, frozen=frozen+? WHERE user_id=?",
                   (credits, credits, uid))
         _ledger(c, uid, "hold", -credits, frozen_delta=credits, ref=ref,
@@ -453,14 +478,18 @@ def list_unlimited() -> list[dict]:
 
 
 def list_users(limit: int = 200) -> list[dict]:
+    now = time.time()
     with _conn() as c:
         rows = c.execute(
             "SELECT u.id, u.phone, u.created_at, u.status, u.is_unlimited,"
+            " u.plan, u.plan_expires,"
             " c.balance, c.frozen,"
             " COALESCE((SELECT SUM(credits) FROM usage WHERE user_id=u.id),0) AS used"
             " FROM users u LEFT JOIN credits c ON c.user_id=u.id"
             " ORDER BY u.id LIMIT ?", (limit,)).fetchall()
-        return [dict(r, phone=mask_phone(r["phone"])) for r in rows]
+        return [dict(r, phone=mask_phone(r["phone"]),
+                     paid=bool(r["plan"] == "paid" and r["plan_expires"] > now))
+                for r in rows]
 
 
 def list_usage(uid: int | None = None, limit: int = 50) -> list[dict]:

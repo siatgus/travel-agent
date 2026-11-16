@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict[str, tuple[float, float]] = {
     "send_code_ip": (5, 1 / 120),        # 同一 IP 发码：峰值 5，2 分钟补 1
     "login_ip": (10, 1 / 30),            # 同一 IP 登录：峰值 10，30 秒补 1
     "chat_user": (10, 1 / 6),            # 每用户对话：峰值 10 次，6 秒补 1
+    "chat_user_paid": (20, 1 / 2),       # 付费档对话：峰值 20 次，2 秒补 1
     "chat_ip": (20, 1 / 3),              # 同一 IP 对话兜底（多设备共享出口）
     "proxy_ip": (30, 1 / 2),             # 地图/路由代理：峰值 30，2 秒补 1
 }

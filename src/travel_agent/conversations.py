@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -51,6 +52,13 @@ def _conn() -> sqlite3.Connection:
               content TEXT NOT NULL,
               created_at REAL NOT NULL,
               PRIMARY KEY(uid, sid, seq));
+            CREATE TABLE IF NOT EXISTS plan_shares(
+              token TEXT PRIMARY KEY,           -- 公开链接令牌（不可枚举）
+              uid INTEGER NOT NULL,
+              sid TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              revoked INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS idx_shares_sid ON plan_shares(uid, sid);
             """)
         _INITED = True
     return c
@@ -192,3 +200,44 @@ def get_plan_by_sid(sid: str) -> tuple[dict, str] | None:
         return json.loads(row["plan_json"]), row["plan_utterance"]
     except json.JSONDecodeError:
         return None
+
+
+# ------------------------------------------------------------------ 分享
+
+def create_share(uid: int, sid: str) -> dict | None:
+    """为一次对话生成公开分享令牌。已分享过的复用同一令牌（幂等，可再撤销重开）。"""
+    if not sid:
+        return None
+    with _LOCK, _conn() as c:
+        # 只有自己且确实有方案的对话才能分享
+        row = c.execute("SELECT has_plan FROM conversations WHERE uid=? AND sid=?",
+                        (uid, sid)).fetchone()
+        if not row or not row["has_plan"]:
+            return None
+        old = c.execute("SELECT token FROM plan_shares WHERE uid=? AND sid=?"
+                        " AND revoked=0", (uid, sid)).fetchone()
+        if old:
+            return {"token": old["token"]}
+        token = secrets.token_urlsafe(16)
+        c.execute("INSERT INTO plan_shares(token, uid, sid, created_at)"
+                  " VALUES(?,?,?,?)", (token, uid, sid, time.time()))
+        return {"token": token}
+
+
+def revoke_share(uid: int, sid: str) -> bool:
+    """撤销分享：链接立即失效（分享页按 revoked 过滤）。"""
+    with _LOCK, _conn() as c:
+        cur = c.execute("UPDATE plan_shares SET revoked=1 WHERE uid=? AND sid=?"
+                        " AND revoked=0", (uid, sid))
+        return cur.rowcount > 0
+
+
+def get_share(sid_token: str) -> tuple[dict, str] | None:
+    """分享页取方案：令牌有效（未撤销）→ 返回该对话最近一次方案。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT s.sid FROM plan_shares s WHERE s.token=? AND s.revoked=0",
+            (sid_token,)).fetchone()
+    if not row:
+        return None
+    return get_plan_by_sid(row["sid"])

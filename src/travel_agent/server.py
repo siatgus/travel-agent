@@ -55,6 +55,7 @@ except Exception:
     pass
 
 from . import auth
+from . import billing
 from . import conversations
 from . import llm as llm_layer
 from . import moderation
@@ -796,6 +797,7 @@ PAGE_SRC = """<!DOCTYPE html>
     <span class="userbox" id="userbox" title="当前登录账号">
       <span id="ub-phone"></span><span class="sep">·</span><span class="cr" id="ub-credits"></span>
     </span>
+    <button class="quit" id="btn-recharge" onclick="openRecharge()" title="充值与套餐">充值</button>
     <button class="quit" id="btn-logout" onclick="askLogout()" title="退出登录">退出</button>
   </div>
   <button id="btn-hist" onclick="openHist()" style="display:none"
@@ -844,6 +846,27 @@ PAGE_SRC = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+</div>
+<div id="paymask" style="display:none;position:fixed;inset:0;z-index:60;background:rgba(15,23,42,.45);
+  align-items:center;justify-content:center" onclick="if(event.target===this)closeRecharge()">
+  <div style="background:#fff;border-radius:22px;width:400px;max-width:94vw;padding:26px 24px;
+    font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+    <h2 style="margin:0 0 4px;font-size:19px">充值与套餐</h2>
+    <div id="pay-plan" style="color:#8a8a82;font-size:12.5px;margin-bottom:14px"></div>
+    <div id="pay-list"></div>
+    <div id="pay-msg" style="font-size:13px;margin-top:10px;min-height:18px"></div>
+    <button onclick="closeRecharge()" style="margin-top:6px;width:100%;padding:10px;border:none;
+      border-radius:12px;background:#eef0ee;font-size:14px;cursor:pointer">关闭</button>
+  </div>
+</div>
+<div id="sharebar" style="display:none;position:fixed;left:50%;transform:translateX(-50%);
+  bottom:26px;z-index:70;background:#111827;color:#fff;padding:12px 18px;border-radius:14px;
+  font-size:13.5px;align-items:center;gap:10px;box-shadow:0 8px 30px rgba(0,0,0,.25)">
+  <span>分享链接已复制：</span><code id="shareurl" style="color:#93c5fd"></code>
+  <button onclick="copyShare()" style="background:#1d4ed8;border:none;color:#fff;padding:5px 12px;
+    border-radius:8px;cursor:pointer">再复制</button>
+  <button onclick="document.getElementById('sharebar').style.display='none'"
+    style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:15px">✕</button>
 </div>
 <div id="logoutmask">
   <div class="card">
@@ -1007,7 +1030,10 @@ function addBot(html,meta,planUrl){const d=document.createElement('div');d.class
   d.innerHTML=Array.isArray(html)?html.join(''):html;
   if(meta){const m=document.createElement('div');m.className='meta';m.textContent=meta;d.appendChild(m);}
   if(planUrl){const a=document.createElement('a');a.className='plan-link';a.href=planUrl;
-    a.target='_blank';a.textContent='🗺 查看可视化行程页';d.appendChild(a);}
+    a.target='_blank';a.textContent='🗺 查看可视化行程页';d.appendChild(a);
+    const sb=document.createElement('button');sb.className='plan-link';sb.textContent='🔗 分享行程';
+    sb.style.cssText='background:none;border:1px solid var(--line);cursor:pointer;margin-left:8px';
+    sb.onclick=()=>sharePlan(planUrl.split('/plan/')[1]);d.appendChild(sb);}
   chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
 // 思考气泡：点击发送立即出现，按等待时长分阶段更新文案
 let thinkTimer=null;
@@ -1067,7 +1093,10 @@ async function addBotStream(blocks,meta,planUrl){
     m.style.animation='none';d.appendChild(m);}
   if(planUrl){const a=document.createElement('a');a.className='plan-link';a.href=planUrl;
     a.target='_blank';a.textContent='🗺 查看可视化行程页';a.style.animation='none';
-    d.appendChild(a);}
+    d.appendChild(a);
+    const sb=document.createElement('button');sb.className='plan-link';sb.textContent='🔗 分享行程';
+    sb.style.cssText='background:none;border:1px solid var(--line);cursor:pointer;margin-left:8px;animation:none';
+    sb.onclick=()=>sharePlan(planUrl.split('/plan/')[1]);d.appendChild(sb);}
   chat.scrollTop=chat.scrollHeight;
 }
 
@@ -1075,6 +1104,55 @@ async function addBotStream(blocks,meta,planUrl){
 let token = store.get('ta_token') || '';
 let refreshToken = store.get('ta_refresh') || '';
 const userbox = document.getElementById('userbox');
+
+// ---------------- 充值与套餐（M2 收钱闭环） ----------------
+let PLANS = [];
+async function openRecharge(){
+  document.getElementById('paymask').style.display='flex';
+  document.getElementById('pay-msg').textContent='';
+  const r = await fetch('/api/plans');
+  const j = await r.json();
+  PLANS = j.plans || [];
+  document.getElementById('pay-plan').textContent =
+    j.pay_mode==='mock' ? '演示支付：点击套餐后跳转收银台，确认即到账' : '微信支付';
+  const list = document.getElementById('pay-list');
+  list.innerHTML = PLANS.map(p=>'<div style="display:flex;justify-content:space-between;align-items:center;'
+    +'padding:11px 14px;border:1.5px solid #e5e7eb;border-radius:14px;margin-bottom:9px;cursor:pointer"'
+    +' onclick="buy(\\''+p.plan_id+'\\')">'
+    +'<span><b>'+p.title+'</b><br><small style="color:#8a8a82">'
+    +(p.kind==='sub'?'订阅后每日上限放宽到 1500 积分':'积分永不过期')+'</small></span>'
+    +'<b style="color:#1d4ed8;font-size:16px">¥'+p.price_yuan+'</b></div>').join('');
+}
+function closeRecharge(){ document.getElementById('paymask').style.display='none'; }
+async function buy(pid){
+  const msg = document.getElementById('pay-msg');
+  msg.textContent = '正在创建订单…';
+  const r = await fetch('/api/orders', {method:'POST',
+    headers:Object.assign({'Content-Type':'application/json'}, authHeaders()),
+    body:JSON.stringify({plan_id:pid})});
+  const j = await r.json();
+  if(j.ok){ closeRecharge(); window.open(j.pay_url, '_blank'); }
+  else msg.textContent = j.error || (j.error==='unauthorized'?'请先登录':'下单失败');
+}
+
+// ---------------- 分享行程（M2 裂变入口） ----------------
+async function sharePlan(sid){
+  const r = await fetch('/api/share', {method:'POST',
+    headers:Object.assign({'Content-Type':'application/json'}, authHeaders()),
+    body:JSON.stringify({sid:sid})});
+  const j = await r.json();
+  if(!j.ok) return alert(j.error||'分享失败');
+  const url = location.origin + j.url;
+  try{ await navigator.clipboard.writeText(url); }
+  catch(e){}
+  const bar = document.getElementById('sharebar');
+  bar.style.display='flex';
+  document.getElementById('shareurl').textContent = url;
+}
+function copyShare(){
+  const t = document.getElementById('shareurl').textContent;
+  navigator.clipboard ? navigator.clipboard.writeText(t) : null;
+}
 
 function authHeaders(){ return token ? {'Authorization':'Bearer '+token} : {}; }
 
@@ -2087,6 +2165,84 @@ TERMS_PAGE = _legal_page("用户协议", [
      "如有疑问或投诉，请通过应用内联系方式与我们取得联系。"),
 ], "2026-11-16")
 
+def _share_page(html: str) -> str:
+    """给行程页 HTML 顶部注入分享引导条：访客看到方案后引导注册（裂变入口）。"""
+    banner = """<div style="position:sticky;top:0;z-index:50;background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+color:#fff;padding:10px 18px;font-size:14px;display:flex;gap:10px;align-items:center;
+justify-content:center;flex-wrap:wrap;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+<span>这是一份用 AI 排好的旅行行程</span>
+<a href="/" target="_blank" style="background:#fff;color:#1d4ed8;padding:4px 14px;border-radius:999px;
+font-weight:600;text-decoration:none;white-space:nowrap">免费生成我的行程 →</a></div>"""
+    if "<body>" in html:
+        return html.replace("<body>", "<body>" + banner, 1)
+    return banner + html
+
+
+_PAY_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>收银台 · 晴航旅行助手</title>
+<style>
+body{{margin:0;background:#f6f7f5;color:#2b2a26;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}}
+main{{max-width:420px;margin:48px auto;background:#fff;border-radius:20px;padding:32px 28px;
+box-shadow:0 10px 40px rgba(0,0,0,.08)}}
+h1{{font-size:19px;margin:0 0 4px}}
+.amt{{font-size:40px;font-weight:800;color:#1d4ed8;margin:16px 0}}
+.meta{{color:#8a8a82;font-size:13px;line-height:1.8}}
+button{{width:100%;margin-top:24px;padding:13px;border:none;border-radius:14px;
+background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
+button:disabled{{opacity:.6}}
+.ok{{color:#16a34a;font-weight:700}}
+.hint{{font-size:12px;color:#8a8a82;margin-top:14px;text-align:center}}
+</style></head><body><main>
+<h1>{title}</h1>
+<div class="amt">¥{yuan}</div>
+<div class="meta">订单号：{order_no}<br>套餐：{title}<br>到账积分：{credits}</div>
+{action}
+<div class="hint">{hint}</div>
+</main>
+<script>
+async function pay(){{
+  const b=document.getElementById('paybtn');b.disabled=true;b.textContent='处理中…';
+  const r=await fetch('/api/pay/mock',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{order_no:'{order_no}'}})}});
+  const j=await r.json();
+  if(j.ok){{document.getElementById('st').innerHTML=
+    '<span class="ok">支付成功，{credits} 积分已到账</span>\n<br><a href="/">返回助手继续规划 →</a>';
+    b.style.display='none';}}
+  else{{document.getElementById('st').textContent=j.error||'支付失败';
+    b.disabled=false;b.textContent='确认支付（演示）';}}
+}}
+</script></body></html>"""
+
+
+def _cashier_page(order: dict, pay_mode: str) -> str:
+    """收银页：演示模式给「确认支付」按钮；真实支付未接入前明说。"""
+    if order["status"] == "paid":
+        action = (f"<div id='st'><span class='ok'>已支付（{_ts(order['paid_at'])}），"
+                  f"{order['credits']} 积分已到账</span></div>")
+        hint = "可直接关闭本页。"
+    elif pay_mode == "mock":
+        action = (f"<div id='st'></div><button id='paybtn' onclick='pay()'>"
+                  f"确认支付（演示）</button>")
+        hint = "演示模式：点击即完成支付入账。真实微信支付在部署阶段接入后本页自动切换。"
+    else:
+        action = "<div id='st'>微信支付接入中，敬请期待</div>"
+        hint = "暂未开放支付。"
+    return _PAY_PAGE.format(title=order["title"], yuan=order["amount_cents"] / 100,
+                            order_no=order["order_no"], credits=order["credits"],
+                            action=action, hint=hint)
+
+
+def _ts(v) -> str:
+    from datetime import datetime
+    try:
+        return datetime.fromtimestamp(float(v)).isoformat(timespec="seconds") if v else ""
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
 
 # ---------------------------------------------------------------- HTTP 服务
 
@@ -2205,6 +2361,27 @@ class Handler(BaseHTTPRequestHandler):
             self._tianditu_drive()
         elif path == "/api/amap/drive":
             self._amap_drive()
+        elif path == "/api/plans":
+            # 充值套餐：公开接口（未登录也能看价格，登录后才下单）
+            self._json({"ok": True, "plans": billing.list_plans(),
+                        "pay_mode": billing.pay_mode()})
+        elif path.startswith("/share/"):
+            # 公开分享页：令牌有效即可看，不需要登录（裂变入口）
+            saved = conversations.get_share(path[len("/share/"):])
+            if not saved:
+                self._html("<h1>链接已失效</h1><p>分享已被作者撤销或不存在。</p>", 404)
+                return
+            result, utterance = saved
+            try:
+                self._html(_share_page(build_html(result, utterance)))
+            except Exception as e:
+                self._html(f"<h1>渲染失败</h1><pre>{e}</pre>", 500)
+        elif path.startswith("/pay/"):
+            order = billing.order_info(path[len("/pay/"):])
+            if not order:
+                self._html("<h1>订单不存在</h1>", 404)
+                return
+            self._html(_cashier_page(order, billing.pay_mode()))
         else:
             self._json({"ok": False, "error": "not found"}, 404)
 
@@ -2278,6 +2455,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json(r, 200 if r.get("ok") else 401)
             return
 
+        # ---- 套餐/订单/分享（需登录） ----
+        if path in ("/api/orders", "/api/share", "/api/pay/mock"):
+            user = self._auth_user()
+            if user is None:
+                self._json({"ok": False, "error": "unauthorized",
+                            "message": "请先登录后再使用"}, 401)
+                return
+            uid = user["uid"]
+            if path == "/api/orders":
+                r = billing.create_order(uid, str(data.get("plan_id") or ""))
+                self._json(r, 200 if r.get("ok") else 400)
+                return
+            if path == "/api/pay/mock":
+                r = billing.pay_order(str(data.get("order_no") or ""), uid=uid)
+                self._json(r, 200 if r.get("ok") else (404 if "不存在" in r.get("error", "") else 400))
+                return
+            # /api/share：生成分享链接（幂等，已有有效链接直接复用）
+            sid_s = str(data.get("sid") or "")[:64]
+            sh = conversations.create_share(uid, sid_s)
+            if not sh:
+                self._json({"ok": False,
+                            "error": "该对话还没有可分享的行程方案"}, 400)
+                return
+            self._json({"ok": True, "token": sh["token"],
+                        "url": f"/share/{sh['token']}"})
+            return
+
         sid = str(data.get("sid") or "")[:64]
         if path == "/api/chat":
             user = self._auth_user()
@@ -2290,8 +2494,10 @@ class Handler(BaseHTTPRequestHandler):
             if not sid or not msg or len(msg) > 2000:
                 self._json({"ok": False, "error": "需要 sid 与 message（≤2000 字）"}, 400)
                 return
-            # 限流：按用户主桶 + IP 兜底桶（免费/付费不同阈值接运营配置后再分档）
-            for key, bucket in ((f"u{uid}", "chat_user"), (ip, "chat_ip")):
+            # 限流精细化：付费档独立桶（阈值更宽），免费档维持默认
+            paid = billing.is_paid(uid)
+            for key, bucket in ((f"u{uid}", "chat_user_paid" if paid else "chat_user"),
+                                (ip, "chat_ip")):
                 ok, retry = ratelimit.hit(key, bucket)
                 if not ok:
                     self._json({"ok": False, "error": "rate_limited",
@@ -2394,7 +2600,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.split("?")[0].rstrip("/")
-        if path.startswith("/api/conversations/"):
+        if path.startswith("/api/share/"):
+            user = self._auth_user()
+            if user is None:
+                self._json({"ok": False, "error": "unauthorized",
+                            "message": "请先登录后再使用"}, 401)
+                return
+            sid_s = path[len("/api/share/"):]
+            gone = conversations.revoke_share(user["uid"], sid_s)
+            self._json({"ok": gone, "revoked": gone},
+                       200 if gone else 404)
+        elif path.startswith("/api/conversations/"):
             user = self._auth_user()
             if user is None:
                 self._json({"ok": False, "error": "unauthorized",

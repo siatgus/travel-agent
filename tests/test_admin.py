@@ -109,8 +109,9 @@ def _view(name: str) -> str:
 def test_nav_layout() -> None:
     nav = re.search(r'<nav class="nav">(.*?)</nav>', admin.PAGE, re.S)
     links = re.findall(r'href="#/([a-z]+)"', nav.group(1)) if nav else []
-    check("导航栏含五个视图且顺序为 概览/数据/用户/内容审计/模型",
-          links == ["overview", "data", "users", "moderation", "model"], f"links={links}")
+    check("导航栏含六个视图且顺序为 概览/数据/用户/财务/内容审计/模型",
+          links == ["overview", "data", "users", "finance", "moderation", "model"],
+          f"links={links}")
 
     data, users = _view("data"), _view("users")
     check("数据管理与用户管理已分区：数据视图无用户表",
