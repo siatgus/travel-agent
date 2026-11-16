@@ -365,6 +365,22 @@ def test_bad_request(base: str, token: str) -> None:
     check("空消息返回 400", status == 400, f"status={status}")
 
 
+def test_legal_pages(base: str) -> None:
+    """隐私政策与用户协议：上线首日合规要求（个保法 + 生成式AI办法）。"""
+    st, html = _get(base, "/legal/privacy")
+    check("隐私政策页 200 且含关键条款", st == 200
+          and "我们收集哪些信息" in html and "注销" in html
+          and "DeepSeek" in html and "未成年人" in html, f"status={st}")
+    st, html = _get(base, "/legal/terms")
+    check("用户协议页 200 且含积分规则", st == 200
+          and "500 积分" in html and "每日消耗上限" in html
+          and "免责声明" in html, f"status={st}")
+    st, html = _get(base, "/")
+    check("登录面板挂协议/政策链接（注册前可见）",
+          '/legal/terms' in html and '/legal/privacy' in html
+          and '登录/注册即代表同意' in html, "")
+
+
 def test_drive_prefetch() -> None:
     """动线预热：路段提取与前端 chain 规则一致、坏坐标不进、uncertain 不进。
 
@@ -423,6 +439,7 @@ def main() -> int:
     test_conversations_endpoints(base, token)
     test_reset(base, token)
     test_bad_request(base, token)
+    test_legal_pages(base)
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

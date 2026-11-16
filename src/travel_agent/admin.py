@@ -412,6 +412,54 @@ PAGE = """<!DOCTYPE html>
       <span style="font-size:12px;color:#8A8A82;align-self:center;">
         行程页备用底图（没配高德时用） · console.tianditu.gov.cn 免费申请（应用类型选「浏览器端」）</span>
     </div>
+    <details style="margin-top:10px">
+      <summary>备用供应商与轻任务模型（LLM 网关）</summary>
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="llm-fb-enabled"> 启用备用供应商</label>
+        <span style="font-size:12px;color:#8A8A82;align-self:center;">
+          主供应商超时/报错时自动切换，全链失败才降级到规则</span>
+      </div>
+      <div class="row">
+        <select id="llm-fb-provider">
+          <option value="fallback">备用</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI</option>
+          <option value="moonshot">Moonshot Kimi</option>
+          <option value="qwen">通义千问</option>
+          <option value="zhipu">智谱 GLM</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="custom">自定义</option>
+        </select>
+        <input id="llm-fb-base" placeholder="备用 Base URL" size="36">
+        <input id="llm-fb-model" placeholder="备用模型名" size="18">
+        <input id="llm-fb-key" type="password" placeholder="备用 API Key" size="26">
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="llm-light-enabled"> 启用轻任务便宜档</label>
+        <span style="font-size:12px;color:#8A8A82;align-self:center;">
+          槽位抽取/班次查询/翻译类任务路由到这里，省成本</span>
+      </div>
+      <div class="row">
+        <select id="llm-light-provider">
+          <option value="light">轻任务</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI</option>
+          <option value="moonshot">Moonshot Kimi</option>
+          <option value="qwen">通义千问</option>
+          <option value="zhipu">智谱 GLM</option>
+          <option value="custom">自定义</option>
+        </select>
+        <input id="llm-light-base" placeholder="轻任务 Base URL" size="36">
+        <input id="llm-light-model" placeholder="轻任务模型名" size="18">
+        <input id="llm-light-key" type="password" placeholder="轻任务 API Key" size="26">
+      </div>
+      <div class="row">
+        <input id="llm-light-tasks" placeholder="轻任务名单（逗号分隔 task 名）" size="56">
+        <span style="font-size:12px;color:#8A8A82;align-self:center;">
+          默认 extract_slots,poi_lookup,poi_name_en；重排/补全/对话恒走主链</span>
+      </div>
+      <div class="fresh">所有 API Key 加密落盘（主密钥 data/.master_key），界面只显示脱敏形式；留空表示不修改。</div>
+    </details>
     <div class="fresh">保存后对话服务下一句话即刻生效，无需重启。Key 只保存在本机设置文件中，界面上永远只显示脱敏形式；留空表示不修改。</div>
   </section>
 </div>
@@ -895,6 +943,21 @@ async function loadLlm(){
   $('llm-amapsecurity').value='';
   $('llm-amapsecurity').placeholder=s.has_amap_security
     ?('已保存 '+s.amapsec_masked+'（留空则不修改）'):'高德安全密钥（选填）';
+  $('llm-fb-enabled').checked=!!s.fallback_enabled;
+  $('llm-fb-provider').value=s.fallback_provider||'fallback';
+  $('llm-fb-base').value=s.fallback_base_url||'';
+  $('llm-fb-model').value=s.fallback_model||'';
+  $('llm-fb-key').value='';
+  $('llm-fb-key').placeholder=s.has_fallback_key
+    ?('已保存 '+s.fallback_masked+'（留空则不修改）'):'备用 API Key';
+  $('llm-light-enabled').checked=!!s.light_enabled;
+  $('llm-light-provider').value=s.light_provider||'light';
+  $('llm-light-base').value=s.light_base_url||'';
+  $('llm-light-model').value=s.light_model||'';
+  $('llm-light-tasks').value=s.light_tasks||'';
+  $('llm-light-key').value='';
+  $('llm-light-key').placeholder=s.has_light_key
+    ?('已保存 '+s.light_masked+'（留空则不修改）'):'轻任务 API Key';
   $('llm-state').textContent=(s.chat&&s.chat.online)
     ?(s.chat.has_detail?'对话服务在线 · 实时读取':'对话服务在线 · 旧版本，按配置显示')
     :'对话服务未探测到 · 显示配置值';
@@ -908,7 +971,18 @@ async function saveLlm(){
     api_key:$('llm-key').value.trim(),
     tdt_key:$('llm-tdtkey').value.trim(),
     amap_key:$('llm-amapkey').value.trim(),
-    amap_security:$('llm-amapsecurity').value.trim()});
+    amap_security:$('llm-amapsecurity').value.trim(),
+    fallback_enabled:$('llm-fb-enabled').checked,
+    fallback_provider:$('llm-fb-provider').value,
+    fallback_base_url:$('llm-fb-base').value.trim(),
+    fallback_model:$('llm-fb-model').value.trim(),
+    fallback_api_key:$('llm-fb-key').value.trim(),
+    light_enabled:$('llm-light-enabled').checked,
+    light_provider:$('llm-light-provider').value,
+    light_base_url:$('llm-light-base').value.trim(),
+    light_model:$('llm-light-model').value.trim(),
+    light_api_key:$('llm-light-key').value.trim(),
+    light_tasks:$('llm-light-tasks').value.trim()});
   showLlm(r.ok, r.ok?'已保存 —— 对话服务下一句话即刻生效':('保存失败：'+(r.error||'未知错误')));
   loadLlm();
 }
@@ -1401,6 +1475,37 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "高德安全密钥格式异常（通常为 32 位字母数字）"}, 400)
                 return
             cfg["amap_security"] = amap_sec
+        # ---- LLM 网关：备用供应商与轻任务便宜档（均可选，不配=单供应商直连） ----
+        cfg["fallback_enabled"] = bool(data.get("fallback_enabled"))
+        cfg["light_enabled"] = bool(data.get("light_enabled"))
+        for pfx, label in (("fallback_", "备用供应商"), ("light_", "轻任务供应商")):
+            if pfx == "fallback_" and not cfg["fallback_enabled"]:
+                continue
+            if pfx == "light_" and not cfg["light_enabled"]:
+                continue
+            base = str(data.get(pfx + "base_url") or "").strip()
+            model = str(data.get(pfx + "model") or "").strip()
+            if not base.startswith("http") or not model:
+                self._json({"ok": False,
+                            "error": f"启用{label}需填写 Base URL（http 开头）与模型名"}, 400)
+                return
+            cfg[pfx + "provider"] = str(data.get(pfx + "provider") or "")[:40]
+            cfg[pfx + "base_url"] = base
+            cfg[pfx + "model"] = model
+            key = str(data.get(pfx + "api_key") or "").strip()
+            if key:
+                if len(key) < 8:
+                    self._json({"ok": False,
+                                "error": f"{label} API Key 长度异常（至少 8 位）"}, 400)
+                    return
+                cfg[pfx + "api_key"] = key
+            elif not llm.load_settings().get(pfx + "api_key"):
+                self._json({"ok": False,
+                            "error": f"启用{label}需先填写 API Key"}, 400)
+                return
+        if cfg.get("light_enabled"):
+            tasks = str(data.get("light_tasks") or "").strip()
+            cfg["light_tasks"] = tasks or llm.DEFAULT_LIGHT_TASKS
         llm.save_settings(cfg)
         self._json({"ok": True})
 

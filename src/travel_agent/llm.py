@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -241,6 +244,9 @@ class MeteredClient(Client):
 
     def chat(self, system: str, user: str, *, temperature: float | None = None,
              history: list[dict] | None = None) -> str:
+        # task 透传：json_task 把 task 记在计量客户端上，内层（Client 或
+        # GatewayClient）看不到就记不了真实任务名，网关的轻任务路由也会失效
+        self._inner.task = self.task or ""
         import uuid
         chars = len(system) + len(user) + sum(len(m.get("content") or "")
                                               for m in (history or []))
@@ -294,6 +300,95 @@ class ScriptedClient(Client):
         if isinstance(item, Exception):
             raise item
         return item
+
+
+# ------------------------------------------------------------------ LLM 网关
+
+
+class GatewayClient(Client):
+    """多供应商网关：故障转移 + 按任务等级选模型（企业化路线图 2.1）。
+
+    - **故障转移**：供应商按优先级排成调用链（primary + fallbacks），主供应商
+      网络层失败（超时/HTTP 错误/响应不合法）自动切下一个，全链失败才抛
+      LLMError（错误里带每家的失败原因）。json_task 的「回灌重问」语义不变。
+    - **按任务等级选模型**：轻任务（槽位抽取/班次查询/POI 名称翻译等）可配
+      独立的便宜供应商（light 链）；重任务（重排/补全/对话）走主链。判定依据
+      是 Client.task（json_task 里的 task 参数），chat 直调未标记的按重任务。
+    - **计量透明**：成功后把 self.model / self.base_url 更新为实际命中的供应
+      商，MeteredClient 的结算与 usage 流水自动记到真实模型上。
+
+    供应商描述（dict）：{name, api_key, base_url, model}。
+    """
+
+    def __init__(self, primary: dict, fallbacks: list[dict] | None = None,
+                 light: dict | None = None, light_tasks: set[str] | None = None,
+                 timeout: float = 30.0, temperature: float = 0.2):
+        super().__init__(api_key=primary["api_key"],
+                         base_url=primary["base_url"],
+                         model=primary["model"],
+                         timeout=timeout, temperature=temperature)
+        self._chain: list[dict] = [primary] + list(fallbacks or [])
+        self._light_chain: list[dict] = [light] if light else []
+        self._light_tasks = light_tasks or set()
+        self.last_provider = ""                  # 最近一次成功命中的供应商名
+
+    def _chain_for(self) -> list[dict]:
+        t = getattr(self, "task", "")
+        if t and self._light_chain and t in self._light_tasks:
+            return self._light_chain
+        return self._chain
+
+    @staticmethod
+    def _call_provider(prov: dict, system: str, user: str, *,
+                       temperature: float, history: list[dict] | None,
+                       timeout: float) -> str:
+        messages = [{"role": "system", "content": system}]
+        for m in (history or []):
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user})
+        payload = {"model": prov["model"], "messages": messages,
+                   "temperature": temperature}
+        req = urllib.request.Request(
+            f"{prov['base_url'].rstrip('/')}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {prov['api_key']}"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:200]
+            raise LLMError(f"HTTP {e.code}: {body}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise LLMError(f"网络错误: {e}") from e
+        except json.JSONDecodeError as e:
+            raise LLMError(f"响应非 JSON: {e}") from e
+        try:
+            return data["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(f"响应结构异常: {str(data)[:200]}") from e
+
+    def chat(self, system: str, user: str, *, temperature: float | None = None,
+             history: list[dict] | None = None) -> str:
+        temp = self.temperature if temperature is None else temperature
+        errors: list[str] = []
+        for prov in self._chain_for():
+            try:
+                text = self._call_provider(prov, system, user,
+                                           temperature=temp, history=history,
+                                           timeout=self.timeout)
+                # 计量/展示口径对齐实际命中的供应商
+                self.model = prov["model"]
+                self.base_url = prov["base_url"]
+                self.api_key = prov["api_key"]
+                self.last_provider = str(prov.get("name") or "")
+                return text
+            except LLMError as e:
+                errors.append(f"[{prov.get('name') or prov['model']}] {e}")
+        raise LLMError("全部供应商调用失败（按优先级）：" + "；".join(errors))
 
 
 # ------------------------------------------------------------------ 解析与校验
@@ -1177,25 +1272,131 @@ def from_env(**overrides) -> Client | None:
 
 _SETTINGS_NAME = ".llm_settings.json"
 
+# 默认走「轻任务」便宜供应商的任务名（与 json_task 的 task 参数对应）。
+# 未配置 light 供应商时此名单无效；管理后台可改（逗号分隔）。
+DEFAULT_LIGHT_TASKS = "extract_slots,poi_lookup,poi_name_en"
+
 
 def settings_path() -> Path:
     from . import paths
     return paths.llm_settings()
 
 
+# ------------------------------------------------------- 密钥加密落盘
+#
+# 路线图 2.1「用户 key 从此是平台资产，加密存储」的最小实现：
+# 主密钥 data/.master_key（32 字节随机，首次生成）；密文格式
+# enc:v1:<b64(nonce||ciphertext)>，流密码 = HMAC-SHA256(master, nonce||counter)
+# 滚动异或。不引入 pip 依赖、无第三方 C 扩展；威胁模型是「配置文件被拷走但
+# 主密钥还在原机」——完整方案（KMS/DPAPI）留给容器化部署时替换。
+
+SECRET_FIELDS = ("api_key", "tdt_key", "amap_key", "amap_security",
+                 "fallback_api_key", "light_api_key")
+_ENC_PREFIX = "enc:v1:"
+_master_cache: bytes | None = None
+
+
+def _master_key() -> bytes:
+    global _master_cache
+    if _master_cache:
+        return _master_cache
+    from . import paths
+    p = paths.data_dir() / ".master_key"
+    try:
+        raw = p.read_bytes()
+        if len(raw) >= 32:
+            _master_cache = raw[:32]
+            return _master_cache
+    except OSError:
+        pass
+    key = os.urandom(32)
+    try:
+        p.write_bytes(key)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass                       # 只读目录（.pyz）：本轮用临时密钥，重启后密文失效
+    _master_cache = key
+    return key
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hmac.new(key, nonce + counter.to_bytes(4, "big"),
+                            hashlib.sha256).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def encrypt_secret(value: str) -> str:
+    """明文 → 密文。已是密文或空值原样返回（幂等，可重复调用）。"""
+    v = str(value or "")
+    if not v or v.startswith(_ENC_PREFIX):
+        return v
+    nonce = os.urandom(16)
+    data = v.encode("utf-8")
+    ks = _keystream(_master_key(), nonce, len(data))
+    ct = bytes(a ^ b for a, b in zip(data, ks))
+    return _ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
+
+
+def decrypt_secret(value: str) -> str:
+    """密文 → 明文。主密钥丢失/密文损坏返回 ""（按未配置处理，运营重新录入）。"""
+    v = str(value or "")
+    if not v.startswith(_ENC_PREFIX):
+        return v
+    try:
+        blob = base64.b64decode(v[len(_ENC_PREFIX):])
+        nonce, ct = blob[:16], blob[16:]
+        ks = _keystream(_master_key(), nonce, len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks)).decode("utf-8")
+    except Exception:
+        return ""
+
+
 def load_settings() -> dict:
+    """读取设置。返回的字典里密钥字段是**明文**（调用方如 from_settings 直接用）；
+    落盘永远是密文——发现明文旧格式自动加密迁移并重写文件。"""
     try:
         raw = json.loads(settings_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    changed = False
+    for f in SECRET_FIELDS:
+        v = raw.get(f)
+        if not v:
+            continue
+        sv = str(v)
+        if sv.startswith(_ENC_PREFIX):
+            raw[f] = decrypt_secret(sv)
+        else:
+            raw[f] = encrypt_secret(sv)         # 先换成本次返回用的密文占位
+            changed = True
+    if changed:
+        merged = {**raw, "updated_at": raw.get("updated_at")
+                  or datetime.now().isoformat(timespec="seconds")}
+        settings_path().write_text(json.dumps(merged, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        # 重读一遍，保证返回值是解密后的明文口径
+        return load_settings()
+    return raw
 
 
 def save_settings(cfg: dict) -> dict:
-    """合并式保存，附 updated_at。返回实际落盘内容。"""
+    """合并式保存，附 updated_at。密钥字段自动加密落盘。返回实际落盘内容。"""
     merged = {**load_settings(), **cfg,
               "updated_at": datetime.now().isoformat(timespec="seconds")}
-    settings_path().write_text(json.dumps(merged, ensure_ascii=False, indent=2),
+    on_disk = dict(merged)
+    for f in SECRET_FIELDS:
+        if on_disk.get(f):
+            on_disk[f] = encrypt_secret(str(on_disk[f]))
+    settings_path().write_text(json.dumps(on_disk, ensure_ascii=False, indent=2),
                                encoding="utf-8")
     return merged
 
@@ -1255,6 +1456,20 @@ def settings_summary() -> dict:
         "amap_masked": mask_key(s.get("amap_key")),
         "has_amap_security": bool(s.get("amap_security")),
         "amapsec_masked": mask_key(s.get("amap_security")),
+        # 备用供应商（主供应商故障时自动切换）与轻任务供应商（便宜档跑抽取类任务）
+        "fallback_enabled": bool(s.get("fallback_enabled")),
+        "fallback_provider": str(s.get("fallback_provider") or ""),
+        "fallback_base_url": str(s.get("fallback_base_url") or ""),
+        "fallback_model": str(s.get("fallback_model") or ""),
+        "has_fallback_key": bool(s.get("fallback_api_key")),
+        "fallback_masked": mask_key(s.get("fallback_api_key")),
+        "light_enabled": bool(s.get("light_enabled")),
+        "light_provider": str(s.get("light_provider") or ""),
+        "light_base_url": str(s.get("light_base_url") or ""),
+        "light_model": str(s.get("light_model") or ""),
+        "light_tasks": str(s.get("light_tasks") or DEFAULT_LIGHT_TASKS),
+        "has_light_key": bool(s.get("light_api_key")),
+        "light_masked": mask_key(s.get("light_api_key")),
         "updated_at": str(s.get("updated_at") or ""),
         "env_fallback": bool(os.environ.get("OPENAI_API_KEY")),
         "env_model": os.environ.get("OPENAI_MODEL", ""),
@@ -1262,14 +1477,49 @@ def settings_summary() -> dict:
     }
 
 
+def _provider_from(s: dict, prefix: str = "") -> dict | None:
+    """从设置里取一家供应商描述。prefix="" 主供应商；"fallback_"/"light_" 辅链。"""
+    key = str(s.get(prefix + "api_key") or "")
+    model = str(s.get(prefix + "model") or "")
+    base = str(s.get(prefix + "base_url") or "")
+    if not (key and model and base):
+        return None
+    return {"name": str(s.get(prefix + "provider") or "")
+            or ("备用" if prefix == "fallback_" else ("轻任务" if prefix == "light_" else "主")),
+            "api_key": key, "base_url": base, "model": model}
+
+
 def from_settings(**overrides) -> Client | None:
-    """构造客户端：设置文件（已启用且有 Key）优先，其次环境变量，都没有返回 None。"""
+    """构造客户端：设置文件（已启用且有 Key）优先，其次环境变量，都没有返回 None。
+
+    配了备用/轻任务供应商时返回 GatewayClient（故障转移 + 任务分级路由）；
+    只配了主供应商时行为与旧版完全一致（单 Client，测试与调用方无感）。
+    """
     s = load_settings()
     if s.get("enabled") and s.get("api_key"):
-        kwargs = {"api_key": str(s["api_key"]),
-                  "base_url": str(s.get("base_url") or "https://api.openai.com/v1"),
-                  "model": str(s.get("model") or "gpt-4o-mini"),
-                  "timeout": float(s.get("timeout") or 30)}
+        primary = _provider_from(s)
+        if primary is None:
+            return from_env(**overrides)
+        timeout = float(s.get("timeout") or 30)
+        fallbacks: list[dict] = []
+        if s.get("fallback_enabled"):
+            fb = _provider_from(s, "fallback_")
+            if fb:
+                fallbacks.append(fb)
+        light = _provider_from(s, "light_") if s.get("light_enabled") else None
+        if fallbacks or light:
+            raw_tasks = str(s.get("light_tasks") or DEFAULT_LIGHT_TASKS)
+            light_tasks = {t.strip() for t in raw_tasks.split(",") if t.strip()}
+            gw = GatewayClient(primary, fallbacks, light=light,
+                               light_tasks=light_tasks, timeout=timeout)
+            # overrides 允许调用方临时换主供应商（测试用）
+            if overrides.get("model"):
+                gw._chain[0]["model"] = str(overrides["model"])
+            return gw
+        kwargs = {"api_key": primary["api_key"],
+                  "base_url": primary["base_url"],
+                  "model": primary["model"],
+                  "timeout": timeout}
         kwargs.update(overrides)
         return Client(**kwargs)
     return from_env(**overrides)

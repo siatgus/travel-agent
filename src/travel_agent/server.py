@@ -838,6 +838,9 @@ PAGE_SRC = """<!DOCTYPE html>
         <button class="pri" id="lg-btn" onclick="doLogin()">登录 / 注册</button>
         <button class="ghost" onclick="closeLogin()">先看看，稍后登录</button>
         <div class="hint" id="lg-msg"></div>
+        <div class="hint" style="margin-top:10px">登录/注册即代表同意
+          <a href="/legal/terms" target="_blank" style="color:var(--blue)">《用户协议》</a>与
+          <a href="/legal/privacy" target="_blank" style="color:var(--blue)">《隐私政策》</a></div>
       </div>
     </div>
   </div>
@@ -2006,6 +2009,85 @@ QR_LIB_B64 = (
 PAGE = PAGE_SRC.replace("__QR_B64__", QR_LIB_B64)
 
 
+# ------------------------------------------------------- 隐私政策 / 用户协议
+#
+# 《个人信息保护法》与《生成式人工智能服务管理暂行办法》要求面向公众的服务
+# 上线首日必须公示隐私政策与用户协议。内容必须与产品实际行为一致——积分
+# 规则、数据收集范围、注销即删等条款均对应真实实现，改产品行为要同步改这里。
+
+
+def _legal_page(title: str, sections: list[tuple[str, str]], updated: str) -> str:
+    body = "".join(f"<h2>{h}</h2><p>{p}</p>" for h, p in sections)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} · 晴航旅行助手</title>
+<style>
+body{{margin:0;background:#f6f7f5;color:#2b2a26;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.9}}
+main{{max-width:720px;margin:0 auto;padding:48px 20px 80px;background:#fff;min-height:100vh}}
+h1{{font-size:26px;margin:0 0 4px}}
+.meta{{color:#8a8a82;font-size:13px;margin-bottom:28px}}
+h2{{font-size:17px;margin:30px 0 8px;color:#1c2b3a}}
+p{{margin:6px 0;font-size:14.5px}}
+a{{color:#2563eb;text-decoration:none}}
+.back{{display:inline-block;margin-bottom:24px;font-size:13.5px}}
+</style></head><body><main>
+<a class="back" href="/">&larr; 返回首页</a>
+<h1>{title}</h1>
+<div class="meta">更新日期：{updated}</div>
+{body}
+</main></body></html>"""
+
+
+PRIVACY_PAGE = _legal_page("隐私政策", [
+    ("一、我们收集哪些信息",
+     "为提供旅行规划服务，我们只收集以下最小必要信息：1）手机号码——用于验证码登录与账号识别；"
+     "2）你主动发送的对话内容与行程需求（目的地、日期、预算、偏好等）——用于生成与改进行程方案；"
+     "3）服务运行产生的技术记录（登录时间、积分变动、模型调用量）——用于计费与安全审计。"
+     "我们不收集你的通讯录、位置轨迹、相册等与核心功能无关的信息。"),
+    ("二、信息如何使用",
+     "上述信息仅用于：提供与维持旅行规划服务、账号与积分管理、防范刷量与滥用（限流与内容安全审查）、"
+     "法律法规要求的记录留存。我们不会将你的个人信息用于广告画像，也不会出售给任何第三方。"),
+    ("三、第三方服务与数据出境",
+     "为生成行程方案，你的对话内容会经我们服务端调用已通过算法备案的大模型服务（如 DeepSeek）处理；"
+     "为展示路线与天气，行程页会请求公开的地图与气象数据接口。上述第三方均在国内提供服务，"
+     "我们不会把你的数据传输到境外。"),
+    ("四、信息存储与保护",
+     "数据存储于境内服务器；API 密钥等敏感配置加密存储；手机号在日志与后台展示中一律脱敏；"
+     "全站传输采用加密通道。我们采取的技术与管理措施与业务规模相匹配，并持续改进。"),
+    ("五、你的权利",
+     "你有权查询、更正你的个人信息；你可以随时删除历史行程对话；注销账号时，你的账号信息、"
+     "积分账户与全部对话记录将被永久删除且不可恢复。行使上述权利可通过页面内功能或联系客服完成。"),
+    ("六、未成年人保护",
+     "本服务面向成年用户。未成年人使用本服务应取得监护人同意并由监护人陪同。"),
+    ("七、政策更新",
+     "本政策更新后会在本页公示并标注更新日期。重大变更我们会以显著方式提示。"),
+], "2026-11-16")
+
+TERMS_PAGE = _legal_page("用户协议", [
+    ("一、服务内容",
+     "晴航旅行助手为用户提供旅行咨询与行程规划服务：基于你提供的需求生成行程方案、查询景点/美食/"
+     "酒店/交通参考信息、渲染行程页面。服务输出为参考建议，实际出行请以官方实时信息为准。"),
+    ("二、账号与积分",
+     "1）本服务采用手机验证码登录，首次登录自动注册；2）新用户注册赠送 500 积分（约 15 次完整"
+     "行程规划），免费档每日消耗上限 300 积分；3）积分用于抵扣模型调用成本，按实际用量结算，"
+     "调用失败不扣分；4）积分不可转让、不可提现；赠送积分有效期为获得之日起 30 天。"),
+    ("三、用户行为规范",
+     "你承诺不利用本服务从事任何违法活动，不输入或传播违法违规信息；服务内置内容安全审查，"
+     "命中违法有害内容的输入将被拒绝，相关记录依法留存。你对自己输入内容承担法律责任。"),
+    ("四、免责声明",
+     "1）行程方案由算法自动生成，价格、班次、开放时间等信息存在时效性，出行前请自行核实；"
+     "2）模型输出可能存在错误或遗漏，我们不对此承担赔偿责任；3）因不可抗力、第三方服务变更"
+     "导致的服务中断或数据偏差，我们不承担责任。"),
+    ("五、服务变更与终止",
+     "我们有权基于技术与运营需要调整服务内容（含积分规则），调整前将在本页或应用内公示。"
+     "你违反本协议的，我们有权限制或终止向你提供服务。"),
+    ("六、协议生效",
+     "你在登录/注册时勾选或继续使用本服务，即视为已阅读并同意本协议与《隐私政策》。"
+     "如有疑问或投诉，请通过应用内联系方式与我们取得联系。"),
+], "2026-11-16")
+
+
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
@@ -2049,6 +2131,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path == "/":
             self._html(PAGE)
+        elif path == "/legal/privacy":
+            self._html(PRIVACY_PAGE)
+        elif path == "/legal/terms":
+            self._html(TERMS_PAGE)
         elif path == "/api/health":
             self._json({"ok": True, "sessions": len(_SESSIONS), "llm": _llm_state()})
         elif path == "/api/lan":
