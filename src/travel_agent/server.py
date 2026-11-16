@@ -2204,15 +2204,25 @@ button:disabled{{opacity:.6}}
 <script>
 async function pay(){{
   const b=document.getElementById('paybtn');b.disabled=true;b.textContent='处理中…';
-  const r=await fetch('/api/pay/mock',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{order_no:'{order_no}'}})}});
-  const j=await r.json();
-  if(j.ok){{document.getElementById('st').innerHTML=
-    '<span class="ok">支付成功，{credits} 积分已到账</span>\n<br><a href="/">返回助手继续规划 →</a>';
-    b.style.display='none';}}
-  else{{document.getElementById('st').textContent=j.error||'支付失败';
-    b.disabled=false;b.textContent='确认支付（演示）';}}
+  let tok=''; try{{ tok=window.localStorage.getItem('ta_token')||''; }}catch(e){{}}
+  const h={{'Content-Type':'application/json'}};
+  if(tok) h.Authorization='Bearer '+tok;
+  try{{
+    const r=await fetch('/api/pay/mock',{{method:'POST',headers:h,
+      body:JSON.stringify({{order_no:'{order_no}'}})}});
+    const j=await r.json();
+    if(j.ok){{
+      document.getElementById('st').innerHTML=
+        '<span class="ok">支付成功，{credits} 积分已到账</span><br><a href="/">返回助手继续规划 →</a>';
+      b.style.display='none';
+    }}else{{
+      document.getElementById('st').textContent=j.error||'支付失败';
+      b.disabled=false;b.textContent='确认支付（演示）';
+    }}
+  }}catch(e){{
+    document.getElementById('st').textContent='网络异常，请重试';
+    b.disabled=false;b.textContent='确认支付（演示）';
+  }}
 }}
 </script></body></html>"""
 
