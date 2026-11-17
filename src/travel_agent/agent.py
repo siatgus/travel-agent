@@ -2155,7 +2155,7 @@ def render(result: dict, client=None) -> str:
          if result.get("outbound") is not None
          else "- 交通：未指定出发地，往返大交通未安排（预算未含）；定了出发地我补上班次"),
         stay_line,
-        f"- 需提前预约：{'、'.join(n['name'] for d in result['days_plan'] for n in d['nodes'] if n['booking_required']) or '无'}",
+        f"- 需提前预约：{'、'.join(n['name'] for d in result['days_plan'] for n in d['nodes'] if n.get('booking_required')) or '无'}",
         "",
     ]
     out.append("### 预算明细")

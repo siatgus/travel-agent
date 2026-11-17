@@ -2216,7 +2216,7 @@ def render_day(day: dict, color: str, weather: dict | None = None) -> str:
                  + f'<div style="font-size:12px;color:#7a8299;margin-top:3px;">'
                    f'{stay_label.get(n["type"], "停留")} {n["duration_min"]} 分钟'
                  + ('　<span style="color:#B26A00;">需预约</span>'
-                    if n["booking_required"] else "")
+                    if n.get("booking_required") else "")
                  + '</div>')
         # 时间轴：上下两段竖线 + 一个类型圆点（首行不画上段，末行不画下段）
         axis = (

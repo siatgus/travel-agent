@@ -227,7 +227,15 @@ def test_llm_http(base: str, tmp: Path) -> None:
     status, j = _post(base, "/api/llm/settings",
                       {"enabled": True, "base_url": "not-a-url",
                        "model": "m", "api_key": "sk-valid-key-123"})
-    check("Base URL 非法 → 拒绝保存", status == 400 and j.get("ok") is False,
+    check("Base URL 非法 + 本次存了 Key → Key 保存并警告，不改启用状态",
+          status == 200 and j.get("ok") is True and "Base URL" in j.get("warning", ""),
+          f"status={status} j={j}")
+
+    status, j = _post(base, "/api/llm/settings",
+                      {"enabled": True, "base_url": "not-a-url",
+                       "model": "m", "api_key": ""})
+    check("Base URL 非法且无 Key → 拒绝保存",
+          status == 400 and j.get("ok") is False and "Base URL" in j.get("error", ""),
           f"status={status} j={j}")
 
     status, j = _post(base, "/api/llm/settings",

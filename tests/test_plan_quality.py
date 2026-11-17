@@ -1414,14 +1414,24 @@ def test_poi_info_cards() -> None:
           imgv)
 
     # 图片卡（site=百度图片）：来源行与按钮换成图片文案
-    res3 = _fake_result(days_plan=plan)
-    res3["poi_links"] = {"宽窄巷子": {
-        "url": "https://image.baidu.com/search/index?tn=baiduimage&ie=utf-8"
-               "&word=%E5%AE%BD%E7%AA%84%E5%B7%B7%E5%AD%90",
-        "site": "百度图片", "snippet": "", "img": "https://img0.baidu.com/x.jpg"}}
-    h3 = render_html.build_html(res3, "成都4天")
-    check("图片卡按钮显示「查看更多图片」", "查看更多图片" in h3, "按钮文案缺失")
-    check("图片卡来源行显示「图片来源」", "图片来源：" in h3)
+    # 与上方卡片断言同理：必须强制天地图模板，否则无 Key 机器上
+    # build_html 走无地图降级模板，卡片 JS 根本不在页面里
+    _orig_ak5 = render_html.get_amap_key
+    _orig_tk5 = render_html.get_tdt_key
+    render_html.get_amap_key = lambda: ""
+    render_html.get_tdt_key = lambda: "tdtkey0123456789abcdef0123456789abcd"
+    try:
+        res3 = _fake_result(days_plan=plan)
+        res3["poi_links"] = {"宽窄巷子": {
+            "url": "https://image.baidu.com/search/index?tn=baiduimage&ie=utf-8"
+                   "&word=%E5%AE%BD%E7%AA%84%E5%B7%B7%E5%AD%90",
+            "site": "百度图片", "snippet": "", "img": "https://img0.baidu.com/x.jpg"}}
+        h3 = render_html.build_html(res3, "成都4天")
+        check("图片卡按钮显示「查看更多图片」", "查看更多图片" in h3, "按钮文案缺失")
+        check("图片卡来源行显示「图片来源」", "图片来源：" in h3)
+    finally:
+        render_html.get_amap_key = _orig_ak5
+        render_html.get_tdt_key = _orig_tk5
 
 
 # ------------------------------------------------------------------ 杭州实测三连

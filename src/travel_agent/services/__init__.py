@@ -1,4 +1,4 @@
-"""services：统一数据服务层（行野 2.0 第二阶段）。
+"""services：统一数据服务层（晴航 2.0 第二阶段）。
 
 对外入口：get_data_service() 单例。业务 Handler（dialogue / orchestrator）
 通过它取数据，不再直接理解各工具返回协议；real_tools 六工具保留为兼容

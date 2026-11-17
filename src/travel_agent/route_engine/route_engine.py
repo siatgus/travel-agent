@@ -1,4 +1,4 @@
-"""RouteEngine：路线优化统一入口（行野 2.0 第三阶段，文档 §10）。
+"""RouteEngine：路线优化统一入口（晴航 2.0 第三阶段，文档 §10）。
 
 完整链路 plan(request)：
     距离矩阵 → 优化顺序 → 时间表 → 约束检查 → RouteResult

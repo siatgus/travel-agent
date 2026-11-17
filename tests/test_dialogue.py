@@ -394,11 +394,14 @@ def test_pace_loosen_deletes_instead_of_relocating() -> None:
           (s.slots.get("pace") or "moderate") == "moderate",
           str(s.slots.get("pace")))
     mid = s.last_plan["days_plan"][1]
-    # 确定性夹具：真实 KB 数据会影响当天排几个点（非密闭测试），先把当天
-    # 景点裁到 2 个、再塞一个 30 元票价的"可删景点"——放松到轻松档（上限 2）
-    # 必然恰好删它，预算必然 -60（30 元 × 2 人），断言不再漂
-    for n in [n for n in mid["nodes"] if n.get("type") == "attraction"][2:]:
-        mid["nodes"].remove(n)
+    # 确定性夹具：真实 KB 数据会影响当天排几个点（非密闭测试）。直接清空当天
+    # 景点、塞进 3 个固定 attraction——放松到轻松档（上限 2）必然删最后一个
+    # 「可删景点」（从后往前删、非必去点），预算必然 -60（30 元 × 2 人），断言不再漂
+    mid["nodes"] = [n for n in mid["nodes"] if n.get("type") != "attraction"]
+    mid["nodes"].append({"time": "10:00", "name": "保留景点甲", "type": "attraction",
+                         "duration_min": 60, "cost": 20, "transit": "", "tip": ""})
+    mid["nodes"].append({"time": "15:00", "name": "保留景点乙", "type": "attraction",
+                         "duration_min": 60, "cost": 20, "transit": "", "tip": ""})
     mid["nodes"].append({"time": "19:00", "name": "可删景点", "type": "attraction",
                          "duration_min": 60, "cost": 30, "transit": "", "tip": ""})
     before = _attractions(s.last_plan)

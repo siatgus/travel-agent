@@ -1,4 +1,4 @@
-"""Route Engine 配置（行野 2.0 第三阶段，文档 §11.4/§14）。
+"""Route Engine 配置（晴航 2.0 第三阶段，文档 §11.4/§14）。
 
 所有开关都可以用环境变量覆盖，保证「新旧路线模式可随时切换回滚」：
     TRAVEL_ROUTE_ENGINE=0   关闭 Route Engine，composer 走原有启发式排序

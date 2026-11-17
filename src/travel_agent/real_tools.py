@@ -643,6 +643,13 @@ POIS_DB: dict[str, list[dict[str, Any]]] = {
          "duration_min": 70, "cost": 70, "open_hours": "11:00-21:30", "open_days": "每天",
          "need_booking": False, "tags": ["骨酥鱼", "本地菜"], "intensity": "low",
          "indoor_alternative": ""},
+        {"poi_id": "H10", "name": "邯郸方特国色春秋", "category": "attraction",
+         "area": "磁县", "geo": [36.2848, 114.3930], "appeal": 4,
+         "duration_min": 300, "cost": 280,
+         "open_hours": "09:30-17:30", "open_days": "每天",
+         "need_booking": True,
+         "tags": ["主题乐园", "游乐园", "方特"], "intensity": "high",
+         "indoor_alternative": "", "note": "市区车程约 1 小时；门票 280 元起，节假日需提前订"},
     ],
     # 上海：门票按携程/同程 2026-10-29 查询口径（东方明珠 199、豫园 40）
     "上海": [
@@ -709,6 +716,22 @@ POIS_DB: dict[str, list[dict[str, Any]]] = {
          "duration_min": 45, "cost": 40, "open_hours": "07:00-20:00", "open_days": "每天",
          "need_booking": False, "tags": ["点心", "糕团", "老字号"], "intensity": "low",
          "indoor_alternative": ""},
+        {"poi_id": "S12", "name": "上海迪士尼乐园", "category": "attraction",
+         "area": "浦东·川沙", "geo": [31.1443, 121.6570], "appeal": 5,
+         "duration_min": 480, "cost": 475,
+         "open_hours": "09:00-20:30（季节浮动）", "open_days": "每天",
+         "need_booking": True, "tags": ["主题乐园", "迪士尼", "亲子"],
+         "intensity": "high", "indoor_alternative": "",
+         "note": "市区地铁约 40 分钟；门票 475 元起，节假日需提前订"},
+    ],
+    "杭州": [
+        {"poi_id": "X1", "name": "西湖（湖滨·断桥一带）", "category": "attraction",
+         "area": "湖滨", "geo": [30.2431, 120.1503], "appeal": 5,
+         "duration_min": 180, "cost": 0,
+         "open_hours": "全天", "open_days": "每天",
+         "need_booking": False, "tags": ["世界遗产", "湖泊", "免费"], "intensity": "low",
+         "indoor_alternative": "浙江省博物馆（孤山馆区）",
+         "note": "环湖步行为主，核心段约 3 小时；游船 55 元可选"},
     ],
 }
 

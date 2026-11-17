@@ -1,4 +1,4 @@
-"""PlanHandler：规划管道（行野 2.0 设计文档 §4.1 第三阶段落地）。
+"""PlanHandler：规划管道（晴航 2.0 设计文档 §4.1 第三阶段落地）。
 
 整段自 orchestrator.run_plan_pipeline **逐字节搬移**（2026-11-16）：
 槽位抽取与合并、多城/景点误判纠正、day_targets、追问策略、无脑重排

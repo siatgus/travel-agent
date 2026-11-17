@@ -1,4 +1,4 @@
-"""QA Handler 层（行野 2.0 设计文档 §4.1/§8 第二阶段落地）。
+"""QA Handler 层（晴航 2.0 设计文档 §4.1/§8 第二阶段落地）。
 
 Handler 是职责清晰的业务模块，不是互相交接的 LLM Agent（文档 §3）；
 本包内的 Handler 全部复用 Session 既有业务方法（_weather_answer 等），
