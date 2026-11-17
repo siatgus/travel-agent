@@ -44,9 +44,29 @@ DEFAULT_CONFIG: dict[str, tuple[float, float]] = {
     "proxy_ip": (30, 1 / 2),             # 地图/路由代理：峰值 30，2 秒补 1
 }
 
+# 免费模式保守档：没有付费墙时，脚本刷量的成本全由运营方承担（LLM + 短信
+# 都是真金白银），所以默认收紧。只覆盖「免费站真的会赔钱」的那几档：
+# 对话按用户/按 IP、发码按 IP。显式 TRAVEL_RATE_LIMITS 仍然优先于本档。
+FREE_MODE_CONFIG: dict[str, tuple[float, float]] = {
+    "chat_user": (6, 1 / 15),            # 每用户：峰值 6，15 秒补 1（≈4 次/分钟）
+    "chat_ip": (8, 1 / 20),              # 同 IP 兜底：峰值 8，20 秒补 1
+    "send_code_ip": (3, 1 / 300),        # 同 IP 发码：峰值 3，5 分钟补 1
+}
+
+
+def _free_mode() -> bool:
+    """延迟导入 auth，避免模块级循环依赖，也躲开测试环境的导入顺序问题。"""
+    try:
+        from . import auth
+        return auth.is_free_mode()
+    except Exception:
+        return False
+
 
 def _config() -> dict[str, tuple[float, float]]:
     cfg = dict(DEFAULT_CONFIG)
+    if _free_mode():
+        cfg.update(FREE_MODE_CONFIG)
     raw = os.environ.get("TRAVEL_RATE_LIMITS", "").strip()
     if raw:
         try:

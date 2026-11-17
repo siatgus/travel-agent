@@ -2519,7 +2519,13 @@ def build_html(result: dict, utterance: str) -> str:
   <h2>质检结果</h2>
   <div class="card">{checks_html}</div>
 
-  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e6eaf5;
+  <div class="aigc-mark" style="margin-top:36px;padding:10px 14px;border-radius:8px;
+              background:#f2f4fa;border:1px solid #e6eaf5;
+              font-size:12px;color:#5a6478;line-height:1.7;">
+    <b>本页内容由人工智能生成合成</b>，仅供参考，不构成出行承诺；请以官方实时信息为准。
+  </div>
+
+  <div style="margin-top:16px;padding-top:16px;border-top:1px solid #e6eaf5;
               font-size:11px;color:#a0a8bd;line-height:1.8;">
     天气：16 天内为 Open-Meteo 实时预报，更远日期为历史同期参考（每日卡片已标注）；
     景点坐标来自知识库与 OSM，位置估算项均已标注「位置待确认」；

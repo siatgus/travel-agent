@@ -12,6 +12,8 @@
 环境变量：
     TRAVEL_APP_DB   账号库路径（默认 data/.app.db；测试重定向到临时目录）
     TRAVEL_SMS_MOCK 1=验证码直接返回（默认），0=走真实短信（需自行实现 send_sms）
+    TRAVEL_FREE_MODE 1=免费模式（默认关）：所有登录用户免额度/免每日上限，
+                     用量照记（后台仍可看 token 消耗），充值/套餐入口由前端隐藏
 """
 
 from __future__ import annotations
@@ -41,6 +43,15 @@ ACCESS_TTL = 1800            # access token 30 分钟
 REFRESH_TTL = 30 * 86400     # refresh token 30 天
 CODE_TTL = 300               # 验证码 5 分钟
 TOKENS_PER_CREDIT = 100      # 1 积分 = 100 tokens（ DeepSeek 档系数为 1）
+
+
+def is_free_mode() -> bool:
+    """免费模式：所有登录用户免额度、免每日上限（用量照记，后台仍可看消耗）。
+
+    TRAVEL_FREE_MODE=1 开启（默认关，保持收费模式可回滚）。开启后由 server
+    层隐藏充值/套餐/积分 UI，这里只负责在计费链路上放行——两处独立、可单独回滚。
+    """
+    return os.environ.get("TRAVEL_FREE_MODE", "0") == "1"
 
 
 class QuotaError(Exception):
@@ -264,6 +275,7 @@ def login(phone: str, code: str) -> dict:
                 "expires_in": ACCESS_TTL, "user_id": uid,
                 "phone": mask_phone(phone), "new_user": new_user,
                 "unlimited": bool(row["is_unlimited"]) if not new_user else False,
+                "free_mode": is_free_mode(),
                 "credits": bal["balance"] if bal else 0}
 
 
@@ -294,9 +306,9 @@ def get_account(uid: int) -> dict:
                       " LEFT JOIN credits c ON c.user_id=u.id WHERE u.id=?",
                       (uid,)).fetchone()
         if not r:
-            return {"balance": 0, "frozen": 0, "unlimited": False}
+            return {"balance": 0, "frozen": 0, "unlimited": is_free_mode()}
         return {"balance": r["balance"] or 0, "frozen": r["frozen"] or 0,
-                "unlimited": bool(r["is_unlimited"])}
+                "unlimited": bool(r["is_unlimited"]) or is_free_mode()}
 
 
 def is_unlimited(uid: int) -> bool:
@@ -343,7 +355,7 @@ def freeze(uid: int, credits: int, ref: str) -> int:
         if row is None:
             raise QuotaError("insufficient", 0, "账号不存在")
         bal = row["balance"] or 0
-        unlimited = bool(row["is_unlimited"])
+        unlimited = bool(row["is_unlimited"]) or is_free_mode()
         if not unlimited:
             if bal < credits:
                 raise QuotaError("insufficient", bal, f"积分不足：需要约 {credits}，余额 {bal}")
@@ -384,12 +396,12 @@ def settle(uid: int, ref: str, actual: int, *, model: str = "", task: str = "",
                         " LEFT JOIN credits c ON c.user_id=u.id WHERE u.id=?",
                         (uid,)).fetchone()
         bal = (row["balance"] or 0) if row else 0
-        unlimited = bool(row["is_unlimited"]) if row else False
+        unlimited = (bool(row["is_unlimited"]) if row else False) or is_free_mode()
         c.execute("UPDATE credits SET frozen=MAX(0, frozen-?) WHERE user_id=?",
                   (est, uid))
         if unlimited:
-            # 测试账号：预扣全额退回，余额回到调用前；用量按实际写进 usage 表，
-            # 后台照样能看到 token 和"本应扣多少"，只是不真扣。
+            # 测试账号/免费模式：预扣全额退回，余额回到调用前；用量按实际写进
+            # usage 表，后台照样能看到 token 和"本应扣多少"，只是不真扣。
             diff, reason = est, f"测试账号不计费（实际 {actual} 积分，已记用量）"
         else:
             diff = est - actual                      # 正=退回，负=补扣
