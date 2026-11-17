@@ -918,6 +918,25 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
                           f"点名景点补全（模型）：{name} → {poi['name']}")
             return {**base, "status": "fetched", "poi": poi, "source": "llm",
                     "message": f"补到「{poi['name']}」（模型整理，坐标为近似值）"}
+        if row:
+            # 模型知道这个点，但坐标远离当前城市（上海语境里问南京的
+            # 「国民政府中央广播电台旧址」）。绝不能落进下面的「按市区估算」
+            # 兜底——那会把别的城市的点硬塞进本城行程（实测上海行程排出
+            # 南京旧址）。按模型坐标找最近的核实城市重定向补全，补到就如实
+            # 告诉用户"它不在当前城市"；重定向也失败同样报 other_city，
+            # 宁可不排也不造假位置。
+            redirect = _nearest_known_city(row["lat"], row["lon"])
+            if redirect and redirect != city:
+                sub = ensure_spot(redirect, name, db=db, client=client)
+                if sub.get("status") in ("exists", "fetched"):
+                    poi = sub.get("poi") or {}
+                    return {**base, "status": "other_city", "city": redirect,
+                            "poi": poi, "source": sub.get("source") or "",
+                            "message": f"「{poi.get('name') or name}」在{redirect}，"
+                                       f"不在{city}"}
+            return {**base, "status": "other_city",
+                    "message": f"「{name}」的位置离{city}很远，"
+                               f"我没能核实到它在{city}"}
 
     if time.time() >= _OSM_DOWN_UNTIL:
         for term in _spot_terms(name, city):
@@ -1164,6 +1183,21 @@ def _overpass(query: str, budget: float | None = None) -> dict:
         except Exception as e:                    # 换镜像重试
             last = e
     raise ConnectionError(f"Overpass 全部镜像不可达，最后错误: {last}")
+
+
+def _nearest_known_city(lat: float, lon: float) -> str | None:
+    """按坐标找最近的核实城市（CITY_GEO，351 个地级政区）。
+
+    模型给出的点名景点坐标远离当前城市时，用它判断该点真正属于哪座城：
+    上海语境里问「国民政府中央广播电台旧址」（在南京），重定向到南京补全。
+    """
+    from .tools import CITY_GEO
+    best, best_d = None, LLM_MAX_KM
+    for c, (la, lo) in CITY_GEO.items():
+        d = _km(lat, lon, la, lo)
+        if d < best_d:
+            best, best_d = c, d
+    return best
 
 
 def _resolve_center(city: str) -> list[float] | None:

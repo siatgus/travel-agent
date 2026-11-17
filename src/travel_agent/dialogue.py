@@ -937,6 +937,17 @@ class Session:
                 items = [res.get("poi") or {}]
                 if st == "fetched":
                     note = "这条是刚帮你在线查的：坐标与票价为检索值，出行前请再核实。"
+            elif st == "other_city":
+                # 「国民政府中央广播电台旧址介绍一下」（上海语境）：点在南京，
+                # 不能装作没听见去答泛推荐，也不能把南京的点记到上海名下。
+                poi = res.get("poi") or {}
+                true_city = res.get("city") or ""
+                if poi:
+                    note = f"「{poi.get('name') or spot}」位于{true_city}，不在{city}。"
+                    return intent.spot_answer(true_city, spot, [poi], note=note,
+                                              client=self.client)
+                return (res.get("message")
+                        or f"「{spot}」不在{city}一带，我没法按{city}来介绍。")
             elif st == "custom":
                 return (f"「{spot}」我没能查到可靠资料（在线数据源与模型都没拿到），"
                         f"不敢编门票和位置。\n要排进行程的话可以直接说"

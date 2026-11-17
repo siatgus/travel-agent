@@ -1328,7 +1328,15 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
             trace.append({"batch": 2, "tool": "autofetch.ensure_spot",
                           "args": {"city": dest, "name": m},
                           "ok": ok_spot, "summary": spot.get("message") or ""})
-            if ok_spot:
+            if st == "other_city":
+                # 点名景点核实为别的城市（上海行程点名南京的旧址）：
+                # 不能按"市区估算"硬塞进方案，也不该悄悄消失——
+                # 在备注里如实说，用户可以改去那座城或换一个点。
+                assumptions.append(
+                    f"「{m}」不在{dest}（{spot.get('message') or ''}），"
+                    f"未能排进{dest}的行程")
+                must_report["unresolved"].append(m)
+            elif ok_spot:
                 got_new = got_new or st in ("fetched", "custom")
                 bucket = "custom" if st == "custom" else "fetched"
                 must_report[bucket].append(

@@ -347,19 +347,25 @@ def test_spot_llm_preferred() -> None:
           r["status"] == "fetched" and r["source"] == "llm", f"{r}")
 
     old_down = autofetch._OSM_DOWN_UNTIL
+    old_nearest = autofetch._nearest_known_city
     llm.lookup_poi = lambda *a: ({"name": "外地景点", "lat": 39.90, "lon": 116.40,
                                   "category": "attraction", "duration_min": 120,
                                   "ticket": 0, "open_hours": "", "note": ""}, None)
     restore = _patch_center(CENTER)
     autofetch._OSM_DOWN_UNTIL = 1e12          # 假装 OSM 熔断，别真打网络
+    autofetch._nearest_known_city = lambda *a: None   # 屏蔽跨城重定向，专注测本层契约
     try:
         r2 = autofetch.ensure_spot(CITY, "外地景点", client=object())
     finally:
         llm.lookup_poi = old
         autofetch._OSM_DOWN_UNTIL = old_down
+        autofetch._nearest_known_city = old_nearest
         restore()
-    check("模型编的坐标离城区 >60km → 不收，退回未收录安排",
-          r2["status"] == "custom", f"{r2}")
+    # 2026-11-17 契约变更：远坐标绝不能按"市区估算"入库排程——那会把
+    # 别的城市的点硬塞进本城行程（实测上海行程排出南京的广播电台旧址）。
+    # 现在如实报 other_city，让对话层/编排层告诉用户"它不在本城"。
+    check("模型编的坐标离城区 >60km → 不收，报 other_city 而非按市区估算入库",
+          r2["status"] == "other_city" and r2["poi"] is None, f"{r2}")
 
 
 def test_spot_custom_fallback() -> None:
