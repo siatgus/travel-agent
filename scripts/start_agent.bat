@@ -1,12 +1,12 @@
 @echo off
 rem Travel Agent local launcher (Windows)
 rem Python absolute path (no system Python required on PATH)
-set "PY=C:\Users\23126\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+set "PY=C:\Users\SMZJ\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 
 rem LLM fallback (DeepSeek, OpenAI-compatible). Delete these lines to go rule-only.
 rem Note: settings saved in admin console (port 8788) take priority over these.
-rem 安全提示：不要把真实 API Key 提交进仓库，填你自己的 Key 或改用管理后台保存。
-set "OPENAI_API_KEY=sk-在这里填你自己的KEY"
+rem Security: do NOT commit real API keys. Fill in your own key or use the admin console.
+set "OPENAI_API_KEY=sk-REPLACE-WITH-YOUR-KEY"
 set "OPENAI_BASE_URL=https://api.deepseek.com"
 set "OPENAI_MODEL=deepseek-chat"
 set "OPENAI_TIMEOUT=60"

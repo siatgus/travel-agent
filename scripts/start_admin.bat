@@ -1,7 +1,7 @@
 @echo off
 rem Travel Agent admin launcher (Windows)
 rem Python absolute path (no system Python required on PATH)
-set "PY=C:\Users\23126\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+set "PY=C:\Users\SMZJ\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 
 rem src layout: make "python -m" find the travel_agent package
 set "ROOT=%~dp0.."
