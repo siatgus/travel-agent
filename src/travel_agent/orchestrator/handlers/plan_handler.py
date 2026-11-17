@@ -50,6 +50,22 @@ class PlanHandler:
         """
         delta = agent.extract_slots(utterance, today=session.today, client=session.client)
         explicit = _explicit_fields(utterance, delta)
+
+        # 裸数字回答（2026-11-17 用户实测）：追问「几个人出行？」后用户只回
+        # 「1」——人数正则要求「N个人」这类说法，裸数字不命中，抽取器也认不出，
+        # 于是明明答了还被追问第二遍（追问 2/2 复读）。按上一轮追问的字段
+        # 解释裸数字：问人数答「2」是两个人，问天数答「5」是玩五天。
+        _bare = re.fullmatch(r"\s*([0-9]+|[一二两三四五六七八九十]+)\s*", utterance or "")
+        if _bare and session.pending_field in ("party_size", "days"):
+            _n = agent.cn_to_int(_bare.group(1))
+            if _n and session.pending_field == "party_size" and 1 <= _n <= 30:
+                delta = dict(delta)
+                delta["party_size"] = _n
+                explicit.add("party_size")
+            elif _n and session.pending_field == "days" and 1 <= _n <= 60:
+                delta = dict(delta)
+                delta["days"] = _n
+                explicit.add("days")
         lead_notes: list[str] = []
         # 这轮改动前的槽位：用来判断"用户要的调整是不是本来就已经满足"
         prev_slots = dict(session.slots or {})
