@@ -746,26 +746,42 @@ class Session:
         r = agent.dispatch("search_poi", args)
         items = (r.get("items") or []) if r.get("ok") else []
         if not items:
-            # 整座城市没收录餐厅：先走一次在线补库再答
-            self._coverage(city)
+            # 整座城市没收录餐厅：按餐饮标签定向补库再答。
+            # 不能走 _coverage——它只补景点（ensure_city 看景点 covered 就短路），
+            # 南京这种「有 37 个景点、0 家餐厅」的城市会永远补不出餐厅
+            # （2026-11-17 用户实测「中山陵景区附近有什么吃的」查不着）。
+            if city not in self._rest_fetched:
+                self._rest_fetched[city] = get_data_service().ensure(
+                    city, "restaurant")
             r = agent.dispatch("search_poi", args)
             items = (r.get("items") or []) if r.get("ok") else []
         pool = items
         if kw:
-            hit = [p for p in items
-                   if kw in (p.get("name") or "")
-                   or any(kw in t for t in (p.get("tags") or []))]
-            pool = hit or pool   # 品类词不在招牌上时放宽（与餐厅搜索同策略）
-        for radius in (3, 10):
-            near = self._within(lat, lon, pool, disp, radius)
-            if not near:
-                continue
+            if kw in disp:
+                # 「中山陵景区附近有什么吃的」会把地名当品类词抽出来，
+                # 变成「周边·中山陵景区」的怪标签——锚点名不是菜品，清掉
+                kw = ""
+            else:
+                hit = [p for p in items
+                       if kw in (p.get("name") or "")
+                       or any(kw in t for t in (p.get("tags") or []))]
+                pool = hit or pool   # 品类词不在招牌上时放宽（与餐厅搜索同策略）
+        # 两圈一起算：3 公里内凑不满 3 家就扩展到 10 公里，别只报 1 家
+        # （2026-11-17 实测中山陵 3km 圈只有 1 家，10km 圈有 12 家）
+        near3 = self._within(lat, lon, pool, disp, 3)
+        near10 = self._within(lat, lon, pool, disp, 10)
+        near = near3 if len(near3) >= 3 else (near10 or near3)
+        if near:
             label = f"{disp}周边·{kw}" if kw else f"{disp}周边美食"
             text = intent.recommend_answer(city, label, near[:6],
                                            client=self.client)
-            if radius > 3:
-                text += (f"\n\n> 「{disp}」3 公里内暂无收录餐厅，"
-                         f"以上是 {radius} 公里内由近到远的。")
+            if near is not near3:
+                if near3:
+                    text += (f"\n\n> 「{disp}」3 公里内只有 {len(near3)} 家"
+                             f"收录餐厅，以上扩展到 10 公里内由近到远。")
+                else:
+                    text += (f"\n\n> 「{disp}」3 公里内暂无收录餐厅，"
+                             f"以上是 10 公里内由近到远的。")
             return text
         return (f"「{disp}」周边的餐厅我收录得还不够，不敢瞎报名字。\n"
                 f"可以问「{city}有什么好吃的」，或排行程时让我安排用餐。")
@@ -781,16 +797,23 @@ class Session:
         args = {"city": city, "check_in": din, "check_out": dout,
                 "guests": guests}
         hotels, note = self._hotels_with_fetch(city, args)
-        for radius in (3, 10):
-            near = self._within(lat, lon, hotels, disp, radius)
-            if not near:
-                continue
+        # 与餐厅周边同策略：3 公里内凑不满 3 家就扩展到 10 公里
+        near3 = self._within(lat, lon, hotels, disp, 3)
+        near10 = self._within(lat, lon, hotels, disp, 10)
+        near = near3 if len(near3) >= 3 else (near10 or near3)
+        if near:
             text = intent.stay_answer(city, near[:5], client=self.client,
                                       note=note)
             head = f"以「{disp}」为中心由近到远：\n\n"
-            tail = "" if radius <= 3 else \
-                (f"\n\n> 「{disp}」3 公里内暂无收录酒店，"
-                 f"以上是 {radius} 公里内最近的。")
+            if near is not near3:
+                if near3:
+                    tail = (f"\n\n> 「{disp}」3 公里内只有 {len(near3)} 家"
+                            f"收录酒店，以上扩展到 10 公里内。")
+                else:
+                    tail = (f"\n\n> 「{disp}」3 公里内暂无收录酒店，"
+                            f"以上是 10 公里内最近的。")
+            else:
+                tail = ""
             return head + text + tail
         return (f"「{disp}」周边的酒店我收录得还不够，不敢瞎报名字和价格。\n"
                 f"可以问「{city}有什么酒店」，或排行程时按住宿片区帮你选。")
