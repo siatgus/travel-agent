@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, timedelta
+import re
 
 from .tools import haversine_km, transit_estimate
 from .route_engine import optimize_order
@@ -708,7 +709,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     and clock + p["duration_min"] > 12 * 60 + 30):
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
                                            ("晚餐", prev_geo, 6.0)],
-                                   spicy_free, used_food)
+                                   spicy_free, used_food, slots)
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "先吃饭再逛，避免拖到下午两点")
@@ -795,7 +796,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     and clock <= 14 * 60 + 30):
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
                                            ("晚餐", prev_geo, 6.0)],
-                                   spicy_free, used_food)
+                                   spicy_free, used_food, slots)
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "当地口味，按你的忌口筛过一轮")
@@ -816,7 +817,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             clock = max(clock, 11 * 60 + 30)
             lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
                                        ("晚餐", prev_geo, 6.0)],
-                               spicy_free, used_food)
+                               spicy_free, used_food, slots)
             if lunch:
                 meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                         spicy_free, slots, "当天唯一一顿坐下来吃的，不用赶")
@@ -885,7 +886,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         if i < days - 1:
             dinner = _pick_meal(foods, [("晚餐", prev_geo, 6.0),
                                         ("晚餐", home, 6.0)],
-                                spicy_free, used_food)
+                                spicy_free, used_food, slots)
             if dinner:
                 dkm = haversine_km(prev_geo, dinner.get("geo") or prev_geo)
                 dmode, dmin = transit_estimate(dkm, prev_geo, dinner.get("geo") or prev_geo)
@@ -1144,13 +1145,44 @@ def _food_pool(foods: list[dict], spicy_free: bool) -> list[dict]:
     return safe or foods
 
 
+# 点名餐厅的识别口径与 agent 抽取层同一张后缀表：must_visit 里带餐饮
+# 后缀的条目按店名处理，优先占餐位；其余条目仍走景点必去逻辑。
+_FOOD_SUFFIXES = ("大排档", "菜馆", "饭馆", "餐厅", "面馆", "米线店", "米粉店",
+                  "火锅店", "烧烤店", "小吃店", "酒楼", "食堂", "汤包店",
+                  "烧饼店", "奶茶店", "咖啡店", "甜品店", "糕团店")
+_FOOD_TERM_RE = re.compile("(?:" + "|".join(_FOOD_SUFFIXES) + r")$")
+
+
+def _named_food(foods: list[dict], slots: dict,
+                used_food: set[str]) -> dict | None:
+    """must_visit 里点名的那家店（若在餐厅池里）——多个点名按顺序占餐位。"""
+    from .agent import _loose_poi_hit          # 局部导入避免循环依赖
+    for term in (slots.get("must_visit") or []):
+        if not term or not _FOOD_TERM_RE.search(term):
+            continue
+        for f in foods:
+            if f.get("poi_id") in used_food:
+                continue
+            if _loose_poi_hit(term, f.get("name") or ""):
+                return f
+    return None
+
+
 def _pick_meal(foods: list[dict], attempts: list[tuple[str, list[float] | None, float]],
-               spicy_free: bool, used_food: set[str]) -> dict | None:
+               spicy_free: bool, used_food: set[str],
+               slots: dict | None = None) -> dict | None:
     """跨天选餐位。attempts 按顺序尝试（标签, 参照点, 最远距离）。
 
     不吃辣的三级候选：没用过的不辣店 → 不辣店（哪怕中午刚去过——
     回头吃茶馆也好过把人推进麻辣川菜）→ 实在没有才放开到全部。
+
+    slots 里有店名必吃（must_visit 带餐饮后缀）时点名优先：用户说
+    「那给我排海贝皇大排档」，行程里就该吃这家，而不是"就近自选"。
     """
+    if slots:
+        named = _named_food(foods, slots, used_food)
+        if named:
+            return named
     unused = [f for f in foods if f.get("poi_id") not in used_food]
     if spicy_free:
         cands = ([f for f in unused if not _looks_spicy(f)]

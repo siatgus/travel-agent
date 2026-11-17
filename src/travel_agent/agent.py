@@ -354,6 +354,74 @@ _BAD_POI_RE = re.compile(r"时间|时刻|改为|改成|改到|班次|车次|航�
 _QUANT_RE = re.compile(r"一些|某些|部分|几个|几处|别的地方|其他地方|其它地方")
 
 
+# ---------------------------------------------------------------- 点名餐厅抽取
+#
+# 「那给我排上海贝皇大排档」「想吃海贝皇海鲜大排档」「把南翔馒头店排进行程」
+# 是点名一家店，不是排一座城市。没有这道识别，known-city 全文扫描会把
+# 「排上海贝皇大排档」里的「上海」（实为「排上」+「海贝皇」两个字跨词拼接）
+# 抽成目的地——南京排好的行程被整单改排成上海（2026-11-17 用户实测）。
+# 餐饮后缀是店名的强特征，借此把店名从句子里圈出来：既当 must_visit 点名，
+# 又把这些片段从目的地扫描文本里遮掉。
+_FOOD_SUFFIXES = ("大排档", "菜馆", "饭馆", "餐厅", "面馆", "米线店", "米粉店",
+                  "火锅店", "烧烤店", "小吃店", "酒楼", "食堂", "汤包店",
+                  "烧饼店", "奶茶店", "咖啡店", "甜品店", "糕团店", "大排档")
+_FOOD_SUFFIX_ALT = "|".join(sorted(set(_FOOD_SUFFIXES), key=len, reverse=True))
+# 店名核心不含动词字（去/到/玩/吃）：「去上海吃大排档」里"上海吃"不是店名，
+# 上海仍是目的地；排除标点与空白，店名是一个连续词。
+_FOOD_CORE = r"[^去到玩吃，。、,；;！!？?\s（）()]{1,12}"
+# 动词前置：「排上海贝皇大排档」「想吃南翔馒头店」「安排个南京大牌档」。
+# 「排上」的「上」是动趋补语不是上海——连接位吃掉它。
+_FOOD_EST_RE = re.compile(
+    r"(?:排|加|安排|带上?|去吃|想吃|吃)(?:[上到进个家])?"
+    r"([^去到玩吃，。、,；;！!？?\s（）()]{1,12}(?:" + _FOOD_SUFFIX_ALT + r"))")
+# 动词后置：「把海贝皇海鲜大排档排进行程」「南翔馒头店加进必去」
+_FOOD_EST_POST_RE = re.compile(
+    r"([^去到玩吃，。、,；;！!？?\s（）()]{1,12}(?:" + _FOOD_SUFFIX_ALT + r"))"
+    r"(?:排进|排上|加进|加到|放进|安排进|安排上|排进行程|加进行程)")
+# 店名前缀垃圾字：量词/指代词/把字句引导词粘在名字前面
+#（「把海贝皇海鲜大排档排进行程」抽成「把海贝皇海鲜大排档」）
+_FOOD_NAME_STRIP = re.compile(
+    r"^(?:一下|一个|那家|这家|哪家|个|家|附近|就近|顺便|把|将|想|要|帮|给我|帮我)+")
+
+
+def _food_establishment(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+    """从句子里圈出点名餐厅：返回 (店名列表, 全匹配 span 列表)。
+
+    动词前置与后置两种语序都认；店名过垃圾字剥离后至少 2 字才算点名。
+    """
+    names: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for m in _FOOD_EST_RE.finditer(text):
+        nm = _FOOD_NAME_STRIP.sub("", m.group(1))
+        if len(nm) >= 2 and nm not in names:
+            names.append(nm)
+            spans.append(m.span())
+    for m in _FOOD_EST_POST_RE.finditer(text):
+        nm = _FOOD_NAME_STRIP.sub("", m.group(1))
+        if len(nm) >= 2 and nm not in names:
+            names.append(nm)
+            spans.append(m.span())
+    return names, spans
+
+
+def _mask_food_spans(text: str) -> str:
+    """把点名餐厅片段从文本里遮掉（替换为逗号），供目的地扫描专用。
+
+    只遮店名片段，不碰日期/人数等其他抽取——「12月20号去南京玩2天，
+    那给我排海贝皇大排档」里南京、日期都原样保留。
+    """
+    _, spans = _food_establishment(text)
+    if not spans:
+        return text
+    out, last = [], 0
+    for a, b in spans:
+        out.append(text[last:a])
+        out.append("，")
+        last = b
+    out.append(text[last:])
+    return "".join(out)
+
+
 def valid_poi_name(name: str | None) -> bool:
     """这个名字有没有资格当景点：一句话、没标点、不是城市/省份/虚词。
 
@@ -520,6 +588,16 @@ def extract_slots(text: str, today: date | None = None,
         if slots.get("destination") and slots.get("origin") \
                 and name_hit(slots["destination"], slots["origin"]):
             slots["destination"] = None
+        # 店名请求闸（与规则路径同源）：「排上海贝皇大排档」模型同样把
+        # 「上海」回成目的地——店名跨词把城市名拆进句子。目的地落在
+        # 店名片段里就作废，店名转 must_visit。
+        est_names, est_spans = _food_establishment(text)
+        _d = slots.get("destination")
+        if _d and any(_d in text[a:b] for a, b in est_spans):
+            slots["destination"] = None
+        for nm in est_names:
+            if nm not in (slots.get("must_visit") or []):
+                slots.setdefault("must_visit", []).append(nm)
         # 模型给的必去/排除同样要过景点名校验：城市串、时刻碎片、省份名
         # 一旦留下来，autofetch 会把它当"未收录景点"落库并长期污染
         for key in ("must_visit", "avoid"):
@@ -560,6 +638,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     origin_r, dest_r = _extract_route(text)
     if origin_r:
         slots["origin"] = origin_r
+    # 点名餐厅的句子先把店名片段遮掉再扫目的地：「排上海贝皇大排档」的
+    # 「上海」是「排上」+「海贝皇」跨词拼出来的，原文扫描必命中——
+    # 遮掉后「排海贝皇大排档」才是这轮真正的新信息（店名走 must_visit）。
+    text_dest = _mask_food_spans(text)
     # 已知城市优先：整词命中最可靠，避免正则把「丽江吧」截成目的地。
     # 这里必须覆盖全部有坐标的地级政区（351 个），不能只认几个写死的城市：
     # 「再帮我排个西安的」不带"去/到"，旧实现认不出西安，用户换了城市也当没换。
@@ -572,10 +654,10 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     # 还连带把'豫园'从排除清单里过滤掉（frag==destination 被丢弃）。
     # 「去掉苍山」的「去」是否定/删除动词的一部分——(?!掉|除) 挡住，
     # 否则会截出「掉苍山」当地点/景点，还写进 KB 造成数据污染（实测闭环）。
-    _m_go = re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|往|飞)(?!掉|除)([\u4e00-\u9fa5]{2,4})", text)
+    _m_go = re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|往|飞)(?!掉|除)([\u4e00-\u9fa5]{2,4})", text_dest)
     _go_city = next((c for c in known
                      if _m_go and _in_text(c, _m_go.group(1))), None)
-    dest = dest_r or _go_city or next((c for c in known if _in_text(c, text)), None)
+    dest = dest_r or _go_city or next((c for c in known if _in_text(c, text_dest)), None)
     if not dest:
         # 「安排去迪士尼的行程」「去迪士尼的行程」：旧正则只认「去X玩/去X吧」，
         # 撞上"…的行程"整句一个目的地都抽不出来，于是被当成"用户没说去哪儿"，
@@ -583,7 +665,7 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
         if m := re.search(r"(?<![不别])(?<!不想)(?<!不用)(?:去|到|玩|安排去)(?!掉|除)"
                           r"([\u4e00-\u9fa5]{2,6}?)(?:的)?"
                           r"(?:行程|旅游|旅行|路线|计划|安排|玩|逛|吧|呀|啊|呢|哦|嘛|"
-                          r"，|,|。|$|\s)", text):
+                          r"，|,|。|$|\s)", text_dest):
             dest = m.group(1)
     if dest:
         # 兜底剥离句尾语气词（非贪婪正则可能拿不到边界时）
@@ -865,6 +947,20 @@ def extract_slots_rules(text: str, today: date | None = None) -> dict:
     # 顺便类不用挡，"不顺便去"不是人话。
     _POI_STOP = r"[玩旅逛吧呀啊呢哦嘛的之，。、,；;！!（(\s]|$"
     _MUST_VB = r"([\u4e00-\u9fa5]{2,10}?)(?=" + _POI_STOP + r")"
+    # 点名餐厅先行：「排上海贝皇大排档」「想吃南翔馒头店」「把X排进行程」。
+    # 必须走在「想去/要去」泛动词之前——「我想去海贝皇海鲜大排档吃饭」的
+    # 「想去」会抓到带「吃饭」尾巴的整串，店名匹配就废了；餐饮后缀圈出的
+    # 名字干净、还能顺着 _loose 命中库里的全名（含门店括注）。
+    for m in re.finditer(r"(?:排|加|安排|带上?|去吃|想吃|吃)(?:[上到进个家])?"
+                         r"([^去到玩吃，。、,；;！!？?\s（）()]{1,12}"
+                         r"(?:" + _FOOD_SUFFIX_ALT + r"))", text):
+        frag = _trim_stop(_FOOD_NAME_STRIP.sub("", m.group(1)))
+        if _valid_poi(frag) and frag not in slots["must_visit"]:
+            slots["must_visit"].append(frag)
+    for m in _FOOD_EST_POST_RE.finditer(text):
+        frag = _trim_stop(_FOOD_NAME_STRIP.sub("", m.group(1)))
+        if _valid_poi(frag) and frag not in slots["must_visit"]:
+            slots["must_visit"].append(frag)
     # 顿号并列：「想去大熊猫基地、人民公园、都江堰」是三个点名，不是一个。
     # 旧正则一路吃到标点才停，「大熊猫基地、人民公园、都江堰」被当成一个
     # 景点名，含「、」直接判非法——三个点名全丢，方案里一个都没排（实测）。
@@ -1106,6 +1202,23 @@ def hotel_rooms(children: int | None, total: int) -> tuple[int, str]:
     return (1 if total <= 2 else (total + 1) // 2), "间"
 
 
+def _loose_poi_hit(term: str, name: str) -> bool:
+    """点名与 POI 名的宽松匹配：双向包含之外再认开头滑窗。
+
+    「海贝皇大排档」vs「海贝皇海鲜大排档(郑和南路店)」：用户念的是简称，
+    双向包含都不中；取点名开头 4 字的 2 字滑窗，命中即算同一个地方。
+    只用于"点名是否已在池里/能否当餐位"这类宽松判定，不用于排除清单。
+    """
+    if not term or not name:
+        return False
+    if name_hit(term, name):
+        return True
+    head = (term or "")[:4]
+    if len(head) < 2:
+        return False
+    return any(head[i:i + 2] in name for i in range(len(head) - 1))
+
+
 def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None,
               today: date | None = None,
               on_phase: "Callable[[str], None] | None" = None) -> dict:
@@ -1180,8 +1293,34 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
     if must_names:
         pool = pois.get("items") or []
         missing = [m for m in must_names
-                   if not any(name_hit(m, p.get("name") or "") for p in pool)]
+                   if not any(_loose_poi_hit(m, p.get("name") or "") for p in pool)]
         got_new = False
+        # 点名餐厅绝不能走 ensure_spot——城市中心落点的"位置估算景点"
+        # 会把一家查无此店的餐厅伪造成景点排进白天动线。店里没有就补
+        # 一次该城餐厅库（高德/维基导游 eat），还没有就如实报未收录。
+        # 补完还要把点中的店直接捞进候选池：全城 POI 池按热度截断，
+        # 餐厅经常被挤出去，光补库不给池照样排不进（实测）。
+        _food_missing = [m for m in missing if re.search(
+            "(?:" + _FOOD_SUFFIX_ALT + r")$", m)]
+        if _food_missing:
+            autofetch.ensure_restaurants(dest)
+            _r = call("search_poi", {"city": dest, "category": "restaurant",
+                                     "limit": 60}, 2)
+            _have = {p.get("name") for p in (pois.get("items") or [])}
+            for p in (_r.get("items") or []):
+                nm = p.get("name") or ""
+                if nm in _have:
+                    continue
+                if any(_loose_poi_hit(m, nm) for m in _food_missing):
+                    pois.setdefault("items", []).append(p)
+                    _have.add(nm)
+            pool = pois.get("items") or []
+            for m in _food_missing:
+                if any(_loose_poi_hit(m, p.get("name") or "") for p in pool):
+                    must_report["fetched"].append(m)
+                else:
+                    must_report["unresolved"].append(m)
+            missing = [m for m in missing if m not in _food_missing]
         for m in missing:
             spot = autofetch.ensure_spot(dest, m, client=client)
             st = spot.get("status")
@@ -1399,7 +1538,7 @@ def plan_trip(slots: dict, trace: list, client: "llm_layer.Client | None" = None
     # 三种情况对用户来说意味完全不同，用一句"未能排入"糊过去最招投诉。
     node_names = [n["name"] for d in days_plan for n in d["nodes"]]
     must_report["placed"] = [m for m in must_names
-                             if any(name_hit(m, nm) for nm in node_names)]
+                             if any(_loose_poi_hit(m, nm) for nm in node_names)]
     must_report["missed"] = [m for m in must_names
                              if m not in must_report["placed"]
                              and m not in must_report["unresolved"]]
