@@ -890,11 +890,8 @@ def ensure_spot(city: str, name: str, *, db=None, client=None,
         try:
             from . import llm as llm_layer
             row, rec = llm_layer.lookup_poi(client, city, name)
-        except Exception as e:                     # 额度不足在这里显式上抛
-            from .llm import QuotaError
-            if isinstance(e, QuotaError):
-                raise
-            row = None
+        except Exception:
+            row = None                             # 模型查询失败回退本地池子
         if row and _km(center[0], center[1], row["lat"], row["lon"]) <= LLM_MAX_KM:
             # 模型坐标常只有 2 位小数（误差约 1km）：先按天地图地理编码校正，
             # 查不到再退回模型原值——图钉与连线都以这个点为准，宁可多花一次
@@ -996,10 +993,7 @@ def _load(city: str, center: list[float], fetcher=None,
             pois, _hotels = fetch_city_llm(client, city, center)
             if pois:
                 return pois, [], "llm"
-        except Exception as e:                    # 额度不足要上抛，不给假数据
-            from .llm import QuotaError
-            if isinstance(e, QuotaError):
-                raise
+        except Exception as e:                    # 失败回退 OSM/本地，不给假数据
             err = e
     if time.time() >= _OSM_DOWN_UNTIL:
         try:

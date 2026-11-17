@@ -21,10 +21,10 @@
     GET  /                 聊天页面
     GET  /api/health       存活检查
     POST /api/auth/send_code {"phone"} 发验证码（演示模式直接回显）
-    POST /api/auth/login   {"phone","code"} 验证码登录，首登自动注册+赠送积分
+    POST /api/auth/login   {"phone","code"} 验证码登录，首登自动注册
     POST /api/auth/refresh {"refresh"} 换新 access token
-    GET  /api/me           当前用户与积分余额（需 Bearer token）
-    POST /api/chat         {"sid","message"} 需登录；LLM 调用按 token 计积分；
+    GET  /api/me           当前登录用户（需 Bearer token）
+    POST /api/chat         {"sid","message"} 需登录；LLM 调用按 token 记用量；
                            每轮自动存档（首轮建档 = 自动保存为一次行程）
     GET  /api/conversations         历史行程列表（需登录）
     GET  /api/conversations/{sid}   一次对话的完整内容（需登录）
@@ -56,7 +56,6 @@ except Exception:
 
 from . import auditlog
 from . import auth
-from . import billing
 from . import conversations
 from . import llm as llm_layer
 from . import moderation
@@ -377,9 +376,9 @@ def _get_memory() -> PreferenceMemory:
 
 
 def _metered(uid: int):
-    """给用户包一层计量客户端：LLM 每次调用按 token 预扣-结算积分。"""
+    """给用户包一层计量客户端：LLM 每次调用按实际 token 记用量（只记账不扣费）。"""
     base = _get_llm()
-    return llm_layer.MeteredClient(base, uid, meter=auth) if base is not None else None
+    return llm_layer.MeteredClient(base, uid) if base is not None else None
 
 
 def _get_session(uid: int, sid: str) -> Session:
@@ -733,7 +732,7 @@ PAGE_SRC = """<!DOCTYPE html>
        #board.on{transform:translateY(0)}
        #board-fab{display:flex}
        #bclose{display:flex;align-items:center;justify-content:center}
-       /* 顶栏一行放下：按钮一律不换行、全面收紧；手机号藏起只留积分，
+       /* 顶栏一行放下：按钮一律不换行、全面收紧；手机号藏起只留登录名，
           否则「历史行程(6)」「＋新对话」会被挤成两行竖排（截图实测） */
        header{padding:0 8px;gap:6px}
        header .sub{display:none}
@@ -796,9 +795,8 @@ PAGE_SRC = """<!DOCTYPE html>
   <button id="guestbar" onclick="showLogin('登录后即可开始规划')" title="点击登录">未登录 · 点此登录</button>
   <div class="userwrap" id="userwrap" style="display:none">
     <span class="userbox" id="userbox" title="当前登录账号">
-      <span id="ub-phone"></span><span class="sep" id="ub-sep">·</span><span class="cr" id="ub-credits"></span>
+      <span id="ub-phone"></span>
     </span>
-    <button class="quit" id="btn-recharge" onclick="openRecharge()" title="充值与套餐" style="display:none">充值</button>
     <button class="quit" id="btn-logout" onclick="askLogout()" title="退出登录">退出</button>
   </div>
   <button id="btn-hist" onclick="openHist()" style="display:none"
@@ -830,7 +828,7 @@ PAGE_SRC = """<!DOCTYPE html>
       </div>
       <div class="lg-panel">
         <h2>欢迎来到晴航 &#9992;&#65039;</h2>
-        <div class="hint" id="lg-signup-hint">手机验证码登录，首次登录自动注册，并赠送 <b>500 积分</b>（约 15 次完整行程规划）</div>
+        <div class="hint" id="lg-signup-hint">手机验证码登录，首次登录自动注册，全程免费使用</div>
         <div class="f-label">手机号</div>
         <div class="row2"><input id="lg-phone" maxlength="11" inputmode="numeric" placeholder="请输入 11 位手机号"></div>
         <div class="f-label">验证码</div>
@@ -846,18 +844,6 @@ PAGE_SRC = """<!DOCTYPE html>
           <a href="/legal/privacy" target="_blank" style="color:var(--blue)">《隐私政策》</a></div>
       </div>
     </div>
-  </div>
-</div>
-<div id="paymask" style="display:none;position:fixed;inset:0;z-index:60;background:rgba(15,23,42,.45);
-  align-items:center;justify-content:center" onclick="if(event.target===this)closeRecharge()">
-  <div style="background:#fff;border-radius:22px;width:400px;max-width:94vw;padding:26px 24px;
-    font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
-    <h2 style="margin:0 0 4px;font-size:19px">充值与套餐</h2>
-    <div id="pay-plan" style="color:#8a8a82;font-size:12.5px;margin-bottom:14px"></div>
-    <div id="pay-list"></div>
-    <div id="pay-msg" style="font-size:13px;margin-top:10px;min-height:18px"></div>
-    <button onclick="closeRecharge()" style="margin-top:6px;width:100%;padding:10px;border:none;
-      border-radius:12px;background:#eef0ee;font-size:14px;cursor:pointer">关闭</button>
   </div>
 </div>
 <div id="sharebar" style="display:none;position:fixed;left:50%;transform:translateX(-50%);
@@ -971,12 +957,6 @@ PAGE_SRC = """<!DOCTYPE html>
   <div id="foot">数据口径：天气 16 天内为 Open-Meteo 实时预报、更远日期为历史同期参考 &middot; OSRM 真实路网 &middot; 2026-10-29 查价的班次与酒店 &middot; 仅供演示</div>
 </div>
 <script>
-// 免费模式：服务端启动时确定，随页面注入（__FREE_MODE__ 由 PAGE 构建时替换）。
-window.FREE_MODE = __FREE_MODE__;
-if(window.FREE_MODE){
-  const h = document.getElementById('lg-signup-hint');
-  if(h) h.textContent = '手机验证码登录，首次登录自动注册，全程免费使用';
-}
 // localStorage 在沙箱 iframe 里会抛 SecurityError，任何存储访问都必须兜住，
 // 否则脚本初始化即死、所有按钮失灵。
 const store = {
@@ -1110,42 +1090,12 @@ async function addBotStream(blocks,meta,planUrl){
   chat.scrollTop=chat.scrollHeight;
 }
 
-// ---------------- 账号与积分 ----------------
+// ---------------- 账号 ----------------
 let token = store.get('ta_token') || '';
 let refreshToken = store.get('ta_refresh') || '';
 const userbox = document.getElementById('userbox');
 
-// ---------------- 充值与套餐（M2 收钱闭环） ----------------
-let PLANS = [];
-async function openRecharge(){
-  document.getElementById('paymask').style.display='flex';
-  document.getElementById('pay-msg').textContent='';
-  const r = await fetch('/api/plans');
-  const j = await r.json();
-  PLANS = j.plans || [];
-  document.getElementById('pay-plan').textContent =
-    j.pay_mode==='mock' ? '演示支付：点击套餐后跳转收银台，确认即到账' : '微信支付';
-  const list = document.getElementById('pay-list');
-  list.innerHTML = PLANS.map(p=>'<div style="display:flex;justify-content:space-between;align-items:center;'
-    +'padding:11px 14px;border:1.5px solid #e5e7eb;border-radius:14px;margin-bottom:9px;cursor:pointer"'
-    +' onclick="buy(\\''+p.plan_id+'\\')">'
-    +'<span><b>'+p.title+'</b><br><small style="color:#8a8a82">'
-    +(p.kind==='sub'?'订阅后每日上限放宽到 1500 积分':'积分永不过期')+'</small></span>'
-    +'<b style="color:#1d4ed8;font-size:16px">¥'+p.price_yuan+'</b></div>').join('');
-}
-function closeRecharge(){ document.getElementById('paymask').style.display='none'; }
-async function buy(pid){
-  const msg = document.getElementById('pay-msg');
-  msg.textContent = '正在创建订单…';
-  const r = await fetch('/api/orders', {method:'POST',
-    headers:Object.assign({'Content-Type':'application/json'}, authHeaders()),
-    body:JSON.stringify({plan_id:pid})});
-  const j = await r.json();
-  if(j.ok){ closeRecharge(); window.open(j.pay_url, '_blank'); }
-  else msg.textContent = j.error || (j.error==='unauthorized'?'请先登录':'下单失败');
-}
-
-// ---------------- 分享行程（M2 裂变入口） ----------------
+// ---------------- 分享行程 ----------------
 async function sharePlan(sid){
   const r = await fetch('/api/share', {method:'POST',
     headers:Object.assign({'Content-Type':'application/json'}, authHeaders()),
@@ -1166,21 +1116,8 @@ function copyShare(){
 
 function authHeaders(){ return token ? {'Authorization':'Bearer '+token} : {}; }
 
-function showUser(phone, bal, unlimited){
-  const fm = window.FREE_MODE === true;
+function showUser(phone){
   document.getElementById('ub-phone').textContent = phone;
-  const cr = document.getElementById('ub-credits');
-  const sep = document.getElementById('ub-sep');
-  const rc = document.getElementById('btn-recharge');
-  if(fm){
-    cr.textContent = '免费使用';
-    sep.style.display = 'none';
-    rc.style.display = 'none';
-  }else{
-    cr.textContent = unlimited ? '∞ 额度' : (bal + ' 积分');
-    sep.style.display = '';
-    rc.style.display = unlimited ? 'none' : '';
-  }
   document.getElementById('userwrap').style.display = '';
   document.getElementById('guestbar').style.display = 'none';
   document.getElementById('btn-hist').style.display = '';
@@ -1199,8 +1136,7 @@ async function loadMe(){
     if(r.status !== 200) return false;
     const j = await r.json();
     if(!j.ok) return false;
-    window.FREE_MODE = j.free_mode === true;
-    showUser(j.phone, j.balance, j.unlimited);
+    showUser(j.phone);
     document.getElementById('login').style.display = 'none';
     refreshHistCount();
     return true;
@@ -1279,18 +1215,14 @@ async function doLogin(){
     }
     token = j.access; refreshToken = j.refresh;
     store.set('ta_token', token); store.set('ta_refresh', refreshToken);
-    window.FREE_MODE = j.free_mode === true;
-    showUser(j.phone, j.credits, j.unlimited);
+    showUser(j.phone);
     document.getElementById('login').style.display = 'none';
     document.getElementById('lg-msg').textContent = '';
     const queued = pendingMsg;                 // 登录前没发出去的那句，接着发
     pendingMsg = '';
     if(queued){ send(queued); }
     else if(j.new_user){
-      const hello = window.FREE_MODE
-        ? '登录成功！直接说说你的旅行计划吧：目的地、日期、天数、人数、预算，说几样算几样～\\n（这次对话会自动保存为一次行程，随时从右上角「历史行程」找回）'
-        : '登录成功！新用户已赠送 **500 积分**。\\n直接说说你的旅行计划吧：目的地、日期、天数、人数、预算，说几样算几样～\\n（这次对话会自动保存为一次行程，随时从右上角「历史行程」找回）';
-      addBotStream(mdBlocks(hello));
+      addBotStream(mdBlocks('登录成功！直接说说你的旅行计划吧：目的地、日期、天数、人数、预算，说几样算几样～\\n（这次对话会自动保存为一次行程，随时从右上角「历史行程」找回）'));
     }
     else{ refreshHistHint(); }
   }finally{ btn.disabled = false; }
@@ -1569,15 +1501,8 @@ async function send(text){
     const wait=min-(Date.now()-t0);
     if(wait>0)await sleep(wait);
     typing(false);
-    if(window.FREE_MODE === true){
-      document.getElementById('ub-credits').textContent = '免费使用';
-    }else if(j.unlimited){
-      document.getElementById('ub-credits').textContent = '∞ 额度';
-    }else if(j.credits_left !== undefined){
-      document.getElementById('ub-credits').textContent = j.credits_left + ' 积分';
-    }
     if(!j.ok){
-      addBot(esc(j.error==='quota' ? (j.message||'积分不足') : ('出错了：'+(j.error||'未知错误'))));
+      addBot(esc('出错了：' + (j.error || '未知错误')));
     }
     else if(j.mode==='answer'){ await addBotStream(mdBlocks(j.text)); }
     else if(j.mode==='clarify'){ await addBotStream(mdBlocks(j.text), '追问 '+j.ask_rounds+'/2'); }
@@ -2114,13 +2039,12 @@ QR_LIB_B64 = (
     "b2R1bGUuZXhwb3J0cz10KCkpfSgoZnVuY3Rpb24oKXtyZXR1cm4gcXJjb2RlfSkpOwovLyMgc291cmNlTWFwcGluZ1VSTD0vc20v"
     "MjZiNGIwZDBiMWUyODNkNmIzZWM5ODU3YWM1OTdkN2E2MGM3NmFjMTdiZTFlZjRjOTY1ZjAzMDg2ZGU0MjZiYi5tYXA=")
 PAGE = PAGE_SRC.replace("__QR_B64__", QR_LIB_B64) \
-              .replace("__FREE_MODE__", "true" if auth.is_free_mode() else "false")
 
 
 # ------------------------------------------------------- 隐私政策 / 用户协议
 #
 # 《个人信息保护法》与《生成式人工智能服务管理暂行办法》要求面向公众的服务
-# 上线首日必须公示隐私政策与用户协议。内容必须与产品实际行为一致——积分
+# 上线首日必须公示隐私政策与用户协议。内容必须与产品实际行为一致——条款
 # 规则、数据收集范围、注销即删等条款均对应真实实现，改产品行为要同步改这里。
 
 
@@ -2147,17 +2071,15 @@ a{{color:#2563eb;text-decoration:none}}
 </main></body></html>"""
 
 
-_FREE = auth.is_free_mode()
-
 PRIVACY_PAGE = _legal_page("隐私政策", [
     ("一、我们收集哪些信息",
      "为提供旅行规划服务，我们只收集以下最小必要信息：1）手机号码——用于验证码登录与账号识别；"
      "2）你主动发送的对话内容与行程需求（目的地、日期、预算、偏好等）——用于生成与改进行程方案；"
-     "3）服务运行产生的技术记录（登录时间" + ("" if _FREE else "、积分变动") + "、模型调用量）"
-     "——用于" + ("服务优化" if _FREE else "计费") + "与安全审计。"
+     "3）服务运行产生的技术记录（登录时间、模型调用量）"
+     "——用于服务优化与安全审计。"
      "我们不收集你的通讯录、位置轨迹、相册等与核心功能无关的信息。"),
     ("二、信息如何使用",
-     "上述信息仅用于：提供与维持旅行规划服务、" + ("账号管理" if _FREE else "账号与积分管理") +
+     "上述信息仅用于：提供与维持旅行规划服务、账号管理、"
      "、防范刷量与滥用（限流与内容安全审查）、法律法规要求的记录留存。"
      "我们不会将你的个人信息用于广告画像，也不会出售给任何第三方。"),
     ("三、第三方服务与数据出境",
@@ -2169,7 +2091,7 @@ PRIVACY_PAGE = _legal_page("隐私政策", [
      "全站传输采用加密通道。我们采取的技术与管理措施与业务规模相匹配，并持续改进。"),
     ("五、你的权利",
      "你有权查询、更正你的个人信息；你可以随时删除历史行程对话；注销账号时，你的账号信息" +
-     ("" if _FREE else "、积分账户") + "与全部对话记录将被永久删除且不可恢复。"
+     "与全部对话记录将被永久删除且不可恢复。"
      "行使上述权利可通过页面内功能或联系客服完成。"),
     ("六、未成年人保护",
      "本服务面向成年用户。未成年人使用本服务应取得监护人同意并由监护人陪同。"),
@@ -2183,11 +2105,8 @@ TERMS_PAGE = _legal_page("用户协议", [
      "酒店/交通参考信息、渲染行程页面。服务输出为参考建议，实际出行请以官方实时信息为准。"),
     ("二、账号与服务",
      "1）本服务采用手机验证码登录，首次登录自动注册；2）" +
-     ("本服务当前免费向用户开放，不设积分与次数限制；3）为保障服务稳定与公平，"
-      "我们对异常高频调用保留限流与风控措施。" if _FREE else
-      "新用户注册赠送 500 积分（约 15 次完整行程规划），免费档每日消耗上限 300 积分；"
-      "3）积分用于抵扣模型调用成本，按实际用量结算，调用失败不扣分；4）积分不可转让、不可提现；"
-      "赠送积分有效期为获得之日起 30 天。")),
+     "2）本服务免费向用户开放，不设积分与次数限制；3）为保障服务稳定与公平，"
+     "我们对异常高频调用保留限流与风控措施。"),
     ("三、用户行为规范",
      "你承诺不利用本服务从事任何违法活动，不输入或传播违法违规信息；服务内置内容安全审查，"
      "命中违法有害内容的输入将被拒绝，相关记录依法留存。你对自己输入内容承担法律责任。"),
@@ -2196,8 +2115,7 @@ TERMS_PAGE = _legal_page("用户协议", [
      "2）模型输出可能存在错误或遗漏，我们不对此承担赔偿责任；3）因不可抗力、第三方服务变更"
      "导致的服务中断或数据偏差，我们不承担责任。"),
     ("五、服务变更与终止",
-     "我们有权基于技术与运营需要调整服务内容" + ("" if _FREE else "（含积分规则）") +
-     "，调整前将在本页或应用内公示。你违反本协议的，我们有权限制或终止向你提供服务。"),
+     "我们有权基于技术与运营需要调整服务内容，调整前将在本页或应用内公示。你违反本协议的，我们有权限制或终止向你提供服务。"),
     ("六、协议生效",
      "你在登录/注册时勾选或继续使用本服务，即视为已阅读并同意本协议与《隐私政策》。"
      "如有疑问或投诉，请通过应用内联系方式与我们取得联系。"),
@@ -2214,82 +2132,6 @@ font-weight:600;text-decoration:none;white-space:nowrap">免费生成我的行�
     if "<body>" in html:
         return html.replace("<body>", "<body>" + banner, 1)
     return banner + html
-
-
-_PAY_PAGE = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>收银台 · 晴航旅行助手</title>
-<style>
-body{{margin:0;background:#f6f7f5;color:#2b2a26;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}}
-main{{max-width:420px;margin:48px auto;background:#fff;border-radius:20px;padding:32px 28px;
-box-shadow:0 10px 40px rgba(0,0,0,.08)}}
-h1{{font-size:19px;margin:0 0 4px}}
-.amt{{font-size:40px;font-weight:800;color:#1d4ed8;margin:16px 0}}
-.meta{{color:#8a8a82;font-size:13px;line-height:1.8}}
-button{{width:100%;margin-top:24px;padding:13px;border:none;border-radius:14px;
-background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
-button:disabled{{opacity:.6}}
-.ok{{color:#16a34a;font-weight:700}}
-.hint{{font-size:12px;color:#8a8a82;margin-top:14px;text-align:center}}
-</style></head><body><main>
-<h1>{title}</h1>
-<div class="amt">¥{yuan}</div>
-<div class="meta">订单号：{order_no}<br>套餐：{title}<br>到账积分：{credits}</div>
-{action}
-<div class="hint">{hint}</div>
-</main>
-<script>
-async function pay(){{
-  const b=document.getElementById('paybtn');b.disabled=true;b.textContent='处理中…';
-  let tok=''; try{{ tok=window.localStorage.getItem('ta_token')||''; }}catch(e){{}}
-  const h={{'Content-Type':'application/json'}};
-  if(tok) h.Authorization='Bearer '+tok;
-  try{{
-    const r=await fetch('/api/pay/mock',{{method:'POST',headers:h,
-      body:JSON.stringify({{order_no:'{order_no}'}})}});
-    const j=await r.json();
-    if(j.ok){{
-      document.getElementById('st').innerHTML=
-        '<span class="ok">支付成功，{credits} 积分已到账</span><br><a href="/">返回助手继续规划 →</a>';
-      b.style.display='none';
-    }}else{{
-      document.getElementById('st').textContent=j.error||'支付失败';
-      b.disabled=false;b.textContent='确认支付（演示）';
-    }}
-  }}catch(e){{
-    document.getElementById('st').textContent='网络异常，请重试';
-    b.disabled=false;b.textContent='确认支付（演示）';
-  }}
-}}
-</script></body></html>"""
-
-
-def _cashier_page(order: dict, pay_mode: str) -> str:
-    """收银页：演示模式给「确认支付」按钮；真实支付未接入前明说。"""
-    if order["status"] == "paid":
-        action = (f"<div id='st'><span class='ok'>已支付（{_ts(order['paid_at'])}），"
-                  f"{order['credits']} 积分已到账</span></div>")
-        hint = "可直接关闭本页。"
-    elif pay_mode == "mock":
-        action = (f"<div id='st'></div><button id='paybtn' onclick='pay()'>"
-                  f"确认支付（演示）</button>")
-        hint = "演示模式：点击即完成支付入账。真实微信支付在部署阶段接入后本页自动切换。"
-    else:
-        action = "<div id='st'>微信支付接入中，敬请期待</div>"
-        hint = "暂未开放支付。"
-    return _PAY_PAGE.format(title=order["title"], yuan=order["amount_cents"] / 100,
-                            order_no=order["order_no"], credits=order["credits"],
-                            action=action, hint=hint)
-
-
-def _ts(v) -> str:
-    from datetime import datetime
-    try:
-        return datetime.fromtimestamp(float(v)).isoformat(timespec="seconds") if v else ""
-    except (TypeError, ValueError, OSError):
-        return ""
-
 
 
 # ---------------------------------------------------------------- HTTP 服务
@@ -2341,7 +2183,6 @@ class Handler(BaseHTTPRequestHandler):
             self._html(TERMS_PAGE)
         elif path == "/api/health":
             self._json({"ok": True, "sessions": len(_SESSIONS), "llm": _llm_state(),
-                        "free_mode": auth.is_free_mode(),
                         # 日志留存自检：运维应看到 enabled=true 且文件数在增长
                         "audit": auditlog.stats()})
         elif path == "/api/lan":
@@ -2360,13 +2201,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "unauthorized",
                             "message": "请先登录"}, 401)
                 return
-            acct = auth.get_account(user["uid"])
-            self._json({"ok": True, "phone": auth.mask_phone(user["phone"]),
-                        "balance": acct["balance"], "frozen": acct["frozen"],
-                        "unlimited": acct["unlimited"],
-                        "free_mode": auth.is_free_mode(),
-                        "bonus": auth.BONUS_CREDITS,
-                        "daily_cap": auth.DAILY_CAP_CREDITS})
+            self._json({"ok": True, "phone": auth.mask_phone(user["phone"])})
         elif path == "/api/conversations":
             user = self._auth_user()
             if user is None:
@@ -2413,13 +2248,6 @@ class Handler(BaseHTTPRequestHandler):
             self._tianditu_drive()
         elif path == "/api/amap/drive":
             self._amap_drive()
-        elif path == "/api/plans":
-            # 充值套餐：公开接口（未登录也能看价格，登录后才下单）
-            # 免费模式下不提供套餐（前端已隐藏充值入口，这里一并置空防手工调用）
-            self._json({"ok": True,
-                        "plans": [] if auth.is_free_mode() else billing.list_plans(),
-                        "pay_mode": billing.pay_mode(),
-                        "free_mode": auth.is_free_mode()})
         elif path.startswith("/share/"):
             # 公开分享页：令牌有效即可看，不需要登录（裂变入口）
             saved = conversations.get_share(path[len("/share/"):])
@@ -2431,12 +2259,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(_share_page(build_html(result, utterance)))
             except Exception as e:
                 self._html(f"<h1>渲染失败</h1><pre>{e}</pre>", 500)
-        elif path.startswith("/pay/"):
-            order = billing.order_info(path[len("/pay/"):])
-            if not order:
-                self._html("<h1>订单不存在</h1>", 404)
-                return
-            self._html(_cashier_page(order, billing.pay_mode()))
         else:
             self._json({"ok": False, "error": "not found"}, 404)
 
@@ -2516,22 +2338,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(r, 200 if r.get("ok") else 401)
             return
 
-        # ---- 套餐/订单/分享（需登录） ----
-        if path in ("/api/orders", "/api/share", "/api/pay/mock"):
+        # ---- 分享（需登录） ----
+        if path == "/api/share":
             user = self._auth_user()
             if user is None:
                 self._json({"ok": False, "error": "unauthorized",
                             "message": "请先登录后再使用"}, 401)
                 return
             uid = user["uid"]
-            if path == "/api/orders":
-                r = billing.create_order(uid, str(data.get("plan_id") or ""))
-                self._json(r, 200 if r.get("ok") else 400)
-                return
-            if path == "/api/pay/mock":
-                r = billing.pay_order(str(data.get("order_no") or ""), uid=uid)
-                self._json(r, 200 if r.get("ok") else (404 if "不存在" in r.get("error", "") else 400))
-                return
             # /api/share：生成分享链接（幂等，已有有效链接直接复用）
             sid_s = str(data.get("sid") or "")[:64]
             sh = conversations.create_share(uid, sid_s)
@@ -2556,9 +2370,8 @@ class Handler(BaseHTTPRequestHandler):
             if not sid or not msg or len(msg) > 2000:
                 self._json({"ok": False, "error": "需要 sid 与 message（≤2000 字）"}, 400)
                 return
-            # 限流精细化：付费档独立桶（阈值更宽），免费档维持默认
-            paid = billing.is_paid(uid)
-            for key, bucket in ((f"u{uid}", "chat_user_paid" if paid else "chat_user"),
+            # 限流：user 主桶 + ip 兜底桶（免费站统一阈值，无付费档）
+            for key, bucket in ((f"u{uid}", "chat_user"),
                                 (ip, "chat_ip")):
                 ok, retry = ratelimit.hit(key, bucket)
                 if not ok:
@@ -2568,7 +2381,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "retry_after": retry,
                                 "message": f"消息发得太快了，{retry} 秒后再试"}, 429)
                     return
-            # 内容安全 · 输入侧：命中不进 LLM、不扣积分，直接给兜底话术
+            # 内容安全 · 输入侧：命中不进 LLM，直接给兜底话术
             v_in = moderation.scan(msg)
             if not v_in.ok:
                 moderation.log("input", v_in, uid=uid, sid=sid,
@@ -2579,17 +2392,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "mode": "chat", "text": moderation.fallback_reply(v_in.category),
                             "turn_no": 0, "ask_rounds": 0, "assumptions": [],
                             "tool_calls": 0, "has_plan": False, "plan": None,
-                            "credits_left": auth.get_balance(uid),
                             "moderated": True})
-                return
-            # 额度预检：余额低到连一次规划都不够时，直接明说，别让用户白等
-            # （不限额测试账号/免费模式跳过这道，否则余额用完会被拦在门口）
-            acct = auth.get_account(uid)
-            if not acct["unlimited"] and acct["balance"] < auth.MIN_BALANCE:
-                self._json({"ok": False, "error": "quota", "reason": "insufficient",
-                            "balance": acct["balance"],
-                            "message": f"积分不足（余额 {acct['balance']}），请充值后再试"},
-                           403)
                 return
             try:
                 with _LOCK:          # 编排涉及外部 API，串行执行
@@ -2630,10 +2433,6 @@ class Handler(BaseHTTPRequestHandler):
                             utterance=msg, state=s.snapshot())
                     except Exception:
                         pass         # 存档失败只降级，不吞掉当轮回复
-            except auth.QuotaError as e:       # 预扣失败（余额/每日上限）
-                self._json({"ok": False, "error": "quota", "reason": e.reason,
-                            "balance": e.balance, "message": e.message}, 403)
-                return
             except Exception as e:
                 self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
                 return
@@ -2652,8 +2451,6 @@ class Handler(BaseHTTPRequestHandler):
                 "has_plan": reply.plan is not None,
                 # 完整方案 JSON：前端行程面板据此渲染交互式行程单
                 "plan": reply.plan if reply.mode == "plan" else None,
-                "credits_left": auth.get_balance(uid),
-                "unlimited": acct["unlimited"],
                 "slots": {k: v for k, v in reply.slots.items() if not k.startswith("_")},
                 # 本轮自动补全过的城市（前端可据此提示"数据是刚联网补的"）
                 "fetched": reply.fetched,

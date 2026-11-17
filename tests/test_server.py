@@ -245,8 +245,9 @@ def test_plan_flow(base: str, token: str) -> None:
           "出行概要" in text and "出发地 → 目的地" in text
           and "2 人" in text and "4 天 3 晚" in text,
           text[:200])
-    check("出方案响应带积分余额", isinstance(j.get("credits_left"), int)
-          and j["credits_left"] >= 0, f"credits_left={j.get('credits_left')}")
+    check("出方案响应不再带积分字段（计费层已移除）",
+          "credits_left" not in j and "unlimited" not in j,
+          f"keys={sorted(k for k in j if 'credit' in k or 'unlimited' in k)}")
 
 
 def test_me(base: str, token: str) -> None:
@@ -256,28 +257,21 @@ def test_me(base: str, token: str) -> None:
                                  headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=30) as r:
         j = json.loads(r.read())
-    check("/api/me 返回手机号与余额",
+    check("/api/me 返回手机号（无余额字段）",
           j.get("ok") is True and "****" in j.get("phone", "")
-          and isinstance(j.get("balance"), int), f"j={j}")
+          and "balance" not in j and "unlimited" not in j, f"j={j}")
 
 
-def test_unlimited_account(base: str) -> None:
-    """不限额测试账号必须真的穿透 HTTP 链路：预检、计费、/api/me 标记。"""
-    from travel_agent import auth
+def test_free_account(base: str) -> None:
+    """免费站语义穿透 HTTP 链路：登录即用，无额度预检、无积分字段。"""
     phone = "19900001111"
-    auth.create_unlimited(phone, credits=0)
     token = _login(base, phone)
-    req = urllib.request.Request(base + "/api/me",
-                                 headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        me = json.loads(r.read())
-    check("/api/me 标出不限额且余额可以是 0",
-          me.get("unlimited") is True and me.get("balance") == 0, f"me={me}")
     status, j = _post(base, "/api/chat",
-                      {"sid": "t-unl", "message": "一个人去大理玩"}, token=token)
-    check("零余额的不限额账号仍能对话（MIN_BALANCE 预检被放行）",
+                      {"sid": "t-free", "message": "一个人去大理玩"}, token=token)
+    check("免费站登录后直接可对话（无额度预检拦截）",
           status == 200 and j.get("ok") is True, f"status={status} j={j}")
-    check("对话响应带 unlimited 标记", j.get("unlimited") is True, f"j={j}")
+    check("对话响应不带积分/档位字段",
+          "credits_left" not in j and "unlimited" not in j, f"j={j}")
 
 
 def test_conversations_endpoints(base: str, token: str) -> None:
@@ -372,9 +366,9 @@ def test_legal_pages(base: str) -> None:
           and "我们收集哪些信息" in html and "注销" in html
           and "DeepSeek" in html and "未成年人" in html, f"status={st}")
     st, html = _get(base, "/legal/terms")
-    check("用户协议页 200 且含积分规则", st == 200
-          and "500 积分" in html and "每日消耗上限" in html
-          and "免责声明" in html, f"status={st}")
+    check("用户协议页 200 且为免费版条款", st == 200
+          and "免费向用户开放" in html and "不设积分与次数限制" in html
+          and "免责声明" in html and "500 积分" not in html, f"status={st}")
     st, html = _get(base, "/")
     check("登录面板挂协议/政策链接（注册前可见）",
           '/legal/terms' in html and '/legal/privacy' in html
@@ -431,7 +425,7 @@ def main() -> int:
     test_chat_no_auth(base)
     token = _login(base, "13800001111")
     test_me(base, token)
-    test_unlimited_account(base)
+    test_free_account(base)
     test_clarify_flow(base, token)
     test_plan_flow(base, token)
     test_plan_page(base)

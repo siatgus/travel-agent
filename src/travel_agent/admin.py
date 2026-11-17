@@ -10,7 +10,7 @@
 - 概览：城市/POI/酒店/班次总量、各城市数据新鲜度（来源与最近更新时间）
 - 数据管理：POI / 酒店 / 班次增删改、批量导入（JSON 数组走 import_json 校验）、
   一键 Overpass 同步（主站+镜像轮询）、同步日志最近 50 条
-- 用户与积分：用户列表（脱敏）、手工调账（充值/扣减+原因入账本）、LLM 用量流水
+- 用户管理：用户列表（脱敏）、LLM 用量流水（token 消耗统计）
 - 模型设置：切换/配置大语言模型与 API Key（写 .llm_settings.json，
   优先级高于环境变量；对话服务每句话都检查文件指纹，改完即生效）
 
@@ -38,7 +38,6 @@ except Exception:
 from . import kb
 from . import llm
 from . import auth
-from . import billing
 from . import moderation
 
 HOST = "127.0.0.1"
@@ -181,8 +180,7 @@ PAGE = """<!DOCTYPE html>
     <div class="nav-group">数据</div>
     <a href="#/data"><span class="ic">◈</span>数据管理</a>
     <div class="nav-group">运营</div>
-    <a href="#/users"><span class="ic">◍</span>用户与积分</a>
-    <a href="#/finance"><span class="ic">￥</span>财务看板</a>
+    <a href="#/users"><span class="ic">◍</span>用户管理</a>
     <a href="#/moderation"><span class="ic">⚠</span>内容审计</a>
     <a href="#/model"><span class="ic">✦</span>模型设置</a>
   </nav>
@@ -307,8 +305,8 @@ PAGE = """<!DOCTYPE html>
 </div>
 
 <div class="view" id="v-users">
-  <div class="view-head"><h1>用户与积分</h1>
-    <div class="sub">手机号登录即注册 · 余额与冻结额度、手工调账、模型调用流水</div></div>
+  <div class="view-head"><h1>用户管理</h1>
+    <div class="sub">手机号登录即注册 · 模型调用 token 流水</div></div>
   <section>
     <h2>用户列表 <span class="fresh" id="user-fresh"></span></h2>
     <div class="msg" id="user-msg"></div>
@@ -319,21 +317,12 @@ PAGE = """<!DOCTYPE html>
         <option value="active">active</option>
         <option value="disabled">disabled</option>
       </select>
-      <input id="flt-min" type="number" placeholder="余额 ≥" size="8" oninput="filterUsers(true)">
-      <input id="flt-max" type="number" placeholder="余额 ≤" size="8" oninput="filterUsers(true)">
-      <select id="flt-paid" onchange="filterUsers(true)">
-        <option value="">全部档位</option>
-        <option value="paid">付费中</option>
-        <option value="free">免费档</option>
-        <option value="unlimited">不限额</option>
-      </select>
       <span style="font-size:12.5px;color:#8a8a82">注册</span>
       <input id="user-from" type="date" onchange="filterUsers(true)" title="注册起始日期">
       <span style="font-size:12.5px;color:#8a8a82">至</span>
       <input id="user-to" type="date" onchange="filterUsers(true)" title="注册截止日期">
       <select id="sort-user" onchange="filterUsers(true)" title="排序">
         <option value="id">ID ↑</option>
-        <option value="balance">余额 ↓</option>
         <option value="used">累计消耗 ↓</option>
         <option value="new">注册时间 ↓</option>
       </select>
@@ -342,19 +331,6 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div style="overflow-x:auto"><table id="user-table"></table></div>
     <div class="pager" id="user-pager"></div>
-    <div class="fresh" style="margin-top:8px">点行内「调账」可直接改该用户积分，无需输入用户 ID。</div>
-  </section>
-  <section>
-    <details>
-      <summary>按用户 ID 直接调账（正数充值 / 负数扣减）</summary>
-      <div class="row">
-        <input id="adj-uid" placeholder="用户 ID" size="8">
-        <input id="adj-delta" placeholder="变动积分，如 100 或 -50" size="18">
-        <input id="adj-reason" placeholder="原因*" size="30">
-        <button class="pri" onclick="adjustCredits()">确认调整</button>
-      </div>
-      <div class="fresh">每次调账都会写入账本流水，可追溯。</div>
-    </details>
   </section>
   <section>
     <h2>LLM 用量流水</h2>
@@ -366,63 +342,11 @@ PAGE = """<!DOCTYPE html>
       <input id="usage-from" type="date" onchange="filterUsage(true)" title="起始日期">
       <span style="font-size:12.5px;color:#8a8a82">至</span>
       <input id="usage-to" type="date" onchange="filterUsage(true)" title="截止日期">
-      <input id="usage-min" type="number" placeholder="积分 ≥" size="8" oninput="filterUsage(true)">
       <button onclick="resetUsageFilter()">重置</button>
       <span class="fresh" id="usage-count"></span>
     </div>
     <div style="overflow-x:auto"><table id="usage-table"></table></div>
     <div class="pager" id="usage-pager"></div>
-  </section>
-</div>
-
-<div class="view" id="v-finance">
-  <div class="view-head"><h1>财务看板</h1>
-    <div class="sub">订单与积分流水 · 收入曲线来自订单账本，消耗曲线来自模型计量</div></div>
-  <div class="cards" id="fin-cards"></div>
-  <section>
-    <div class="filters">
-      <span style="font-size:13px;color:#55554f">统计窗口</span>
-      <select id="fin-days" onchange="loadFinance()">
-        <option value="7">近 7 天</option>
-        <option value="14" selected>近 14 天</option>
-        <option value="30">近 30 天</option>
-        <option value="90">近 90 天</option>
-      </select>
-      <span class="fresh" id="fin-window"></span>
-    </div>
-  </section>
-  <section>
-    <h2>每日收入</h2>
-    <div style="overflow-x:auto"><table id="fin-rev"></table></div>
-  </section>
-  <section>
-    <h2>每日积分消耗</h2>
-    <div style="overflow-x:auto"><table id="fin-usage"></table></div>
-  </section>
-  <section>
-    <h2>订单明细 <span class="fresh" id="ord-count"></span></h2>
-    <div class="filters">
-      <select id="flt-ord-status" onchange="filterOrders(true)">
-        <option value="">全部状态</option>
-        <option value="paid">已支付</option>
-        <option value="created">待支付</option>
-      </select>
-      <select id="flt-ord-plan" onchange="filterOrders(true)">
-        <option value="">全部套餐</option>
-      </select>
-      <input id="q-ord" placeholder="订单号 / 手机号 / 用户 ID" size="20" oninput="filterOrders(true)">
-      <input id="ord-min" type="number" placeholder="金额 ≥" size="8" oninput="filterOrders(true)">
-      <input id="ord-max" type="number" placeholder="金额 ≤" size="8" oninput="filterOrders(true)">
-      <span style="font-size:12.5px;color:#8a8a82">下单</span>
-      <input id="ord-from" type="date" onchange="filterOrders(true)" title="下单日期（起）">
-      <span style="font-size:12.5px;color:#8a8a82">至</span>
-      <input id="ord-to" type="date" onchange="filterOrders(true)" title="下单日期（止）">
-      <button onclick="resetOrderFilter()">重置</button>
-      <span class="fresh" id="ord-sum"></span>
-    </div>
-    <div class="msg" id="ord-msg"></div>
-    <div style="overflow-x:auto"><table id="fin-orders"></table></div>
-    <div class="pager" id="ord-pager"></div>
   </section>
 </div>
 
@@ -1198,22 +1122,17 @@ async function testLlm(){
     :('连接失败：'+(r.error||'未知错误')));
 }
 
-// ---------------- 用户与积分：条件搜索 + 行内调账 ----------------
+// ---------------- 用户管理：条件搜索 ----------------
 let USERS=[];
 let USER_ROWS=[];    // 当前过滤结果
-let ADJ_UID=null;          // 展开行内调账的用户 ID
 let USAGE=[];
 let USAGE_ROWS=[];   // 当前过滤结果
-
-function showUser(ok,text){
-  const m=$('user-msg');m.className='msg '+(ok?'ok':'bad');m.textContent=text;
-}
 
 async function loadUsers(){
   const r=await api('/api/users');
   if(!r.ok)return;
   USERS=r.users||[];
-  $('user-fresh').textContent='共 '+r.total+' 人 · 注册赠 '+r.bonus+' 积分 · 免费档日上限 '+r.daily_cap;
+  $('user-fresh').textContent='共 '+r.total+' 人';
   filterUsers();
 }
 
@@ -1221,17 +1140,9 @@ function filterUsers(reset){
   if(reset)PAGES.user=1;
   const q=$('q-user').value.trim();
   const st=$('flt-status').value;
-  const paid=$('flt-paid').value;
-  const mn=$('flt-min').value, mx=$('flt-max').value;
-  const lo=mn===''?-Infinity:Number(mn), hi=mx===''?Infinity:Number(mx);
   const from=$('user-from').value, to=$('user-to').value;
   USER_ROWS=USERS.filter(function(u){
     if(st && u.status!==st)return false;
-    const bal=u.balance||0;
-    if(bal<lo||bal>hi)return false;
-    if(paid==='paid' && !u.paid)return false;
-    if(paid==='free' && (u.paid||u.is_unlimited))return false;
-    if(paid==='unlimited' && !u.is_unlimited)return false;
     const d=dayOf(u.created_at);
     if(from && (!d || d<from))return false;
     if(to && (!d || d>to))return false;
@@ -1239,15 +1150,13 @@ function filterUsers(reset){
     return String(u.id).indexOf(q)>=0 || (u.phone||'').indexOf(q)>=0;
   });
   const sort=$('sort-user').value;
-  if(sort==='balance')USER_ROWS.sort(function(a,b){return (b.balance||0)-(a.balance||0);});
-  else if(sort==='used')USER_ROWS.sort(function(a,b){return (b.used||0)-(a.used||0);});
+  if(sort==='used')USER_ROWS.sort(function(a,b){return (b.used||0)-(a.used||0);});
   else if(sort==='new')USER_ROWS.sort(function(a,b){
     return String(b.created_at||'').localeCompare(String(a.created_at||''));});
   else USER_ROWS.sort(function(a,b){return a.id-b.id;});
-  const sumUsed=USER_ROWS.reduce(function(a,u){return a+(u.used||0);},0);
-  const sumBal=USER_ROWS.reduce(function(a,u){return a+(u.balance||0);},0);
+  const sumTok=USER_ROWS.reduce(function(a,u){return a+(u.used||0);},0);
   $('user-count').textContent='命中 '+USER_ROWS.length+' / '+USERS.length+' 人'
-    +' · 余额合计 '+sumBal+' · 消耗合计 '+sumUsed;
+    +' · 累计消耗合计 '+sumTok;
   renderUsers();
 }
 
@@ -1258,62 +1167,23 @@ function renderUsers(){
   let page=PAGES.user||1; if(page>pages)page=pages; PAGES.user=page;
   const slice=USER_ROWS.slice((page-1)*size,(page-1)*size+size);
   const body=slice.map(function(u){
-    const bal=u.is_unlimited
-      ? '<span class="tag">∞ 额度</span>'
-      : ('<b>'+u.balance+'</b>（冻结 '+u.frozen+'）');
-    const st=u.is_unlimited?'不限额测试':(u.status||'');
     let h='<tr><td>'+u.id+'</td><td>'+esc(u.phone)+'</td>'
-      +'<td>'+bal+'</td><td>'+u.used+'</td>'
-      +'<td>'+esc(u.created_at||'')+'</td><td>'+esc(st)+'</td>'
-      +'<td><button onclick="adjRow('+u.id+')">调账</button> '
-      +'<button onclick="showUsage('+u.id+')">用量</button></td></tr>';
-    if(u.id===ADJ_UID){
-      h+='<tr class="editrow"><td colspan="7">调账用户 #'+u.id+' '+esc(u.phone)+'：'
-        +'<input id="radj-delta" placeholder="变动积分，如 100 或 -50" size="18"> '
-        +'<input id="radj-reason" placeholder="原因*" size="26"> '
-        +'<button class="pri" onclick="applyRowAdjust('+u.id+')">确认</button> '
-        +'<button onclick="adjRow('+u.id+')">取消</button>'
-        +'<span class="fresh" style="margin-left:8px">当前余额 '+u.balance+'</span></td></tr>';
-    }
+      +'<td>'+(u.used||0)+'</td>'
+      +'<td>'+esc(u.created_at||'')+'</td><td>'+esc(u.status||'')+'</td>'
+      +'<td><button onclick="showUsage('+u.id+')">用量</button></td></tr>';
     return h;
   }).join('');
-  $('user-table').innerHTML='<tr><th>ID</th><th>手机号</th><th>余额</th><th>累计消耗</th>'
+  $('user-table').innerHTML='<tr><th>ID</th><th>手机号</th><th>累计消耗</th>'
     +'<th>注册时间</th><th>状态</th><th>操作</th></tr>'
-    +(body||'<tr><td colspan="7" class="empty">没有符合条件的用户</td></tr>');
+    +(body||'<tr><td colspan="6" class="empty">没有符合条件的用户</td></tr>');
   $('user-pager').innerHTML=pagerHtml('user',page,pages,total);
 }
 
-function adjRow(uid){
-  ADJ_UID=(ADJ_UID===uid)?null:uid;
-  filterUsers();
-  if(ADJ_UID){const el=$('radj-delta'); if(el)el.focus();}
-}
-
-async function applyRowAdjust(uid){
-  const delta=Number($('radj-delta').value);
-  const reason=$('radj-reason').value.trim();
-  if(!delta||!reason){showUser(false,'需要变动积分和原因');return;}
-  const r=await api('/api/user/credits',{user_id:uid,delta:delta,reason:reason});
-  showUser(r.ok, r.ok?('已调整：用户 '+uid+' '+delta+' 积分'):('调整失败：'+(r.error||'')));
-  if(r.ok){ADJ_UID=null;loadUsers();}
-}
-
 function resetUserFilter(){
-  $('q-user').value=''; $('flt-status').value=''; $('flt-paid').value='';
-  $('flt-min').value=''; $('flt-max').value='';
+  $('q-user').value=''; $('flt-status').value='';
   $('user-from').value=''; $('user-to').value='';
   $('sort-user').value='id';
   filterUsers(true);
-}
-
-async function adjustCredits(){
-  const uid=Number($('adj-uid').value), delta=Number($('adj-delta').value);
-  const reason=$('adj-reason').value.trim();
-  if(!uid||!delta||!reason){showUser(false,'需要用户 ID、变动积分和原因');return;}
-  const r=await api('/api/user/credits',{user_id:uid,delta:delta,reason:reason});
-  showUser(r.ok, r.ok?('已调整：用户 '+uid+' '+delta+' 积分'):('调整失败：'+(r.error||'')));
-  if(r.ok){$('adj-uid').value='';$('adj-delta').value='';$('adj-reason').value='';}
-  loadUsers();
 }
 
 function showUsage(uid){
@@ -1336,21 +1206,19 @@ function filterUsage(reset){
   const m=$('q-usage-model').value.trim().toLowerCase();
   const tk=$('q-usage-task').value.trim().toLowerCase();
   const from=$('usage-from').value, to=$('usage-to').value;
-  const mv=$('usage-min').value;
-  const min=mv===''?-Infinity:Number(mv);
   USAGE_ROWS=USAGE.filter(function(u){
     if(uid && String(u.user_id).indexOf(uid)<0)return false;
     if(m && (u.model||'').toLowerCase().indexOf(m)<0)return false;
     if(tk && (u.task||'').toLowerCase().indexOf(tk)<0)return false;
-    if((u.credits||0)<min)return false;
     const d=dayOf(u.created_at);
     if(from && (!d || d<from))return false;
     if(to && (!d || d>to))return false;
     return true;
   });
-  const sum=USAGE_ROWS.reduce(function(a,u){return a+(u.credits||0);},0);
+  const sum=USAGE_ROWS.reduce(function(a,u){
+    return a+((u.prompt_tokens||0)+(u.completion_tokens||0));},0);
   $('usage-count').textContent='命中 '+USAGE_ROWS.length+' / '+USAGE.length
-    +' 条 · 积分合计 '+sum;
+    +' 条 · token 合计 '+sum;
   renderUsage();
 }
 
@@ -1361,126 +1229,19 @@ function renderUsage(){
   let page=PAGES.usage||1; if(page>pages)page=pages; PAGES.usage=page;
   const slice=USAGE_ROWS.slice((page-1)*size,(page-1)*size+size);
   $('usage-table').innerHTML='<tr><th>时间</th><th>用户</th><th>模型</th><th>任务</th>'
-    +'<th>输入tok</th><th>输出tok</th><th>积分</th></tr>'
+    +'<th>输入tok</th><th>输出tok</th></tr>'
     +(slice.length?slice.map(function(u){
       return '<tr><td>'+esc(u.created_at)+'</td><td>'+u.user_id
         +'</td><td>'+esc(u.model||'')+'</td><td>'+esc(u.task||'')+'</td>'
-        +'<td>'+(u.prompt_tokens??'-')+'</td><td>'+(u.completion_tokens??'-')+'</td>'
-        +'<td><b>'+u.credits+'</b></td></tr>';
-    }).join(''):'<tr><td colspan="7" class="empty">没有符合条件的流水</td></tr>');
+        +'<td>'+(u.prompt_tokens??'-')+'</td><td>'+(u.completion_tokens??'-')+'</td></tr>';
+    }).join(''):'<tr><td colspan="6" class="empty">没有符合条件的流水</td></tr>');
   $('usage-pager').innerHTML=pagerHtml('usage',page,pages,total);
 }
 
 function resetUsageFilter(){
   $('q-usage').value=''; $('q-usage-model').value=''; $('q-usage-task').value='';
-  $('usage-from').value=''; $('usage-to').value=''; $('usage-min').value='';
+  $('usage-from').value=''; $('usage-to').value='';
   filterUsage(true);
-}
-
-// ---------------- 财务看板 ----------------
-let ORDERS=[];      // 订单全量（服务端已按窗口取足）
-let ORD_ROWS=[];    // 当前条件过滤结果
-
-async function loadFinance(){
-  const daysEl=$('fin-days');
-  const days=daysEl?daysEl.value:'14';
-  const r=await api('/api/finance?days='+days+'&limit=500');
-  if(!r.ok){
-    const m=$('ord-msg');
-    if(m){m.className='msg bad';m.textContent='加载失败：'+(r.error||'未知错误');}
-    return;
-  }
-  const st=r.stats||{};
-  const cards=$('fin-cards');
-  if(cards) cards.innerHTML=[
-    ['累计收入','¥'+(st.revenue_yuan_total||0).toFixed(2)],
-    ['已付订单',st.orders_paid_total||0],
-    ['今日收入','¥'+((st.revenue_cents_today||0)/100).toFixed(2)],
-    ['订阅中用户',st.active_subs||0],
-    ['今日积分消耗',st.credits_used_today||0],
-    ['支付通道',st.pay_mode==='mock'?'演示':'微信']
-  ].map(c=>'<div class="card"><b>'+c[1]+'</b><span>'+c[0]+'</span></div>').join('');
-
-  const win=$('fin-window');
-  if(win) win.textContent='（收入与消耗按天聚合，各取最近 '+days+' 天）';
-
-  const rev=st.daily_revenue||[];
-  $('fin-rev').innerHTML='<tr><th>日期</th><th>收入</th><th>订单数</th></tr>'
-    +(rev.length?rev.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>¥'
-      +d.yuan.toFixed(2)+'</b></td><td>'+d.orders+'</td></tr>').join('')
-      :'<tr><td colspan="3" class="empty">窗口内还没有已支付订单</td></tr>');
-  const us=st.daily_usage||[];
-  $('fin-usage').innerHTML='<tr><th>日期</th><th>消耗积分</th><th>调用次数</th></tr>'
-    +(us.length?us.map(d=>'<tr><td>'+esc(d.date)+'</td><td><b>'+d.credits
-      +'</b></td><td>'+d.calls+'</td></tr>').join('')
-      :'<tr><td colspan="3" class="empty">窗口内暂无用量</td></tr>');
-
-  // 套餐下拉：从服务端配置来，别在前端写死定价表
-  const sel=$('flt-ord-plan');
-  if(sel){
-    const cur=sel.value;
-    sel.innerHTML='<option value="">全部套餐</option>'
-      +((r.plans||[]).map(p=>'<option value="'+escq(p.plan_id)+'">'+esc(p.title)
-        +'</option>').join(''));
-    sel.value=cur||'';
-  }
-  ORDERS=r.orders||[];
-  filterOrders();
-}
-
-function filterOrders(reset){
-  if(reset)PAGES.ord=1;
-  const st=$('flt-ord-status').value;
-  const plan=$('flt-ord-plan').value;
-  const q=$('q-ord').value.trim().toLowerCase();
-  const mn=$('ord-min').value, mx=$('ord-max').value;
-  const lo=mn===''?-Infinity:Number(mn), hi=mx===''?Infinity:Number(mx);
-  const from=$('ord-from').value, to=$('ord-to').value;
-  ORD_ROWS=ORDERS.filter(function(o){
-    if(st && o.status!==st)return false;
-    if(plan && o.plan_id!==plan)return false;
-    const yuan=(o.amount_cents||0)/100;
-    if(yuan<lo||yuan>hi)return false;
-    const d=dayOf(o.created_str||o.paid_str);
-    if(from && (!d || d<from))return false;
-    if(to && (!d || d>to))return false;
-    if(!q)return true;
-    return ((o.order_no||'')+' '+(o.phone||'')+' '+(o.uid||'')+' '+(o.title||''))
-      .toLowerCase().indexOf(q)>=0;
-  });
-  const cnt=$('ord-count');
-  if(cnt)cnt.textContent='命中 '+ORD_ROWS.length+' / '+ORDERS.length+' 单';
-  const sum=ORD_ROWS.reduce(function(a,o){
-    return a+(o.status==='paid'?(o.amount_cents||0):0);},0);
-  const sm=$('ord-sum');
-  if(sm)sm.textContent='筛选内已付合计 ¥'+(sum/100).toFixed(2);
-  renderOrders();
-}
-
-function renderOrders(){
-  const size=getPageSize('fin');
-  const total=ORD_ROWS.length;
-  const pages=Math.max(1,Math.ceil(total/size));
-  let page=PAGES.ord||1; if(page>pages)page=pages; PAGES.ord=page;
-  const slice=ORD_ROWS.slice((page-1)*size,(page-1)*size+size);
-  $('fin-orders').innerHTML='<tr><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th>'
-    +'<th>状态</th><th>下单时间</th><th>支付时间</th></tr>'
-    +(slice.length?slice.map(function(o){
-      const uname=o.phone?(esc(o.phone)+' <span class="fresh">#'+o.uid+'</span>'):('# '+o.uid);
-      return '<tr><td>'+esc(o.order_no)+'</td><td>'+uname+'</td>'
-        +'<td>'+esc(o.title)+'</td><td>¥'+(o.amount_cents/100).toFixed(2)+'</td>'
-        +'<td>'+(o.status==='paid'?'<b style="color:var(--ok)">已支付</b>'
-          :'<span style="color:#8a8a82">待支付</span>')+'</td>'
-        +'<td>'+esc(o.created_str||'-')+'</td><td>'+esc(o.paid_str||'-')+'</td></tr>';
-    }).join(''):'<tr><td colspan="7" class="empty">没有符合条件的订单</td></tr>');
-  $('ord-pager').innerHTML=pagerHtml('fin',page,pages,total);
-}
-
-function resetOrderFilter(){
-  $('flt-ord-status').value=''; $('flt-ord-plan').value='';
-  $('q-ord').value=''; $('ord-min').value=''; $('ord-max').value='';
-  $('ord-from').value=''; $('ord-to').value='';
-  filterOrders(true);
 }
 
 // ---------------- 内容审计 ----------------
@@ -1555,7 +1316,7 @@ async function dismissHit(id){
 }
 
 // ---------------- 左侧导航 / 视图切换 ----------------
-const VIEWS=['overview','data','users','finance','moderation','model'];
+const VIEWS=['overview','data','users','moderation','model'];
 
 function showView(v){
   if(VIEWS.indexOf(v)<0)v='overview';
@@ -1567,7 +1328,6 @@ function showView(v){
   if(v==='overview') loadStats();
   else if(v==='data') loadPois().then(loadLogs);
   else if(v==='users'){ loadUsers(); loadUsage(); }
-  else if(v==='finance') loadFinance();
   else if(v==='moderation') loadModeration();
   else if(v==='model') loadLlm();
   window.scrollTo({top:0});
@@ -1681,9 +1441,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/users":
             users = auth.list_users(limit=500)
-            self._json({"ok": True, "total": len(users), "users": users,
-                        "bonus": auth.BONUS_CREDITS,
-                        "daily_cap": auth.DAILY_CAP_CREDITS})
+            self._json({"ok": True, "total": len(users), "users": users})
             return
         if path == "/api/usage":
             import urllib.parse
@@ -1692,18 +1450,6 @@ class Handler(BaseHTTPRequestHandler):
             # 条件查询在前端做：一次多取一些，避免筛完只剩窗口里那几条
             limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
             self._json({"ok": True, "usage": auth.list_usage(uid, limit=limit)})
-            return
-        if path == "/api/finance":
-            import urllib.parse
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            days = min(max(int(q["days"][0]) if q.get("days") else 14, 1), 365)
-            limit = min(max(int(q["limit"][0]) if q.get("limit") else 500, 1), 2000)
-            self._json({"ok": True, "stats": billing.finance_stats(days),
-                        "orders": billing.list_orders(limit=limit),
-                        "plans": [{"plan_id": k, "title": v["title"],
-                                   "kind": v.get("kind", "pack")}
-                                  for k, v in billing.PLANS.items()],
-                        "days": days})
             return
         if path == "/api/moderation":
             import urllib.parse
@@ -1755,21 +1501,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/llm/test":
             self._test_llm(data)
-            return
-        if path == "/api/user/credits":
-            try:
-                uid = int(data.get("user_id") or 0)
-                delta = int(data.get("delta") or 0)
-            except (TypeError, ValueError):
-                self._json({"ok": False, "error": "user_id/delta 应为整数"}, 400)
-                return
-            if delta == 0:
-                self._json({"ok": False, "error": "变动量不能为 0"}, 400)
-                return
-            ok = auth.admin_adjust(uid, delta, str(data.get("reason") or ""))
-            self._json({"ok": ok,
-                        "error": None if ok else "用户不存在或扣减后余额为负"},
-                        200 if ok else 400)
             return
         if path == "/api/moderation/dismiss":
             try:

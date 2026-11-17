@@ -7,7 +7,6 @@
 这里锁死：
 1. 有模型时，天气/景点/班次/闲聊/追问都由模型组织语言；
 2. 模型漏关键数字、或编出事实里没有的金额温度 → 一律回退模板；
-3. 额度不足抛 QuotaError，不能被"降级"吞掉（那是拒绝服务，不是降级）；
 4. 没配模型时行为与之前完全一致。
 """
 
@@ -167,27 +166,6 @@ def test_session_passes_client() -> None:
         _unpatch_weather(old)
 
 
-def test_quota_error_not_swallowed() -> None:
-    """额度不足要拒绝服务，不能被当成"模型不可用"悄悄降级。
-
-    真实链路抛的是 auth.QuotaError（freeze 失败），server 靠它回 403；
-    任何"宽泛的 except"把它吃掉，等于给欠费用户白送服务。
-    """
-    from travel_agent import auth
-    client = llm.ScriptedClient([auth.QuotaError("insufficient", 0, "积分不足")])
-    s = Session(client=client, today=date(2026, 10, 31))
-    old = _patch_weather()
-    try:
-        raised = False
-        try:
-            s.turn("邯郸天气")
-        except auth.QuotaError:
-            raised = True
-        check("额度不足抛 QuotaError 而非降级", raised)
-    finally:
-        _unpatch_weather(old)
-
-
 def test_clarify_uses_llm_without_inventing() -> None:
     """追问也要像人话，但不能替用户编同行人数。"""
     client = llm.ScriptedClient(["大理打算待几天？周边游 4 天最舒服，赶一点 3 天也够。"])
@@ -208,7 +186,6 @@ def main() -> None:
     test_poi_and_transport_use_llm()
     test_smalltalk_uses_llm()
     test_session_passes_client()
-    test_quota_error_not_swallowed()
     test_clarify_uses_llm_without_inventing()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 条说话层断言通过")

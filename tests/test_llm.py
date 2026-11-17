@@ -369,14 +369,8 @@ def test_history_scope() -> None:
 
     # 线上一定是 MeteredClient 包一层：历史要能透到内层，否则"加了上下文"
     # 只在测试里成立、线上每句都失忆
-    class _FakeMeter:
-        def freeze(self, *a, **k): pass
-        def release(self, *a, **k): pass
-        def settle(self, *a, **k): pass
-        def tokens_to_credits(self, n): return n
-
     inner = llm.ScriptedClient(["大理古城和洱海都值得去"])
-    mc = llm.MeteredClient(inner, 1, _FakeMeter())
+    mc = llm.MeteredClient(inner, 1)
     llm.attach_history(mc, turns)
     llm.compose_reply(mc, "poi", {"城市": "大理"}, "那边呢")
     check("计量客户端把历史透到内层", len(inner.histories[-1]) == 2,

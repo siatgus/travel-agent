@@ -29,7 +29,7 @@ def data_dir() -> Path:
 
 
 def app_db() -> Path:
-    """账号/积分/用量/对话存档库（auth + conversations 共用）。"""
+    """账号/用量/对话存档库（auth + conversations 共用）。"""
     env = os.environ.get("TRAVEL_APP_DB")
     return Path(env) if env else data_dir() / ".app.db"
 

@@ -1438,7 +1438,7 @@ class Session:
 
     @staticmethod
     def _say(client, kind: str, facts: dict, must_keep: list | None = None) -> str | None:
-        """模型不可用/输出跑偏时统一返回 None，调用方回退模板。QuotaError 会向上抛。"""
+        """模型不可用/输出跑偏时统一返回 None，调用方回退模板。"""
         if client is None:
             return None
         from . import llm as llm_layer

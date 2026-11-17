@@ -4,7 +4,7 @@
 
 1. **短信轰炸**：send_code 按「手机号」+「IP」两把桶分别限，
    同号 60 秒 1 条、同 IP 每 2 分钟补 1 条（峰值 5）；
-2. **刷接口/烧 LLM**：chat 按登录用户限流（默认峰值 10、每 6 秒补 1），
+2. **刷接口/烧 LLM**：chat 按登录用户限流（默认峰值 6、每 15 秒补 1），
    未登录流量与共享出口按 IP 兜底；地图代理（OSRM/高德/天地图）按 IP 限，
    防止被当免费路由服务薅。
 
@@ -39,34 +39,12 @@ DEFAULT_CONFIG: dict[str, tuple[float, float]] = {
     "send_code_ip": (5, 1 / 120),        # 同一 IP 发码：峰值 5，2 分钟补 1
     "login_ip": (10, 1 / 30),            # 同一 IP 登录：峰值 10，30 秒补 1
     "chat_user": (10, 1 / 6),            # 每用户对话：峰值 10 次，6 秒补 1
-    "chat_user_paid": (20, 1 / 2),       # 付费档对话：峰值 20 次，2 秒补 1
-    "chat_ip": (20, 1 / 3),              # 同一 IP 对话兜底（多设备共享出口）
+     "chat_ip": (20, 1 / 3),              # 同一 IP 对话兜底（多设备共享出口）
     "proxy_ip": (30, 1 / 2),             # 地图/路由代理：峰值 30，2 秒补 1
 }
 
-# 免费模式保守档：没有付费墙时，脚本刷量的成本全由运营方承担（LLM + 短信
-# 都是真金白银），所以默认收紧。只覆盖「免费站真的会赔钱」的那几档：
-# 对话按用户/按 IP、发码按 IP。显式 TRAVEL_RATE_LIMITS 仍然优先于本档。
-FREE_MODE_CONFIG: dict[str, tuple[float, float]] = {
-    "chat_user": (6, 1 / 15),            # 每用户：峰值 6，15 秒补 1（≈4 次/分钟）
-    "chat_ip": (8, 1 / 20),              # 同 IP 兜底：峰值 8，20 秒补 1
-    "send_code_ip": (3, 1 / 300),        # 同 IP 发码：峰值 3，5 分钟补 1
-}
-
-
-def _free_mode() -> bool:
-    """延迟导入 auth，避免模块级循环依赖，也躲开测试环境的导入顺序问题。"""
-    try:
-        from . import auth
-        return auth.is_free_mode()
-    except Exception:
-        return False
-
-
 def _config() -> dict[str, tuple[float, float]]:
     cfg = dict(DEFAULT_CONFIG)
-    if _free_mode():
-        cfg.update(FREE_MODE_CONFIG)
     raw = os.environ.get("TRAVEL_RATE_LIMITS", "").strip()
     if raw:
         try:

@@ -109,8 +109,8 @@ def _view(name: str) -> str:
 def test_nav_layout() -> None:
     nav = re.search(r'<nav class="nav">(.*?)</nav>', admin.PAGE, re.S)
     links = re.findall(r'href="#/([a-z]+)"', nav.group(1)) if nav else []
-    check("导航栏含六个视图且顺序为 概览/数据/用户/财务/内容审计/模型",
-          links == ["overview", "data", "users", "finance", "moderation", "model"],
+    check("导航栏含五个视图且顺序为 概览/数据/用户/内容审计/模型（财务看板已随计费层移除）",
+          links == ["overview", "data", "users", "moderation", "model"],
           f"links={links}")
 
     data, users = _view("data"), _view("users")
@@ -296,20 +296,6 @@ def test_users_http(base: str, tmp: Path) -> None:
           status == 200 and j.get("ok") is True and len(users) >= 2
           and all("****" in u["phone"] for u in users), f"j={str(j)[:200]}")
 
-    uid = users[-1]["id"]
-    bal0 = users[-1]["balance"]
-    status, j = _post(base, "/api/user/credits",
-                      {"user_id": uid, "delta": 100, "reason": "测试充值"})
-    check("调账充值成功", status == 200 and j.get("ok") is True, f"j={j}")
-    status, j = _get(base, "/api/users")
-    check("调账后余额更新",
-          next(u for u in j["users"] if u["id"] == uid)["balance"] == bal0 + 100)
-
-    status, j = _post(base, "/api/user/credits",
-                      {"user_id": 99999, "delta": 10, "reason": "无此用户"})
-    check("不存在用户调账 400", status == 400 and j.get("ok") is False,
-          f"status={status}")
-
     status, j = _get(base, "/api/usage")
     check("用量流水接口 200", status == 200 and j.get("ok") is True)
 
@@ -320,18 +306,6 @@ def test_query_params_http(base: str) -> None:
     前端是"取足量数据再本地筛"，接口若把 limit 写死（原来 usage/orders 只有
     50 条、日志 50 条），筛出来的结果就只是窗口里那几条，条件查询等于摆设。
     """
-    status, j = _get(base, "/api/finance?days=7&limit=500")
-    check("财务接口支持 days/limit", status == 200 and j.get("days") == 7
-          and len(j.get("orders") or []) >= 0, f"status={status}")
-    check("财务接口回传套餐表（前端下拉用）",
-          isinstance(j.get("plans"), list) and len(j["plans"]) >= 4
-          and all("plan_id" in p and "title" in p for p in j["plans"]),
-          str(j.get("plans"))[:200])
-    check("统计窗口按 days 收窄",
-          len(j["stats"]["daily_revenue"]) <= 7
-          and len(j["stats"]["daily_usage"]) <= 7,
-          f"{len(j['stats']['daily_revenue'])}")
-
     status, j = _get(base, "/api/usage?limit=500")
     check("用量接口支持 limit", status == 200 and j.get("ok") is True)
 
@@ -341,10 +315,10 @@ def test_query_params_http(base: str) -> None:
     status, j = _get(base, "/api/logs?limit=500")
     check("日志接口支持 limit", status == 200 and j.get("ok") is True)
 
-    # 非法参数不能把接口打挂（负数/超大值都应被夹到合法区间）
-    status, j = _get(base, "/api/finance?days=-5&limit=999999")
-    check("非法 days/limit 被夹到合法区间",
-          status == 200 and j.get("days", 0) >= 1, f"status={status}")
+    # 非法参数不能把接口打挂（超大值应被夹到合法区间）
+    status, j = _get(base, "/api/usage?limit=999999")
+    check("非法 limit 被夹到合法区间", status == 200 and j.get("ok") is True,
+          f"status={status}")
 
 
 def test_search_ui() -> None:
@@ -352,33 +326,22 @@ def test_search_ui() -> None:
     check("POI 条件搜索控件齐全",
           all(k in p for k in ('id="q-poi"', 'id="flt-cat"', 'id="flt-src"',
                                'id="poi-count"')))
-    check("用户条件搜索控件齐全",
-          all(k in p for k in ('id="q-user"', 'id="flt-status"', 'id="flt-min"')))
+    check("用户条件搜索控件齐全（余额筛选已随计费层移除）",
+          all(k in p for k in ('id="q-user"', 'id="flt-status"'))
+          and 'id="flt-min"' not in p)
     check("用量与日志搜索控件齐全",
           all(k in p for k in ('id="q-usage"', 'id="q-usage-model"',
                                'id="q-log"', 'id="flt-log-status"')))
-    # 条件查询补全（2026-11-16）：原来财务看板/内容审计/用户/用量/日志
-    # 只有个别维度，筛选不出"某个状态某段时间的某类记录"
-    check("财务看板订单条件查询齐全",
-          all(k in p for k in ('id="flt-ord-status"', 'id="flt-ord-plan"',
-                               'id="q-ord"', 'id="ord-min"', 'id="ord-max"',
-                               'id="ord-from"', 'id="ord-to"',
-                               'id="fin-days"', 'function filterOrders',
-                               'function resetOrderFilter')))
-    check("财务看板订单表有筛选合计与分页",
-          'id="ord-sum"' in p and 'id="ord-pager"' in p
-          and "pagerHtml('fin'" in p)
     check("内容审计条件查询齐全（处置/用户/关键词/日期）",
           all(k in p for k in ('id="flt-mod-disp"', 'id="q-mod-uid"',
                                'id="q-mod-kw"', 'id="mod-from"', 'id="mod-to"',
                                'function resetModFilter')))
-    check("用户列表条件查询齐全（档位/余额区间/注册时间/排序）",
-          all(k in p for k in ('id="flt-paid"', 'id="flt-max"',
-                               'id="user-from"', 'id="user-to"',
-                               'id="sort-user"')))
-    check("用量流水条件查询齐全（任务/日期/积分下限）",
+    check("用户列表条件查询齐全（状态/注册时间/排序）",
+          all(k in p for k in ('id="flt-status"', 'id="user-from"',
+                               'id="user-to"', 'id="sort-user"')))
+    check("用量流水条件查询齐全（任务/日期）",
           all(k in p for k in ('id="q-usage-task"', 'id="usage-from"',
-                               'id="usage-to"', 'id="usage-min"')))
+                               'id="usage-to"')))
     check("同步日志条件查询齐全（来源/时间）",
           all(k in p for k in ('id="flt-log-src"', 'id="log-from"',
                                'id="log-to"')))
@@ -392,8 +355,8 @@ def test_search_ui() -> None:
     check("表格行内编辑已接线",
           all(k in p for k in ('function startEdit', 'function saveRow',
                                'function cancelRow', 'id="e-name"', 'id="e-lat"')))
-    check("用户行内调账已接线",
-          'function applyRowAdjust' in p and 'id="radj-delta"' in p)
+    check("用户行内调账已随计费层移除",
+          'applyRowAdjust' not in p and 'radj-delta' not in p)
     check("POI 城市下拉含「全部城市」",
           '<option value="*">全部城市</option>' in p)
     check("城市四级级联控件齐全（国家/省/城市/区县）",

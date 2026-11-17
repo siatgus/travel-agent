@@ -5,7 +5,7 @@
 2. moderation 单元：明文命中、变体规避（空格/符号/全角）、无害文本不误伤、
    外部词库合并与热切换、输出侧打码与兜底分流、拦截记录落库与误报标记；
 3. HTTP 全链路：send_code 同号 429（防短信轰炸）、chat 未登录 401、
-   chat 命中敏感词被拒且不扣积分、连续超频 429、管理后台 /api/moderation
+   chat 命中敏感词被拒、连续超频 429、管理后台 /api/moderation
    可查可标记。
 
 运行：python test_security.py    失败时退出码为 1。
@@ -241,18 +241,12 @@ def test_http(base: str, admin_base: str) -> None:
     check("chat 未登录 401", st == 401, f"{st} {j}")
 
     token, login_j = _login(base, "13900009002")
-    bal0 = login_j["credits"]
 
     st, j = _post(base, "/api/chat",
                   {"sid": "sec1", "message": "介绍下赌博是怎么回事"}, token)
     check("chat 命中敏感词返回兜底话术（200，mode=chat）",
           st == 200 and j.get("ok") and j.get("moderated") is True
           and "旅行" in j.get("text", ""), f"{st} {str(j)[:120]}")
-    st, me = _post(base, "/api/me", {}, token)  # /api/me 是 GET，这里换 GET
-    st, me = _get_auth(base, "/api/me", token)
-    check("被拒请求不扣积分", me.get("balance") == bal0,
-          f"before={bal0} after={me.get('balance')}")
-
     # —— 对话限流：连发超过 chat_user 峰值（10）→ 429 ——
     ratelimit.reset("chat_user")
     got429 = False

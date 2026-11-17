@@ -101,11 +101,6 @@ class LLMError(RuntimeError):
     """网络层错误（超时、HTTP 非 2xx、响应体不合法）。"""
 
 
-class QuotaError(RuntimeError):
-    """用户积分不足/触发每日上限——与 LLMError 分开：额度问题不该触发规则降级，
-    而应该直接拒绝本次服务（否则等于免费送服务）。"""
-
-
 # ------------------------------------------------------------------ 客户端
 
 
@@ -221,17 +216,17 @@ class Client:
 
 
 class MeteredClient(Client):
-    """计量客户端：包一层任意 Client，每次 chat() 走积分预扣-结算。
+    """计量客户端：包一层任意 Client，每次 chat() 按实际 token 记用量。
 
+    本服务免费开放，只记账不扣费——usage 流水供后台做成本统计与排障。
     不重写 json_task——它内部调的就是 self.chat，所以槽位抽取/重排
-    的每一次模型调用都会被记账。调用失败全额退回预扣。
-    额度不足抛 QuotaError（不是 LLMError）：额度问题应拒绝服务而非降级。
+    的每一次模型调用都会被记账。
     """
 
     def __init__(self, inner: Client, uid: int, meter=None):
         self._inner = inner
         self.uid = uid
-        self._meter = meter                      # auth 模块（延迟注入避免循环导入）
+        self._meter = meter                      # 保留参数兼容旧签名，已不使用
         self.model = inner.model
         self.base_url = inner.base_url
         self.api_key = inner.api_key
@@ -247,30 +242,20 @@ class MeteredClient(Client):
         # task 透传：json_task 把 task 记在计量客户端上，内层（Client 或
         # GatewayClient）看不到就记不了真实任务名，网关的轻任务路由也会失效
         self._inner.task = self.task or ""
-        import uuid
-        chars = len(system) + len(user) + sum(len(m.get("content") or "")
-                                              for m in (history or []))
-        est_tokens = min(6000, max(400, chars // 2 + 400))   # 粗估，结算时多退少补
-        ref = f"u{self.uid}-{uuid.uuid4().hex[:10]}"
-        self._meter.freeze(self.uid, self._meter.tokens_to_credits(est_tokens), ref)
-        try:
-            # 历史是说话层专属：外层收到的 history 必须显式透给内层，
-            # 否则计量客户端包一层之后，每条回复都会悄悄丢掉上下文
-            text = self._inner.chat(system, user, temperature=temperature,
-                                    history=history)
-        except Exception:
-            self._meter.release(self.uid, ref)
-            raise
+        # 历史是说话层专属：外层收到的 history 必须显式透给内层，
+        # 否则计量客户端包一层之后，每条回复都会悄悄丢掉上下文
+        text = self._inner.chat(system, user, temperature=temperature,
+                                history=history)
         u = getattr(self._inner, "last_usage", None) or {}
-        actual_tokens = ((u.get("prompt") or est_tokens)
-                         + (u.get("completion") or 200))
-        self._meter.settle(self.uid, ref,
-                           self._meter.tokens_to_credits(actual_tokens),
-                           model=self._inner.model,
-                           task=getattr(self, "task", "") or "chat",
-                           prompt_tokens=u.get("prompt"),
-                           completion_tokens=u.get("completion"))
         self.last_usage = u
+        try:
+            from . import auth
+            auth.record_usage(self.uid, model=self._inner.model,
+                              task=getattr(self, "task", "") or "chat",
+                              prompt_tokens=u.get("prompt"),
+                              completion_tokens=u.get("completion"))
+        except Exception:
+            pass                                 # 用量记录失败不影响业务
         return text
 
 
@@ -315,7 +300,7 @@ class GatewayClient(Client):
       独立的便宜供应商（light 链）；重任务（重排/补全/对话）走主链。判定依据
       是 Client.task（json_task 里的 task 参数），chat 直调未标记的按重任务。
     - **计量透明**：成功后把 self.model / self.base_url 更新为实际命中的供应
-      商，MeteredClient 的结算与 usage 流水自动记到真实模型上。
+      商，MeteredClient 的 usage 流水自动记到真实模型上。
 
     供应商描述（dict）：{name, api_key, base_url, model}。
     """
@@ -1075,7 +1060,6 @@ def compose_reply(client: Client | None, kind: str, facts: dict,
     must_keep 是关键数字/名称清单：模型漏掉任何一个就判定这轮输出不可信；
     _numbers_faithful 再拦一遍脑补出来的金额/温度。宁可回退模板，
     也不能让用户看到被改过的价格。
-    额度不足抛 QuotaError，这里不捕获——那是拒绝服务，不是降级。
     """
     if client is None:
         return None
@@ -1125,7 +1109,6 @@ def chat_reply(client: Client | None, text: str,
     这类问题没有【事实】可以照抄（「你是什么模型」不是查得到的数据），
     所以不能走 compose_reply 的事实约束模板：给它一套独立的闲聊规则，
     仍然硬拦"编造数字"——闲聊里出现价格/里程/时刻只可能是脑补。
-    QuotaError 不捕获：额度不足要拒绝服务，不是降级。
     """
     if client is None:
         return None
@@ -1163,7 +1146,7 @@ def unknown_spot_reply(client: Client | None, city: str, spot: str,
     不是补事实——事实没有。是让拒绝带上上下文和出路（这个名字通常是
     什么地方、接下来可以怎么说），而不是甩一句"换个我收录的城市"。
     提示词硬性禁止编造价格/时间等数字；输出里出现数字就整句弃用回模板
-    ——查不到的地点还报数字，只可能是脑补。QuotaError 不捕获（拒绝服务≠降级）。
+    ——查不到的地点还报数字，只可能是脑补。
     """
     if client is None:
         return None
@@ -1232,7 +1215,7 @@ def classify_intent(client: Client | None, text: str) -> str | None:
 
     只在调用方觉得"这句像个问题但规则认不出"时用（省一次调用）。
     返回 _INTENT_LABELS 之一；模型/网络/输出格式任何问题都返回 None，
-    调用方回落原流程。QuotaError 不在这里捕——额度不足要拒绝服务。
+    调用方回落原流程。
     """
     if client is None:
         return None

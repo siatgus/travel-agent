@@ -4,7 +4,7 @@
 1. GatewayClient：主供应商失败自动切备用、全链失败错误聚合、成功后
    model/base_url 对齐实际命中的供应商（计量口径）；
 2. 轻任务路由：extract_slots 等走便宜链，rerank/未标记任务走主链；
-3. MeteredClient 包 GatewayClient：结算记到真实命中模型上；
+3. MeteredClient 包 GatewayClient：用量记到真实命中模型上；
 4. Key 加密：roundtrip、幂等、明文旧格式自动迁移、save/load 闭环。
 
 运行：python test_gateway.py    失败时退出码为 1。
@@ -128,33 +128,37 @@ def test_metered_over_gateway() -> None:
         (_ for _ in ()).throw(llm.LLMError("down")) if prov["name"] == "主"
         else "回复")
 
-    class FakeMeter:
+    class FakeAuth:
+        """模拟 auth 模块：record_usage 收到的参数即"记账落库"内容。"""
         def __init__(self):
-            self.events = []
+            self.records = []
 
-        def tokens_to_credits(self, n):
-            return max(1, n // 100)
+        def record_usage(self, uid, *, model="", task="",
+                         prompt_tokens=None, completion_tokens=None):
+            self.records.append((uid, model, task))
 
-        def freeze(self, uid, credits, ref):
-            self.events.append(("freeze", ref))
-
-        def settle(self, uid, ref, credits, *, model="", task="", **kw):
-            self.events.append(("settle", ref, credits, model, task))
-
-        def release(self, uid, ref):
-            self.events.append(("release", ref))
-
-    meter = FakeMeter()
-    gw = llm.GatewayClient(PRIMARY, [FALLBACK])
-    mc = llm.MeteredClient(gw, uid=7, meter=meter)
-    mc.task = "rerank"                   # 生产链路：json_task 把 task 记在计量层
-    out = mc.chat("s", "u")
-    check("计量客户端包网关可用", out == "回复", out)
-    check("task 已透传给内层网关（轻任务路由依赖它）", gw.task == "rerank", gw.task)
-    settles = [e for e in meter.events if e[0] == "settle"]
-    check("结算记到实际命中的备用模型",
-          settles and settles[0][3] == "f-model" and settles[0][4] == "rerank",
-          str(settles))
+    fake = FakeAuth()
+    # MeteredClient.chat 内部延迟 `from . import auth`；从 sys.modules 注入替身
+    import sys as _sys, types as _types
+    saved = _sys.modules.get("travel_agent.auth")
+    _sys.modules["travel_agent.auth"] = _types.SimpleNamespace(
+        record_usage=fake.record_usage)
+    try:
+        gw = llm.GatewayClient(PRIMARY, [FALLBACK])
+        mc = llm.MeteredClient(gw, uid=7)
+        mc.task = "rerank"               # 生产链路：json_task 把 task 记在计量层
+        out = mc.chat("s", "u")
+        check("计量客户端包网关可用", out == "回复", out)
+        check("task 已透传给内层网关（轻任务路由依赖它）", gw.task == "rerank", gw.task)
+        check("用量记到实际命中的备用模型",
+              fake.records and fake.records[0][0] == 7
+              and fake.records[0][1] == "f-model" and fake.records[0][2] == "rerank",
+              str(fake.records))
+    finally:
+        if saved is None:
+            _sys.modules.pop("travel_agent.auth", None)
+        else:
+            _sys.modules["travel_agent.auth"] = saved
 
 
 def test_key_encryption() -> None:
