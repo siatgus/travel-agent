@@ -678,6 +678,28 @@ P1.5 契约补全           PendingDisambiguation 契约 + LLMCandidateAdapter
 │                         destination 时，city_source 必须如实记录
 │                         来源（destination），不能只记最终城市值
 P2   消歧通道           PendingDisambiguation 实现 + 多轮消费规则（含原子化）
+│                       P1.5 验收前置风险项（2026-11-18 补录，P2 必须处理）：
+│                       ① 快照真正不可变——frozen dataclass 只防字段
+│                         重赋值，内部 dict 仍可被外部改动
+│                         （candidates[0]["name"]=…）；P2 须改用冻结
+│                         候选结构 + tuple，保证外部拿到 Pending 对象
+│                         也改不了历史候选；SQLite 迁移时必须保留
+│                         P1.5 的并发语义（Barrier 恰好一次成功），
+│                         采用条件更新 UPDATE…WHERE status='open'
+│                         AND expires_at > ?，受影响行数=1 才算成功，
+│                         候选校验/状态迁移/结果记录同一事务边界
+│                       ② city_hints 注入边界——经 HC-1 意图城市字段
+│                         路径传入验证上下文，不写 slots；三级区分：
+│                         用户明确 query_city（可参与判定）＞LLM
+│                         city_hints（仅辅助线索，不得升级为用户
+│                         明确指定）＞destination（规划目的地，LLM
+│                         提示绝不覆盖）
+│                       ③ P2 核心验收场景：ambiguous→创建 Pending→
+│                         展示快照→用户选择→快照 ID 校验→原子消费→
+│                         重验证 confirmed→交原 Handler；二次选择/
+│                         过期选择/快照外选择一律拒绝；**消歧成功
+│                         ≠授权修改行程**（身份确定，行程动作仍由
+│                         原有权限与角色规则决定）
 P3   查询类接管         按 §9.1 边界：仅具体实体候选；泛化问答/品类/酒店不动
 P4   LLM 兜底           **P3 稳定之后**（不并行上线）；适配器接真 LLM，
 │                       产物回流统一候选集合，六红线测试
@@ -871,3 +893,5 @@ expect_status，第二轮 expect_action（含 pending 消费原子性、补充�
 | 2026-11-18 | P0 完成 `bf9292a` + 验收补强 `7f01ea6` | 探测元数据与限额落地；注入缓存隔离 + no_key 分类显式测试 | P0 有条件通过（79 断言全绿） |
 | 2026-11-18 | P1 完成 `4b43c03`（验收通过，基线冻结） | decision.py 纯新增：DecisionResult 冻结契约、五档内部定档、六档映射、HC-1~HC-7、shadow_decision、9 条阻断项测试 | P1 验收意见（2026-11-18） |
 | 2026-11-18 | P1.5 前置要求补录（§10） | ① shadow_sink 回调异常必须兜底隔离（负向测试）；② city_source 回退继承 destination 时必须如实记 source，不只记最终值 | P1 验收附带注意事项，属 P1.5 契约测试覆盖范围 |
+| 2026-11-18 | P1.5 完成 `169bb6e`（验收通过，基线冻结） | pending.py（快照契约+五方法+锁内条件迁移原子消费+Barrier 并发测试）、llm_entity_fallback.py（五键白名单+越权三层过滤+Span 不伪造+保守降级）、FakeLLM 回流桩；P1 两条注意事项测试落地 | P1.5 验收意见（2026-11-18） |
+| 2026-11-18 | P2 前置风险项补录（§10）：①快照真正不可变（冻结候选结构+tuple，SQLite 条件更新保留并发语义）②city_hints 三级注入边界（不写 slots、不覆盖 destination）③八步核心验收场景+「消歧成功≠授权修改行程」 | P1.5 验收附带风险项，P2 设计与实施必须处理，不构成 P1.5 返工 |
