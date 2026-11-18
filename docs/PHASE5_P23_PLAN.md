@@ -203,3 +203,18 @@ P2.4 未授权不启动。
 3. **过期边界**：`expires_at == now` 即过期（>=），内存桩/SQLite/
    SQL 三处口径一致；**异常时间值失败关闭**（保守视为已过期，
    绝不让 Pending 被继续消费），见 §9.1。
+
+## 9. P2.3 复验补丁记录（R1/R2）
+
+1. **R1 消费原子性（内存桩）**：`consume_pending` 的可失败前置
+   步骤（候选读取、时钟获取/epoch 转换、消费记录构造）全部提前
+   到状态迁移之前；记录写入与 open→consumed 迁移背靠背完成，中间
+   无任何可失败步骤——任何前置失败，pending 保持 open、无消费
+   记录（等效 P2.2 SQLite 单事务 ROLLBACK 的半成功防线）。故障
+   注入测试：时钟抛异常 / 时钟返回非法类型两种场景，均验证
+   open 保持 + `_latest_consumption()` 为 None + 恢复后可成功消费。
+2. **R2 candidate 契约恢复（P2.1）**：`_ConsumeOutcome.candidate`
+   类型标注由误写的 `dict | None` 恢复为 `PendingCandidate | None`
+   （两实现运行时本就返回冻结对象，属标注回归）；补
+   `candidate_as_dict()` 兼容垫片（六字段 dict 拷贝，失败为 None）；
+   双实现测试锁定冻结结构与垫片行为。

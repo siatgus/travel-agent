@@ -183,11 +183,20 @@ class PendingDisambiguation:
 
 @dataclass
 class _ConsumeOutcome:
-    """consume_pending 的返回值（规则 7：只回传消歧结果，无行程动作）。"""
+    """consume_pending 的返回值（规则 7：只回传消歧结果，无行程动作）。
+
+    candidate 契约（P2.1 冻结）：成功时为**冻结 PendingCandidate**
+    （不是 dict）；需要 dict 的旧调用方使用 candidate_as_dict()。
+    """
     ok: bool
     pending_id: str | None = None
-    candidate: dict | None = None   # 所选快照候选（快照外选择为 None）
+    candidate: PendingCandidate | None = None  # 所选快照候选（冻结结构）
     reason: str = ""                # 失败原因（可归因）
+
+    def candidate_as_dict(self) -> dict | None:
+        """兼容垫片（P2.1 冻结）：所选候选的 dict 拷贝；失败为 None。"""
+        return self.candidate.as_dict() if self.candidate is not None \
+            else None
 
 
 class PendingStore:
@@ -304,25 +313,27 @@ class PendingStore:
                 return _ConsumeOutcome(
                     ok=False, pending_id=pending_id,
                     reason="candidate_id 不在原快照内，一律拒绝（规则 9）")
-            # ---- 条件迁移：检查与写入同锁，open→consumed 单次成功 ----
-            consumed = replace(p, status=PENDING_CONSUMED)
-            self._active = consumed
-            # P2.3：消费成功才记录（与 SQLite pending_consumption 同语义；
-            # 未成功消费绝不产生记录）
-            self._consumptions.append({
+            # ---- P2.3-R1 原子性：先完成全部可失败前置步骤 ----
+            # （候选读取、时间获取、消费记录构造），任何一步抛异常
+            # 都不改变 pending 状态（等效 P2.2 的单事务 ROLLBACK：
+            # 绝无「pending 已 consumed 但记录缺失」的半成功状态）。
+            cand = p.candidate_by_id(candidate_id)
+            consumed_at = _epoch(self._now())   # 时钟/epoch 异常在此抛出
+            record = {
                 "session_id": self._session_id,
                 "pending_id": pending_id,
                 "candidate_id": candidate_id,
-                "consumed_at": _epoch(self._now()),
+                "consumed_at": consumed_at,
                 "original_intent": p.original_intent,
-                "selected_name": p.candidate_by_id(candidate_id).name
-                if p.candidate_by_id(candidate_id) is not None else "",
-                "selected_city": p.candidate_by_id(candidate_id).city
-                if p.candidate_by_id(candidate_id) is not None else None,
-            })
+                "selected_name": cand.name if cand is not None else "",
+                "selected_city": cand.city if cand is not None else None,
+            }
+            # ---- 条件迁移：检查与写入同锁，open→consumed 单次成功 ----
+            # 记录写入与状态迁移背靠背完成（两者之间无任何可失败步骤）
+            self._consumptions.append(record)
+            self._active = replace(p, status=PENDING_CONSUMED)
             return _ConsumeOutcome(
-                ok=True, pending_id=pending_id,
-                candidate=p.candidate_by_id(candidate_id))
+                ok=True, pending_id=pending_id, candidate=cand)
 
     # -------------------------------------------------- ④ cancel
 

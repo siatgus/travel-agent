@@ -285,10 +285,130 @@ def test_immutable_snapshot_p21() -> None:
             check(f"store 转换拦截：{why}", True, "")
 
 
+def test_consume_atomicity_fault_injection() -> None:
+    """P2.3-R1/R2：消费原子性故障注入 + candidate 冻结契约。
+
+    R1：前置步骤（时钟/epoch/记录构造）任一失败 → pending 保持
+    open、无消费记录（无「已 consumed 但记录缺失」半成功状态）；
+    恢复后仍可成功消费。
+    R2：_ConsumeOutcome.candidate 为冻结 PendingCandidate（P2.1），
+    candidate_as_dict() 兼容垫片返回六字段 dict。
+    """
+    from travel_agent.pending import SNAPSHOT_FIELDS
+
+    # ---- R1：时钟抛异常 ----
+    clock, advance = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
+    st = PendingStore(ttl_seconds=300, now=clock)
+    p = st.create_pending("排海贝皇大排档", "plan_modify",
+                          "must_visit", SNAP)
+    boom = {"on": True}
+
+    def broken_now():
+        if boom["on"]:
+            raise RuntimeError("时钟故障注入")
+        return clock()
+
+    st._now = broken_now
+    try:
+        st.consume_pending(p.pending_id, "c1")
+        raised = False
+    except RuntimeError:
+        raised = True
+    check("R1 时钟故障 → 异常如实抛出（不吞异常不伪装失败）", raised, "")
+    check("R1 故障后 pending 仍 open",
+          st.get_pending_by_id(p.pending_id).status == PENDING_OPEN,
+          st.get_pending_by_id(p.pending_id).status)
+    check("R1 故障后 _latest_consumption() 为 None（无半成功记录）",
+          st._latest_consumption() is None, str(st._latest_consumption()))
+    # 恢复时钟后仍可成功消费（同一 pending、同一候选）
+    boom["on"] = False
+    out = st.consume_pending(p.pending_id, "c1")
+    check("R1 恢复时钟后消费成功", out.ok, str(out))
+    rec = st._latest_consumption()
+    check("R1 恢复后记录恰好一条且七字段正确",
+          rec is not None and rec["pending_id"] == p.pending_id
+          and rec["candidate_id"] == "c1"
+          and rec["original_intent"] == "plan_modify"
+          and rec["selected_name"] == "海贝皇大排档（南京店）"
+          and rec["selected_city"] == "南京"
+          and isinstance(rec["consumed_at"], int), str(rec))
+    out2 = st.consume_pending(p.pending_id, "c2")
+    check("R1 成功后同一 pending 不可再消费（恰一次）",
+          not out2.ok and "已消费" in out2.reason, str(out2))
+
+    # ---- R1 变体：时钟返回非法类型（epoch 转换失败）----
+    clock3, _ = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
+    st3 = PendingStore(ttl_seconds=300, now=clock3)
+    p3 = st3.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    st3._now = lambda: "不是时间"   # _epoch 将抛 TypeError
+    try:
+        st3.consume_pending(p3.pending_id, "c1")
+        raised3 = False
+    except (TypeError, RuntimeError):
+        raised3 = True
+    check("R1 非法时钟类型 → 异常抛出", raised3, "")
+    check("R1 非法时钟后 pending 仍 open",
+          st3.get_pending_by_id(p3.pending_id).status == PENDING_OPEN, "")
+    check("R1 非法时钟后无消费记录",
+          st3._latest_consumption() is None, "")
+
+    # ---- R2：candidate 冻结契约 + dict 兼容垫片 ----
+    clock4, _ = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
+    st4 = PendingStore(ttl_seconds=300, now=clock4)
+    p4 = st4.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    out4 = st4.consume_pending(p4.pending_id, "c1")
+    cand = out4.candidate
+    check("R2 candidate 是 PendingCandidate 冻结结构",
+          isinstance(cand, PendingCandidate)
+          and cand.__dataclass_params__.frozen, repr(type(cand)))
+    check("R2 冻结候选不可属性赋值",
+          _raises_frozen(cand), "")
+    d = out4.candidate_as_dict()
+    check("R2 candidate_as_dict 垫片返回六字段 dict",
+          isinstance(d, dict) and set(d) == set(SNAPSHOT_FIELDS)
+          and d["candidate_id"] == "c1"
+          and d["name"] == "海贝皇大排档（南京店）", str(d))
+    check("R2 垫片 dict 是拷贝（改它不动冻结快照）",
+          (d.__setitem__("name", "篡改"), True)[1]
+          and cand.name == "海贝皇大排档（南京店）", "")
+    # SQLite 实现同契约抽查（返回对象同为冻结结构 + 垫片可用）
+    from travel_agent.pending_store_sqlite import SQLitePendingStore
+    st5 = SQLitePendingStore("s-r2", db_path=temp_db(),
+                             ttl_seconds=300, now=clock4)
+    p5 = st5.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    out5 = st5.consume_pending(p5.pending_id, "c1")
+    check("R2 SQLite candidate 同为冻结 PendingCandidate",
+          out5.ok and isinstance(out5.candidate, PendingCandidate)
+          and out5.candidate.__dataclass_params__.frozen, str(out5))
+    check("R2 SQLite 垫片同样返回六字段 dict",
+          isinstance(out5.candidate_as_dict(), dict)
+          and set(out5.candidate_as_dict()) == set(SNAPSHOT_FIELDS), "")
+
+
+def _raises_frozen(obj) -> bool:
+    try:
+        obj.name = "篡改"
+        return False
+    except Exception:
+        return True
+
+
+def temp_db() -> str:
+    """R2 SQLite 抽查用的临时库路径。"""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    return path
+
+
 def main() -> int:
     for fn in (test_dataclass_contract, test_five_methods_lifecycle,
                test_atomic_consume, test_single_active_and_rules,
-               test_immutable_snapshot_p21):
+               test_immutable_snapshot_p21,
+               test_consume_atomicity_fault_injection):
         fn()
     print(f"\npending contract: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
