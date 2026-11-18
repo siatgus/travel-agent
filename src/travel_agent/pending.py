@@ -199,6 +199,13 @@ class PendingStore:
         now = self._now()
         with self._lock:
             if self._active is not None and \
+                    self._active.status == PENDING_OPEN and \
+                    self._is_expired(self._active):
+                # P2.2：锁内先自动过期再查重（与 SQLite 实现同语义，
+                # 阻断项①：到期永不阻塞新 Pending，规则 5+8）
+                self._active = replace(self._active,
+                                       status=PENDING_EXPIRED)
+            if self._active is not None and \
                     self._active.status == PENDING_OPEN:
                 raise ValueError(
                     f"已存在 active pending（{self._active.pending_id}），"

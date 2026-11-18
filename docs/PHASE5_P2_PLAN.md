@@ -293,3 +293,25 @@ Handler 接口**。
 
 **申请结论**：以上方案确认后申请开工，从 ①PendingCandidate 冻结
 结构改造开始，每步独立提交、独立回归、独立验收，不提前进入 P3。
+
+## 9. P2.2 实施记录（SQLite PendingStore）
+
+> 实施基线：P2.1 `589ebe4` 验收通过。交付 `pending_store_sqlite.py`
+> + `tests/test_pending_sqlite.py`；内存桩保留为测试桩与无 DB 降级
+> 路径。P2.2 八条验收要求逐条落点见模块 docstring。
+
+**相对本方案 §2 的契约偏差（P2.2 验收要求 1 定版）**：时间列由
+TEXT ISO 字符串升级为 **INTEGER UTC Unix epoch**——created_at /
+expires_at / consumed_at / revalidated_at 库内一律 epoch 整数，
+所有过期判定与比较只用 `expires_at > ?` / `expires_at <= ?` 整数
+比较，绝不做字符串时间比较；`PendingDisambiguation` 数据类的
+created_at/expires_at 仍是 ISO 字符串（v3.2.1 冻结契约），由
+epoch 以 UTC 派生，仅展示用途。注入时钟返回 naive datetime 按
+UTC 解释（测试确定性）。`pending_consumption.pending_id` 设为
+PRIMARY KEY（同一 pending 只能成功消费一次），同时充当半成功
+回滚的失败诱因测试锚点。
+
+**内存桩同语义补丁**：`PendingStore.create_pending` 锁内先自动
+过期（open 且已到期 → expired）再查重——到期永不阻塞新 Pending
+（阻断项①），与 SQLite 实现双实现对拍锁定（`_lifecycle` 逐位
+对比脚本）。

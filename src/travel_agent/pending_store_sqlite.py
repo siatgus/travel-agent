@@ -1,0 +1,400 @@
+"""SQLite PendingStore（Phase 5 P2.2）。
+
+设计依据 docs/PHASE5_P2_PLAN.md §2 与 P2.1 验收后的 P2.2 开工要求。
+内存桩 `PendingStore` 保留为测试桩与无 DB 降级路径；本实现与其
+**五方法签名完全一致**（每实例绑定一个 session_id，共享同一 SQLite
+库文件，session_id 隔离在 SQL 条件层强制，不靠应用层判断）。
+
+P2.2 八条验收要求逐条落点：
+1. 时间契约：created_at / expires_at / consumed_at / revalidated_at
+   在库内**统一为 UTC Unix epoch 整数**，所有过期判定与比较只用
+   epoch 整数（`expires_at > ?` / `expires_at <= ?`），绝不做字符串
+   时间比较。PendingDisambiguation 数据类的 created_at/expires_at
+   仍是 ISO 字符串（v3.2.1 冻结契约），由 epoch 以 UTC 派生，仅
+   用于展示与序列化，不参与任何比较。注入时钟返回 naive datetime
+   时按 UTC 解释（测试确定性，不依赖本机时区）。
+2. 创建事务：BEGIN IMMEDIATE → 自动过期该 Session 已到期的 open
+   记录 → INSERT → COMMIT（阻断项①：到期永不阻塞新 Pending）。
+3. 部分唯一索引 ux_pending_open(session_id) WHERE status='open'：
+   单 Session 最多一个 open Pending，数据库级强制；并发创建由
+   IntegrityError 兜底（规则 8）。
+4. 消费原子性：候选校验、条件更新（受影响行数=1 才算成功）、
+   消费记录写入处于同一 BEGIN IMMEDIATE 事务内。
+5. 并发消费：BEGIN IMMEDIATE 写锁串行化，两线程同时消费同一
+   Pending 恰好一个成功（与 P1.5 内存桩 Barrier 测试同语义）。
+6. 自动过期：A 到期但无人显式 expire，create B 在同一事务内先
+   把 A 条件更新为 expired 再插入 B。
+7. Session 隔离：所有读写都带 session_id 条件；B 用 A 的
+   pending_id 消费 → 查不到行 → 拒绝，A 的状态不受影响。
+8. 内存桩兼容：内存桩 create_pending 同步补「锁内先自动过期再
+   查重」，两实现状态语义一致（tests/test_pending_sqlite.py
+   双实现生命周期对拍锁定）。
+
+半成功防线：consume_pending 中消费记录 INSERT 失败 → 整体
+ROLLBACK，pending 回到 open；**绝不出现 pending 已 consumed 而
+consumption 记录缺失的状态**。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from travel_agent import paths
+from travel_agent.pending import (DEFAULT_TTL_SECONDS, PENDING_OPEN,
+                                  PENDING_CONSUMED,
+                                  PendingDisambiguation,
+                                  _ConsumeOutcome, _candidate_from_dict)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_disambiguation (
+    pending_id         TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL,
+    original_utterance TEXT NOT NULL,
+    original_intent    TEXT NOT NULL,
+    original_role      TEXT NOT NULL,
+    candidates_json    TEXT NOT NULL,     -- 冻结候选 tuple 的 JSON
+    created_at         INTEGER NOT NULL,  -- UTC Unix epoch（验收要求 1）
+    expires_at         INTEGER NOT NULL,  -- UTC Unix epoch
+    status             TEXT NOT NULL      -- open/consumed/cancelled/expired
+);
+-- 规则 8：单 Session 单 active——数据库级强制，不靠应用层判断
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_open
+    ON pending_disambiguation(session_id) WHERE status = 'open';
+-- 消费结果记录（P2.3 重复选择识别的数据源；pending_id 唯一——
+-- 同一 pending 只能成功消费一次，同时充当半成功回滚的失败诱因）
+CREATE TABLE IF NOT EXISTS pending_consumption (
+    pending_id              TEXT PRIMARY KEY,
+    session_id              TEXT NOT NULL,
+    candidate_id            TEXT NOT NULL,
+    consumed_at             INTEGER NOT NULL,  -- UTC Unix epoch
+    original_intent         TEXT NOT NULL,
+    selected_name           TEXT NOT NULL,
+    selected_city           TEXT,
+    revalidate_status       TEXT,              -- P2.5 重验证回填
+    revalidate_probe_status TEXT,
+    revalidated_at          INTEGER
+);
+"""
+
+
+def _epoch(value) -> int:
+    """任意注入时间值 → UTC epoch 整数（唯一比较格式）。
+
+    - 数值：直接取整（已是 epoch）；
+    - aware datetime：按其时区转 epoch；
+    - naive datetime：**按 UTC 解释**（测试注入确定性，不依赖
+      本机时区；生产默认时钟直接用 time.time()，不走此分支）。
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"非法时间值：{value!r}")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp())
+    raise TypeError(f"非法时间值类型：{type(value).__name__}")
+
+
+def _iso_utc(epoch: int) -> str:
+    """epoch → ISO 字符串（仅展示/序列化用途，绝不参与比较）。"""
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+
+
+class SQLitePendingStore:
+    """绑定单一 session_id 的 PendingStore SQLite 实现。
+
+    与内存桩 PendingStore 的五方法签名与返回契约一致：
+    - create_pending 存在 active 时抛 ValueError（规则 8）；
+    - consume/cancel/expire 返回 _ConsumeOutcome，失败 reason 可归因；
+    - get_active_pending 对已到期 open 记录返回 None（规则 5），
+      与内存桩一致不做读取期隐式迁移（显式迁移只发生在 consume
+      与 create 的自动过期路径）。
+    """
+
+    def __init__(self, session_id: str, *,
+                 db_path=None,
+                 ttl_seconds: int = DEFAULT_TTL_SECONDS,
+                 now=None, id_gen=None) -> None:
+        if not str(session_id).strip():
+            raise ValueError("session_id 不得为空（多用户库必须隔离）")
+        self._session_id = str(session_id)
+        self._db = Path(db_path) if db_path is not None else paths.app_db()
+        self._ttl = int(ttl_seconds)
+        self._now = now                          # 测试可注入时钟
+        self._id_gen = id_gen or (lambda: uuid.uuid4().hex[:12])
+        self._init_schema()
+
+    # -------------------------------------------------- 连接与 schema
+
+    def _connect(self) -> sqlite3.Connection:
+        # isolation_level=None：显式管理 BEGIN/COMMIT/ROLLBACK
+        con = sqlite3.connect(str(self._db), timeout=10.0,
+                              isolation_level=None)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def _init_schema(self) -> None:
+        con = self._connect()
+        try:
+            con.executescript(_SCHEMA)
+        finally:
+            con.close()
+
+    def _now_epoch(self) -> int:
+        return _epoch(self._now()) if self._now is not None \
+            else int(time.time())
+
+    # -------------------------------------------------- 行重建
+
+    def _pending_from_row(self, row) -> PendingDisambiguation:
+        cands = tuple(_candidate_from_dict(d)
+                      for d in json.loads(row["candidates_json"]))
+        return PendingDisambiguation(
+            pending_id=row["pending_id"],
+            original_utterance=row["original_utterance"],
+            original_intent=row["original_intent"],
+            original_role=row["original_role"],
+            candidates=cands,
+            created_at=_iso_utc(int(row["created_at"])),
+            expires_at=_iso_utc(int(row["expires_at"])),
+            status=row["status"])
+
+    @staticmethod
+    def _rollback(con: sqlite3.Connection) -> None:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    # -------------------------------------------------- ① create
+
+    def create_pending(self, original_utterance: str, original_intent: str,
+                       original_role: str,
+                       candidates: list[dict]) -> PendingDisambiguation:
+        """创建 pending（同内存桩签名；session_id 取构造绑定值）。
+
+        BEGIN IMMEDIATE 单事务：自动过期该 Session 已到期的 open
+        记录 → INSERT → COMMIT。撞部分唯一索引 → IntegrityError →
+        按规则 8 抛 ValueError（与内存桩同异常契约）。
+        """
+        snap = tuple(_candidate_from_dict(c) for c in candidates)
+        now_e = self._now_epoch()
+        # 先构造（复用 PendingDisambiguation 全部校验），再入事务
+        p = PendingDisambiguation(
+            pending_id=self._id_gen(),
+            original_utterance=original_utterance,
+            original_intent=original_intent,
+            original_role=original_role,
+            candidates=snap,
+            created_at=_iso_utc(now_e),
+            expires_at=_iso_utc(now_e + self._ttl),
+            status=PENDING_OPEN)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            # 阻断项①：自动过期——到期永不阻塞新 Pending
+            con.execute(
+                "UPDATE pending_disambiguation SET status = 'expired'"
+                " WHERE session_id = ? AND status = 'open'"
+                "   AND expires_at <= ?",
+                (self._session_id, now_e))
+            try:
+                con.execute(
+                    "INSERT INTO pending_disambiguation (pending_id,"
+                    " session_id, original_utterance, original_intent,"
+                    " original_role, candidates_json, created_at,"
+                    " expires_at, status)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (p.pending_id, self._session_id, p.original_utterance,
+                     p.original_intent, p.original_role,
+                     json.dumps([c.as_dict() for c in p.candidates]),
+                     now_e, now_e + self._ttl, PENDING_OPEN))
+            except sqlite3.IntegrityError as e:
+                self._rollback(con)
+                raise ValueError(
+                    "已存在 active pending，同一 Session 同时最多一个"
+                    "可消费的 active pending（规则 8，部分唯一索引兜底）"
+                ) from e
+            con.execute("COMMIT")
+        except BaseException:
+            self._rollback(con)
+            raise
+        finally:
+            con.close()
+        return p
+
+    # -------------------------------------------------- ② get
+
+    def get_active_pending(self) -> PendingDisambiguation | None:
+        """取本 Session 当前可消费的 active pending（规则 5/8）。
+
+        过期判定用 epoch 整数比较 `expires_at > ?`；到期的 open
+        记录不返回（也不做读取期隐式迁移，与内存桩一致）。
+        """
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT * FROM pending_disambiguation"
+                " WHERE session_id = ? AND status = 'open'"
+                "   AND expires_at > ?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (self._session_id, self._now_epoch())).fetchone()
+        finally:
+            con.close()
+        return self._pending_from_row(row) if row is not None else None
+
+    def get_pending_by_id(self, pending_id: str) \
+            -> PendingDisambiguation | None:
+        """按 ID 取**本 Session** 的记录（含已终结状态，供归因）。
+
+        session_id 条件强制：其他 Session 的 pending 一律不可见。
+        """
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT * FROM pending_disambiguation"
+                " WHERE pending_id = ? AND session_id = ?",
+                (pending_id, self._session_id)).fetchone()
+        finally:
+            con.close()
+        return self._pending_from_row(row) if row is not None else None
+
+    # -------------------------------------------------- ③ consume（原子）
+
+    def consume_pending(self, pending_id: str,
+                        candidate_id: str) -> _ConsumeOutcome:
+        """原子消费：单事务完成候选校验 + 条件更新 + 消费记录写入。
+
+        失败契约与内存桩一致；消费记录 INSERT 失败 → 整体 ROLLBACK
+        （pending 保持 open，绝无半成功状态）。
+        """
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status, candidates_json, expires_at,"
+                " original_intent FROM pending_disambiguation"
+                " WHERE pending_id = ? AND session_id = ?",
+                (pending_id, self._session_id)).fetchone()
+            if row is None:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False,
+                    reason="pending 不存在或 pending_id 不匹配")
+            status = row["status"]
+            if status == PENDING_CONSUMED:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason="pending 已消费过（同一 pending 只能成功"
+                           "消费一次）")
+            if status != PENDING_OPEN:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason=f"pending 状态为 {status}，不可消费")
+            now_e = self._now_epoch()
+            if int(row["expires_at"]) <= now_e:
+                # 到期显式登记持久化（与内存桩 consume 过期分支同语义）
+                con.execute(
+                    "UPDATE pending_disambiguation SET status = 'expired'"
+                    " WHERE pending_id = ? AND session_id = ?"
+                    "   AND status = 'open'",
+                    (pending_id, self._session_id))
+                con.execute("COMMIT")
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason="pending 已过期，不得继续执行（规则 5）")
+            snap = tuple(_candidate_from_dict(d)
+                         for d in json.loads(row["candidates_json"]))
+            if candidate_id not in tuple(c.candidate_id for c in snap):
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason="candidate_id 不在原快照内，一律拒绝（规则 9）")
+            chosen = next(c for c in snap if c.candidate_id == candidate_id)
+            # 条件更新：受影响行数 = 1 才算成功（并发语义核心）
+            cur = con.execute(
+                "UPDATE pending_disambiguation SET status = 'consumed'"
+                " WHERE pending_id = ? AND session_id = ?"
+                "   AND status = 'open' AND expires_at > ?",
+                (pending_id, self._session_id, now_e))
+            if cur.rowcount != 1:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason="pending 状态已变化，本次未消费")
+            # 消费记录写入与状态迁移同事务：失败整体回滚
+            try:
+                con.execute(
+                    "INSERT INTO pending_consumption (pending_id,"
+                    " session_id, candidate_id, consumed_at,"
+                    " original_intent, selected_name, selected_city)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (pending_id, self._session_id, candidate_id, now_e,
+                     row["original_intent"], chosen.name, chosen.city))
+            except sqlite3.Error as e:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason=f"消费记录写入失败，事务已回滚"
+                           f"（pending 保持 open）：{e}")
+            con.execute("COMMIT")
+            return _ConsumeOutcome(ok=True, pending_id=pending_id,
+                                   candidate=chosen)
+        finally:
+            con.close()
+
+    # -------------------------------------------------- ④⑤ cancel / expire
+
+    def cancel_pending(self, pending_id: str) -> _ConsumeOutcome:
+        """用户取消 → cancelled（规则 2）。条件更新，行数=1 才成功。"""
+        return self._terminal_transition(
+            pending_id, "cancelled", "不可取消")
+
+    def expire_pending(self, pending_id: str) -> _ConsumeOutcome:
+        """过期登记 → expired（规则 5）。条件更新，行数=1 才成功。"""
+        return self._terminal_transition(
+            pending_id, "expired", "无需过期登记")
+
+    def _terminal_transition(self, pending_id: str, target: str,
+                             mismatch_hint: str) -> _ConsumeOutcome:
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status FROM pending_disambiguation"
+                " WHERE pending_id = ? AND session_id = ?",
+                (pending_id, self._session_id)).fetchone()
+            if row is None:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False,
+                    reason="pending 不存在或 pending_id 不匹配")
+            if row["status"] != PENDING_OPEN:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason=f"pending 状态为 {row['status']}，"
+                           f"{mismatch_hint}")
+            cur = con.execute(
+                "UPDATE pending_disambiguation SET status = ?"
+                " WHERE pending_id = ? AND session_id = ?"
+                "   AND status = 'open'",
+                (target, pending_id, self._session_id))
+            if cur.rowcount != 1:
+                self._rollback(con)
+                return _ConsumeOutcome(
+                    ok=False, pending_id=pending_id,
+                    reason="pending 状态已变化，本次未迁移")
+            con.execute("COMMIT")
+            return _ConsumeOutcome(ok=True, pending_id=pending_id)
+        finally:
+            con.close()
