@@ -1,9 +1,11 @@
-# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3 修订版）
+# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3.1 修订版）
 
 > 版本历史：
-> v1 `e0438ab`（2026-11-18 初稿）→ v2（2026-11-18 评审修订）→ **v3 本文**
-> （2026-11-18 最后一轮修订，仅文档，未动业务代码）。
-> 第四阶段基线：commit `2f66f4e`。
+> v1 `e0438ab`（2026-11-18 初稿）→ v2（2026-11-18 评审修订）→ v3
+> （2026-11-18 最后一轮修订）→ **v3.1 本文**（2026-11-18 开发指令
+> 补录：DecisionResult schema、模块职责表、15 条重点病例、长期路线；
+> 仅文档，未动业务代码）。
+> 第四阶段基线：commit `2f66f4e`（验收已通过）。
 > 本阶段定位：**建立可靠的决策边界**，让三、四阶段的结果逐步参与业务
 > 决策——不是继续堆叠识别规则。
 
@@ -126,6 +128,50 @@ confirmed / ambiguous / rejected / unverified / skipped 五状态；
   回流 EntityResolver 相互矛盾）。
 - 兜底是旁路**触发机制**，不是与四档并列的第四层：主链无可用结构时
   才触发，触发与否、触发结果全部记录进影子数据供归因。
+
+### 2.1 五档运行时路由（v3.1 补录）
+
+DecisionEngine 按 status 分流，五档各自是**运行时状态**而非仅影子
+记录：
+
+| status | 路由 |
+|---|---|
+| confirmed | 直接进入原业务（如「介绍一下总统府」→ _spot_qa，**绝不掉到泛推荐**） |
+| ambiguous | **执行阻断态**：澄清不执行（「我查到几家海贝皇大排档，你想去哪一家？如果是南京这家，我可以直接排进南京行程」） |
+| rejected | 查询/规划分别处理：查询如实告知规定范围内查无此地并引导换说法；规划不排入、保留原始表达 |
+| unverified | 保守处理（「我暂时查不到这家餐厅的可靠信息，你可以告诉我所在城市或地址，我再帮你确认」） |
+| skipped | 品类词，走品类查询/泛化 Handler |
+
+### 2.2 模块职责表（v3.1 补录，命名对齐开发指令）
+
+| 模块 | 负责什么 |
+|---|---|
+| parser.py | 用户说了什么（统一 Schema、三城市字段） |
+| candidate_extractor.py | 里面有哪些实体候选（五层瀑布） |
+| entity_resolver.py | 候选到底是谁（存在性验证与消歧） |
+| **decision.py**（新增） | 系统现在应该做什么（消费 ParseResult + resolved 实体 + context，产出 DecisionResult） |
+| **llm_entity_fallback.py**（新增） | 规则实在看不懂时辅助理解（LLMCandidateAdapter 落点，产出候选对象而非决策） |
+| orchestrator.py | 调度整个流程（消费 DecisionResult；**不再在 _turn_impl 里堆 if/elif 做置信判断**） |
+
+### 2.3 DecisionResult 契约（v3.1 补录）
+
+```python
+@dataclass
+class DecisionResult:
+    action: str          # execute / clarify / reject_reply / conservative /
+                         # category_path / deferred
+    intent: str          # 细分意图（poi_qa / poi_query / plan_modify / ...）
+    entity: object | None   # 归并后的已验证实体（可含 entity_id）
+    city: str | None     # 本次决策实际采用的城市（按 HC-1 意图字段选取）
+    confidence: float    # 同档内排序用，永不跨档
+    reason: str          # 可归因说明（命中哪条硬约束/哪条分流规则）
+    pending: PendingDisambiguation | None   # action=clarify 时携带
+```
+
+- orchestrator 及所有 Handler 只消费 `DecisionResult`，不直接读
+  resolver 原始记录；后续意图接管都在 decision.py 内扩展。
+- `confidence` 只在同档内使用（如消歧候选展示排序），任何硬约束失败
+  直接定档，分数不参与跨档救回（§3）。
 
 ## 3. 硬约束清单（先检查能否确认，再算分）
 
@@ -342,6 +388,23 @@ P5   规划类消费         5.3 批次
 
 每步独立 commit；回归门槛：v1–v4 语料 + 全套件绿 + 当步新语料绿。
 
+### 10.1 长期路线（v3.1 补录，开发指令定版）
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Phase 1 | 回归语料库 | ✅ `842170b` |
+| Phase 2 | 统一 Parser + 城市字段拆分 | ✅ `b3a2547` |
+| Phase 3 | 五层候选识别 | ✅ `80337bd` |
+| Phase 4 | EntityResolver + 校验 | ✅ `2f66f4e`（验收通过） |
+| Phase 5 | Decision + LLM 兜底 | ← 本文档 |
+| Phase 6 | 行程依赖一致性引擎（DEP-001：删除豫园联动南翔馒头店；强依赖删除/弱依赖重选/独立保留） | 待设计 |
+| Phase 7 | POI/酒店/餐厅问答能力完善 | 待设计 |
+| Phase 8 | 性能、缓存、工具调用优化 | 待设计 |
+
+DEP-001 在第五阶段**完全不碰**：它属于「实体解析 → 行程实体依赖
+关系 → 删除传播 → 重新校验」的独立系统，留待 Phase 6 单独设计；
+现有删除/排除功能不以其为前置（§5）。
+
 ## 11. 测试用例清单
 
 ### T-A rejected/unverified 不混淆
@@ -394,6 +457,29 @@ plan_trip / 不动行程节点 / 不静默选分店）。
 | nearby_food_query 只验证锚点 | 仅锚点进入验证；搜索返回餐厅不作 user 候选 |
 | query_city 与 destination 不冲突 | 查询类两城不同不判 HC-1 冲突 |
 
+### T-J 重点病例 15 条（v3.1 补录，开发指令点名，语料 v5 必含）
+
+| # | 病例 | 预期要点 |
+|---|---|---|
+| ① | 排上海贝皇大排档 | 城市前缀并入实体；EntityResolver 按上海验证 |
+| ② | 排海贝皇大排档 | 多分店 → ambiguous 执行阻断，澄清不排入 |
+| ③ | 介绍国民政府中央广播电台旧址 | 长名 L1/L2 命中 → confirmed → POI QA，不掉泛推荐 |
+| ④ | 宽窄巷子是什么地方 | 点名景点 confirmed → 查询应答 |
+| ⑤ | 成都有哪些好吃的火锅店 | **category_query 不进实体验证**，走品类路径（skipped/品类 Handler） |
+| ⑥ | 上海有哪些好吃的 | 泛化美食走 FoodHandler；**query_city=上海 且 destination=成都 两字段互不污染**（防线断言） |
+| ⑦ | 南京有哪些酒店 | 泛化酒店走 HotelHandler/DataService，不进实体验证 |
+| ⑧ | 南京总统府附近有什么好吃的 | 锚点=总统府验证；返回餐厅不作 user 候选 |
+| ⑨ | 这个地方介绍一下 | 无具体实体候选 → 不接管，走澄清/上下文 |
+| ⑩ | 那家店怎么样 | 同上，规则无候选且 LLM 不触发时保守处理 |
+| ⑪ | 海贝皇大排档是哪家 | 指代消歧 → 引用 active pending 快照或澄清 |
+| ⑫ | 南京的海贝皇大排档 | 城市限定 → 归并后唯一则 confirmed |
+| ⑬ | 上海的海贝皇大排档 | 同上按上海验证；跨城同名不静默合并 |
+| ⑭ | 查不到的餐厅 | 双源复核均空 → rejected（措辞「规定范围内没有找到」） |
+| ⑮ | 网络不可用时查询餐厅 | probe unavailable → unverified + reason=network_timeout，**绝不 rejected** |
+
+其中 ⑥ 是本阶段最重要防线之一：三城市字段拆分后任何路由都不得把
+query_city 写进 destination。⑭⑮ 是 T-A 的真实语料落地形式。
+
 ## 12. 明确不做（阶段边界）
 
 - 不修 DEP-001（且不是现有删除/排除功能的前置条件）。
@@ -415,3 +501,7 @@ plan_trip / 不动行程节点 / 不静默选分店）。
 | 2026-11-18 | v3 | §7 快照逐条字段（candidate_id/display_order/entity_id/name/city/address）；单 active pending；ID 与顺序冻结；状态消费原子化 | 防重复提交、防顺序漂移、防跨 pending 误引用（评审 4） |
 | 2026-11-18 | v3 | §1.2 rejected 语义收紧为「规定数据源与检索范围内没有找到」；双源复核增加独立性+类型适用性前置检查；逐源 probe_results 明细；不适用源不强制执行 | 双源都未收录 ≠ 现实不存在（评审 5） |
 | 2026-11-18 | v3 | §11 新增 T-I 测试组（9 条） | 覆盖本轮全部修订（评审 6） |
+| 2026-11-18 | v3.1（本文） | §2.1 五档运行时路由表（confirmed 直接执行不掉泛推荐、ambiguous 执行阻断、rejected/unverified 分行为、skipped 品类路径） | 开发指令要求五档成为真正的运行时状态 |
+| 2026-11-18 | v3.1 | §2.2 模块职责表（decision.py / llm_entity_fallback.py 命名对齐）、§2.3 DecisionResult 契约（action/intent/entity/city/confidence/reason/pending），orchestrator 只消费 DecisionResult | 开发指令：不再在 _turn_impl 里堆 if/elif |
+| 2026-11-18 | v3.1 | §11 新增 T-J 重点病例 15 条（含 ⑥ query_city/destination 防线、⑭⑮ rejected/unverified 真实语料） | 开发指令点名的重点测试病例 |
+| 2026-11-18 | v3.1 | §10.1 长期路线 Phase 6–8 定版；DEP-001 留待 Phase 6，第五阶段完全不碰 | 开发指令的路线定版要求 |
