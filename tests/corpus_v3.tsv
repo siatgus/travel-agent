@@ -1,0 +1,26 @@
+﻿case_id	category	utterance	context	expected_pois	expected_cities	negatives	note
+C01	negate	不想去豫园	{"slots":{"destination":"上海"},"plan_made":true}	[{"text":"豫园","entity_type":"attraction","role":"negated","matched":true}]	[]		否定目标：豫园为 negated，不当候选不当城市
+C02	remove	去掉苍山	{"slots":{"destination":"大理"},"plan_made":true}	[{"text":"苍山","entity_type":"attraction","role":"remove","matched":true}]	[]		删除目标：苍山为 remove
+C03	route	从大理到丽江玩5天	{}	[]	[{"text":"大理","role":"departure_city"},{"text":"丽江","role":"destination"}]	no_poi	路线框架：大理出发、丽江目的地、天数 5；不产生 POI 候选
+C04	spot_qa	宽窄巷子是什么地方	{}	[{"text":"宽窄巷子","entity_type":"attraction","role":"query","matched":true}]	[]		无城市上下文的景点问答
+C05	location_qa	老驴头驴肉火烧在哪里	{"slots":{"destination":"邯郸","party_size":2},"plan_made":true}	[{"text":"老驴头驴肉火烧","entity_type":"restaurant","role":"query","matched":true}]	[]		点名餐厅位置问句：类型取 KB 的 restaurant
+C06	category_qa	成都有没有中小型游乐园	{}	[{"text":"游乐园","entity_type":"category","role":"query","matched":true}]	[{"text":"成都","role":"query_city"}]		品类词不是 POI；城市进 query_city
+C07	unknown_restaurant	那给我排上海贝皇大排档	{"slots":{"destination":"成都"},"plan_made":true}	[{"text":"上海贝皇大排档","entity_type":"restaurant","role":"must_visit","matched":false}]	[]	no_city=上海	城市前缀并入店名；绝不另发上海城市候选
+C08	long_name	国民政府中央广播电台旧址介绍一下	{}	[{"text":"国民政府中央广播电台旧址","entity_type":"attraction","role":"query","matched":true}]	[]		12 字以上长全名整体识别，无碎片候选
+C09	nearby_food	南京中山陵景区附近有什么吃的	{}	[{"text":"中山陵","entity_type":"attraction","role":"nearby_anchor","matched":true}]	[{"text":"南京","role":"query_city"}]		周边锚点与查询城市分立
+C10	bare_number	1	{"slots":{"destination":"邯郸"},"pending_field":"party_size"}	[]	[]		裸数字补槽：无实体候选
+C11	city_query	上海有哪些好吃的	{"slots":{"destination":"成都","party_size":2}}	[]	[{"text":"上海","role":"query_city"}]	no_destination	查询城市绝不覆盖目的地（成都）
+C12	cross_city_add	那给我排国民政府中央广播电台旧址	{"slots":{"destination":"上海"},"plan_made":true}	[{"text":"国民政府中央广播电台旧址","entity_type":"attraction","role":"must_visit","matched":true}]	[]	no_city=上海	跨城加点：候选如实产生；归属校验（上海 vs 南京）留第四阶段
+T01	long_name	国民政府中央广播电台旧址怎么样	{}	[{"text":"国民政府中央广播电台旧址","entity_type":"attraction","role":"query","matched":true}]	[]		长全名 + 疑问尾词
+T02	unknown_restaurant	排上海贝皇大排档	{"slots":{"destination":"成都"},"plan_made":true}	[{"text":"上海贝皇大排档","entity_type":"restaurant","role":"must_visit","matched":false}]	[]	no_city=上海	同 C07 无「那给我」变体
+T03	city_query	上海有哪些好吃的	{}	[]	[{"text":"上海","role":"query_city"}]		上海只进 query_city
+T04	route	从大理到丽江	{}	[]	[{"text":"大理","role":"departure_city"},{"text":"丽江","role":"destination"}]	no_poi	纯路线表达
+T05	route_fragment	从大理到玩5天	{}	[]	[{"text":"大理","role":"departure_city"}]	no_poi;no_destination	「到」后无城市：目的地留空并注明，绝不错当 POI 或城市
+T06	negate	不想去豫园	{"slots":{"destination":"上海"},"plan_made":true}	[{"text":"豫园","entity_type":"attraction","role":"negated","matched":true}]	[]		否定与删除区分
+T07	remove	去掉苍山	{"slots":{"destination":"大理"},"plan_made":true}	[{"text":"苍山","entity_type":"attraction","role":"remove","matched":true}]	[]		删除动词识别
+T08	category_qa	成都有哪些好吃的火锅店	{}	[{"text":"火锅","entity_type":"category","role":"query","matched":true}]	[{"text":"成都","role":"query_city"}]		火锅为品类不是 POI
+T09	nearby_restaurant	南京总统府附近有什么餐厅	{}	[{"text":"总统府","entity_type":"attraction","role":"nearby_anchor","matched":true}]	[{"text":"南京","role":"query_city"}]	no_poi_with_suffix=餐厅	总统府为位置锚点；「什么餐厅」是泛指不生成实体
+T10	branch_name	海贝皇海鲜大排档郑和南路店	{}	[{"text":"海贝皇海鲜大排档郑和南路店","entity_type":"restaurant","role":"query","matched":false}]	[]		完整分店名一条候选；店名内品类词（海鲜）不独立
+T11	plain_desc	这个地方风景很好	{}	[]	[]		普通描述不虚构 POI
+T12	multi_entity	去完总统府再去鸡鸣寺	{"plan_made":true}	[{"text":"总统府","entity_type":"attraction","role":"must_visit","matched":true},{"text":"鸡鸣寺","entity_type":"attraction","role":"must_visit","matched":true}]	[]		两个独立景点各自保留、Span 不重叠
+T13	dish_request	第一天给我安排小笼包	{"slots":{"destination":"上海"},"plan_made":true}	[{"text":"小笼包","entity_type":"unknown","role":"must_visit","matched":false}]	[]		无类型后缀但有实体指向意图：保留 unknown 候选（第四阶段校验）

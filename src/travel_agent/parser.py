@@ -97,6 +97,10 @@ class ParseResult:
     people: int | None = None            # 未提供时保持 None（绝不默认 1）
     confidence: float = 0.5
     notes: list[str] = field(default_factory=list)
+    # 影子运行（Phase 3）：CandidateExtractor 的候选识别结果，仅供对比与
+    # 回归观测，不驱动任何业务行为。dict 见 candidate_extractor.PoCandidate。
+    shadow_candidates: list[dict] = field(default_factory=list)
+    shadow_notes: list[str] = field(default_factory=list)
 
     # -------------------------------------------------- 兼容层
     def to_legacy_delta(self) -> dict:
@@ -278,6 +282,18 @@ def parse_utterance(text: str, context=None, today: date | None = None,
             and (res.food_keyword in anchor or anchor in res.food_keyword):
         res.notes.append(f"「{res.food_keyword}」是周边锚点不是菜品词，已清掉")
         res.food_keyword = None
+
+    # ---- 影子运行（Phase 3）：五层候选瀑布并行解析，不驱动业务 ----
+    # 旧解析链（spot_mention / extract_slots / 上面 PoCandidate 映射）继续
+    # 决定行为；新候选只做记录与对比，稳定后再逐步切换消费方。
+    try:
+        from .candidate_extractor import extract as _extract_candidates
+        _shadow = _extract_candidates(t, ctx, plan_like=plan_like)
+        res.shadow_candidates = ([c.as_dict() for c in _shadow.poi_candidates]
+                                 + [c.as_dict() for c in _shadow.city_candidates])
+        res.shadow_notes = list(_shadow.notes)
+    except Exception as e:                     # 影子通道绝不影响业务
+        res.notes.append(f"影子解析异常：{type(e).__name__}: {e}")
 
     return res
 

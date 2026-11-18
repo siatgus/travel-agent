@@ -1,0 +1,118 @@
+========================================================================
+corpus v3 报告（Phase 3 候选识别专项 + 新旧解析器差异）
+生成：候选层五层瀑布（candidate_extractor.extract）
+========================================================================
+
+[C01] negate  「不想去豫园」  →  PASS（4/4 断言）
+    POI  {'text': '豫园', 'span_start': 3, 'span_end': 5, 'entity_type': 'attraction', 'role': 'negated', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '豫园', 'entity_type': 'attraction', 'role': 'negated', 'matched': True}]
+
+[C02] remove  「去掉苍山」  →  PASS（4/4 断言）
+    POI  {'text': '苍山', 'span_start': 2, 'span_end': 4, 'entity_type': 'attraction', 'role': 'remove', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '苍山', 'entity_type': 'attraction', 'role': 'remove', 'matched': True}]
+
+[C03] route  「从大理到丽江玩5天」  →  PASS（6/6 断言）
+    CITY {'text': '大理', 'span_start': 1, 'span_end': 3, 'entity_type': 'city', 'role': 'departure_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    CITY {'text': '丽江', 'span_start': 4, 'span_end': 6, 'entity_type': 'city', 'role': 'destination', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+
+[C04] spot_qa  「宽窄巷子是什么地方」  →  PASS（4/4 断言）
+    POI  {'text': '宽窄巷子', 'span_start': 0, 'span_end': 4, 'entity_type': 'attraction', 'role': 'query', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[role-diff]    「宽窄巷子」旧 role=spot_mention 新 role=query
+
+[C05] location_qa  「老驴头驴肉火烧在哪里」  →  PASS（4/4 断言）
+    POI  {'text': '老驴头驴肉火烧', 'span_start': 0, 'span_end': 7, 'entity_type': 'restaurant', 'role': 'query', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[role-diff]    「老驴头驴肉火烧」旧 role=spot_mention 新 role=query
+
+[C06] category_qa  「成都有没有中小型游乐园」  →  PASS（5/5 断言）
+    POI  {'text': '游乐园', 'span_start': 8, 'span_end': 11, 'entity_type': 'category', 'role': 'query', 'match_type': 'category_lex', 'matched': True, 'layer': 2, 'city': None}
+    CITY {'text': '成都', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '游乐园', 'entity_type': 'category', 'role': 'query', 'matched': True}]
+
+[C07] unknown_restaurant  「那给我排上海贝皇大排档」  →  PASS（5/5 断言）
+    POI  {'text': '上海贝皇大排档', 'span_start': 4, 'span_end': 11, 'entity_type': 'restaurant', 'role': 'must_visit', 'match_type': 'suffix_inferred', 'matched': False, 'layer': 2, 'city': None}
+    notes: ['城市前缀「上海」并入候选实体名，不发独立城市候选']
+    差异[recall-gain]  新增候选: [{'text': '上海贝皇大排档', 'entity_type': 'restaurant', 'role': 'must_visit', 'matched': False}]
+    差异[dropped]      旧有新无（需人工确认）: [{'text': '海贝皇大排档', 'entity_type': 'restaurant', 'role': 'must_visit', 'matched': None}]
+
+[C08] long_name  「国民政府中央广播电台旧址介绍一下」  →  PASS（4/4 断言）
+    POI  {'text': '国民政府中央广播电台旧址', 'span_start': 0, 'span_end': 12, 'entity_type': 'attraction', 'role': 'query', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[role-diff]    「国民政府中央广播电台旧址」旧 role=spot_mention 新 role=query
+
+[C09] nearby_food  「南京中山陵景区附近有什么吃的」  →  PASS（5/5 断言）
+    POI  {'text': '中山陵', 'span_start': 2, 'span_end': 5, 'entity_type': 'attraction', 'role': 'nearby_anchor', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    CITY {'text': '南京', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '中山陵', 'entity_type': 'attraction', 'role': 'nearby_anchor', 'matched': True}]
+    差异[dropped]      旧有新无（需人工确认）: [{'text': '中山陵景区', 'entity_type': 'attraction', 'role': 'nearby_anchor', 'matched': None}]
+
+[C10] bare_number  「1」  →  PASS（3/3 断言）
+
+[C11] city_query  「上海有哪些好吃的」  →  PASS（5/5 断言）
+    CITY {'text': '上海', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+
+[C12] cross_city_add  「那给我排国民政府中央广播电台旧址」  →  PASS（5/5 断言）
+    POI  {'text': '国民政府中央广播电台旧址', 'span_start': 4, 'span_end': 16, 'entity_type': 'attraction', 'role': 'must_visit', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '国民政府中央广播电台旧址', 'entity_type': 'attraction', 'role': 'must_visit', 'matched': True}]
+
+[T01] long_name  「国民政府中央广播电台旧址怎么样」  →  PASS（4/4 断言）
+    POI  {'text': '国民政府中央广播电台旧址', 'span_start': 0, 'span_end': 12, 'entity_type': 'attraction', 'role': 'query', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[role-diff]    「国民政府中央广播电台旧址」旧 role=spot_mention 新 role=query
+
+[T02] unknown_restaurant  「排上海贝皇大排档」  →  PASS（5/5 断言）
+    POI  {'text': '上海贝皇大排档', 'span_start': 1, 'span_end': 8, 'entity_type': 'restaurant', 'role': 'must_visit', 'match_type': 'suffix_inferred', 'matched': False, 'layer': 2, 'city': None}
+    notes: ['城市前缀「上海」并入候选实体名，不发独立城市候选']
+    差异[recall-gain]  新增候选: [{'text': '上海贝皇大排档', 'entity_type': 'restaurant', 'role': 'must_visit', 'matched': False}]
+    差异[dropped]      旧有新无（需人工确认）: [{'text': '海贝皇大排档', 'entity_type': 'restaurant', 'role': 'must_visit', 'matched': None}]
+
+[T03] city_query  「上海有哪些好吃的」  →  PASS（4/4 断言）
+    CITY {'text': '上海', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+
+[T04] route  「从大理到丽江」  →  PASS（6/6 断言）
+    CITY {'text': '大理', 'span_start': 1, 'span_end': 3, 'entity_type': 'city', 'role': 'departure_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    CITY {'text': '丽江', 'span_start': 4, 'span_end': 6, 'entity_type': 'city', 'role': 'destination', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    差异[dropped]      旧有新无（需人工确认）: [{'text': '从到丽江', 'entity_type': 'attraction', 'role': 'spot_mention', 'matched': None}]
+
+[T05] route_fragment  「从大理到玩5天」  →  PASS（6/6 断言）
+    CITY {'text': '大理', 'span_start': 1, 'span_end': 3, 'entity_type': 'city', 'role': 'departure_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    notes: ['「到」后面没有城市名，目的地未知']
+
+[T06] negate  「不想去豫园」  →  PASS（4/4 断言）
+    POI  {'text': '豫园', 'span_start': 3, 'span_end': 5, 'entity_type': 'attraction', 'role': 'negated', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '豫园', 'entity_type': 'attraction', 'role': 'negated', 'matched': True}]
+
+[T07] remove  「去掉苍山」  →  PASS（4/4 断言）
+    POI  {'text': '苍山', 'span_start': 2, 'span_end': 4, 'entity_type': 'attraction', 'role': 'remove', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '苍山', 'entity_type': 'attraction', 'role': 'remove', 'matched': True}]
+
+[T08] category_qa  「成都有哪些好吃的火锅店」  →  PASS（5/5 断言）
+    POI  {'text': '火锅', 'span_start': 8, 'span_end': 10, 'entity_type': 'category', 'role': 'query', 'match_type': 'category_lex', 'matched': True, 'layer': 2, 'city': None}
+    CITY {'text': '成都', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '火锅', 'entity_type': 'category', 'role': 'query', 'matched': True}]
+    差异[dropped]      旧有新无（需人工确认）: [{'text': '的火锅店', 'entity_type': 'restaurant', 'role': 'must_visit', 'matched': None}]
+
+[T09] nearby_restaurant  「南京总统府附近有什么餐厅」  →  PASS（6/6 断言）
+    POI  {'text': '总统府', 'span_start': 2, 'span_end': 5, 'entity_type': 'attraction', 'role': 'nearby_anchor', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    CITY {'text': '南京', 'span_start': 0, 'span_end': 2, 'entity_type': 'city', 'role': 'query_city', 'match_type': 'city_lex', 'matched': True, 'layer': 4, 'city': None}
+
+[T10] branch_name  「海贝皇海鲜大排档郑和南路店」  →  PASS（4/4 断言）
+    POI  {'text': '海贝皇海鲜大排档郑和南路店', 'span_start': 0, 'span_end': 13, 'entity_type': 'restaurant', 'role': 'query', 'match_type': 'suffix_inferred', 'matched': False, 'layer': 2, 'city': None}
+    notes: ['候选「海鲜」与已确认候选 Span 重叠，丢弃']
+    差异[role-diff]    「海贝皇海鲜大排档郑和南路店」旧 role=spot_mention 新 role=query
+
+[T11] plain_desc  「这个地方风景很好」  →  PASS（3/3 断言）
+
+[T12] multi_entity  「去完总统府再去鸡鸣寺」  →  PASS（5/5 断言）
+    POI  {'text': '总统府', 'span_start': 2, 'span_end': 5, 'entity_type': 'attraction', 'role': 'must_visit', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    POI  {'text': '鸡鸣寺', 'span_start': 7, 'span_end': 10, 'entity_type': 'attraction', 'role': 'must_visit', 'match_type': 'kb_full', 'matched': True, 'layer': 1, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '总统府', 'entity_type': 'attraction', 'role': 'must_visit', 'matched': True}]
+
+[T13] dish_request  「第一天给我安排小笼包」  →  PASS（4/4 断言）
+    POI  {'text': '小笼包', 'span_start': 7, 'span_end': 10, 'entity_type': 'unknown', 'role': 'must_visit', 'match_type': 'intent_only', 'matched': False, 'layer': 2, 'city': None}
+    差异[recall-gain]  新增候选: [{'text': '小笼包', 'entity_type': 'unknown', 'role': 'must_visit', 'matched': False}]
+
+========================================================================
+总计 25 条 | PASS 25 | FAIL 0
+Span 契约与全部负向断言内嵌于各条断言中。
+差异分类说明：recall-gain=新瀑布识别出旧剥词漏掉的候选；
+dropped=旧剥词产出而新瀑布没有（多为误报清除或待人工确认）；
+role-diff=双方都有但角色判定不同（新瀑布按 L3 角色规则）。
+========================================================================
