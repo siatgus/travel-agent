@@ -44,13 +44,17 @@ def fixed_clock(start: datetime):
 SNAP = [_snap("c1", 1, "海贝皇大排档（南京店）", "南京", "nj-001", "中山路1号"),
         _snap("c2", 2, "海贝皇大排档（上海店）", "上海", "sh-001", "南京西路2号")]
 
+from travel_agent.pending import PendingCandidate, _candidate_from_dict
+
+FROZEN = tuple(_candidate_from_dict(d) for d in SNAP)
+
 
 def test_dataclass_contract() -> None:
     """交付 1：数据结构字段、枚举、候选快照契约。"""
     p = PendingDisambiguation(
         pending_id="p1", original_utterance="排海贝皇大排档",
         original_intent="plan_modify", original_role="must_visit",
-        candidates=tuple(SNAP), created_at="2026-11-18T15:00:00",
+        candidates=FROZEN, created_at="2026-11-18T15:00:00",
         expires_at="2026-11-18T15:05:00")
     check("八字段契约齐全",
           all(hasattr(p, f) for f in
@@ -58,19 +62,19 @@ def test_dataclass_contract() -> None:
                "original_role", "candidates", "created_at", "expires_at",
                "status")), "")
     check("快照逐条六冻结字段齐全",
-          all(all(k in c for k in
+          all(all(hasattr(c, k) for k in
                   ("candidate_id", "display_order", "entity_id", "name",
                    "city", "address")) for c in p.candidates), "")
     check("frozen：pending_id 与快照不可变",
-          p.__dataclass_params__.frozen, "")
-    check("display_order 冻结为 1..N", [c["display_order"] for c in
+          p.__dataclass_params__.frozen
+          and p.candidates[0].__dataclass_params__.frozen, "")
+    check("display_order 冻结为 1..N", [c.display_order for c in
                                         p.candidates] == [1, 2], "")
-    check("as_dict 候选为列表拷贝",
-          p.as_dict()["candidates"] == SNAP and
-          p.as_dict()["candidates"] is not p.candidates, "")
+    check("as_dict 候选输出形状与 P1.5 完全兼容",
+          p.as_dict()["candidates"] == SNAP, "")
 
     for bad, why in (
-            (dict(status="unknown", candidates=tuple(SNAP)), "非法 status"),
+            (dict(status="unknown", candidates=FROZEN), "非法 status"),
             (dict(candidates=()), "open 无候选"),
     ):
         try:
@@ -90,9 +94,10 @@ def test_dataclass_contract() -> None:
             candidates=({"name": "缺字段"},),
             created_at="2026-11-18T15:00:00",
             expires_at="2026-11-18T15:05:00")
-        check("缺冻结字段的快照被拦截", False, "未抛异常")
-    except ValueError as e:
-        check("缺冻结字段的快照被拦截", "candidate_id" in str(e), str(e))
+        check("dict 快照直构被拦截（须经 store 转换）", False, "未抛异常")
+    except TypeError as e:
+        check("dict 快照直构被拦截（须经 store 转换）",
+              "PendingCandidate" in str(e), str(e))
 
 
 def test_five_methods_lifecycle() -> None:
@@ -105,8 +110,9 @@ def test_five_methods_lifecycle() -> None:
     check("② get_active_pending 返回同一 pending",
           got is not None and got.pending_id == p.pending_id, str(got))
     out = st.consume_pending(p.pending_id, "c1")
-    check("③ consume 成功并回传所选候选（无行程动作）",
-          out.ok and out.candidate == SNAP[0], str(out))
+    check("③ consume 成功并回传所选候选（frozen，无行程动作）",
+          out.ok and isinstance(out.candidate, PendingCandidate)
+          and out.candidate.candidate_id == "c1", str(out))
     check("③ consume 后 status=consumed",
           st.get_pending_by_id(p.pending_id).status == PENDING_CONSUMED, "")
     check("③ 消费后无 active pending（单 active 契约）",
@@ -215,9 +221,74 @@ def test_single_active_and_rules() -> None:
           not out.ok and "过期" in out.reason, str(out))
 
 
+def test_immutable_snapshot_p21() -> None:
+    """P2.1 专项：快照真正不可变 + 接口兼容（验收冻结项）。"""
+    st = PendingStore()
+    src = [_snap("c1", 1, "海贝皇大排档（南京店）", "南京"),
+           _snap("c2", 2, "海贝皇大排档（上海店）", "上海")]
+    p = st.create_pending("排海贝皇大排档", "plan_modify", "must_visit", src)
+
+    # 验收点：输入 dict 后续修改不能污染 Pending 快照
+    src[0]["name"] = "被污染的名字"
+    src[0]["city"] = "被污染的城市"
+    got = st.get_active_pending()
+    check("入参 dict 事后修改不污染快照",
+          got.candidates[0].name == "海贝皇大排档（南京店）"
+          and got.candidates[0].city == "南京",
+          f"{got.candidates[0].name}/{got.candidates[0].city}")
+
+    # 验收点：PendingCandidate 必须是真正的 frozen dataclass
+    try:
+        p.candidates[0].name = "另一个地点"
+        check("候选字段赋值被拦截（真正不可变）", False, "未抛异常")
+    except Exception as e:
+        from dataclasses import FrozenInstanceError
+        check("候选字段赋值被拦截（真正不可变）",
+              isinstance(e, FrozenInstanceError), str(e))
+
+    # 验收点：candidate_by_id 返回 frozen 结构，无 dict 可改路径
+    c = got.candidate_by_id("c1")
+    check("candidate_by_id 返回 frozen PendingCandidate",
+          isinstance(c, PendingCandidate)
+          and c.__dataclass_params__.frozen, str(type(c)))
+    check("candidate_as_dict 兼容旧调用方（拷贝 dict）",
+          got.candidate_as_dict("c1")["name"] == "海贝皇大排档（南京店）"
+          and got.candidate_as_dict("999") is None, "")
+    check("snapshot_candidate_ids 行为与返回结构不变",
+          got.snapshot_candidate_ids() == ("c1", "c2"), "")
+
+    # 验收点：as_dict 外部结构保持兼容（list[dict]，六字段齐全）
+    d = got.as_dict()
+    check("as_dict 外部结构兼容",
+          isinstance(d["candidates"], list)
+          and all(isinstance(x, dict) and set(x) == {
+              "candidate_id", "display_order", "entity_id", "name",
+              "city", "address"} for x in d["candidates"]), str(d))
+
+    # 消费语义回归：frozen 候选贯穿 consume 结果与状态迁移
+    out = st.consume_pending(p.pending_id, "c2")
+    check("frozen 候选贯穿消费（快照外仍拒绝）",
+          out.ok and out.candidate.name == "海贝皇大排档（上海店）", str(out))
+    check("消费后再次消费仍被拒绝（原子语义不变）",
+          not st.consume_pending(p.pending_id, "c1").ok, "")
+
+    # 缺字段 / 坏序号的 dict 在 store 转换处被拦截
+    for bad, why in (
+            ([{"candidate_id": "c9"}], "缺冻结字段"),
+            ([_snap("c1", 2, "店", "城"), _snap("c2", 2, "店", "城")],
+             "序号非 1..N"),
+    ):
+        try:
+            st.create_pending("x", "poi_qa", "query", bad)
+            check(f"store 转换拦截：{why}", False, "未抛异常")
+        except ValueError:
+            check(f"store 转换拦截：{why}", True, "")
+
+
 def main() -> int:
     for fn in (test_dataclass_contract, test_five_methods_lifecycle,
-               test_atomic_consume, test_single_active_and_rules):
+               test_atomic_consume, test_single_active_and_rules,
+               test_immutable_snapshot_p21):
         fn()
     print(f"\npending contract: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

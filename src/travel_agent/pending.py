@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 # ---- pending 状态枚举（§7） ----
@@ -50,6 +50,47 @@ def _iso(dt: datetime) -> str:
 
 
 @dataclass(frozen=True)
+class PendingCandidate:
+    """候选快照的单条记录（P2.1 冻结结构）。
+
+    frozen dataclass：外部拿到 Pending 对象后**无法**修改历史候选
+    （frozen 只防字段重赋值，因此候选绝不用 dict 承载——dict 可被
+    `c["name"] = …` 改动，违反快照冻结契约）。"""
+
+    candidate_id: str
+    display_order: int          # 展示序号（1..N，冻结）
+    entity_id: str | None
+    name: str
+    city: str
+    address: str | None
+
+    def as_dict(self) -> dict:
+        """序列化输出（形状与 P1.5 dict 快照完全兼容）。"""
+        return {"candidate_id": self.candidate_id,
+                "display_order": self.display_order,
+                "entity_id": self.entity_id,
+                "name": self.name,
+                "city": self.city,
+                "address": self.address}
+
+
+def _candidate_from_dict(d: dict) -> PendingCandidate:
+    """dict 快照 → PendingCandidate（store 转换入口，字段校验）。
+
+    拷贝语义：转换即脱离调用方 dict，入参后续修改不污染快照。"""
+    missing = [k for k in SNAPSHOT_FIELDS if k not in d]
+    if missing:
+        raise ValueError(f"候选快照缺少冻结字段：{missing}")
+    return PendingCandidate(
+        candidate_id=str(d["candidate_id"]),
+        display_order=int(d["display_order"]),
+        entity_id=d.get("entity_id"),
+        name=str(d["name"]),
+        city=str(d["city"]),
+        address=d.get("address"))
+
+
+@dataclass(frozen=True)
 class PendingDisambiguation:
     """一次执行阻断（action=clarify）对应的消歧状态快照。
 
@@ -61,7 +102,7 @@ class PendingDisambiguation:
     original_utterance: str       # 触发消歧的原始句子
     original_intent: str          # 当时的细分意图
     original_role: str            # 候选当时的角色
-    candidates: tuple[dict, ...]  # 候选快照（字段见 SNAPSHOT_FIELDS，冻结）
+    candidates: tuple[PendingCandidate, ...]  # 冻结候选快照
     created_at: str               # ISO 时间
     expires_at: str               # 过期时间
     status: str = PENDING_OPEN    # open / consumed / cancelled / expired
@@ -74,29 +115,40 @@ class PendingDisambiguation:
             raise ValueError("original_utterance 不得为空")
         if self.status == PENDING_OPEN and not self.candidates:
             raise ValueError("open 状态的 pending 至少需要一个候选快照")
-        orders = []
         for c in self.candidates:
-            missing = [k for k in SNAPSHOT_FIELDS if k not in c]
-            if missing:
-                raise ValueError(f"候选快照缺少冻结字段：{missing}")
-            orders.append(c["display_order"])
+            if not isinstance(c, PendingCandidate):
+                raise TypeError(
+                    "候选快照必须是 PendingCandidate 冻结结构，"
+                    f"收到 {type(c).__name__}（dict 快照请经 "
+                    "PendingStore.create_pending 转换）")
+        orders = [c.display_order for c in self.candidates]
         if orders and sorted(orders) != list(range(1, len(orders) + 1)):
             raise ValueError(f"display_order 必须是 1..N 连续序号，"
                              f"实际 {sorted(orders)}")
-        if len({c["candidate_id"] for c in self.candidates}) != \
+        if len({c.candidate_id for c in self.candidates}) != \
                 len(self.candidates):
             raise ValueError("candidate_id 在快照内必须唯一")
 
     def snapshot_candidate_ids(self) -> tuple[str, ...]:
-        """快照内全部合法 candidate_id（规则 9 的判定依据）。"""
-        return tuple(c["candidate_id"] for c in self.candidates)
+        """快照内全部合法 candidate_id（规则 9 的判定依据）。
 
-    def candidate_by_id(self, candidate_id: str) -> dict | None:
-        """按 ID 取快照内候选；快照外 ID 返回 None（绝不外推）。"""
+        行为与返回结构与 P1.5 完全一致。"""
+        return tuple(c.candidate_id for c in self.candidates)
+
+    def candidate_by_id(self, candidate_id: str) -> PendingCandidate | None:
+        """按 ID 取快照内候选（frozen，不可变）；快照外 ID 返回 None。
+
+        P2.1 起返回 PendingCandidate；需要 dict 的调用方用
+        candidate_as_dict()。"""
         for c in self.candidates:
-            if c["candidate_id"] == candidate_id:
-                return dict(c)   # 拷贝：调用方改动不影响冻结快照
+            if c.candidate_id == candidate_id:
+                return c
         return None
+
+    def candidate_as_dict(self, candidate_id: str) -> dict | None:
+        """按 ID 取快照内候选的 dict 拷贝（兼容旧调用方）。"""
+        c = self.candidate_by_id(candidate_id)
+        return c.as_dict() if c is not None else None
 
     def as_dict(self) -> dict:
         return {
@@ -104,7 +156,7 @@ class PendingDisambiguation:
             "original_utterance": self.original_utterance,
             "original_intent": self.original_intent,
             "original_role": self.original_role,
-            "candidates": [dict(c) for c in self.candidates],
+            "candidates": [c.as_dict() for c in self.candidates],
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "status": self.status,
@@ -151,7 +203,7 @@ class PendingStore:
                 raise ValueError(
                     f"已存在 active pending（{self._active.pending_id}），"
                     "同一 Session 同时最多一个可消费的 active pending")
-            snap = tuple(dict(c) for c in candidates)
+            snap = tuple(_candidate_from_dict(c) for c in candidates)
             p = PendingDisambiguation(
                 pending_id=self._id_gen(),
                 original_utterance=original_utterance,
@@ -213,8 +265,7 @@ class PendingStore:
                     ok=False, pending_id=pending_id,
                     reason=f"pending 状态为 {p.status}，不可消费")
             if self._is_expired(p):
-                p = PendingDisambiguation(
-                    **{**p.as_dict(), "status": PENDING_EXPIRED})
+                p = replace(p, status=PENDING_EXPIRED)
                 self._active = p
                 return _ConsumeOutcome(
                     ok=False, pending_id=pending_id,
@@ -224,8 +275,7 @@ class PendingStore:
                     ok=False, pending_id=pending_id,
                     reason="candidate_id 不在原快照内，一律拒绝（规则 9）")
             # ---- 条件迁移：检查与写入同锁，open→consumed 单次成功 ----
-            consumed = PendingDisambiguation(
-                **{**p.as_dict(), "status": PENDING_CONSUMED})
+            consumed = replace(p, status=PENDING_CONSUMED)
             self._active = consumed
             return _ConsumeOutcome(
                 ok=True, pending_id=pending_id,
@@ -244,8 +294,7 @@ class PendingStore:
                 return _ConsumeOutcome(
                     ok=False, pending_id=pending_id,
                     reason=f"pending 状态为 {p.status}，不可取消")
-            self._active = PendingDisambiguation(
-                **{**p.as_dict(), "status": PENDING_CANCELLED})
+            self._active = replace(p, status=PENDING_CANCELLED)
             return _ConsumeOutcome(ok=True, pending_id=pending_id)
 
     # -------------------------------------------------- ⑤ expire
@@ -261,8 +310,7 @@ class PendingStore:
                 return _ConsumeOutcome(
                     ok=False, pending_id=pending_id,
                     reason=f"pending 状态为 {p.status}，无需过期登记")
-            self._active = PendingDisambiguation(
-                **{**p.as_dict(), "status": PENDING_EXPIRED})
+            self._active = replace(p, status=PENDING_EXPIRED)
             return _ConsumeOutcome(ok=True, pending_id=pending_id)
 
     # -------------------------------------------------- 内部
