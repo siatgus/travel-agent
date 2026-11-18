@@ -321,6 +321,9 @@ class Session:
         self.asked_fields: set[str] = set()   # 已经问过的槽位，第二轮不再重复问
         self.last_good_dest: str | None = None  # 最近一次确认过有数据的目的地
         self.last_city: str | None = None     # 最近提到的城市（问天气后接着排行程要用）
+        # 本句查询绑定的城市（统一解析层 ParseResult.query_city 的会话级落点，
+        # 与 slots.destination 独立存储：查询类意图绝不改写目的地）
+        self.query_city: str | None = None
         self.weather_rounds = 0               # 连续问天气的轮数（避免每轮重复同一段引导）
         self.fetched: dict[str, dict] = {}    # 自动补全过的城市 → 结果（会话内去重）
         self.max_autofetch = 3                # 一次会话最多为几个新城市联网抓数据
@@ -364,6 +367,7 @@ class Session:
             "asked_fields": sorted(self.asked_fields),
             "last_good_dest": self.last_good_dest,
             "last_city": self.last_city,
+            "query_city": self.query_city,
             "weather_rounds": self.weather_rounds,
             "party_stated": self.party_stated,
             "trip_dest": self.trip_dest,
@@ -389,6 +393,7 @@ class Session:
         self.asked_fields = set(snap.get("asked_fields") or ())
         self.last_good_dest = snap.get("last_good_dest")
         self.last_city = snap.get("last_city")
+        self.query_city = snap.get("query_city")
         self.weather_rounds = int(snap.get("weather_rounds") or 0)
         self.party_stated = bool(snap.get("party_stated"))
         self.trip_dest = snap.get("trip_dest")

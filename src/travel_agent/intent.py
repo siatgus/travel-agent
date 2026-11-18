@@ -509,6 +509,12 @@ def food_keyword(text: str, city: str | None = None) -> str | None:
     cand = (text or "").strip("？?。！!，, 　~")
     if city and city in cand:
         cand = cand.replace(city, "", 1)
+    # 城市名绝不是菜品词（第二阶段修复，2026-11-17 语料事实）：city 参数
+    # 传错（传成行程目的地而非本句城市）时，「上海有哪些好吃的」会把
+    # 「上海」整个当品类词返回——这里把句中出现的任何已知城市都剥掉。
+    for _c in real_tools.CITY_GEO:
+        if _c in cand:
+            cand = cand.replace(_c, " ")
     area = food_area(text)
     if area and area in cand:
         cand = cand.replace(area, "", 1)     # 「春熙路附近的川菜馆」别把片区当菜系
@@ -1004,6 +1010,13 @@ def spot_mention(text: str, city: str | None = None) -> str | None:
         if trimmed != cand:
             cand, changed = trimmed, True
     cand = cand.strip("的了呀啊呢吧，, ")
+    # 路线/规划碎片绝不是景点名（第二阶段修复，2026-11-17 语料事实）：
+    # 「从大理到玩5天」曾被整串当景点候选——「从X到/去」是路线句式，
+    # 「玩N天/N天」是规划口径，真景点名不可能含这些。
+    if re.search(r"从.{1,6}(?:到|去)"
+                 r"|玩\s*[一二两三四五六七八九十\d]+\s*天"
+                 r"|[一二两三四五六七八九十\d]+\s*天\s*$", cand):
+        return None
     # 12-16 字的真实全名很常见：「国民政府中央广播电台旧址」（12）曾被
     # 10 字上限整条拒掉，问句被当成泛推荐、答一串不相干的热门景点（实测）。
     # 放宽到 16 后仍被疑问词/泛指词/开头词三道防线兜住误报。

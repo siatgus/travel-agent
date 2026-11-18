@@ -19,10 +19,17 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from datetime import date
 from pathlib import Path
+
+# —— 数据目录隔离：避免读到/写坏真实 kb.db（并行跑套件或主站在跑时会漂移，
+#    曾导致熊猫基地用例随机失败）。必须在导入 travel_agent 之前设置。——
+os.environ.setdefault("TRAVEL_DATA_DIR", tempfile.mkdtemp(prefix="dialogue-test-"))
+os.environ.setdefault("TRAVEL_APP_DB",
+                      os.path.join(tempfile.mkdtemp(prefix="dialogue-test-"), "t.db"))
 
 
 # —— src 布局引导：tests/scripts 无需安装即可导入 travel_agent 包 ——

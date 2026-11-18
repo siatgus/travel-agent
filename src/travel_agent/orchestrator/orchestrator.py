@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from .. import llm
 from ..dialogue import Reply
+from ..parser import parse_utterance
 from .context import TurnContext
 from .guard import GuardPipeline
 from .handlers import QA_HANDLERS
@@ -49,6 +50,14 @@ class Orchestrator:
         # 说话层/闲聊层带最近几轮（分类、抽取、校验层不读它，见 llm.attach_history）
         llm.attach_history(session.client, session._llm_history())
 
+        # ---- 1.5 统一解析（Phase 2）：一句话只完整解析一次，结果挂在
+        # ctx.parse 供路由/守卫/规划管道消费——任何模块不得再对原始句子
+        # 独立执行互相冲突的实体抽取。查询城市落在 session.query_city，
+        # 与 slots.destination 独立存储（查询类意图绝不改写目的地）。
+        ctx.parse = parse_utterance(utterance, context=session,
+                                    today=session.today)
+        session.query_city = ctx.parse.query_city
+
         # ---- 2. 明确咨询预判：周边问句分流（找吃的/找住的/两点路线）----
         # 「宽窄巷子附近有什么好吃的」一旦被当成「问宽窄巷子这个景点」，
         # 周边查询就提前结束；「从X怎么去Y」的「怎么去」还会撞上行程点名拦截。
@@ -68,7 +77,7 @@ class Orchestrator:
         # ---- 4. 意图路由：问天气/景点/班次/闲聊时直接答，不进排行程流水线 ----
         # 之前所有输入都被当成「补槽位」，于是问天气会被回「排行程还差 2 件事」，
         # 问到第三轮还会硬凑出一份别的城市的行程。
-        ir = self.router.route(session, utterance)
+        ir = self.router.route(session, utterance, parse=getattr(ctx, "parse", None))
         ctx.intent, ctx.intent_source = ir.name, ir.source
         ctx.city = ir.entities.get("city")
 

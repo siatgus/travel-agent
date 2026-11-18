@@ -51,6 +51,26 @@ class PlanHandler:
         delta = agent.extract_slots(utterance, today=session.today, client=session.client)
         explicit = _explicit_fields(utterance, delta)
 
+        # 写入权限表（Phase 2，统一解析层裁定）：查询类意图只允许写
+        # query_city（已落在 session.query_city），不得修改 destination。
+        # 闸门只拦「查询句式漏进规划管道」的情况：解析层判为非规划意图
+        # + 句子本身是问句 + 抽出的目的地就是本句查询城市。像「我想下个
+        # 月去大理」这种不带规划关键词的陈述句不拦——那是规划管道的
+        # 槽位机器在兜底，拦了反而把正常规划堵死（test_reply 实测回归）。
+        parsed = getattr(ctx, "parse", None)
+        if parsed is not None and not parsed.destination_writable \
+                and "destination" in explicit and delta.get("destination") \
+                and delta["destination"] == parsed.query_city \
+                and intent.looks_like_question(utterance):
+            _dropped_city = delta["destination"]
+            delta = dict(delta)
+            delta["destination"] = None
+            explicit.discard("destination")
+            lead_notes = [f"「{_dropped_city}」按查询城市记录，"
+                          f"没有改动行程目的地"]
+        else:
+            lead_notes = []
+
         # 裸数字回答（2026-11-17 用户实测）：追问「几个人出行？」后用户只回
         # 「1」——人数正则要求「N个人」这类说法，裸数字不命中，抽取器也认不出，
         # 于是明明答了还被追问第二遍（追问 2/2 复读）。按上一轮追问的字段
@@ -66,7 +86,7 @@ class PlanHandler:
                 delta = dict(delta)
                 delta["days"] = _n
                 explicit.add("days")
-        lead_notes: list[str] = []
+        # （lead_notes 已在写入权限闸处初始化：默认空，命中闸时带说明）
         # 这轮改动前的槽位：用来判断"用户要的调整是不是本来就已经满足"
         prev_slots = dict(session.slots or {})
 

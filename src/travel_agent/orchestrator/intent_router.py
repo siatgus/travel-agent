@@ -37,7 +37,8 @@ class IntentResult:
 class IntentRouter:
     """规则优先、LLM 兜底（受限）的意图路由。"""
 
-    def route(self, session, utterance: str) -> IntentResult:
+    def route(self, session, utterance: str,
+              parse=None) -> IntentResult:
         # ---- 规则分类 ----
         kind = intent.classify(utterance)
         source = "rule"
@@ -47,13 +48,24 @@ class IntentRouter:
             alt = llm.classify_intent(session.client, utterance)
             if alt in _LLM_KINDS:
                 kind, source = alt, "llm"
-        # ---- 城市实体：本句里的城市 > 当前行程目的地 > 最近提到的城市 ----
-        city = (intent.city_in(utterance) or session.slots.get("destination")
-                or session.last_city or session.trip_dest)
+        # ---- 城市实体：消费统一解析结果（Phase 2 迁移）----
+        # ParseResult.query_city 已按「本句城市 > 行程目的地 > 最近城市」
+        # 的同一优先级绑定查询城市；destination 是独立字段，查询类意图
+        # 不会吸收本句城市（写入权限表）。无解析结果时走原逻辑兜底。
+        if parse is not None:
+            city = (parse.query_city or parse.destination
+                    or session.last_city or session.trip_dest)
+            entities = {"city": city,
+                        "query_city": parse.query_city,
+                        "destination": parse.destination}
+        else:
+            city = (intent.city_in(utterance) or session.slots.get("destination")
+                    or session.last_city or session.trip_dest)
+            entities = {"city": city}
         # ---- 规则兜底：other 且点名了收录景点在问细节（「宽窄巷子是什么地方」）
         # → 按景点问答处理。无模型时实测这句落进补槽位流程，被追问「想去哪儿」。
         if kind == "other" and intent.is_spot_qa(utterance) and city:
             kind, source = "poi", "rule:spot_qa"
         confidence = {"rule": 1.0, "rule:spot_qa": 0.95, "llm": 0.6}[source]
         return IntentResult(name=kind, confidence=confidence, source=source,
-                            entities={"city": city})
+                            entities=entities)

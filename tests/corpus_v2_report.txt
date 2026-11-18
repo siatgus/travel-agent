@@ -1,0 +1,82 @@
+========================================================================
+语料库 v2 报告（第二阶段：统一解析 Schema + 三城市字段拆分）
+基线 commit：842170b（v1 冻结）    固定 today：2026-11-17
+Schema 字段来自 parse_utterance（新 Schema 唯一事实源）
+========================================================================
+
+[C01] exclude_poi  「不想去豫园」  →  REGRESSION
+    回复：mode=plan  plan=True  「## 上海 3 天行程 · 起 2026-12-20 > 假设：未提供出发地，方案不含往返大交通（班次与费用）；定了出发地告诉我，我补上班次并更新预算；往返大交通未计入预算（班次票价未查到或未提供出发地），出发前请自行查票价确认；已按你的要」
+    query_city: FAIL  期望=上海  实际=None
+    负向[ok] destination_not=豫园  实际 destination='上海'
+    负向[FAIL] plan_not_contains=豫园  方案含：['南翔馒头店（豫园店）']
+
+[C02] remove_poi  「去掉苍山」  →  PASS
+    回复：mode=plan  plan=True  「## 大理 3 天行程 · 起 2026-12-20 > 假设：未提供出发地，方案不含往返大交通（班次与费用）；定了出发地告诉我，我补上班次并更新预算；往返大交通未计入预算（班次票价未查到或未提供出发地），出发前请自行查票价确认；已按你的要」
+    负向[ok] kb_no_poi=掉苍山  KB 无污染
+    负向[ok] plan_not_contains=苍山  方案不含该点
+
+[C03] plan_create  「从大理到丽江玩5天」  →  PASS
+    回复：mode=clarify  plan=False  「大概什么时候出发？ （错开节假日，机票酒店能便宜三成）」
+    负向[ok] destination_not=大理  实际 destination='丽江'
+
+[C04] poi_intro  「宽窄巷子是什么地方」  →  SCHEMA-GAP
+    回复：mode=clarify  plan=False  「你想去哪儿？给我城市名就能开始排。 （只想先了解情况也可以问：某地天气、城际班次、城市景点）」
+    query_city: SCHEMA-GAP  期望=成都  实际=None  (需实体解析（POI→城市），第三/四阶段实现)
+    负向[ok] destination_not=成都  实际 destination=None
+
+[C05] poi_location  「老驴头驴肉火烧在哪里」  →  PASS
+    回复：mode=answer  plan=True  「**邯郸 · 老驴头驴肉火烧**： - **老驴头驴肉火烧**（丛台区，建议留 45 分钟，人均 25 元，06:30-19:30）  想把它排进行程？说「我想去老驴头驴肉火烧」我就重排。」
+    负向[ok] destination_keep  上下文后='邯郸'，最终='邯郸'
+    负向[ok] plan_delta_no_new=老驴头  原有 7 个节点，本轮新增 0 个，差量为零
+    负向[ok] plan_structure_keep  方案结构保持：7 个节点、2 天，名称/类型/天序/天内顺序均未变
+
+[C06] category_query  「成都有没有中小型游乐园」  →  PASS
+    回复：mode=answer  plan=False  「我在网上查了一下，摘几条供参考： - **成都游乐园_百度百科**：成都游乐园是位于四川省成都市成华区一环路东二段（东郊一号桥头府河畔）的集科学、体育、游乐于一体的多功能综合性大型公园， … - **成都十大亲子景区·动物园·主题乐园 成都」
+    负向[ok] destination_not=成都  实际 destination=None
+
+[C07] unknown_restaurant_add  「那给我排上海贝皇大排档」  →  PASS
+    回复：mode=plan  plan=True  「## 成都 2 天行程 · 起 2026-12-20 > 假设：未提供出发地，方案不含往返大交通（班次与费用）；定了出发地告诉我，我补上班次并更新预算；预算内（≤480 元/晚）没有可用住宿，已放宽到 900.0 元/晚的锦江宾馆；往返大交」
+    负向[ok] destination_not=上海  实际 destination='成都'
+    负向[ok] candidate_not=上海  候选无污染
+
+[C08] long_poi_intro  「国民政府中央广播电台旧址介绍一下」  →  PASS
+    回复：mode=answer  plan=False  「你想问哪个城市的景点？告诉我城市，我把值得去的地方列出来。」
+    负向[ok] destination_null  实际 destination=None
+
+[C09] nearby_food  「南京中山陵景区附近有什么吃的」  →  PASS
+    回复：mode=answer  plan=False  「**南京** 值得去的地方（按我的评分排序）： - **南京中山陵景区**（南京，约 180 分钟） —— 维基导游（CC BY-SA 4.0）；地址：江苏省南京市中山陵园风景区内；电话：02584446111 - **金陵大学旧址**（南」
+    负向[ok] destination_null  实际 destination=None
+    负向[ok] poi_category_not=中山陵景区  实际品类='restaurant'
+
+[C10] clarify_bare_number  「1」  →  PASS
+    回复：mode=plan  plan=True  「## 邯郸 6 天行程 · 起 2026-12-20 > 假设：未提供出发地，方案不含往返大交通（班次与费用）；定了出发地告诉我，我补上班次并更新预算；往返大交通未计入预算（班次票价未查到或未提供出发地），出发前请自行查票价确认 > 天气数」
+    负向[ok] no_repeated_question=几个人  未复读追问
+
+[C11] query_city_separation  「上海有哪些好吃的」  →  PASS
+    回复：mode=answer  plan=True  「上海的特色美食，给你介绍几个代表： - **小笼包**（小吃）：皮薄汁多的蒸包，南翔小笼最负盛名。 先开窗、后吸汤，蘸姜丝香醋。 - **生煎馒头**（小吃）：底脆汁丰的煎包，上海早餐双子星之一。 底部金黄焦脆，撒芝麻葱花，先咬小口防烫。 」
+    负向[ok] destination_keep  上下文后='成都'，最终='成都'
+    负向[ok] destination_not=上海  实际 destination='成都'
+
+[C12] cross_city_add  「那给我排国民政府中央广播电台旧址」  →  SCHEMA-GAP
+    回复：mode=answer  plan=True  「行程已经在上面了。想改的话直接说：加减景点（「加个XX」「不想去XX」）、改节奏（「别太赶」）、改天数、换城市都行；问景点、问吃的、问天气也随便聊。」
+    poi_candidates: SCHEMA-GAP  期望=[{'name': '国民政府中央广播电台旧址', 'entity_type': 'attraction', 'city': '南京'}]  实际=[]  (候选抽取为部分映射，待第三阶段识别瀑布)
+    负向[ok] plan_not_contains=国民政府中央广播电台旧址  方案不含该点
+    负向[ok] kb_no_write_city=上海,name_contains=广播电台  上海 库无污染
+
+========================================================================
+总计 12 条 | PASS 9 | SCHEMA-GAP 2（待三/四阶段） | REGRESSION 1 | MIXED 0 | ERROR 0
+------------------------------------------------------------------------
+新旧结果差异（v1 冻结基线 → v2 本阶段）：
+    C01: MIXED → REGRESSION  ← 变化
+    C02: SCHEMA-GAP → PASS  ← 变化
+    C03: REGRESSION → PASS  ← 改善
+    C04: REGRESSION → SCHEMA-GAP  ← 改善
+    C05: REGRESSION → PASS  ← 改善
+    C06: SCHEMA-GAP → PASS  ← 变化
+    C07: SCHEMA-GAP → PASS  ← 变化
+    C08: SCHEMA-GAP → PASS  ← 变化
+    C09: REGRESSION → PASS  ← 改善
+    C10: SCHEMA-GAP → PASS  ← 变化
+    C11: REGRESSION → PASS  ← 改善
+    C12: REGRESSION → SCHEMA-GAP  ← 改善
+========================================================================

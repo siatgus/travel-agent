@@ -11,13 +11,22 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from datetime import date, timedelta
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+# 数据目录隔离（2026-11-17）：此前用真实 kb.db，用户实测会话抓回的
+# 「鹤壁」POI（黄花寺等）让"没数据不瞎编"用例随机挂——本套件改为
+# 独立临时目录，与语料执行器同风格。已显式设置的变量不覆盖。
+os.environ.setdefault("TRAVEL_DATA_DIR", tempfile.mkdtemp(prefix="intent-test-"))
+os.environ.setdefault("TRAVEL_APP_DB",
+                      os.path.join(tempfile.mkdtemp(prefix="intent-test-"), "t.db"))
 
 
 # —— src 布局引导：tests/scripts 无需安装即可导入 travel_agent 包 ——

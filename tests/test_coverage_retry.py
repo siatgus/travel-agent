@@ -19,9 +19,17 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
+
+# 数据目录隔离（2026-11-17）：鹤壁补库失败契约依赖「库里没有鹤壁」，
+# 真实 kb.db 被实测会话写入鹤壁数据后该前提失效——改用独立临时目录。
+os.environ.setdefault("TRAVEL_DATA_DIR", tempfile.mkdtemp(prefix="covretry-test-"))
+os.environ.setdefault("TRAVEL_APP_DB",
+                      os.path.join(tempfile.mkdtemp(prefix="covretry-test-"), "t.db"))
 
 # —— src 布局引导：tests/scripts 无需安装即可导入 travel_agent 包 ——
 _TA_ROOT = Path(__file__).resolve().parents[1]

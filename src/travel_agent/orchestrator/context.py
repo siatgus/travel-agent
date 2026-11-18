@@ -30,6 +30,9 @@ class TurnContext:
     intent: str | None = None         # IntentRouter 给出的最终意图
     intent_source: str | None = None  # rule / llm / rule:spot_qa
     entities: dict = field(default_factory=dict)
+    # 统一解析结果（Phase 2）：每轮由 Orchestrator 调 parse_utterance 恰好
+    # 一次，路由/守卫/规划管道都消费它，不再各自重复抽取
+    parse: object | None = None
 
     tool_results: dict = field(default_factory=dict)   # 本轮工具调用摘要
     route: str | None = None          # qa_nearby / qa_plan_spot / qa / plan / guard
