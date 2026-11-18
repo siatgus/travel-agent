@@ -1764,6 +1764,55 @@ def test_meta_question_answered() -> None:
           f"mode={r6.mode} {r6.render[:80]}")
 
 
+def test_nearby_unknown_anchor_fetches_or_honest() -> None:
+    """锚点不在库里时：先定向补库，补到真坐标就答周边；
+    补不到就诚实说收录不到——绝不能落进泛推荐答一串不相干景点
+    （2026-11-18 实测「宝船遗址公园附近有什么吃的」回了外滩/东方明珠）。"""
+    from travel_agent import autofetch as af
+    from travel_agent import kb as kb_mod
+
+    t = "宝船遗址公园附近有什么吃的"
+
+    # 1) 补库拿到真实坐标（高德）→ 走周边美食查询
+    orig = af.ensure_spot
+    af.ensure_spot = lambda city, name, **kw: {
+        "status": "fetched", "city": city, "name": name,
+        "poi": {"name": name, "category": "attraction",
+                "geo": [31.21, 121.49]},
+        "source": "amap", "message": "补到了"}
+    try:
+        s1 = Session(today=TODAY)
+        s1.slots["destination"] = "上海"
+        s1._rest_fetched = {}
+        kb_mod.get_kb().upsert_poi("上海", {
+            "name": "老码头菜馆", "category": "restaurant",
+            "geo": [31.215, 121.495], "appeal": 4, "cost": 60,
+            "tags": ["本帮菜"]}, source="test")
+        r1 = s1.turn(t)
+        check("未收录锚点补库后按周边美食作答",
+              "宝船遗址公园周边美食" in r1.render, r1.render[:160])
+        check("不再落进泛推荐",
+              not ("外滩" in r1.render and "东方明珠" in r1.render),
+              r1.render[:160])
+    finally:
+        af.ensure_spot = orig
+
+    # 2) 补库也拿不到坐标（离线）→ 诚实回答
+    af.ensure_spot = lambda city, name, **kw: {
+        "status": "not_found", "city": city, "name": name,
+        "poi": None, "source": "", "message": "没查到"}
+    try:
+        s2 = Session(today=TODAY)
+        s2.slots["destination"] = "上海"
+        r2 = s2.turn(t)
+        check("收录不到时如实说明", "收录不到" in r2.render, r2.render[:160])
+        check("诚实回答不是泛推荐",
+              not ("外滩" in r2.render and "东方明珠" in r2.render),
+              r2.render[:160])
+    finally:
+        af.ensure_spot = orig
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1823,6 +1872,7 @@ def main() -> int:
                test_day_change_keeps_days_and_places_spot,
                test_stay_question_lists_hotels_not_replan,
                test_nearby_food_hotel_route_split,
+               test_nearby_unknown_anchor_fetches_or_honest,
                test_stay_question_triggers_hotel_autofill,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):

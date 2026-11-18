@@ -923,8 +923,13 @@ def poi_answer(city: str, client=None) -> str:
     said = _speak(client, "poi", facts, f"{city}有什么好玩的",
                   [p["name"] for p in items[:3] if p.get("name")])
     if said:
-        return (said + "\n\n想待几天？告诉我天数，我可以按这些地方排一版带真实交通和天气的行程。"
-                + fetch_note)
+        # 提示词要求模型自己带这句引导（实测常带），这里只在它没说时补——
+        # 无条件拼接会变成截图里那种连续问两遍「想待几天」。
+        tail = ("\n\n想待几天？告诉我天数，我可以按这些地方排一版"
+                "带真实交通和天气的行程。")
+        if "想待几天" in said:
+            tail = ""
+        return said + tail + fetch_note
 
     lines = [f"**{city}** 值得去的地方（按我的评分排序）："]
     for p in items:

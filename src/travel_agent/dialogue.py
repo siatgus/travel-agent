@@ -702,7 +702,26 @@ class Session:
         anchor = intent.nearby_anchor(utterance, city) or ""
         base = self._resolve_spot(city, anchor)
         if not (base and base.get("geo")):
-            return None          # 锚点没收录：交回普通景点/餐厅流程
+            # 锚点没收录：先定向补库（高德/模型，与排程时同一条通道），
+            # 补到真实坐标就继续周边查询——「宝船遗址公园附近有什么吃的」
+            # 之前在这里直接交回普通流程，落进泛推荐答一串外滩豫园（实测）。
+            r = autofetch.ensure_spot(city, anchor, client=self.client)
+            if r.get("status") in ("exists", "fetched") and (r.get("poi") or {}).get("geo"):
+                base = r["poi"]
+            elif r.get("status") == "other_city":
+                # 锚点真实位置在别的城市：如实说，不硬在本城找周边
+                return (r.get("message") or f"「{anchor}」不在{city}。")
+            elif r.get("status") in ("custom", "rejected", "no_kb", "disabled",
+                                     "unresolved", "not_found"):
+                # 拿不到真实坐标（rejected 是解析碎片，交回普通流程；其余
+                # 如实说收录不到——按市区估算的坐标算周边会答错位置）
+                if r.get("status") == "rejected":
+                    return None
+                return (f"「{anchor}」我这边收录不到真实位置，"
+                        f"周边的{'美食' if intent.is_nearby_food_question(utterance) else '酒店'}"
+                        f"不敢瞎报。\n可以问「{city}有什么"
+                        f"{'好吃的' if intent.is_nearby_food_question(utterance) else '酒店'}」"
+                        f"，或排行程时让我安排。")
         if intent.is_nearby_food_question(utterance):
             return self._restaurant_nearby_qa(city, utterance, anchor, base)
         return self._hotel_nearby_qa(city, utterance, anchor, base)
