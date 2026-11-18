@@ -63,25 +63,33 @@ def load_cases() -> list[dict]:
 
 
 def _probe_from(case: dict):
-    """语料 probe 列 → probe_fn / allow_online。"""
+    """语料 probe 列 → probe_fn / review_fn / allow_online。"""
     probe = (case.get("probe") or "none").strip()
     if probe == "none":
-        return None, False           # KB-only
+        return None, None, False           # KB-only
     spec = json.loads(probe)
     if spec["mode"] == "raise":
         def probe_fn(city, name, etype):
             raise ConnectionError("模拟网络不可用")
-        return probe_fn, True
+        return probe_fn, None, True
     if spec["mode"] == "none":
         def probe_fn(city, name, etype):
             return []
-        return probe_fn, True
+        return probe_fn, None, True
+    if spec["mode"] == "dual_none":
+        # P0：主源与复核源均成功且均无匹配（rejected 充分证据）
+        def probe_fn(city, name, etype):
+            return []
+        def review_fn(city, name, etype):
+            return []
+        return probe_fn, review_fn, True
     if spec["mode"] == "rows":
         def probe_fn(city, name, etype):
             return [er.MatchRow(city=city, name=nm, category=cat, area=area,
                                 source="amap_online", origin="online")
                     for nm, cat, area in spec["rows"]]
-        return probe_fn, True
+        return probe_fn, None, True
+    return None, None, False
 
 
 def _kb_from(case: dict):
@@ -96,9 +104,10 @@ def run_case(case: dict) -> None:
     expected = json.loads(case["expected"] or "[]")
 
     ext = extract(utt, ctx)
-    probe_fn, online = _probe_from(case)
+    probe_fn, review_fn, online = _probe_from(case)
     rr = er.resolve(ext.poi_candidates, ctx, kb_provider=_kb_from(case),
-                    probe_fn=probe_fn, allow_online=online)
+                    probe_fn=probe_fn, review_fn=review_fn,
+                    allow_online=online)
 
     got = {r.text: r for r in rr.resolved}
     for exp in expected:
@@ -114,6 +123,10 @@ def run_case(case: dict) -> None:
             check(f"[{cid}] 「{exp['text']}」probe={exp['probe_status']}",
                   d["probe_status"] == exp["probe_status"],
                   f"实际 {d['probe_status']}")
+        if "probe_reason" in exp:
+            check(f"[{cid}] 「{exp['text']}」probe_reason={exp['probe_reason']}",
+                  d["probe_reason"] == exp["probe_reason"],
+                  f"实际 {d['probe_reason']}")
         if "ambiguity_reason" in exp:
             check(f"[{cid}] 「{exp['text']}」reason={exp['ambiguity_reason']}",
                   d["ambiguity_reason"] == exp["ambiguity_reason"],

@@ -66,7 +66,7 @@ def test_kb_unique_confirmed() -> None:
     check("城市一致 city_check=match", rc.city_check == "match", rc.city_check)
     check("类型一致 type_check=match", rc.type_check == "match", rc.type_check)
     check("置信度 0.92", abs(rc.confidence - 0.92) < 1e-6, str(rc.confidence))
-    check("无需在线探测", rc.probe_status == "kb_hit", rc.probe_status)
+    check("无需在线探测", rc.probe_status == "not_applicable", rc.probe_status)
 
 
 def test_cross_city_mismatch() -> None:
@@ -126,7 +126,7 @@ def test_type_mismatch() -> None:
 
 
 def test_probe_contract() -> None:
-    """铁律：unavailable ≠ not_found；rejected 必须有 not_found 依据。"""
+    """v3.2.1 探测契约：枚举冻结、reason、逐源 probe_results、双源分流。"""
     ctx = {"slots": {"destination": "成都"}}
 
     def probe_ok(city, name, etype):
@@ -142,18 +142,55 @@ def test_probe_contract() -> None:
     base = kb_provider([])
     r1 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
                     probe_fn=probe_ok, allow_online=True)
-    check("在线命中 → confirmed/online_hit",
-          r1.resolved[0].status == "confirmed"
-          and r1.resolved[0].probe_status == "online_hit",
-          f"{r1.resolved[0].status}/{r1.resolved[0].probe_status}")
+    rc1 = r1.resolved[0]
+    check("在线命中 → confirmed/success_hit",
+          rc1.status == "confirmed"
+          and rc1.probe_status == "success_hit",
+          f"{rc1.status}/{rc1.probe_status}")
+    check("逐源明细：主源 success_hit",
+          rc1.probe_results == [{"source": "amap", "outcome": "success_hit",
+                                 "reason": ""}],
+          str(rc1.probe_results))
+    check("主源命中组合合法",
+          not er.validate_probe_combo(rc1.status, rc1.probe_status,
+                                      rc1.probe_reason, rc1.probe_results),
+          "")
 
     r2 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
                     probe_fn=probe_empty, allow_online=True)
     rc2 = r2.resolved[0]
-    check("探测成功确认没有 → rejected/not_found",
-          rc2.status == "rejected" and rc2.probe_status == "not_found",
+    check("单源空结果 → 保守 unverified/not_found（绝不 rejected）",
+          rc2.status == "unverified" and rc2.probe_status == "not_found",
           f"{rc2.status}/{rc2.probe_status}")
-    check("rejected 保留原始表达", rc2.text == "幻影基地", rc2.text)
+    check("单源空 reason=data_source_empty",
+          rc2.probe_reason == "data_source_empty", rc2.probe_reason)
+    check("复核源未配置 → 明细 skipped/not_configured",
+          any(p["source"] == "wikivoyage" and p["outcome"] == "skipped"
+              for p in rc2.probe_results), str(rc2.probe_results))
+    check("单源空保留原始表达，不下「不存在」结论",
+          rc2.text == "幻影基地"
+          and not any("不存在" in n for n in rc2.notes), str(rc2.notes))
+
+    # 双源复核均空 → 才允许 rejected（v3.2.1 §1.2 充分证据）
+    def review_empty(city, name, etype):
+        return []
+
+    r2b = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
+                     probe_fn=probe_empty, review_fn=review_empty,
+                     allow_online=True)
+    rc2b = r2b.resolved[0]
+    check("双源均空 → rejected/not_found",
+          rc2b.status == "rejected" and rc2b.probe_status == "not_found",
+          f"{rc2b.status}/{rc2b.probe_status}")
+    check("rejected reason=cross_source_empty",
+          rc2b.probe_reason == "cross_source_empty", rc2b.probe_reason)
+    check("rejected 措辞：规定范围内没有找到，不绝对断言",
+          any("没有找到" in n for n in rc2b.notes)
+          and not any("不存在" in n for n in rc2b.notes), str(rc2b.notes))
+    check("rejected 组合合法（≥2 源 success_empty）",
+          not er.validate_probe_combo(rc2b.status, rc2b.probe_status,
+                                      rc2b.probe_reason, rc2b.probe_results),
+          str(rc2b.probe_results))
 
     r3 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
                     probe_fn=probe_down, allow_online=True)
@@ -162,15 +199,150 @@ def test_probe_contract() -> None:
           rc3.status == "unverified"
           and rc3.probe_status == "unavailable",
           f"{rc3.status}/{rc3.probe_status}")
+    check("unavailable 必带 reason=network_timeout",
+          rc3.probe_reason == "network_timeout", rc3.probe_reason)
     check("unavailable ≠ not_found", rc3.probe_status != "not_found",
           rc3.probe_status)
+    check("unavailable 逐源明细 failed",
+          rc3.probe_results[0]["outcome"] == "failed", str(rc3.probe_results))
 
     r4 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
                     probe_fn=probe_ok, allow_online=False)
     rc4 = r4.resolved[0]
-    check("KB-only 影子 → unverified/skipped",
-          rc4.status == "unverified" and rc4.probe_status == "skipped",
+    check("KB-only 影子 → unverified/not_requested",
+          rc4.status == "unverified"
+          and rc4.probe_status == "not_requested",
           f"{rc4.status}/{rc4.probe_status}")
+    check("not_requested reason=disabled_by_policy",
+          rc4.probe_reason == "disabled_by_policy", rc4.probe_reason)
+
+
+def test_dual_source_paths() -> None:
+    """双源复核三条分支：复核命中 / 一成一败 / 复核源不适用。"""
+    ctx = {"slots": {"destination": "成都"}}
+
+    def probe_empty(city, name, etype):
+        return []
+
+    def review_hit(city, name, etype):
+        return [er.MatchRow(city=city, name=name, category="attraction",
+                            source="wikivoyage_online", origin="online")]
+
+    def review_down(city, name, etype):
+        raise ConnectionError("复核源网络不可用")
+
+    base = kb_provider([])
+
+    # ① 主源空 + 复核源命中 → 证据存在，按命中分流，来源如实标注
+    r1 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
+                    probe_fn=probe_empty, review_fn=review_hit,
+                    allow_online=True)
+    rc1 = r1.resolved[0]
+    check("复核源命中 → confirmed/success_hit/probe_source=wikivoyage",
+          rc1.status == "confirmed" and rc1.probe_status == "success_hit"
+          and rc1.probe_source == "wikivoyage",
+          f"{rc1.status}/{rc1.probe_status}/{rc1.probe_source}")
+
+    # ② 主源空 + 复核源失败 → unavailable → unverified（绝不 rejected）
+    r2 = er.resolve([cand("幻影基地")], ctx, kb_provider=base,
+                    probe_fn=probe_empty, review_fn=review_down,
+                    allow_online=True)
+    rc2 = r2.resolved[0]
+    check("一源空一源失败 → unverified/unavailable（绝不 rejected）",
+          rc2.status == "unverified" and rc2.probe_status == "unavailable",
+          f"{rc2.status}/{rc2.probe_status}")
+    check("内部不变量：failed 源存在时聚合非 not_found",
+          not er.validate_probe_combo(rc2.status, rc2.probe_status,
+                                      rc2.probe_reason, rc2.probe_results),
+          str(er.validate_probe_combo(rc2.status, rc2.probe_status,
+                                      rc2.probe_reason, rc2.probe_results)))
+
+    # ③ 复核源类型不适用（餐厅）：不强制执行、不计入复核 → 单源空保守
+    def probe_restaurant(city, name, etype):
+        return []
+
+    r3 = er.resolve([cand("幻影火锅", "restaurant")], ctx, kb_provider=base,
+                    probe_fn=probe_restaurant, review_fn=review_hit,
+                    allow_online=True)
+    rc3 = r3.resolved[0]
+    check("复核源对餐厅不适用 → skipped/type_not_covered",
+          any(p["source"] == "wikivoyage" and p["outcome"] == "skipped"
+              and p["reason"] == "type_not_covered"
+              for p in rc3.probe_results), str(rc3.probe_results))
+    check("不适用源不计入复核 → 单源空保守 unverified",
+          rc3.status == "unverified"
+          and rc3.probe_reason == "data_source_empty",
+          f"{rc3.status}/{rc3.probe_reason}")
+
+
+def test_probe_quota_and_cache() -> None:
+    """P0 限额与缓存：超限 → quota_exceeded（unavailable），缓存不耗额度。"""
+    budget = er._ProbeBudget(limit=2)
+    calls = []
+
+    def probe(city, name, etype):
+        calls.append(1)
+        return []
+
+    rows, cached = er._budgeted_probe(budget, probe, "成都", "幻影基地",
+                                      "attraction")
+    check("首次调用消耗额度", not cached and len(calls) == 1, str(len(calls)))
+    rows2, cached2 = er._budgeted_probe(budget, probe, "成都", "幻影基地",
+                                        "attraction")
+    check("缓存命中不调外部接口", cached2 and len(calls) == 1, str(len(calls)))
+    try:
+        er._budgeted_probe(budget, probe, "南京", "另一景点", "attraction")
+        er._budgeted_probe(budget, probe, "南京", "再一景点", "attraction")
+        check("超限抛 ProbeQuotaError", False, "未抛出")
+    except er.ProbeQuotaError:
+        check("超限抛 ProbeQuotaError", True)
+    check("限额分类为 quota_exceeded",
+          er._classify_probe_error(er.ProbeQuotaError()) == "quota_exceeded",
+          "")
+    # 限额用尽走 resolve 全链：unavailable + quota_exceeded → unverified
+    er._PROBE_CACHE.clear()
+    b2 = er._ProbeBudget(limit=0)
+    r = er.resolve([cand("幻影基地")], {"slots": {"destination": "成都"}},
+                   kb_provider=kb_provider([]), probe_fn=probe,
+                   allow_online=True, budget=b2)
+    rc = r.resolved[0]
+    check("限额耗尽 → unverified/unavailable/quota_exceeded（绝不 rejected）",
+          rc.status == "unverified" and rc.probe_status == "unavailable"
+          and rc.probe_reason == "quota_exceeded",
+          f"{rc.status}/{rc.probe_status}/{rc.probe_reason}")
+    er._PROBE_CACHE.clear()
+
+
+def test_validate_probe_combo() -> None:
+    """§8 合法组合表逐格 + 非法组合拦截。"""
+    v = er.validate_probe_combo
+    check("合法：confirmed/not_applicable",
+          not v("confirmed", "not_applicable"), "")
+    check("合法：rejected/not_found+cross_source_empty（双源明细）",
+          not v("rejected", "not_found", "cross_source_empty",
+                [{"source": "amap", "outcome": "success_empty", "reason": ""},
+                 {"source": "wikivoyage", "outcome": "success_empty",
+                  "reason": ""}]), "")
+    check("非法：(rejected, unavailable)",
+          any("unavailable" in x or "非法组合" in x
+              for x in v("rejected", "unavailable")), "")
+    check("非法：(rejected, not_found+data_source_empty)",
+          v("rejected", "not_found", "data_source_empty") != [], "")
+    check("非法：(rejected, 双源任一 failed)",
+          v("rejected", "not_found", "cross_source_empty",
+            [{"source": "amap", "outcome": "success_empty", "reason": ""},
+             {"source": "wikivoyage", "outcome": "failed",
+              "reason": "network_timeout"}]) != [], "")
+    check("非法：(skipped, success_hit)",
+          v("skipped", "success_hit") != [], "")
+    check("非法：unavailable 无 reason",
+          v("unverified", "unavailable", "") != [], "")
+    check("非法：not_applicable 带 reason",
+          v("confirmed", "not_applicable", "no_key") != [], "")
+    check("非法：not_found 源明细里有 success_hit",
+          v("unverified", "not_found", "data_source_empty",
+            [{"source": "amap", "outcome": "success_hit", "reason": ""}])
+          != [], "")
 
 
 def test_no_city_online_unavailable() -> None:
@@ -184,9 +356,10 @@ def test_no_city_online_unavailable() -> None:
                    probe_fn=probe, allow_online=True)
     rc = r.resolved[0]
     check("无上下文城市 → 不发探测", not calls, str(calls))
-    check("无上下文城市 → unverified/unavailable",
-          rc.status == "unverified" and rc.probe_status == "unavailable",
-          f"{rc.status}/{rc.probe_status}")
+    check("无上下文城市 → unverified/unavailable/no_city_center",
+          rc.status == "unverified" and rc.probe_status == "unavailable"
+          and rc.probe_reason == "no_city_center",
+          f"{rc.status}/{rc.probe_status}/{rc.probe_reason}")
 
 
 def test_category_skipped() -> None:
@@ -295,7 +468,9 @@ def test_parser_shadow_wiring() -> None:
 def main() -> int:
     for fn in (test_kb_unique_confirmed, test_cross_city_mismatch,
                test_multi_city_and_branch, test_type_mismatch,
-               test_probe_contract, test_no_city_online_unavailable,
+               test_probe_contract, test_dual_source_paths,
+               test_probe_quota_and_cache, test_validate_probe_combo,
+               test_no_city_online_unavailable,
                test_category_skipped, test_negated_role_preserved,
                test_readonly_contract, test_accepts_extractor_objects,
                test_as_dict_shape, test_parser_shadow_wiring):
