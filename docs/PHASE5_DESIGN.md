@@ -670,6 +670,13 @@ P1   DecisionEngine     decision.py：硬约束→归并唯一性→置信度→
 │                       影子决策接入 shadow_decision
 P1.5 契约补全           PendingDisambiguation 契约 + LLMCandidateAdapter
 │                       契约：仅契约定义与测试桩，不上线不接业务
+│                       P1 验收补录两条契约测试要求（2026-11-18）：
+│                       ① 影子记录失败隔离——shadow_sink 回调异常
+│                         必须被兜底，不得影响原业务链路或让用户
+│                         请求失败（try/except 全包 + 专项负向测试）
+│                       ② 城市来源一致性——query_city 缺失回退继承
+│                         destination 时，city_source 必须如实记录
+│                         来源（destination），不能只记最终城市值
 P2   消歧通道           PendingDisambiguation 实现 + 多轮消费规则（含原子化）
 P3   查询类接管         按 §9.1 边界：仅具体实体候选；泛化问答/品类/酒店不动
 P4   LLM 兜底           **P3 稳定之后**（不并行上线）；适配器接真 LLM，
@@ -861,3 +868,6 @@ expect_status，第二轮 expect_action（含 pending 消费原子性、补充�
 | 2026-11-18 | v3.2.1（开发基线） | §2.3.1 deferred 返回值判定表（deferred 不是第六种实体状态，不进五档状态机）；§2.6/§2.4 LLM 职责收缩为实体文本补全+类型辅助，角色不确定不再是触发条件；§9.4 接入点 A 固定执行顺序（决策链在 Resolver 之后，复用既有调用链）；§8 probe_reason 空值规则 + probe_results 内部一致性不变量（主源空+复核失败→unverified 作 Resolver 级不变量测试）；§11 T-K TSV 冻结 12 列（expect_status 是测试预期，不回塞 DecisionResult）；§7 消歧存储接口五方法+原子消费实现要求；§3 confidence 计算边界冻结 | 开发前最终评审 5 个必改问题 + 2 个落实事项，防止开发时自行猜测 |
 | 2026-11-18 | v3.1 | §10.1 长期路线 Phase 6–8 定版；DEP-001 留待 Phase 6，第五阶段完全不碰 | 开发指令的路线定版要求 |
 | 2026-11-18 | v3.1 | §2.4 LLM fallback schema（白名单五键、越权字段丢弃、适配器校验、city_hints 不写入）；§2.5 五档状态转换表（轮内转换 + 跨轮迁移 + 禁止转换）；§2.6 触发条件可执行判据（三条件 + 成本闸，默认关）；§9.4 Orchestrator 三接入点只增不改 + 开关矩阵；§11 T-K 语料 v5 全表 30 条（16–30 覆盖 T-A~T-I，含三分类标注） | 「六项怎么设计」评审问答落地：一次定死 DecisionResult / schema / 触发条件 / 状态转换 / 接入点 / 验收语料 |
+| 2026-11-18 | P0 完成 `bf9292a` + 验收补强 `7f01ea6` | 探测元数据与限额落地；注入缓存隔离 + no_key 分类显式测试 | P0 有条件通过（79 断言全绿） |
+| 2026-11-18 | P1 完成 `4b43c03`（验收通过，基线冻结） | decision.py 纯新增：DecisionResult 冻结契约、五档内部定档、六档映射、HC-1~HC-7、shadow_decision、9 条阻断项测试 | P1 验收意见（2026-11-18） |
+| 2026-11-18 | P1.5 前置要求补录（§10） | ① shadow_sink 回调异常必须兜底隔离（负向测试）；② city_source 回退继承 destination 时必须如实记 source，不只记最终值 | P1 验收附带注意事项，属 P1.5 契约测试覆盖范围 |
