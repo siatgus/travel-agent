@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS pending_disambiguation (
 -- 规则 8：单 Session 单 active——数据库级强制，不靠应用层判断
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_open
     ON pending_disambiguation(session_id) WHERE status = 'open';
+-- 消费结果记录（阻断项②③的归因与重复选择识别数据源）
+CREATE TABLE IF NOT EXISTS pending_consumption (
+    pending_id              TEXT NOT NULL,
+    session_id              TEXT NOT NULL,
+    candidate_id            TEXT NOT NULL,
+    consumed_at             TEXT NOT NULL,
+    original_intent         TEXT NOT NULL,
+    selected_name           TEXT NOT NULL,
+    selected_city           TEXT,
+    revalidate_status       TEXT,          -- 重验证结果（confirmed/…）
+    revalidate_probe_status TEXT,
+    revalidated_at          TEXT
+);
 ```
 
 **consume_pending 事务边界**（P1.5 验收点，单事务完成三件事）：
@@ -84,8 +97,7 @@ UPDATE pending_disambiguation
  WHERE pending_id = ? AND session_id = ?
    AND status = 'open' AND expires_at > ?;
 -- rowcount != 1 → ROLLBACK，返回失败原因（已消费/已过期/不存在）
--- ③ 消费结果记录 INSERT INTO pending_consumption(
---      pending_id, candidate_id, consumed_at, selected_name, selected_city)
+-- ③ 消费结果记录 INSERT INTO pending_consumption(...)
 COMMIT;
 ```
 
@@ -94,6 +106,21 @@ COMMIT;
 测试（两线程 + Barrier 打同一 SQLite 文件，恰好一次成功）作为
 迁移验收断言。`create` 撞部分唯一索引 → 捕获 IntegrityError →
 按规则 8 拒绝。时钟注入改为 SQL 参数比较（`expires_at > ?`）。
+
+**create_pending 事务（阻断项 ①：到期永不阻塞新 Pending）**：
+
+```sql
+BEGIN IMMEDIATE;
+-- ① 自动过期：该 Session 已过期的 open 记录 → expired
+UPDATE pending_disambiguation
+   SET status = 'expired'
+ WHERE session_id = ? AND status = 'open' AND expires_at <= ?;
+-- ② 插入新记录（部分唯一索引兜底并发创建）
+INSERT INTO pending_disambiguation(...) VALUES (...);
+COMMIT;
+```
+
+内存桩同语义：锁内先自动过期再查重。
 
 ## 3. 多轮对话：选择候选 vs 新问题（Pending 拦截判定）
 
@@ -109,9 +136,14 @@ intent 分支之前（§9.4 接入点 A 的前置检查，只增不改）；开�
      （**只在快照内匹配，快照外绝不猜**，规则 9）；
    - 城市限定指代：「南京那家」「上海这家」→ 快照内按 city 过滤后
      唯一命中才可消费，多命中追问不消费。
-2. **新问题**：parse 产出与 pending 无关的具体意图（新实体候选、
-   天气、路线框架、泛化品类）→ 先 `cancel_pending`（规则 3，
-   不误消费）再走原链路。
+2. **新问题**：parse 产出与 pending 无关的**明确**具体意图（新实体
+   候选命中、明确意图分类如天气/路线框架/泛化品类）→ 先
+   `cancel_pending`（规则 3，不误消费）再走原链路。
+   **判定必须有足够依据**：解析层产生的**模糊候选**（纯城市候选、
+   泛化品类词、角色未定）**不得**单独触发旧 Pending 取消——
+   「南京那家怎么样」优先按选择线索判定；负向测试三条：明确新
+   查询（介绍一下总统府）→取消、明确新意图（明天天气）→取消、
+   模糊候选（仅城市词）→**不取消**；
 3. **无法判定**（「那家店怎么样」「还是它」但快照有多个候选）：
    不消费，引用 pending 重述选项（「您是指①南京店还是②上海店？」）。
 
@@ -124,29 +156,77 @@ shadow_log，供接管前归因。
 | 情形 | 处理 | 规则 |
 |---|---|---|
 | 到期后选择 | 拦截点发现 `expires_at <= now` → 显式 `expire_pending` 登记为 expired，如实回复「该选择已过期，请重新提问」，不消费 | 规则 5 |
+| **到期但无请求触发显式 expire（阻断项 ①）** | `create_pending` **同一事务内**先把该 Session 已过期的 open 记录条件更新为 expired（`UPDATE … WHERE session_id=? AND status='open' AND expires_at <= ?`），再 INSERT 新记录；内存桩在锁内先自动过期再查重。并发创建仍由部分唯一索引兜底。**到期永不阻塞新 Pending** | 规则 5+8 |
 | 用户取消 | 「取消/算了/不选了」→ `cancel_pending` → cancelled，pending 清除 | 规则 2 |
 | 目的地变化 | parse 检出本轮 destination ≠ pending 所属上下文目的地 → 旧 pending 取消（reason=destination_changed），候选城市归属已变须重走 EntityResolver，本轮按新问题处理 | 规则 4 |
-| 重复选择 | 第一次已 consumed；再次选择 → 拒绝并如实告知已确认过 | 规则 6 |
+| 重复选择 | 见 §3.1 重复选择识别机制；识别为重复 → 如实告知已确认过，不执行任何业务 | 规则 6 |
 | 新消歧需求 | 旧 pending 非 open 时才允许 create（部分唯一索引兜底） | 规则 8 |
+
+**新增测试**：A 到期但无显式 expire → 创建 B 成功（内存桩与
+SQLite 双实现都要过）；并发 create 恰好一个成功（索引兜底）。
+
+## 4.1 重复选择识别机制（阻断项 ③）
+
+**问题**：消费后 `get_active_pending()` 返回 None，第二次「选第一个」
+凭什么识别为重复选择而不是新问题？
+
+**机制**：`pending_consumption` 表（消费结果记录）天然保存了最近
+一次消费的归因信息（session_id / pending_id / candidate_id /
+consumed_at / original_intent / selected_name / selected_city /
+revalidate_status）。拦截点在**无 active pending** 时：
+
+1. 查该 Session 最近一条 consumption 记录（拦截器内部查询路径，
+   不新增公共存储接口）；
+2. **同时满足**以下条件才识别为重复选择：
+   - utterance 是**明确的重复选择语境**：纯选择线索（序号指代、
+     「就这家」「还是它」），**不含**新实体候选、不含新意图信号；
+   - 在合理时间窗口内（默认 10 分钟，`TRAVEL_PENDING_RESELECT_
+     WINDOW` 可配）；
+3. 命中 → 如实告知「刚刚已确认过『XX（南京店）』」，不执行任何
+   业务，不改任何状态；
+4. **无法可靠识别**（语境模糊 / 超窗口 / utterance 含新候选）→
+   **不得猜测用户指哪个历史候选，直接交回原有业务链路**。
+
+**新增测试**：窗口内纯选择线索 → 告知已确认不执行；超窗口 → 按
+新问题走原链路；「选第一个 + 新实体」→ 新问题；跨 Session 的
+consumption 记录互不可见。
 
 ## 5. 消歧成功后如何安全交给原 Handler
 
 **铁律：消歧成功 ≠ 授权修改行程**（身份确定，行程动作仍由原有
-权限与角色规则决定）。分两步走：
+权限与角色规则决定）。
 
-1. **身份确定**：原子消费成功 → 取回所选 PendingCandidate →
-   以其 name/city 重走 EntityResolver（新鲜验证，不用陈旧 matches）
-   → 得到 fresh confirmed 实体。
-2. **按 original_intent 分流**：
-   - **查询类**（poi_qa/poi_query）：直接以 confirmed 实体进入
-     既有 Handler（与用户当场点名该实体等价），正常应答；
-   - **规划类**（plan_modify 等）：**只回复确认话术**（「已确认是
-     南京这家（海贝皇大排档·夫子庙店）」），不写行程；用户随后
-     明确说「排这家」才按既有 PlanHandler 链路处理（HC-5 写权限
-     闸、destination 复核全部照旧）——身份确定与行程写入是两次
-     用户动作；
-   - negated/remove 候选：永不进入消费路径（HC-4，消费只对
-     query/must_visit 语境的 ambiguous 产生，且出口不带 must_visit）。
+**消费与重验证是两个独立阶段，失败契约显式闭合（阻断项 ②）**：
+
+> **原子消费成功只代表用户选择已被接受，不代表实体重新验证成功，
+> 更不代表 Handler 已经执行。**
+
+**重验证 = 全新走 `entity_resolver.resolve()` 决策链**（KB 索引
+重建 + 探测按当时开关执行），**不复用**旧 Pending 的 matches 或
+旧 DecisionResult。允许命中 Resolver 既有进程级探测缓存（缓存
+证据有效期沿用 P0 既有策略）；KB-only 影子模式下重验证受当时
+开关约束，probe_status 如实标注。fresh 定义进测试（mock KB 变化
+→ 重验证结果跟着变）。
+
+**重验证失败分支契约**（原 Pending 保持 consumed，**绝不静默
+恢复 open**；任何后续 Pending 用**新 pending_id + 新快照**）：
+
+| 重验证结果 | 后续处理 |
+|---|---|
+| confirmed | 允许按 original_intent 进入对应流程（查询类直进 Handler；规划类只回确认话术不写行程） |
+| ambiguous | **不执行 Handler**；由 fresh matches 生成**新候选快照**并创建**新 Pending**（新 pending_id、新 TTL）重新请求选择 |
+| unverified | 不执行 Handler；保守回复（「暂时查不到可靠信息，可告知城市或地址」），**绝不判定为 rejected** |
+| rejected | 不执行 Handler；按「规定数据源与检索范围内没有找到」话术回复，保留原始表达 |
+
+**归因要求**：所有失败分支保留原 pending_id、candidate_id 与
+重验证结果（pending_consumption 增加 revalidate_status/
+revalidate_probe_status 列；shadow_log 同步记录；DecisionResult.
+reason 携带全链归因）。
+
+| 消费成功后的流转 | 说明 |
+|---|---|
+| confirmed → Handler | 身份确定；行程动作仍走原有权限与角色规则 |
+| negated/remove 候选 | 永不进入消费路径（HC-4），出口不带 must_visit |
 
 消费后的 DecisionResult（action=execute，entity=fresh confirmed，
 reason 含 pending_id 与 candidate_id 全链归因）走 §9.4 接入点 A
@@ -171,15 +251,34 @@ Handler 接口**。
 
 | 交付 | 内容 |
 |---|---|
-| pending.py 改造 | PendingCandidate 冻结结构 + 接口兼容 + 不可变负向测试 |
-| pending_store_sqlite.py（或并入 pending.py） | 五方法 SQLite 实现，条件更新 + 单事务 + 部分唯一索引 |
-| pending_interceptor.py | 三路判定 + 过期/取消/目的地变化处理 + 影子记录 |
+| pending.py 改造 | PendingCandidate 冻结结构 + 接口兼容 + 不可变负向测试 + create 自动过期（内存桩） |
+| pending_store_sqlite.py（或并入 pending.py） | 五方法 SQLite 实现，条件更新 + 单事务 + 部分唯一索引 + create 自动过期同事务 |
+| pending_interceptor.py | 三路判定 + 过期/取消/目的地变化 + **重复选择识别（§4.1）** + 影子记录 |
 | 接入点 | orchestrator 拦截点一处（开关控制），Handler 零改动 |
-| 测试 | test_pending.py 扩展（不可变 + SQLite 并发迁移断言）、test_pending_interceptor.py 新增（三路判定 8+ 场景、八步核心场景端到端、三个拒绝场景、旧链路零改变） |
+| 测试 | test_pending.py 扩展、test_pending_interceptor.py 新增（见下） |
 
-实施顺序：①PendingCandidate 改造 → ②SQLite store（含并发迁移
-验收）→ ③拦截器 + 判定规则 → ④接入点（开关关）→ ⑤影子验证积累
-→ ⑥（经批准后）开关开启灰度。每步独立 commit。
+**测试清单（评审修订版，含三个建议边界）**：
+- 不可变负向：frozen 赋值抛异常；调用方改入参 dict 不影响快照
+- 到期不阻塞：A 到期无显式 expire → create B 成功（内存桩 + SQLite 双实现）；并发 create 恰好一个成功
+- 重验证失败分支：confirmed → 进流程 / ambiguous → 新 Pending（新 ID 新快照，原 Pending 保持 consumed）/ unverified → 保守不 rejected / rejected → 拒绝话术；失败归因含原 pending_id/candidate_id/重验证结果
+- fresh 定义：mock KB 变化 → 重验证结果跟随变化（不复用旧 matches）
+- 重复选择：窗口内纯选择线索 → 告知已确认不执行；超窗口 → 新问题；含新候选 → 新问题；跨 Session consumption 互不可见
+- Session 隔离：**Session B 用相同 pending_id 请求消费 → 拒绝且 A 的 Pending 状态不变**（不能只靠 pending_id 全局唯一）
+- 新问题判定依据：明确查询 → 取消；明确新意图 → 取消；**模糊候选（仅城市词）→ 不取消**
+- 旧链路零改变：开关关深拷贝对比；负向语料；git diff 单点断言
+
+实施顺序（评审定版 P2.1–P2.6，每步独立 commit）：
+
+| 步骤 | 工作 | 验收重点 |
+|---|---|---|
+| P2.1 | PendingCandidate 不可变改造 | 深拷贝边界、不可变负向测试 |
+| P2.2 | SQLite Store | 事务、条件更新、部分唯一索引、并发迁移、create 自动过期、Session 隔离 |
+| P2.3 | PendingInterceptor | 三路判定、取消、过期、**重复选择识别** |
+| P2.4 | Orchestrator 单点接入 | 开关关闭时旧链路零变化（**即使完成也不默认打开 TRAVEL_PENDING_CHANNEL**） |
+| P2.5 | 消歧运行时验证 | 八步完整链路、**重验证失败四分支** |
+| P2.6 | 影子观察 | 记录决策依据，不自动灰度开启 |
+
+每步独立 commit；回归门槛：v1–v4 语料 + 全套件绿 + 当步新语料绿。
 
 ## 8. 已知风险
 

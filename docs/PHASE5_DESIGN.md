@@ -700,6 +700,29 @@ P2   消歧通道           PendingDisambiguation 实现 + 多轮消费规则（
 │                         过期选择/快照外选择一律拒绝；**消歧成功
 │                         ≠授权修改行程**（身份确定，行程动作仍由
 │                         原有权限与角色规则决定）
+│                       P2 方案评审阻断项（2026-11-18，PHASE5_P2_
+│                       PLAN.md 已闭合，实施必须落实）：
+│                       ① create_pending 同一事务内先把该 Session
+│                         已过期的 open 记录条件更新为 expired 再
+│                         插入——到期永不阻塞新 Pending；内存桩锁内
+│                         同语义；并发创建由部分唯一索引兜底
+│                       ② 重验证失败四分支契约：confirmed→进流程 /
+│                         ambiguous→新 Pending（新 ID 新快照）重新
+│                         选择 / unverified→保守绝不 rejected /
+│                         rejected→拒绝话术；原 Pending 保持
+│                         consumed 绝不静默恢复 open；消费成功≠
+│                         重验证成功≠Handler 已执行；fresh=全新走
+│                         resolve() 不复用旧 matches；失败归因保留
+│                         原 pending_id/candidate_id/重验证结果
+│                       ③ 重复选择识别：pending_consumption 表为
+│                         数据源，无 active 时仅「明确重复选择语境
+│                         + 时间窗口内」识别为重复；无法可靠识别
+│                         不得猜测历史候选，交回原链路
+│                       ④ 三个建议边界进测试清单：新问题判定须有
+│                         足够依据（模糊候选不触发取消）；fresh
+│                         定义成文（mock KB 变化断言）；Session B
+│                         用相同 pending_id 消费 → 拒绝且 A 状态
+│                         不变
 P3   查询类接管         按 §9.1 边界：仅具体实体候选；泛化问答/品类/酒店不动
 P4   LLM 兜底           **P3 稳定之后**（不并行上线）；适配器接真 LLM，
 │                       产物回流统一候选集合，六红线测试
