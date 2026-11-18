@@ -465,12 +465,51 @@ def test_parser_shadow_wiring() -> None:
           str(pr2.notes))
 
 
+def test_injection_isolated_from_production_cache() -> None:
+    """P0 验收点2：注入模式彻底隔离生产缓存（不同注入源结果不可混用）。
+
+    缓存命中的语义：不调外部接口故不消耗限额额度——限额保护的是
+    外部 API 压力，缓存本身就是减压手段，两者不冲突。"""
+    er._PROBE_CACHE[("成都", "缓存污染点", "attraction")] = [
+        er.MatchRow(city="成都", name="缓存污染点", category="attraction",
+                    source="amap_online", origin="online")]
+
+    def probe_empty(city, name, etype):
+        return []
+
+    r = er.resolve([cand("缓存污染点")], {"slots": {"destination": "成都"}},
+                   kb_provider=kb_provider([]), probe_fn=probe_empty,
+                   allow_online=True)
+    rc = r.resolved[0]
+    check("注入模式不读生产缓存（污染点未命中）",
+          rc.status == "unverified" and rc.probe_status == "not_found",
+          f"{rc.status}/{rc.probe_status}")
+    er._PROBE_CACHE.clear()
+
+
+def test_no_key_classification() -> None:
+    """P0 验收点3：无 Key / 熔断等异常路径 → unavailable → unverified。"""
+    def probe_nokey(city, name, etype):
+        raise PermissionError("未配置高德 Key")
+
+    r = er.resolve([cand("幻影基地")], {"slots": {"destination": "成都"}},
+                   kb_provider=kb_provider([]), probe_fn=probe_nokey,
+                   allow_online=True)
+    rc = r.resolved[0]
+    check("无 Key → unverified/unavailable/no_key（绝不 not_found）",
+          rc.status == "unverified" and rc.probe_status == "unavailable"
+          and rc.probe_reason == "no_key",
+          f"{rc.status}/{rc.probe_status}/{rc.probe_reason}")
+
+
 def main() -> int:
     for fn in (test_kb_unique_confirmed, test_cross_city_mismatch,
                test_multi_city_and_branch, test_type_mismatch,
                test_probe_contract, test_dual_source_paths,
                test_probe_quota_and_cache, test_validate_probe_combo,
                test_no_city_online_unavailable,
+               test_injection_isolated_from_production_cache,
+               test_no_key_classification,
                test_category_skipped, test_negated_role_preserved,
                test_readonly_contract, test_accepts_extractor_objects,
                test_as_dict_shape, test_parser_shadow_wiring):
