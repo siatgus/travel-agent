@@ -424,6 +424,52 @@ def test_expiry_boundary_epoch_compare() -> None:
           str(out))
 
 
+def test_latest_consumption_parity() -> None:
+    """P2.3 冻结项：_latest_consumption 双实现同语义对拍。
+
+    - 消费成功才记录七字段；未成功消费不产生记录；
+    - 内存桩与 SQLite 字段级一致（重复选择识别的内部查询路径，
+      不进公共契约）。
+    """
+    recs = {}
+    for impl in ("memory", "sqlite"):
+        if impl == "memory":
+            st = PendingStore(session_id="s1")
+        else:
+            st = SQLitePendingStore("s1", db_path=temp_db())
+        check(f"[{impl}] 初始无消费记录",
+              st._latest_consumption() is None, "")
+        p = st.create_pending("排海贝皇大排档", "plan_modify",
+                              "must_visit", SNAP)
+        check(f"[{impl}] 消费失败（快照外）不产生记录",
+              not st.consume_pending(p.pending_id, "c999").ok
+              and st._latest_consumption() is None, "")
+        out = st.consume_pending(p.pending_id, "c1")
+        check(f"[{impl}] 消费成功产生记录", out.ok
+              and st._latest_consumption() is not None, "")
+        recs[impl] = st._latest_consumption()
+        r = recs[impl]
+        check(f"[{impl}] 记录七字段齐全且值正确",
+              set(r) == {"session_id", "pending_id", "candidate_id",
+                         "consumed_at", "original_intent",
+                         "selected_name", "selected_city"}
+              and r["session_id"] == "s1"
+              and r["pending_id"] == p.pending_id
+              and r["candidate_id"] == "c1"
+              and isinstance(r["consumed_at"], int)
+              and r["original_intent"] == "plan_modify"
+              and r["selected_name"] == "海贝皇大排档（南京店）"
+              and r["selected_city"] == "南京", str(r))
+        check(f"[{impl}] 重复消费失败不追加记录（同一 pending 一次）",
+              not st.consume_pending(p.pending_id, "c2").ok
+              and st._latest_consumption()["candidate_id"] == "c1", "")
+    m, s = recs["memory"], recs["sqlite"]
+    m_cmp = dict(m, consumed_at=s["consumed_at"],
+                 pending_id=s["pending_id"])   # 时间戳/ID 天然不同
+    check("双实现记录字段级一致（时间戳/ID 除外）", m_cmp == s,
+          f"mem={m}\nsql={s}")
+
+
 def main() -> int:
     for fn in (test_time_contract_and_schema,
                test_parity_memory_vs_sqlite,
@@ -433,7 +479,8 @@ def main() -> int:
                test_auto_expire_create,
                test_concurrent_create,
                test_session_isolation,
-               test_expiry_boundary_epoch_compare):
+               test_expiry_boundary_epoch_compare,
+               test_latest_consumption_parity):
         fn()
     print(f"\npending sqlite store: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

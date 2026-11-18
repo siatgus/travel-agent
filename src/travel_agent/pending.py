@@ -27,7 +27,7 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ---- pending 状态枚举（§7） ----
 PENDING_OPEN = "open"
@@ -47,6 +47,24 @@ DEFAULT_TTL_SECONDS = 300
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _epoch(value) -> int:
+    """任意时间值 → UTC epoch 整数（唯一比较格式，P2.2 时间契约）。
+
+    数值直接取整；aware datetime 按其时区转 epoch；naive datetime
+    **按 UTC 解释**（与 SQLitePendingStore 同语义，测试确定性，
+    不依赖本机时区）。
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"非法时间值：{value!r}")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp())
+    raise TypeError(f"非法时间值类型：{type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -183,12 +201,17 @@ class PendingStore:
     """
 
     def __init__(self, *, ttl_seconds: int = DEFAULT_TTL_SECONDS,
-                 now=None, id_gen=None) -> None:
+                 now=None, id_gen=None,
+                 session_id: str = "") -> None:
         self._lock = threading.Lock()
         self._active: PendingDisambiguation | None = None  # 规则 8
         self._ttl = ttl_seconds
         self._now = now or datetime.now      # 测试可注入时钟
         self._id_gen = id_gen or (lambda: uuid.uuid4().hex[:12])
+        # P2.3：本实例即一个 Session；消费结果记录（与 SQLite 同语义，
+        # 供 PendingInterceptor 重复选择识别的内部查询路径）
+        self._session_id = str(session_id)
+        self._consumptions: list[dict] = []
 
     # -------------------------------------------------- ① create
 
@@ -284,6 +307,19 @@ class PendingStore:
             # ---- 条件迁移：检查与写入同锁，open→consumed 单次成功 ----
             consumed = replace(p, status=PENDING_CONSUMED)
             self._active = consumed
+            # P2.3：消费成功才记录（与 SQLite pending_consumption 同语义；
+            # 未成功消费绝不产生记录）
+            self._consumptions.append({
+                "session_id": self._session_id,
+                "pending_id": pending_id,
+                "candidate_id": candidate_id,
+                "consumed_at": _epoch(self._now()),
+                "original_intent": p.original_intent,
+                "selected_name": p.candidate_by_id(candidate_id).name
+                if p.candidate_by_id(candidate_id) is not None else "",
+                "selected_city": p.candidate_by_id(candidate_id).city
+                if p.candidate_by_id(candidate_id) is not None else None,
+            })
             return _ConsumeOutcome(
                 ok=True, pending_id=pending_id,
                 candidate=p.candidate_by_id(candidate_id))
@@ -322,12 +358,23 @@ class PendingStore:
 
     # -------------------------------------------------- 内部
 
+    def _latest_consumption(self) -> dict | None:
+        """P2.3 内部查询（不进公共契约）：本 Session 最近一次消费记录。
+
+        与 SQLitePendingStore 同语义（七字段 dict）；无记录返回 None。
+        """
+        with self._lock:
+            return dict(self._consumptions[-1]) \
+                if self._consumptions else None
+
     def _is_expired(self, p: PendingDisambiguation) -> bool:
         try:
             exp = datetime.strptime(p.expires_at, "%Y-%m-%dT%H:%M:%S")
         except ValueError:
             return False
-        return self._now() > exp
+        # P2.2 时间契约：epoch 整数比较（naive ISO 与 naive 时钟按
+        # UTC 同约定转换，偏移相消，内部自洽）
+        return _epoch(self._now()) > _epoch(exp)
 
 
 def _snap(cid: str, order: int, name: str, city: str,

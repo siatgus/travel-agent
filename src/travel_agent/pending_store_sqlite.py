@@ -48,7 +48,8 @@ from travel_agent import paths
 from travel_agent.pending import (DEFAULT_TTL_SECONDS, PENDING_OPEN,
                                   PENDING_CONSUMED,
                                   PendingDisambiguation,
-                                  _ConsumeOutcome, _candidate_from_dict)
+                                  _ConsumeOutcome, _candidate_from_dict,
+                                  _epoch)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_disambiguation (
@@ -80,25 +81,6 @@ CREATE TABLE IF NOT EXISTS pending_consumption (
     revalidated_at          INTEGER
 );
 """
-
-
-def _epoch(value) -> int:
-    """任意注入时间值 → UTC epoch 整数（唯一比较格式）。
-
-    - 数值：直接取整（已是 epoch）；
-    - aware datetime：按其时区转 epoch；
-    - naive datetime：**按 UTC 解释**（测试注入确定性，不依赖
-      本机时区；生产默认时钟直接用 time.time()，不走此分支）。
-    """
-    if isinstance(value, bool):
-        raise TypeError(f"非法时间值：{value!r}")
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return int(value.timestamp())
-    raise TypeError(f"非法时间值类型：{type(value).__name__}")
 
 
 def _iso_utc(epoch: int) -> str:
@@ -150,6 +132,40 @@ class SQLitePendingStore:
     def _now_epoch(self) -> int:
         return _epoch(self._now()) if self._now is not None \
             else int(time.time())
+
+    def _is_expired(self, p: PendingDisambiguation) -> bool:
+        """到期判定（内部）：ISO 展示字段按 UTC 还原为 epoch 比较。"""
+        try:
+            exp = datetime.strptime(
+                p.expires_at, "%Y-%m-%dT%H:%M:%S").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return False
+        return self._now_epoch() > int(exp.timestamp())
+
+    def _latest_consumption(self) -> dict | None:
+        """P2.3 内部查询（不进公共契约）：本 Session 最近一次消费记录。
+
+        七字段 dict 与内存桩同语义（session_id/pending_id/candidate_id/
+        consumed_at/original_intent/selected_name/selected_city）；
+        无记录返回 None。绝不跨 Session 读取。
+        """
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT pending_id, session_id, candidate_id,"
+                " consumed_at, original_intent, selected_name,"
+                " selected_city FROM pending_consumption"
+                " WHERE session_id = ?"
+                " ORDER BY consumed_at DESC, rowid DESC LIMIT 1",
+                (self._session_id,)).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return None
+        d = dict(row)
+        d["consumed_at"] = int(d["consumed_at"])
+        return d
 
     # -------------------------------------------------- 行重建
 
