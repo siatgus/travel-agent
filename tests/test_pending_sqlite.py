@@ -470,6 +470,77 @@ def test_latest_consumption_parity() -> None:
           f"mem={m}\nsql={s}")
 
 
+def test_expiry_boundary_and_fail_closed() -> None:
+    """P2.3 验收补丁：过期边界（等于即过期）+ 异常时间失败关闭。"""
+    from dataclasses import replace as dc_replace
+    # 边界：now == expires_at → 已过期（内存桩与 SQLite 同语义）
+    clock, advance = fixed_clock(datetime(2026, 11, 18, 15, 0, 0))
+    mem = PendingStore(ttl_seconds=60, now=clock)
+    pm = mem.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    advance(60)
+    check("内存桩：expires_at == now → get_active 返回 None",
+          mem.get_active_pending() is None, "")
+    out = mem.consume_pending(pm.pending_id, "c1")
+    check("内存桩：expires_at == now → 消费被拒",
+          not out.ok and "过期" in out.reason, str(out))
+
+    db = temp_db()
+    sql = SQLitePendingStore("s1", db_path=db, ttl_seconds=60,
+                             now=clock)
+    ps = sql.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    advance(60)
+    check("SQLite：expires_at == now → get_active 返回 None",
+          sql.get_active_pending() is None, "")
+    check("SQLite：expires_at == now → 消费被拒且登记 expired",
+          not sql.consume_pending(ps.pending_id, "c1").ok
+          and raw_row(db, ps.pending_id)["status"] == PENDING_EXPIRED,
+          "")
+
+    # 失败关闭：无法解析的 expires_at 绝不允许消费（内存桩）
+    clock2, _ = fixed_clock(datetime(2026, 11, 18, 15, 0, 0))
+    mem2 = PendingStore(ttl_seconds=600, now=clock2)
+    p2 = mem2.create_pending("排海贝皇大排档", "plan_modify",
+                             "must_visit", SNAP)
+    mem2._active = dc_replace(p2, expires_at="不是时间")
+    out2 = mem2.consume_pending(p2.pending_id, "c1")
+    check("内存桩：异常 expires_at → 失败关闭拒绝消费",
+          not out2.ok, str(out2))
+    check("内存桩：异常 expires_at → get_active 不返回",
+          mem2.get_active_pending() is None, "")
+
+    # 失败关闭：SQLite 异常时间值 → 消费拒绝 + 自动过期兜底
+    clock3, _ = fixed_clock(datetime(2026, 11, 18, 15, 0, 0))
+    db3 = temp_db()
+    sql3 = SQLitePendingStore("s1", db_path=db3, ttl_seconds=600,
+                              now=clock3)
+    p3 = sql3.create_pending("排海贝皇大排档", "plan_modify",
+                             "must_visit", SNAP)
+    con = sqlite3.connect(db3)
+    try:
+        con.execute("UPDATE pending_disambiguation SET"
+                    " expires_at = '不是时间' WHERE pending_id = ?",
+                    (p3.pending_id,))
+        con.commit()
+    finally:
+        con.close()
+    check("SQLite：异常 expires_at → get_active 返回 None（失败关闭）",
+          sql3.get_active_pending() is None, "")
+    out3 = sql3.consume_pending(p3.pending_id, "c1")
+    check("SQLite：异常 expires_at → 消费被拒（失败关闭）",
+          not out3.ok, str(out3))
+    check("SQLite：异常 expires_at → 登记 expired（不被消费）",
+          raw_row(db3, p3.pending_id)["status"] == PENDING_EXPIRED, "")
+    # 异常时间不阻塞新 Pending（自动过期兜底覆盖 SQL 不可比行）
+    p3b = sql3.create_pending("再来一次", "plan_modify",
+                              "must_visit", SNAP)
+    check("SQLite：异常时间旧行不阻塞 create（兜底自动过期）",
+          p3b.status == PENDING_OPEN
+          and sql3.get_active_pending().pending_id == p3b.pending_id,
+          "")
+
+
 def main() -> int:
     for fn in (test_time_contract_and_schema,
                test_parity_memory_vs_sqlite,
@@ -480,7 +551,8 @@ def main() -> int:
                test_concurrent_create,
                test_session_isolation,
                test_expiry_boundary_epoch_compare,
-               test_latest_consumption_parity):
+               test_latest_consumption_parity,
+               test_expiry_boundary_and_fail_closed):
         fn()
     print(f"\npending sqlite store: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

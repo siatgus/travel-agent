@@ -122,9 +122,11 @@ def test_order_selection() -> None:
                   v.verdict == V_CONSUME and v.candidate_id == cid
                   and v.pending_id == p.pending_id, str(v.as_dict()))
         for ut in ("第3个", "第0个"):
-            _, it, _, v = one(impl, ut)
-            check(f"[{impl}] 序号越界「{ut}」→ restate",
-                  v.verdict == V_RESTATE, str(v.as_dict()))
+            st, it, p, v = one(impl, ut)
+            check(f"[{impl}] 序号越界「{ut}」→ hand_back 保持 open",
+                  v.verdict == V_HAND_BACK
+                  and st.get_pending_by_id(p.pending_id).status ==
+                  PENDING_OPEN, str(v.as_dict()))
         # 数字不误触发：日期/人数/天数
         for ut in ("两天行程", "3个人怎么分", "第二天行程"):
             st, it, p, v = one(impl, ut)
@@ -142,9 +144,11 @@ def test_name_city_selection() -> None:
         check(f"[{impl}] 全名匹配 → consume c1",
               v.verdict == V_CONSUME and v.candidate_id == "c1",
               str(v.as_dict()))
-        _, it, _, v = one(impl, "海贝皇")
-        check(f"[{impl}] 名称歧义（两候选都含核心）→ restate",
-              v.verdict == V_RESTATE, str(v.as_dict()))
+        st, it, p, v = one(impl, "海贝皇")
+        check(f"[{impl}] 名称歧义（两候选都含核心）→ hand_back",
+              v.verdict == V_HAND_BACK
+              and st.get_pending_by_id(p.pending_id).status ==
+              PENDING_OPEN, str(v.as_dict()))
         _, it, _, v = one(impl, "南京那家")
         check(f"[{impl}] 城市限定指代唯一命中 → consume c1",
               v.verdict == V_CONSUME and v.candidate_id == "c1",
@@ -156,9 +160,9 @@ def test_name_city_selection() -> None:
         _, it, _, v = one(impl, "苏州那家", parse=pr_city("苏州"))
         check(f"[{impl}] 快照外城市绝不猜 → hand_back",
               v.verdict == V_HAND_BACK, str(v.as_dict()))
-        _, it, _, v = one(impl, "就这家", snap=SNAP2)
-        check(f"[{impl}] 纯选择语气多候选 → restate",
-              v.verdict == V_RESTATE, str(v.as_dict()))
+        st, it, p, v = one(impl, "就这家", snap=SNAP2)
+        check(f"[{impl}] 纯选择语气多候选 → hand_back",
+              v.verdict == V_HAND_BACK, str(v.as_dict()))
         _, it, _, v = one(impl, "就这家", snap=SNAP1)
         check(f"[{impl}] 纯选择语气单候选 → consume",
               v.verdict == V_CONSUME and v.candidate_id == "c1",
@@ -175,10 +179,11 @@ def test_conservative_red_lines() -> None:
         # 「南京那家怎么样？」——询问/评价标记 → 不确认为选择，
         # 绝不取消、绝不消费，pending 保持 open
         st, it, p, v = one(impl, "南京那家怎么样？")
-        check(f"[{impl}] 「南京那家怎么样？」不消费不取消",
-              v.verdict == V_RESTATE and v.verdict not in
+        check(f"[{impl}] 「南京那家怎么样？」→ hand_back 不消费不取消",
+              v.verdict == V_HAND_BACK and v.verdict not in
               (V_CANCEL_NEW_QUESTION, V_CANCEL_EXPLICIT,
-               V_CANCEL_DEST_CHANGED, V_CONSUME), str(v.as_dict()))
+               V_CANCEL_DEST_CHANGED, V_CONSUME, V_RESTATE),
+              str(v.as_dict()))
         check(f"[{impl}] 「南京那家怎么样？」后 pending 仍 open",
               st.get_active_pending() is not None
               and st.get_pending_by_id(p.pending_id).status ==
@@ -189,16 +194,18 @@ def test_conservative_red_lines() -> None:
               v.verdict == V_HAND_BACK, str(v.as_dict()))
         check(f"[{impl}] hand_back 后 pending 保持 open",
               st.get_active_pending() is not None, "")
-        # 「那家店值得去吗」——指代+询问 → 保持 open
+        # 「那家店值得去吗」——指代+询问 → hand_back 保持 open
         st, it, p, v = one(impl, "那家店值得去吗")
-        check(f"[{impl}] 「那家店值得去吗」→ 保持 open 不取消",
-              v.verdict == V_RESTATE
+        check(f"[{impl}] 「那家店值得去吗」→ hand_back 保持 open",
+              v.verdict == V_HAND_BACK
               and st.get_pending_by_id(p.pending_id).status ==
               PENDING_OPEN, str(v.as_dict()))
         # 名称匹配 + 询问标记 → 同样不消费
-        _, it, _, v = one(impl, "海贝皇大排档（南京店）怎么样")
-        check(f"[{impl}] 全名+询问标记 → 不确认消费",
-              v.verdict == V_RESTATE, str(v.as_dict()))
+        st, it, p, v = one(impl, "海贝皇大排档（南京店）怎么样")
+        check(f"[{impl}] 全名+询问标记 → hand_back 不确认消费",
+              v.verdict == V_HAND_BACK
+              and st.get_pending_by_id(p.pending_id).status ==
+              PENDING_OPEN, str(v.as_dict()))
         # plan 粗类但无目的地/无实体 → 依据不足 hand_back（保守）
         _, it, p, v = one(impl, "帮我排个行程", parse=ParseResult(
             text="帮我排个行程", intent="plan_create",
@@ -230,6 +237,36 @@ def test_clear_new_question() -> None:
             text="嗯嗯", intent="smalltalk", intent_coarse="smalltalk"))
         check(f"[{impl}] 闲聊无依据 → hand_back 不取消",
               v.verdict == V_HAND_BACK, str(v.as_dict()))
+
+
+# ------------------------------------------------ Group D2：显式重述请求（restate 唯一来源）
+
+def test_restate_explicit_requests() -> None:
+    """P2.3 验收补丁：restate 只留给显式重述请求。"""
+    for impl in ("memory", "sqlite"):
+        for ut in ("再说一遍有哪些店", "重新列一下", "再列一次选项",
+                   "有哪些店"):
+            st, it, p, v = one(impl, ut)
+            check(f"[{impl}] 显式重述「{ut}」→ restate 保持 open",
+                  v.verdict == V_RESTATE
+                  and st.get_pending_by_id(p.pending_id).status ==
+                  PENDING_OPEN, str(v.as_dict()))
+        # 重述请求与消费/取消互斥：act 零状态变化
+        st, it, p, v = one(impl, "重新列一下")
+        check(f"[{impl}] restate 的 act 零状态变化",
+              it.act(v) is None
+              and st.get_pending_by_id(p.pending_id).status ==
+              PENDING_OPEN, "")
+        # 到期后重述请求 → 如实告知过期（规则 5）
+        clock, advance = fixed_clock(datetime(2026, 11, 18, 15, 0, 0))
+        st, it = make(impl, clock=clock)
+        p = st.create_pending("排海贝皇大排档", "plan_modify",
+                              "must_visit", SNAP2)
+        advance(601)
+        v = it.evaluate("再说一遍有哪些店", now=clock(),
+                        session_pending_id=p.pending_id)
+        check(f"[{impl}] 到期 + 重述请求 → expired_reply",
+              v.verdict == V_EXPIRED_REPLY, str(v.as_dict()))
 
 
 # ------------------------------------------------ Group E：目的地变化（最高优先级）
@@ -326,10 +363,10 @@ def test_explicit_cancel() -> None:
                   v.verdict == V_CANCEL_EXPLICIT and it.act(v).ok
                   and st.get_pending_by_id(p.pending_id).status ==
                   "cancelled", str(v.as_dict()))
-        # 取消与选择冲突 → 保守 restate，pending 保持 open
+        # 取消与选择冲突 → 保守 hand_back，pending 保持 open
         st, it, p, v = one(impl, "算了，还是第一个吧")
-        check(f"[{impl}] 取消+选择冲突 → 保守 restate 不消费",
-              v.verdict == V_RESTATE
+        check(f"[{impl}] 取消+选择冲突 → 保守 hand_back 不消费",
+              v.verdict == V_HAND_BACK
               and st.get_pending_by_id(p.pending_id).status ==
               PENDING_OPEN, str(v.as_dict()))
 
@@ -536,6 +573,7 @@ def test_dual_impl_parity() -> None:
 def main() -> int:
     for fn in (test_order_selection, test_name_city_selection,
                test_conservative_red_lines, test_clear_new_question,
+               test_restate_explicit_requests,
                test_destination_change, test_expiry_handling,
                test_explicit_cancel, test_duplicate_selection,
                test_duplicate_cross_session_sqlite,

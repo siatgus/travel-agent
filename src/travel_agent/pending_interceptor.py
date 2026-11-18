@@ -16,11 +16,12 @@ P2.3 验收要求逐条落点：
    取消 → ④ 过期检查 → ⑤ 可靠候选选择 → ⑥ 明确新问题 →
    ⑦ 重复选择识别（仅无可消费 pending 时）→ ⑧ hand_back →
    ⑨ none。低优先级的名称/城市/序号匹配**绝不覆盖**目的地变化。
-3. hand_back 不得被当作取消：仅城市词 + 泛化品类、无明确新问题
-   证据的表达（「南京有什么好吃的」等）一律 hand_back，旧
-   Pending 保持 open；带询问/评价标记（怎么样/值得/好吃…）的
-   指代表达（「南京那家怎么样」「那家店值得去吗」）不确认为
-   选择 → restate（保持 open，绝不取消）。
+3. hand_back 与 restate 边界（P2.3 验收补丁冻结）——
+   restate **只留给显式重述请求**（「再说一遍有哪些店」「重新列
+   一下」）；其余与 pending 相关但不足以确定是选择、重述还是
+   新问题的表达（「南京那家怎么样」「南京有什么好吃的」「那家
+   店值得去吗」、选择歧义/越界、取消与选择冲突）一律 hand_back：
+   保守交回原链路，pending 保持 open，**绝不消费、绝不取消**。
 4. 重复选择识别（§4.1）须同时满足：纯选择线索（序号指代或
    「就这家/还是它」）+ 不含新实体候选/新意图信号 + 当前 Session
    最近一次消费在 TRAVEL_PENDING_RESELECT_WINDOW（默认 600 秒）
@@ -113,9 +114,15 @@ _PURE_TONES = ("就这家", "还是它", "就它", "就这个", "就要这个",
 _DEMONS = ("那家", "这家", "那间", "那个", "这家店", "那家店")
 
 # 询问/评价标记：出现即不确认为选择（「南京那家怎么样」「那家店
-# 值得去吗」→ 保持 open，绝不取消，也绝不消费）
+# 值得去吗」→ hand_back 保守交回原链路，绝不消费、绝不取消）
 _Q_MARKERS = ("怎么样", "怎样", "如何", "值得", "推荐", "介绍",
               "好吃", "好玩", "评价", "靠谱", "怎么样?", "好吗")
+
+# 显式重述请求：restate 的唯一触发来源（P2.3 验收补丁冻结边界——
+# restate 只留给「用户明确要求重新展示/重复说明候选」）
+_REDISPLAY_PATTERNS = ("再说一遍", "再说一次", "重新列", "再列一次",
+                       "重新说", "重复一下", "重述", "列一下选项",
+                       "有哪些店", "有哪些选择", "重新展示")
 
 # 明确新意图的粗分类（结构化解析依据；poi 粗类须有具名实体候选
 # 才算依据，纯城市词/泛化品类词不算——评审红线）
@@ -255,6 +262,7 @@ class PendingInterceptor:
                                   "交回原链路")
 
         pid = p.pending_id
+        redisplay = any(t in ut for t in _REDISPLAY_PATTERNS)
         # ② 明确目的地变化（最高优先级，规则 4；含新目的地恰在快照
         #    城市集合内的保守取舍——旧快照一律作废重走 Resolver）
         if dest is not None:
@@ -263,26 +271,29 @@ class PendingInterceptor:
                 reason="本句明确新目的地（规划语义），候选城市归属已"
                        "变化，旧快照作废重新走 EntityResolver（规则 4）",
                 evidence=dest)
-        # ③ 用户明确取消（与选择语境冲突时保守 → restate）
+        # ③ 用户明确取消（与选择语境冲突时保守 → hand_back，
+        #    P2.3 验收补丁冻结边界：restate 只留给显式重述请求）
         if cancel_hit:
             if sel.context:
                 return self._v(
-                    V_RESTATE, ut, now_e, pending_id=pid,
-                    reason="取消与选择线索同时命中，保守处理不消费"
-                           "（冲突保守）",
+                    V_HAND_BACK, ut, now_e, pending_id=pid,
+                    reason="取消与选择线索同时命中，不足以确定是选择、"
+                           "重述还是新问题，保守交回原链路（pending "
+                           "保持 open）",
                     evidence={"conflict": "cancel+selection",
                               "selection_kind": sel.kind})
             return self._v(V_CANCEL_EXPLICIT, ut, now_e, pending_id=pid,
                            reason="用户明确取消（规则 2）",
                            evidence={"keyword": next(
                                k for k in _CANCEL_KW if k in ut)})
-        # ④ 过期检查（选择语境一律如实告知过期，规则 5）
+        # ④ 过期检查（选择语境或显式重述请求一律如实告知过期，规则 5）
         expired = self._store._is_expired(p)
-        if expired and sel.context:
+        if expired and (sel.context or redisplay):
             return self._v(
                 V_EXPIRED_REPLY, ut, now_e, pending_id=pid,
                 reason="pending 已过期，不得继续执行（规则 5）",
-                evidence={"selection_kind": sel.kind})
+                evidence={"selection_kind": sel.kind or None,
+                          "redisplay": redisplay})
         # ⑤ 可靠候选选择（规则 1/9；询问/评价标记已排除确认选择）
         if sel.context and not sel.question:
             state, ids = _resolve_selection(sel, p, ut)
@@ -293,11 +304,14 @@ class PendingInterceptor:
                     reason="可靠选择线索定位唯一候选（规则 1/9）",
                     evidence={"selection_kind": sel.kind,
                               "order": sel.order})
+            # P2.3 验收补丁冻结边界：选择尝试失败（越界/歧义）不足
+            # 以确定是选择还是新问题 → hand_back 交回原链路
             if state in ("ambiguous", "invalid"):
                 return self._v(
-                    V_RESTATE, ut, now_e, pending_id=pid,
-                    reason="选择语境但无法唯一定位候选，引用 pending "
-                           "重述选项（§3 路径 3）",
+                    V_HAND_BACK, ut, now_e, pending_id=pid,
+                    reason="选择语境但无法唯一定位候选，不足以确定是"
+                           "选择还是新问题，保守交回原链路（pending "
+                           "保持 open，不消费不取消）",
                     evidence={"selection_kind": sel.kind,
                               "resolve": state,
                               "order": sel.order})
@@ -308,14 +322,24 @@ class PendingInterceptor:
                 reason="明确新问题证据充分，先取消旧 pending 再走原"
                        "链路（规则 3，不误消费）",
                 evidence=newq)
-        # ⑧ 选择语境带询问标记 / 其余模糊 → hand_back / restate
-        if sel.context:
+        # ⑦ 显式重述请求（「再说一遍有哪些店」「重新列一下」）
+        #    → restate：引用 pending 重述选项，保持 open
+        if redisplay:
             return self._v(
                 V_RESTATE, ut, now_e, pending_id=pid,
-                reason="指代/询问语境不确认为选择，保持 open 重述选项"
-                       "（hand_back 不得当作取消）",
+                reason="用户明确要求重新展示候选，引用 pending 重述"
+                       "选项（保持 open，不消费不取消）",
+                evidence={"redisplay": True})
+        # ⑧ 与 pending 相关但不足以判定 → hand_back（验收补丁冻结：
+        #    「南京那家怎么样」「那家店值得去吗」等一律交回原链路）
+        if sel.context:
+            return self._v(
+                V_HAND_BACK, ut, now_e, pending_id=pid,
+                reason="与 pending 相关但不足以确定是选择、重述还是"
+                       "新问题，保守交回原链路（pending 保持 open，"
+                       "不消费不取消）",
                 evidence={"selection_kind": sel.kind,
-                          "question_marker": True})
+                          "question_marker": sel.question})
         return self._v(
             V_HAND_BACK, ut, now_e, pending_id=pid,
             reason="表达模糊且无取消/选择/新问题依据，交回原链路，"

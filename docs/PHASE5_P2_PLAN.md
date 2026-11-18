@@ -315,3 +315,28 @@ PRIMARY KEY（同一 pending 只能成功消费一次），同时充当半成功
 过期（open 且已到期 → expired）再查重——到期永不阻塞新 Pending
 （阻断项①），与 SQLite 实现双实现对拍锁定（`_lifecycle` 逐位
 对比脚本）。
+
+### 9.1 P2.3 验收补丁记录（消费记录字段契约与时间边界）
+
+**消费记录字段契约（定版：七字段）**：`_latest_consumption()`
+双实现统一返回 `session_id / pending_id / candidate_id /
+consumed_at / original_intent / selected_name / selected_city`。
+`selected_city` 并非未批准扩展——`pending_consumption.selected_city
+TEXT` 列自本方案 §2 的冻结建表语句起就存在；其**用途**：
+① `duplicate_select` 话术与影子归因（如实告知「刚刚已确认过
+『XX（南京店）』」，§4.1 要求话术带城市店名）；② 影子证据字段，
+供接管前归因观测。**不参与**重复选择三条件判定（判定只用纯选择
+线索 + 新实体/新意图信号 + 时间窗口），因此不存在城市误关联的
+误判路径。内存桩与 SQLite 均返回相同七字段（字段级对拍锁定）；
+未成功消费不产生记录；按当前 Session 查询、不跨 Session 读取。
+
+**过期边界语义（定版）**：`expires_at` 为有效期**截止时刻**，
+`now == expires_at` 即过期——内存桩与 SQLite 的 `_is_expired`
+统一用 `>=`，SQL 条件更新用 `expires_at <= ?`（自动过期）与
+`expires_at > ?`（可消费），三处口径一致。
+
+**异常时间值失败关闭（定版）**：无法解析的 `expires_at` 一律
+**保守视为已过期**——内存桩与 SQLite 的 `_is_expired` 返回 True；
+SQLite 消费路径对不可比较值同样拒绝；`get_active_pending` 与
+`create_pending` 自动过期均带 Python 侧兜底，异常时间行不被消费
+也不阻塞新 Pending。绝不让异常时间值导致 Pending 被继续消费。

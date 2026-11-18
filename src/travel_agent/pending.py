@@ -368,13 +368,19 @@ class PendingStore:
                 if self._consumptions else None
 
     def _is_expired(self, p: PendingDisambiguation) -> bool:
+        """到期判定（P2.3 验收补丁冻结语义）：
+
+        - expires_at 是有效期**截止时刻**：等于即过期（>=）；
+        - 异常/无法解析的时间值 → **失败关闭**（保守视为已过期，
+          绝不让 Pending 被继续消费），与 SQLite 实现同语义。
+        """
         try:
             exp = datetime.strptime(p.expires_at, "%Y-%m-%dT%H:%M:%S")
-        except ValueError:
-            return False
+        except (ValueError, TypeError):
+            return True
         # P2.2 时间契约：epoch 整数比较（naive ISO 与 naive 时钟按
         # UTC 同约定转换，偏移相消，内部自洽）
-        return _epoch(self._now()) > _epoch(exp)
+        return _epoch(self._now()) >= _epoch(exp)
 
 
 def _snap(cid: str, order: int, name: str, city: str,

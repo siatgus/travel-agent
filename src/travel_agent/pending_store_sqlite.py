@@ -134,14 +134,19 @@ class SQLitePendingStore:
             else int(time.time())
 
     def _is_expired(self, p: PendingDisambiguation) -> bool:
-        """到期判定（内部）：ISO 展示字段按 UTC 还原为 epoch 比较。"""
+        """到期判定（P2.3 验收补丁冻结语义，与内存桩同语义）：
+
+        - expires_at 是有效期**截止时刻**：等于即过期（>=）；
+        - 异常/无法解析的时间值 → **失败关闭**（保守视为已过期，
+          绝不让 Pending 被继续消费）。
+        """
         try:
             exp = datetime.strptime(
                 p.expires_at, "%Y-%m-%dT%H:%M:%S").replace(
                 tzinfo=timezone.utc)
-        except ValueError:
-            return False
-        return self._now_epoch() > int(exp.timestamp())
+        except (ValueError, TypeError):
+            return True
+        return self._now_epoch() >= int(exp.timestamp())
 
     def _latest_consumption(self) -> dict | None:
         """P2.3 内部查询（不进公共契约）：本 Session 最近一次消费记录。
@@ -172,14 +177,23 @@ class SQLitePendingStore:
     def _pending_from_row(self, row) -> PendingDisambiguation:
         cands = tuple(_candidate_from_dict(d)
                       for d in json.loads(row["candidates_json"]))
+
+        def _disp(col) -> str:
+            """时间展示值：正常行转 ISO；异常值原样保留（判定走
+            _is_expired 失败关闭，展示值绝不参与比较）。"""
+            try:
+                return _iso_utc(int(row[col]))
+            except (TypeError, ValueError):
+                return str(row[col])
+
         return PendingDisambiguation(
             pending_id=row["pending_id"],
             original_utterance=row["original_utterance"],
             original_intent=row["original_intent"],
             original_role=row["original_role"],
             candidates=cands,
-            created_at=_iso_utc(int(row["created_at"])),
-            expires_at=_iso_utc(int(row["expires_at"])),
+            created_at=_disp("created_at"),
+            expires_at=_disp("expires_at"),
             status=row["status"])
 
     @staticmethod
@@ -221,6 +235,18 @@ class SQLitePendingStore:
                 " WHERE session_id = ? AND status = 'open'"
                 "   AND expires_at <= ?",
                 (self._session_id, now_e))
+            # 失败关闭兜底：异常时间值（SQL 不可比）不满足上面的
+            # 条件更新，这里用 Python 侧 _is_expired 再兜一道
+            stale = con.execute(
+                "SELECT * FROM pending_disambiguation"
+                " WHERE session_id = ? AND status = 'open'",
+                (self._session_id,)).fetchall()
+            for srow in stale:
+                if self._is_expired(self._pending_from_row(srow)):
+                    con.execute(
+                        "UPDATE pending_disambiguation"
+                        " SET status = 'expired' WHERE pending_id = ?",
+                        (srow["pending_id"],))
             try:
                 con.execute(
                     "INSERT INTO pending_disambiguation (pending_id,"
@@ -264,7 +290,15 @@ class SQLitePendingStore:
                 (self._session_id, self._now_epoch())).fetchone()
         finally:
             con.close()
-        return self._pending_from_row(row) if row is not None else None
+        if row is None:
+            return None
+        p = self._pending_from_row(row)
+        # 失败关闭兜底：异常时间值（TEXT 等 SQL 不可比数据）不被
+        # SQL 过滤时，Python 侧 _is_expired 再拦一道（绝不返回可
+        # 消费的过期 pending）
+        if self._is_expired(p):
+            return None
+        return p
 
     def get_pending_by_id(self, pending_id: str) \
             -> PendingDisambiguation | None:
@@ -317,7 +351,11 @@ class SQLitePendingStore:
                     ok=False, pending_id=pending_id,
                     reason=f"pending 状态为 {status}，不可消费")
             now_e = self._now_epoch()
-            if int(row["expires_at"]) <= now_e:
+            try:
+                expired = int(row["expires_at"]) <= now_e
+            except (TypeError, ValueError):
+                expired = True   # 异常时间值 → 失败关闭（不得消费）
+            if expired:
                 # 到期显式登记持久化（与内存桩 consume 过期分支同语义）
                 con.execute(
                     "UPDATE pending_disambiguation SET status = 'expired'"
