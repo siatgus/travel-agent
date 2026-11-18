@@ -1,9 +1,11 @@
-# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3.2 冻结版）
+# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3.2.1 开发基线）
 
 > 版本历史：
 > v1 `e0438ab`（2026-11-18 初稿）→ v2（2026-11-18 评审修订）→ v3
 > （2026-11-18 最后一轮修订）→ v3.1（开发指令补录 + 六项设计落地）
-> → **v3.2 本文**（2026-11-18 契约冻结：五档/六档分离等 8 项收敛）。
+> → v3.2（契约冻结：五档/六档分离等 8 项收敛）→ **v3.2.1 本文**
+> （2026-11-18 开发前契约修订 5 处：deferred 定义、LLM 职责收缩、
+> 接入点 A 执行顺序、probe 组合校验、语料字段冻结）。
 > 第四阶段基线：commit `2f66f4e`（验收已通过）。
 > **本版为实施基线，核心契约不再改动。**
 > 本阶段定位：**建立可靠的决策边界**，让三、四阶段的结果逐步参与业务
@@ -206,13 +208,23 @@ class DecisionResult:
 | 任意需要延后 | deferred | 已决策但明确不接管，交回原流程 |
 
 映射固定、逐条进测试；DecisionEngine 内部五档定档逻辑变更时映射表
-不变。**deferred 双语义区分（v3.2 冻结）：**
-- 未接管（TAKEOVER=0 或批次白名单未含）→ `decide()` 返回 **None**
-  （影子记录后交回原流程）；
-- 已决策但明确不接管（TAKEOVER=1 且判断完成，但该意图无对应 action
-  路径）→ `DecisionResult(action="deferred")`。
-  **两者不混**：None = DecisionEngine 未形成结论；deferred = 形成了
-  结论但本步不消费。
+不变。
+
+**deferred 双语义与返回值判定表（v3.2.1 冻结）：**
+
+| 情况 | decide() 返回值 |
+|---|---|
+| TAKEOVER=0（默认） | None（影子记录后交回原流程） |
+| 不在批次白名单 | None |
+| 本轮不满足实体验证入口条件 | None |
+| 已形成决策，但当前意图没有接管处理器 | DecisionResult(action="deferred") |
+| 已形成有效实体决策 | 按上表五档映射 action |
+
+**deferred 不是第六种实体状态，也不是五档状态的映射结果**——它是
+执行策略层的「交回」动作，绝不进五档状态机（负向测试：任何
+entity status 不得迁移为 deferred；deferred 不得作为 DecisionEngine
+内部定档输入）。None = DecisionEngine 未形成结论；deferred = 形成了
+结论但本步不消费，两者不混。
 
 字段约束：`action` 六枚举；`city` 必须标注来源（query_city /
 destination / departure_city，供归因）；`entity` 为 None 时 action
@@ -236,6 +248,11 @@ llm_entity_fallback.py 的 LLM 结构化输出契约（schema_version=1）：
 ```
 
 硬性规则：
+0. **LLM 职责只有两项（v3.2.1 冻结）**：① 实体文本补全（如把
+   「民国时候的广播台旧址」补全为具体候选名称）；② 实体类型辅助
+   识别（景点/餐厅/酒店）。**角色判定不在其职责内**——LLM 输出中
+   不存在也不允许出现角色字段，query/must_visit 等角色归属由
+   Parser / CandidateExtractor / 既有角色规则决定。
 1. **白名单字段**：只有上列五个键；出现 `destination`、`plan`、
    `actions`、`poi_id`、`must_visit` 等任何越权字段 → 该字段丢弃并记
    notes（LLM 无权表达这些意图，见 §6.4 红线）。
@@ -306,8 +323,12 @@ skipped → category_path。断言形式：`entity status ≠ skipped` 与
 
 1. **规则主链无可用结构**，具体判据（满足其一）：
    a. 本轮实体候选为空，但意图需要实体（poi_qa / poi_query 类）；
-   b. 候选角色不确定（L3 未定性，query/must_visit 无法判定）；
-   c. 实体边界不确定（候选文本含未消费的残余片段）。
+   b. **实体边界不确定**（规则识别出的文本不完整，需要实体文本
+      补全，如「广播台旧址」→「国民政府中央广播电台旧址」）；
+   c. 实体类型不确定（无法判定候选更接近景点、餐厅还是酒店）。
+   **注意（v3.2.1）：候选角色不确定（query/must_visit 等角色归属）
+   不是触发条件**——角色永远由 Parser、CandidateExtractor 和既有
+   角色规则负责，LLM 不参与角色判断（§2.4 规则 6）。
 2. **兜底开关已开启**：`TRAVEL_LLM_FALLBACK=1`（**默认关闭**，影子
    阶段只统计触发判据命中数，不实际调用）。
 3. **成本闸**：每轮最多一次调用、超时上限（默认 8s）、无重试风暴；
@@ -364,6 +385,14 @@ TAKEOVER=1 + 批次白名单：才按上表消费 action。
 
 分数只做同档内排序（如消歧候选展示顺序），永不跨档救回被硬约束拦下
 的记录。
+
+**confidence 计算边界（v3.2.1 冻结）：**
+- 参与评分的证据：匹配方式基线分（KB 全名 0.92 / 部分匹配 0.82 /
+  在线 0.80）+ 上下文调整（无城市 −0.12 / 类型不符 −0.25），沿用
+  第四阶段策略，**第五阶段不重设计评分模型**；
+- 同档排序依据：分数 → 匹配方式 → 名称长度稳定性；
+- 无足够评分依据时取档内保守值（默认 0.0，不臆造中间分）；
+- 分数仅用于档内排序与展示，绝不参与定档与跨档。
 
 ## 4. 实体归并先于唯一性
 
@@ -479,6 +508,14 @@ class PendingDisambiguation:
    多个，必须通过 pending_id 显式引用，绝不默认消费「最近一个」。
 9. 选择引用的 candidate_id 必须属于原快照；快照外的 ID 一律拒绝。
 
+**存储接口（v3.2.1 补充，P2 实现）：**`create_pending` /
+`get_active_pending` / `consume_pending` / `cancel_pending` /
+`expire_pending`。其中 `consume_pending` 的 open→consumed 迁移
+**必须原子**：不得使用「先读 status 判断再写」两步式（并发请求会
+同时通过判断），须用数据库条件更新（`UPDATE ... WHERE
+status='open'` 检查受影响行数）或等效事务/锁机制，保证只能成功
+一次。
+
 ## 8. 枚举正交与组合合法性
 
 ```text
@@ -510,6 +547,28 @@ probe_results（v3 新增，逐源证据明细）:
 非法组合示例（测试必须拦截）：(rejected, unavailable)、(rejected,
 not_found + data_source_empty)、(rejected, 双源任一 failed/skipped)、
 (skipped, success_hit)、(unavailable 无 probe_reason)。
+
+**probe_reason 空值规则（v3.2.1 冻结，组合校验判定依据）：**
+
+| probe_status | probe_reason 允许值 |
+|---|---|
+| not_applicable | None（必须为空） |
+| not_requested | disabled_by_policy（固定） |
+| success_hit | None（必须为空） |
+| not_found（单源） | data_source_empty（固定） |
+| not_found（双源） | cross_source_empty（固定） |
+| unavailable | 必须为具体失败原因（network_timeout / no_key / circuit_open / no_city_center / quota_exceeded 之一），不得为空 |
+
+**probe_results 内部一致性不变量（v3.2.1 新增，Resolver 级测试）：**
+
+1. 聚合 probe_status 必须能从 probe_results 逐源明细推导重现；
+2. 任一源 outcome=failed → 聚合不得为 not_found（**主源
+   success_empty + 复核源 failed → unverified**，绝不能因两个源都
+   没返回实体就当成双源空结果——此场景同时做成 Resolver 内部
+   不变量测试，不只停留在语料层）；
+3. skipped 的源不计入双源复核计数；
+4. outcome 与 reason 一一对应（failed/skipped 必带 reason，
+   success_hit/success_empty 的 reason 为空）。
 
 ## 9. 分批接管与 P3 边界（v3 修订）
 
@@ -550,25 +609,44 @@ not_found + data_source_empty)、(rejected, 双源任一 failed/skipped)、
 ### 9.4 Orchestrator 接入点（v3.1 补录）
 
 orchestrator._turn_impl 现有流程不动，只在**三个固定点位**插入
-DecisionEngine 调用，全部由开关控制：
+DecisionEngine 调用，全部由开关控制。
+
+**接入点 A 的固定执行顺序（v3.2.1 冻结，决策链严格在
+EntityResolver 之后）：**
 
 ```
 _turn_impl:
-  ① ctx = parse_utterance(...)          # 既有
-  ② [接入点 A] DecisionEngine.decide(ctx.parse, resolved, context)
+  # 1. 解析用户表达（既有调用链，复用不重写）
+  ctx = parse_utterance(...)
+  # 2. 提取候选（既有 CandidateExtractor，影子链路）
+  candidates = candidate_extractor.extract(ctx.parse)
+  # 3. 必要时补充 LLM 候选——默认关闭，P4 才真正启用
+  candidates = fallback_if_needed(ctx.parse, candidates, context)
+  # 4. 实体验证（复用既有 Resolver 调用链，不重复解析或验证）
+  resolved = entity_resolver.resolve(candidates, context)
+  # 5. 决策（接入点 A）
+  decision = decision_engine.decide(ctx.parse, resolved, context)
        TAKEOVER=0（默认）→ 仅记录 shadow_decision，返回 None
        TAKEOVER=1 且本意图批次已启用 → 返回 DecisionResult
-  ③ 既有 intent 路由 if/elif 分支：
-       - 每个分支入口先看 ② 是否给出 DecisionResult：
-           给了且 action=execute      → 走该 Handler 受控链路
-           给了且 action=clarify      → 进消歧通道（P2 后启用）
-           给了且 action=reject_reply → 按措辞约束回复，不执行
-           给了且 action=conservative → 保守话术，不执行
-           给了且 action=category_path/deferred → 交回原分支照旧
-           没给（None）               → 原分支逻辑一字不改
-  ④ [接入点 B] PlanHandler 写入前：HC-5 复核（destination 写权限）
-  ⑤ [接入点 C] 回复组装后：DecisionResult.reason 写入影子记录归因
+  # 6. 交给既有业务路由（原 if/elif 一字不改）
 ```
+
+注意：上表是数据流示意；实际开发**必须复用现有 Resolver 调用链**
+（parser 影子通道中的 shadow_resolved），不得为接入 DecisionEngine
+而重复解析或验证。
+
+**决策结果消费（原 if/elif 分支入口处）：**
+- 每个分支入口先看接入点 A 是否给出 DecisionResult：
+  给了且 action=execute → 走该 Handler 受控链路；clarify → 进消歧
+  通道（P2 后启用）；reject_reply → 按措辞约束回复不执行；
+  conservative → 保守话术不执行；category_path / deferred → 交回
+  原分支照旧；没给（None）→ 原分支逻辑一字不改。
+
+**接入点 B（PlanHandler 写入前）**：HC-5 复核（destination 写权限）
+——即使后续链路出现 destination 也不能绕过。
+
+**接入点 C（回复组装后）**：只记录 DecisionResult.reason 作影子
+归因；**reason 不决定回复文案**。
 
 原则：**接入点只增不改**——旧分支在 DecisionResult 为 None 时行为
 与现状完全一致；任何批次接管都通过「开关 + 批次白名单」双条件放行，
@@ -693,12 +771,24 @@ plan_trip / 不动行程节点 / 不静默选分店）。
 其中 ⑥ 是本阶段最重要防线之一：三城市字段拆分后任何路由都不得把
 query_city 写进 destination。⑭⑮ 是 T-A 的真实语料落地形式。
 
-### T-K 验收语料 v5 全表（v3.1 补录；v3.2 升级为状态机断言）
+### T-K 验收语料 v5 全表（v3.1 补录；v3.2 升级为状态机断言；v3.2.1 冻结字段）
 
-语料文件 tests/corpus_v5.tsv，列格式沿用 v4（id / 期望 /
-utterance / context / kb / probe_spec / expect_resolved / note）；
-KB 与探测全部注入、纯离线运行。**v3.2 断言升级**：每条从「意图分类
-是否正确」升级为逐项断言——
+语料文件 tests/corpus_v5.tsv，**TSV 列格式 v3.2.1 冻结为 12 列**：
+
+```text
+id │ utterance │ context │ kb │ probe_spec │ expect_resolved │
+expect_status │ expect_action │ expect_turn │ expect_permissions │
+expect_diff_class │ note
+```
+
+- `expect_status` 是**测试预期字段**，仅用于断言校验——不意味着把
+  status 塞回 DecisionResult（DecisionResult 契约不变）；
+- `expect_permissions`：越权/错误执行检查（如 destination 未被改写、
+  未静默选分店）；
+- `expect_diff_class`：新旧链路差异三分类（fix_old / by_design /
+  regression）。
+
+KB 与探测全部注入、纯离线运行。**断言要求**：
 
 - **必测正向**：confirmed → execute、ambiguous → clarify、
   rejected → reject_reply、unverified → conservative、
@@ -768,5 +858,6 @@ expect_status，第二轮 expect_action（含 pending 消费原子性、补充�
 | 2026-11-18 | v3.2 | §2.3.1 五档→六档固定映射表 + deferred 双语义（None=未接管 / deferred=已决策不接管，不混） | 评审：灰度迁移需要区分两种「不接管」 |
 | 2026-11-18 | v3.2 | §2.4 LLM 不参与五档判断写死；越权必测字段（plan/must_visit/destination）；触发判据删除 OTHER/低置信度，唯一 should_fallback 公式 | 评审：LLM 权限收紧到只补候选 |
 | 2026-11-18 | v3.2 | §2.5 skipped 入口收紧（没有实体≠skipped）+ 跨轮验收用例 Case A/B/C；§11 T-K 升级为状态机断言（四元组+必测正负向）；§11 新增 T-L 跨轮状态机组；§2.7 收敛总图 | 评审：验收从分类题升级为状态机题 |
+| 2026-11-18 | v3.2.1（开发基线） | §2.3.1 deferred 返回值判定表（deferred 不是第六种实体状态，不进五档状态机）；§2.6/§2.4 LLM 职责收缩为实体文本补全+类型辅助，角色不确定不再是触发条件；§9.4 接入点 A 固定执行顺序（决策链在 Resolver 之后，复用既有调用链）；§8 probe_reason 空值规则 + probe_results 内部一致性不变量（主源空+复核失败→unverified 作 Resolver 级不变量测试）；§11 T-K TSV 冻结 12 列（expect_status 是测试预期，不回塞 DecisionResult）；§7 消歧存储接口五方法+原子消费实现要求；§3 confidence 计算边界冻结 | 开发前最终评审 5 个必改问题 + 2 个落实事项，防止开发时自行猜测 |
 | 2026-11-18 | v3.1 | §10.1 长期路线 Phase 6–8 定版；DEP-001 留待 Phase 6，第五阶段完全不碰 | 开发指令的路线定版要求 |
 | 2026-11-18 | v3.1 | §2.4 LLM fallback schema（白名单五键、越权字段丢弃、适配器校验、city_hints 不写入）；§2.5 五档状态转换表（轮内转换 + 跨轮迁移 + 禁止转换）；§2.6 触发条件可执行判据（三条件 + 成本闸，默认关）；§9.4 Orchestrator 三接入点只增不改 + 开关矩阵；§11 T-K 语料 v5 全表 30 条（16–30 覆盖 T-A~T-I，含三分类标注） | 「六项怎么设计」评审问答落地：一次定死 DecisionResult / schema / 触发条件 / 状态转换 / 接入点 / 验收语料 |
