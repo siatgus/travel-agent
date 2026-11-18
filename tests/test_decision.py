@@ -312,6 +312,61 @@ def test_batch_whitelist_and_shadow_sink() -> None:
           and sink_records[0]["batch_enabled"] is False, str(sink_records))
 
 
+def test_p1_acceptance_shadow_sink_isolation() -> None:
+    """P1 验收注意事项①（P1.5 落地）：shadow_sink 抛异常必须被兜底
+    隔离——不影响决策结果、不影响 shadow_log、不让用户请求失败。"""
+    ctx = {"slots": {"destination": "成都"}}
+    kb = [("成都", {"name": "上海贝皇大排档", "category": "restaurant",
+                    "area": "锦江区"})]
+
+    def broken_sink(rec):
+        raise RuntimeError("影子存储宕机")
+
+    eng = engine(shadow_sink=broken_sink)
+    r = resolve([cand("上海贝皇大排档", "restaurant")], ctx, kb)
+    d = eng.decide(parse(destination="成都", intent="poi_query",
+                         coarse="poi"), r.resolved, ctx, takeover=True)
+    check("sink 异常不影响决策产出（照常返回 DecisionResult）",
+          d is not None and d.action == "execute", str(d))
+    check("sink 异常不影响 shadow_log 追加",
+          len(eng.shadow_log) == 1, str(eng.shadow_log))
+    d2 = eng.decide(parse(destination="成都", intent="poi_query",
+                          coarse="poi"), r.resolved, ctx, takeover=False)
+    check("sink 异常不影响 TAKEOVER=0 语义（仍返回 None）", d2 is None,
+          str(d2))
+
+
+def test_p1_acceptance_city_source_fallback_attribution() -> None:
+    """P1 验收注意事项②（P1.5 落地）：query_city 缺失回退继承
+    destination 时，city_source 必须如实记录 destination——不能只记
+    最终城市值（归因不可靠 Handler 猜）。"""
+    ctx = {"slots": {"destination": "成都"}}
+    kb = [("成都", {"name": "上海贝皇大排档", "category": "restaurant",
+                    "area": "锦江区"})]
+    eng = engine()
+    r = resolve([cand("上海贝皇大排档", "restaurant")], ctx, kb)
+    # 查询类意图、本轮无 query_city → 回退继承目的地
+    d = eng.decide(parse(destination="成都", intent="poi_query",
+                         coarse="poi"), r.resolved, ctx, takeover=True)
+    check("查询类无 query_city → city=继承的目的地值",
+          d is not None and d.city == "成都", str(d and d.city))
+    check("city_source 如实记 destination（不是 query_city）",
+          d is not None and d.city_source == "destination",
+          str(d and d.city_source))
+    # 对照：本轮明确 query_city 时 city_source=query_city
+    r2 = resolve([cand("总统府")],
+                 {"slots": {"destination": "上海", "query_city": "南京"}},
+                 [("南京", {"name": "总统府", "category": "attraction",
+                            "area": "玄武区"})])
+    d2 = eng.decide(parse(text="介绍一下南京的总统府", intent="poi_qa",
+                          coarse="poi", query_city="南京",
+                          destination="上海"), r2.resolved, {}, takeover=True)
+    check("本轮明确 query_city → city_source=query_city",
+          d2 is not None and d2.city == "南京"
+          and d2.city_source == "query_city",
+          f"{d2 and d2.city}/{d2 and d2.city_source}")
+
+
 def test_engine_never_specifies_handler_or_writes() -> None:
     """边界：DecisionEngine 不指定 Handler、不改行程、不写 slots。"""
     import inspect
@@ -347,6 +402,8 @@ def main() -> int:
                test_block8_deferred_not_entity_status,
                test_block9_takeover_off_zero_change,
                test_batch_whitelist_and_shadow_sink,
+               test_p1_acceptance_shadow_sink_isolation,
+               test_p1_acceptance_city_source_fallback_attribution,
                test_engine_never_specifies_handler_or_writes,
                test_serialization_contract):
         fn()
