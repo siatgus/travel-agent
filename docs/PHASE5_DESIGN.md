@@ -173,6 +173,83 @@ class DecisionResult:
 - `confidence` 只在同档内使用（如消歧候选展示排序），任何硬约束失败
   直接定档，分数不参与跨档救回（§3）。
 
+字段约束：`action` 六枚举；`city` 必须标注来源（query_city /
+destination / departure_city，供归因）；`entity` 为 None 时 action
+不得为 execute；`pending` 仅 action=clarify 时非空。
+
+### 2.4 LLM fallback schema（v3.1 补录）
+
+llm_entity_fallback.py 的 LLM 结构化输出契约（schema_version=1）：
+
+```json
+{
+  "schema_version": 1,
+  "intent": "poi_qa | poi_query | nearby_food_query | unknown",
+  "entity_candidates": [
+    {"text": "国民政府中央广播电台旧址",
+     "entity_type": "attraction | restaurant | hotel | unknown"}
+  ],
+  "city_hints": {"query_city": "南京"},
+  "notes": "规则只识别出『广播台』，按上下文补全全名"
+}
+```
+
+硬性规则：
+1. **白名单字段**：只有上列五个键；出现 `destination`、`plan`、
+   `actions`、`poi_id`、`must_visit` 等任何越权字段 → 该字段丢弃并记
+   notes（LLM 无权表达这些意图，见 §6.4 红线）。
+2. **只产候选不产决策**：输出仅含「可能的实体文本 + 类型猜测 + 城市
+   提示」，是否存在、归谁、做什么由 EntityResolver 与 DecisionEngine
+   决定。
+3. **适配器校验**：JSON 不可解析 / entity_candidates 为空 / text 超长
+   或含标点注入特征 → 整体丢弃，走保守处理，不报错。
+4. **来源标记**：经 LLMCandidateAdapter 产出后 candidate_source=llm；
+   text 不在原始用户输入中 → span=null（§6.2）。
+5. **城市提示不是写入**：city_hints.query_city 只作为 EntityResolver
+   的验证上下文，不写 slots（HC-5）。
+
+### 2.5 五档状态转换表（v3.1 补录）
+
+**轮内转换**（单轮解析→验证→决策，由 §2.1 路由表决定，不可逆）：
+
+```
+skipped ← 品类词/城市/空候选（本轮终点，不参与后续）
+confirmed ← KB/双源证据 + 硬约束全过
+ambiguous ← 多实体/城市/类型/分店硬约束命中
+unverified ← 未探测/探测失败/单源空（保守）
+rejected ← 双源适用且独立均空（HC-6 证据闸）
+```
+
+**跨轮转换**（实体在同一会话的后续轮次中允许的状态迁移）：
+
+| 当前 | 下一 | 触发条件 |
+|---|---|---|
+| ambiguous | confirmed | 用户从 pending 快照消歧选择（原子消费，规则 §7） |
+| unverified | confirmed | 用户补充城市/地址/分店后，重验证获得 KB 或双源证据 |
+| unverified | rejected | 仅当重试探测**实际成功**且双源均空；探测仍失败则维持 unverified |
+| rejected | （不复活） | 同一文本保持 rejected；用户换说法产生**新候选**才重新走全链 |
+| 任意 | ambiguous | 上下文变化（如改目的地）触发重新验证（§7 规则 4） |
+| — | skipped | 只能来自品类词/城市/空候选，任何实体状态不得迁入 |
+
+**禁止转换**（负向测试）：unverified → rejected（无充分证据）；
+ambiguous → rejected（静默降档）；confirmed → unverified（证据不
+灭）；任何状态 → must_visit（HC-4）。
+
+### 2.6 LLM 兜底触发条件（v3.1 成文）
+
+三个条件**同时满足**才调用（§2 ①②③ 的可执行判据）：
+
+1. **规则主链无可用结构**，具体判据（满足其一）：
+   a. 本轮实体候选为空，但意图需要实体（poi_qa / poi_query 类）；
+   b. 候选角色不确定（L3 未定性，query/must_visit 无法判定）；
+   c. 实体边界不确定（候选文本含未消费的残余片段）。
+2. **兜底开关已开启**：`TRAVEL_LLM_FALLBACK=1`（**默认关闭**，影子
+   阶段只统计触发判据命中数，不实际调用）。
+3. **成本闸**：每轮最多一次调用、超时上限（默认 8s）、无重试风暴；
+   触发与否、结果、耗时全部记入影子数据。
+
+不满足任一条件 → 静默跳过，走 §2.1 的 unverified/澄清保守路径。
+
 ## 3. 硬约束清单（先检查能否确认，再算分）
 
 | 编号 | 硬约束 | 要点 |
@@ -370,6 +447,42 @@ not_found + data_source_empty)、(rejected, 双源任一 failed/skipped)、
   rejected/unverified 混淆。
 - 回退：`TRAVEL_DECISION_TAKEOVER=0` 立即回旧链路。
 
+### 9.4 Orchestrator 接入点（v3.1 补录）
+
+orchestrator._turn_impl 现有流程不动，只在**三个固定点位**插入
+DecisionEngine 调用，全部由开关控制：
+
+```
+_turn_impl:
+  ① ctx = parse_utterance(...)          # 既有
+  ② [接入点 A] DecisionEngine.decide(ctx.parse, resolved, context)
+       TAKEOVER=0（默认）→ 仅记录 shadow_decision，返回 None
+       TAKEOVER=1 且本意图批次已启用 → 返回 DecisionResult
+  ③ 既有 intent 路由 if/elif 分支：
+       - 每个分支入口先看 ② 是否给出 DecisionResult：
+           给了且 action=execute      → 走该 Handler 受控链路
+           给了且 action=clarify      → 进消歧通道（P2 后启用）
+           给了且 action=reject_reply → 按措辞约束回复，不执行
+           给了且 action=conservative → 保守话术，不执行
+           给了且 action=category_path/deferred → 交回原分支照旧
+           没给（None）               → 原分支逻辑一字不改
+  ④ [接入点 B] PlanHandler 写入前：HC-5 复核（destination 写权限）
+  ⑤ [接入点 C] 回复组装后：DecisionResult.reason 写入影子记录归因
+```
+
+原则：**接入点只增不改**——旧分支在 DecisionResult 为 None 时行为
+与现状完全一致；任何批次接管都通过「开关 + 批次白名单」双条件放行，
+回退开关一关即全部恢复旧路径。
+
+### 9.4.1 语料与开关矩阵
+
+| 开关组合 | 行为 |
+|---|---|
+| `TRAVEL_RESOLVER_ONLINE=0`（默认）+ `TRAVEL_LLM_FALLBACK=0`（默认）+ `TRAVEL_DECISION_TAKEOVER=0`（默认） | 纯影子：候选识别、实体验证、决策全部只记录 |
+| RESOLVER_ONLINE=1 | 影子追加在线探测（有缓存与限额） |
+| LLM_FALLBACK=1 | 兜底可实际调用（P4 后） |
+| DECISION_TAKEOVER=1 + 批次白名单 | 对应意图消费 DecisionResult |
+
 ## 10. 实施顺序
 
 ```
@@ -480,6 +593,34 @@ plan_trip / 不动行程节点 / 不静默选分店）。
 其中 ⑥ 是本阶段最重要防线之一：三城市字段拆分后任何路由都不得把
 query_city 写进 destination。⑭⑮ 是 T-A 的真实语料落地形式。
 
+### T-K 验收语料 v5 全表（v3.1 补录，30 条 = T-J 15 条 + 覆盖 T-A~T-I 的 15 条）
+
+语料文件 tests/corpus_v5.tsv，列格式沿用 v4（id / 期望 /
+utterance / context / kb / probe_spec / expect_resolved / note）；
+KB 与探测全部注入、纯离线运行。以下为编号 16–30（补全 30 条）：
+
+| # | 病例 | 预期要点 | 对应测试组 |
+|---|---|---|---|
+| 16 | 不想去总统府 | negated 走排除链路；role≠must_visit；验证照常 | T-B |
+| 17 | 去掉苍山 | remove 走删除链路；无新增无消歧 | T-B |
+| 18 | 从大理到丽江玩5天 | 城市走路线框架；无垃圾候选（对比第三阶段修复） | T-F |
+| 19 | 记在南京不在上海（destination=上海 上下文） | 跨城归属修正，notes 如实标注 | T-F |
+| 20 | 帮我查一下豫园商城 | 部分匹配→归并证据后 confirmed 或如实 ambiguous | T-G |
+| 21 | 介绍一下南京的总统府 | query_city=南京 且实体同城 → confirmed | T-F |
+| 22 | 上海的总统府（KB 仅南京总统府） | HC-1 城市≠所选字段 → ambiguous，0.92 分不救回 | T-F/T-H |
+| 23 | 我想去南京那家海贝皇 | 城市+品牌引用消费 active pending（快照内 ID） | T-D |
+| 24 | 算了不去海贝皇了 | pending → cancelled，清除不执行 | T-D |
+| 25 | （过期后）选第2家 | pending expired → 拒绝执行，如实告知 | T-D |
+| 26 | 南京天气怎么样 | 无 POI 候选，不进实体验证 | T-J⑨⑩ 同类 |
+| 27 | 帮我排两天的行程 | 无实体候选，规划框架意图不触发 DecisionEngine 实体路径 | §9.1 |
+| 28 | 附近有什么好吃的 | 泛化 nearby，不进验证，走既有 Handler | §9.1 |
+| 29 | （LLM mock）南京那个民国时候的广播台旧址介绍一下 | 规则候选不全 → LLM 兜底产 candidate_source=llm、span=null → Resolver 验证 → confirmed → POI QA | T-C/T-I |
+| 30 | （LLM mock 输出含 destination 字段） | 越权字段丢弃 + notes 记录；destination 不被改写 | T-C 六红线 |
+
+断言规则：30 条逐条含 **新旧链路差异三分类标注**（修复旧缺陷 /
+合理决策差异 / 新系统回归），后者阻断接管；高风险四项零容忍断言
+（§9.3）嵌入语料检查。
+
 ## 12. 明确不做（阶段边界）
 
 - 不修 DEP-001（且不是现有删除/排除功能的前置条件）。
@@ -505,3 +646,4 @@ query_city 写进 destination。⑭⑮ 是 T-A 的真实语料落地形式。
 | 2026-11-18 | v3.1 | §2.2 模块职责表（decision.py / llm_entity_fallback.py 命名对齐）、§2.3 DecisionResult 契约（action/intent/entity/city/confidence/reason/pending），orchestrator 只消费 DecisionResult | 开发指令：不再在 _turn_impl 里堆 if/elif |
 | 2026-11-18 | v3.1 | §11 新增 T-J 重点病例 15 条（含 ⑥ query_city/destination 防线、⑭⑮ rejected/unverified 真实语料） | 开发指令点名的重点测试病例 |
 | 2026-11-18 | v3.1 | §10.1 长期路线 Phase 6–8 定版；DEP-001 留待 Phase 6，第五阶段完全不碰 | 开发指令的路线定版要求 |
+| 2026-11-18 | v3.1 | §2.4 LLM fallback schema（白名单五键、越权字段丢弃、适配器校验、city_hints 不写入）；§2.5 五档状态转换表（轮内转换 + 跨轮迁移 + 禁止转换）；§2.6 触发条件可执行判据（三条件 + 成本闸，默认关）；§9.4 Orchestrator 三接入点只增不改 + 开关矩阵；§11 T-K 语料 v5 全表 30 条（16–30 覆盖 T-A~T-I，含三分类标注） | 「六项怎么设计」评审问答落地：一次定死 DecisionResult / schema / 触发条件 / 状态转换 / 接入点 / 验收语料 |
