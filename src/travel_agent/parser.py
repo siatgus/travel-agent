@@ -101,6 +101,9 @@ class ParseResult:
     # 回归观测，不驱动任何业务行为。dict 见 candidate_extractor.PoCandidate。
     shadow_candidates: list[dict] = field(default_factory=list)
     shadow_notes: list[str] = field(default_factory=list)
+    # 影子运行（Phase 4）：EntityResolver 的实体验证四档分流结果，同样
+    # 只记录不驱动业务。dict 见 entity_resolver.ResolvedCandidate。
+    shadow_resolved: list[dict] = field(default_factory=list)
 
     # -------------------------------------------------- 兼容层
     def to_legacy_delta(self) -> dict:
@@ -292,6 +295,16 @@ def parse_utterance(text: str, context=None, today: date | None = None,
         res.shadow_candidates = ([c.as_dict() for c in _shadow.poi_candidates]
                                  + [c.as_dict() for c in _shadow.city_candidates])
         res.shadow_notes = list(_shadow.notes)
+        # Phase 4 影子：实体验证四档分流。默认 KB-only（不产生网络请求）；
+        # TRAVEL_RESOLVER_ONLINE=1 时影子也做在线只读探测。与 Phase 3 一样
+        # 只记录不驱动业务，任何异常都不影响旧链路。
+        try:
+            from .entity_resolver import resolve as _resolve_entities
+            _rr = _resolve_entities(_shadow.poi_candidates, ctx)
+            res.shadow_resolved = [r.as_dict() for r in _rr.resolved]
+            res.shadow_notes.extend(_rr.notes)
+        except Exception as e:
+            res.notes.append(f"影子实体验证异常：{type(e).__name__}: {e}")
     except Exception as e:                     # 影子通道绝不影响业务
         res.notes.append(f"影子解析异常：{type(e).__name__}: {e}")
 
