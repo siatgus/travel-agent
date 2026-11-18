@@ -577,6 +577,9 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
     pref_rank = build_pref_rank(remaining, slots, reranker, log)
     plan: list[dict] = []
 
+    # 已用餐厅跨天共享：同一家店不重复排（之前在循环内初始化，每天清零，
+    # 同一家店隔天又被排一遍——点名店场景下用户第一天要的店第二天又出现）
+    used_food: set[str] = set()
     for i in range(days):
         d = start + timedelta(days=i)
         w = (weather_res.get("days") or [{}])[min(i, len(weather_res.get("days", [])) - 1)]
@@ -680,7 +683,6 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         prev_geo = home
         prev_uncertain = False
         lunch_done = False
-        used_food: set[str] = set()
         move_total = 0
         dropped: list[dict] = []
         used_pois: list[dict] = []
@@ -709,7 +711,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     and clock + p["duration_min"] > 12 * 60 + 30):
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
                                            ("晚餐", prev_geo, 6.0)],
-                                   spicy_free, used_food, slots)
+                                   spicy_free, used_food, slots, day=i + 1)
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "先吃饭再逛，避免拖到下午两点")
@@ -796,7 +798,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                     and clock <= 14 * 60 + 30):
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 3.0),
                                            ("晚餐", prev_geo, 6.0)],
-                                   spicy_free, used_food, slots)
+                                   spicy_free, used_food, slots, day=i + 1)
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "当地口味，按你的忌口筛过一轮")
@@ -817,7 +819,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
             clock = max(clock, 11 * 60 + 30)
             lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
                                        ("晚餐", prev_geo, 6.0)],
-                               spicy_free, used_food, slots)
+                               spicy_free, used_food, slots, day=i + 1)
             if lunch:
                 meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                         spicy_free, slots, "当天唯一一顿坐下来吃的，不用赶")
@@ -847,7 +849,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                 clock = max(clock, 12 * 60)
                 lunch = _pick_meal(foods, [("午餐", prev_geo, 6.0),
                                            ("晚餐", prev_geo, 6.0)],
-                                   spicy_free, used_food)
+                                   spicy_free, used_food, day=i + 1)
                 if lunch:
                     meal, lmin = _meal_node(lunch, "午餐", prev_geo, clock,
                                             spicy_free, slots, "下午才发车，吃饱再走")
@@ -886,7 +888,7 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
         if i < days - 1:
             dinner = _pick_meal(foods, [("晚餐", prev_geo, 6.0),
                                         ("晚餐", home, 6.0)],
-                                spicy_free, used_food, slots)
+                                spicy_free, used_food, slots, day=i + 1)
             if dinner:
                 dkm = haversine_km(prev_geo, dinner.get("geo") or prev_geo)
                 dmode, dmin = transit_estimate(dkm, prev_geo, dinner.get("geo") or prev_geo)
@@ -904,6 +906,8 @@ def compose(slots: dict, pois_res: dict, weather_res: dict,
                                    dinner["cost"], poi_id=dinner["poi_id"],
                                    geo=dinner.get("geo"),
                                    interests=_meal_interests(dinner, slots)))
+                # 晚餐也要记入已用：之前漏了，同一家店会被第二天午餐再排一遍
+                used_food.add(dinner["poi_id"])
             else:
                 fb = _meal_fallback(max(clock, 18 * 60), "晚餐", spicy_free)
                 nodes.append(fb)
@@ -1149,15 +1153,35 @@ def _food_pool(foods: list[dict], spicy_free: bool) -> list[dict]:
 # 后缀的条目按店名处理，优先占餐位；其余条目仍走景点必去逻辑。
 _FOOD_SUFFIXES = ("大排档", "菜馆", "饭馆", "餐厅", "面馆", "米线店", "米粉店",
                   "火锅店", "烧烤店", "小吃店", "酒楼", "食堂", "汤包店",
-                  "烧饼店", "奶茶店", "咖啡店", "甜品店", "糕团店")
+                  "烧饼店", "馒头店", "包子铺", "奶茶店", "咖啡店", "甜品店",
+                  "糕团店")
 _FOOD_TERM_RE = re.compile("(?:" + "|".join(_FOOD_SUFFIXES) + r")$")
 
 
 def _named_food(foods: list[dict], slots: dict,
-                used_food: set[str]) -> dict | None:
-    """must_visit 里点名的那家店（若在餐厅池里）——多个点名按顺序占餐位。"""
+                used_food: set[str], day: int | None = None) -> dict | None:
+    """must_visit 里点名的那家店（若在餐厅池里）——多个点名按顺序占餐位。
+
+    day 给定时（第 day 天的餐位），day_targets 里点给这一天的店最优先：
+    「第一天安排小笼包」映射成的店必须在第一天餐位出现，别的天不能抢走。
+    """
     from .agent import _loose_poi_hit          # 局部导入避免循环依赖
-    for term in (slots.get("must_visit") or []):
+
+    def _hit_term(term: str, f: dict) -> bool:
+        return (_loose_poi_hit(term, f.get("name") or "")
+                or name_hit(term, f.get("name") or ""))
+
+    if slots and day is not None:
+        _dt = slots.get("day_targets") or {}
+        for term in (_dt.get(str(day)) or _dt.get(day) or []):
+            if not term:
+                continue
+            for f in foods:
+                if f.get("poi_id") in used_food:
+                    continue
+                if _hit_term(term, f):
+                    return f
+    for term in ((slots.get("must_visit") or []) if slots else []):
         if not term or not _FOOD_TERM_RE.search(term):
             continue
         for f in foods:
@@ -1170,7 +1194,7 @@ def _named_food(foods: list[dict], slots: dict,
 
 def _pick_meal(foods: list[dict], attempts: list[tuple[str, list[float] | None, float]],
                spicy_free: bool, used_food: set[str],
-               slots: dict | None = None) -> dict | None:
+               slots: dict | None = None, day: int | None = None) -> dict | None:
     """跨天选餐位。attempts 按顺序尝试（标签, 参照点, 最远距离）。
 
     不吃辣的三级候选：没用过的不辣店 → 不辣店（哪怕中午刚去过——
@@ -1180,7 +1204,7 @@ def _pick_meal(foods: list[dict], attempts: list[tuple[str, list[float] | None, 
     「那给我排海贝皇大排档」，行程里就该吃这家，而不是"就近自选"。
     """
     if slots:
-        named = _named_food(foods, slots, used_food)
+        named = _named_food(foods, slots, used_food, day=day)
         if named:
             return named
     unused = [f for f in foods if f.get("poi_id") not in used_food]

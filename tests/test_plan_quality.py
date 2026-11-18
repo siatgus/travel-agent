@@ -1156,8 +1156,12 @@ def test_kid_party_and_schedule() -> None:
     nap_late = [n for d in plan_late if d["day"] == 2
                 for n in d["nodes"] if "午休" in n["name"]]
     check("午餐 15:31 结束仍插午休（端到端）",
-          len(nap_late) == 1 and nap_late[0]["time"] == "15:31",
+          len(nap_late) == 1 and "15:30" <= nap_late[0]["time"] <= "16:00",
           str([(n["time"], n["name"]) for n in nap_late]))
+    # 注：断言只锁契约「晚收尾的午餐之后仍插入午休、16 点截止前落实」，
+    # 不锁具体分钟——午休起点取决于当天午餐选了哪家店（交通耗时分钟级
+    # 浮动）。餐厅跨天去重（used_food 跨天共享）后，Day2 换了店，起点
+    # 从 15:31 移到 15:30，属行为改善带来的合法浮动。
     # LLM 兜底路径：模型只回 party_detail 漏 party_size 时，总数按构成之和
     from travel_agent import llm as _llm
     _cs = _llm.coerce_slots({"party_detail": "1 大 1 小"})[0]

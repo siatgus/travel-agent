@@ -1813,6 +1813,41 @@ def test_nearby_unknown_anchor_fetches_or_honest() -> None:
         af.ensure_spot = orig
 
 
+def test_dish_request_placed_on_requested_day() -> None:
+    """「第一天给我安排小笼包」（2026-11-18 实测）：
+    小笼包是菜名，抽取器认不出 → 请求被静默吞掉：方案原样重排、
+    无任何确认。修后：菜名映射成库里以它出名的店（tags 命中），
+    排进用户点的那一天的餐位，并在回复里明确确认。"""
+    s = Session(today=TODAY)
+    s.turn("12月20号去上海玩3天，2个人")
+    s.turn("上海有什么特色美食")
+    r = s.turn("第一天给我安排小笼包")
+    check("菜名请求得到确认（回复提及小笼包与映射的店）",
+          "小笼包" in r.render and "南翔馒头店" in r.render, r.render[:160])
+    check("确认排在第 1 天", "第 1 天" in r.render, r.render[:160])
+    plan = s.last_plan or {}
+    days = plan.get("days_plan") or []
+    hits = [(d["day"], n) for d in days for n in d["nodes"]
+            if "南翔" in (n.get("name") or "")]
+    check("南翔馒头店排在第 1 天", bool(hits) and hits[0][0] == 1, str(hits))
+    check("同一家店不跨天重复（跨天已用守卫）",
+          len(hits) == 1, str([(d, n["name"]) for d, n in hits]))
+
+
+def test_dish_request_without_store_is_honest() -> None:
+    """点了库里没有的菜：如实说明没法点名安排，绝不按市区估算伪造景点。"""
+    s = Session(today=TODAY)
+    s.turn("12月20号去上海玩3天，2个人")
+    r = s.turn("第一天给我安排佛跳墙")
+    check("没有的店如实说明", "没找到" in r.render and "佛跳墙" in r.render,
+          r.render[:200])
+    plan = s.last_plan or {}
+    names = [n.get("name") for d in (plan.get("days_plan") or [])
+             for n in d["nodes"]]
+    check("不伪造「佛跳墙」景点节点", not any("佛跳墙" in (nm or "") for nm in names),
+          str(names))
+
+
 def main() -> int:
     for fn in (test_one_shot, test_one_shot_no_assumption,
                test_plan_summary_not_replan, test_nearby_qa,
@@ -1873,6 +1908,8 @@ def main() -> int:
                test_stay_question_lists_hotels_not_replan,
                test_nearby_food_hotel_route_split,
                test_nearby_unknown_anchor_fetches_or_honest,
+               test_dish_request_placed_on_requested_day,
+               test_dish_request_without_store_is_honest,
                test_stay_question_triggers_hotel_autofill,
                test_poi_category_no_local_hit_goes_online,
                test_chat_history_attached):

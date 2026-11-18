@@ -37,6 +37,22 @@ _INSIST_RE = re.compile(r"就排|就要排|偏要排|再试|再补|还是.{0,4}�
 # 四遍，每遍都收到"说「就排北京」我会再试"，可他就是在排北京，凭什么要背口令。
 _PLAN_REQUEST_RE = re.compile(r"去.{1,8}玩|到.{1,8}玩|在.{1,8}玩|旅游|度假")
 
+# 中文 POI 名几乎都以地点后缀结尾；菜名（小笼包/烤鸭/生煎）基本没有。
+# 用于区分"用户点的是没收录的景点"（保留未知景点流程）与"点的是菜"（映射
+# 成店或如实说明）——「幻影基地」不能被当成菜删掉（2026-11-18 回归教训）。
+_SPOT_SUFFIXES = ("公园", "基地", "古镇", "古城", "遗址", "博物馆", "乐园",
+                  "广场", "步行街", "街区", "老街", "街", "巷", "村镇", "村",
+                  "镇", "寺", "庙", "塔", "桥", "陵", "园", "馆", "山", "湖",
+                  "岛", "湾", "滩", "河", "江", "城楼", "楼阁", "戏台", "场")
+
+
+def _looks_like_spot_name(term: str) -> bool:
+    """候选片段是否更像景点名（带地点后缀）而不是菜名。"""
+    t = (term or "").strip()
+    if not t:
+        return False
+    return any(t.endswith(s) for s in _SPOT_SUFFIXES)
+
 
 class PlanHandler:
     """新建与修改行程的规划管道（文档 §8：PlanHandler 职责）。"""
@@ -222,6 +238,55 @@ class PlanHandler:
                 # 模型有时会把"加回来"的景点同时写进两个数组，这里以本轮改口为准
                 delta["avoid"] = [a for a in (delta.get("avoid") or [])
                                   if not any(name_hit(a, b) for b in back)]
+                explicit.add("must_visit")
+
+        # 菜名请求：「第一天给我安排小笼包」。小笼包是菜品不是景点，规则抽取
+        # 认不出（实测 must_visit 为空，请求被静默吞掉：方案原样重排、无任何
+        # 确认，用户以为没照做）。按餐厅池的招牌/tags 把菜名映射成具体店；
+        # 映射成功按点名店占餐位，映射不到就如实说明——绝不按市区估算伪造景点。
+        if session.slots.get("destination"):
+            _dish_city = session.slots.get("destination")
+            _dish_cands = [m for m in (delta.get("must_visit") or []) if m]
+            if _day_no is not None:
+                # 「第N天…安排X」：LLM 常把 X 抽出来，规则层漏抽时这里兜住
+                _m2 = re.search(r"第[一二两三四五六七八九十\d]+天[^，。！!？?]*?"
+                                r"(?:给我)?(?:安排|排上|排|加)(?:个|上)?(.+)",
+                                utterance)
+                if _m2:
+                    _t2 = _m2.group(1).strip("的了呀呢吧，, 。 ")
+                    if (_t2 and len(_t2) <= 12
+                            and not re.fullmatch(r"[一二两三四五六七八九十\d]+\s*天?", _t2)
+                            and not agent.is_city(_t2)
+                            and not agent.is_region(_t2)
+                            and not agent.spot_city(_t2, prefer=_dish_city)
+                            and not any(name_hit(_t2, m) for m in _dish_cands)):
+                        _dish_cands.append(_t2)
+            _mapped: list[tuple[str, str]] = []
+            _unmapped: list[str] = []
+            for _dc in _dish_cands:
+                if agent.spot_city(_dc, prefer=_dish_city):
+                    continue          # 真景点：走既有必去/指定天逻辑
+                _store = self._dish_to_restaurant(_dish_city, _dc)
+                if _store:
+                    _mapped.append((_dc, _store))
+                elif not _looks_like_spot_name(_dc):
+                    # 没有地点后缀、又不在库里 → 按"点的是菜"如实说明
+                    _unmapped.append(_dc)
+                # 像景点名的（幻影基地）：保留原有未知景点流程，不动
+            if _mapped or _unmapped:
+                delta = dict(delta)
+                _new_must = [m for m in (delta.get("must_visit") or [])
+                             if not any(name_hit(a, m) for a, _ in _mapped)
+                             and m not in _unmapped]
+                for _dish, _store in _mapped:
+                    _new_must.append(_store)
+                    if _store != _dish:
+                        lead_notes.append(f"「{_dish}」按「{_store}」安排")
+                for _u in _unmapped:
+                    lead_notes.append(
+                        f"「{_u}」是菜品，库里没找到以它出名的店，这轮没法点名安排；"
+                        f"可以直接说想去的店（如「安排南翔馒头店」），或让我按当地口味排餐位")
+                delta["must_visit"] = _new_must
                 explicit.add("must_visit")
 
         # 点名「第N天」时，这轮新加的必去点归到那一天，不再全局撒——
@@ -714,3 +779,29 @@ class PlanHandler:
                      budget_tiers=tiers, trace=trace, render=text,
                      fetched=dict(session.fetched))
 
+
+    @staticmethod
+    def _dish_to_restaurant(city: str, dish: str) -> str | None:
+        """菜名 → 库里以它出名的店（招牌或 tags 命中，如 小笼包→南翔馒头店）。
+
+        库里没有时先定向补一轮餐厅库再扫（与周边美食同一条补库通道）；
+        补完仍没有就返回 None，由调用方如实说明，不伪造 POI。
+        """
+        from ...services import get_data_service
+
+        def _scan() -> str | None:
+            r = agent.dispatch("search_poi", {"city": city,
+                                              "category": "restaurant",
+                                              "keyword": dish, "limit": 50})
+            items = (r.get("items") or []) if r.get("ok") else []
+            for p in items:
+                nm = p.get("name") or ""
+                if dish in nm or any(dish in t for t in (p.get("tags") or [])):
+                    return nm
+            return None
+
+        hit = _scan()
+        if hit:
+            return hit
+        get_data_service().ensure(city, "restaurant")
+        return _scan()
