@@ -1,11 +1,11 @@
-# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3.1 修订版）
+# 第五阶段设计：置信度三档分流接管与 LLM 语义兜底（v3.2 冻结版）
 
 > 版本历史：
 > v1 `e0438ab`（2026-11-18 初稿）→ v2（2026-11-18 评审修订）→ v3
-> （2026-11-18 最后一轮修订）→ **v3.1 本文**（2026-11-18 开发指令
-> 补录：DecisionResult schema、模块职责表、15 条重点病例、长期路线；
-> 仅文档，未动业务代码）。
+> （2026-11-18 最后一轮修订）→ v3.1（开发指令补录 + 六项设计落地）
+> → **v3.2 本文**（2026-11-18 契约冻结：五档/六档分离等 8 项收敛）。
 > 第四阶段基线：commit `2f66f4e`（验收已通过）。
+> **本版为实施基线，核心契约不再改动。**
 > 本阶段定位：**建立可靠的决策边界**，让三、四阶段的结果逐步参与业务
 > 决策——不是继续堆叠识别规则。
 
@@ -153,7 +153,7 @@ DecisionEngine 按 status 分流，五档各自是**运行时状态**而非仅�
 | **llm_entity_fallback.py**（新增） | 规则实在看不懂时辅助理解（LLMCandidateAdapter 落点，产出候选对象而非决策） |
 | orchestrator.py | 调度整个流程（消费 DecisionResult；**不再在 _turn_impl 里堆 if/elif 做置信判断**） |
 
-### 2.3 DecisionResult 契约（v3.1 补录）
+### 2.3 DecisionResult 契约（v3.2 冻结）
 
 ```python
 @dataclass
@@ -162,16 +162,57 @@ class DecisionResult:
                          # category_path / deferred
     intent: str          # 细分意图（poi_qa / poi_query / plan_modify / ...）
     entity: object | None   # 归并后的已验证实体（可含 entity_id）
-    city: str | None     # 本次决策实际采用的城市（按 HC-1 意图字段选取）
+    city: str | None     # 本次决策实际采用的城市值
+    city_source: str | None  # v3.2 冻结：query_city / destination /
+                             # departure_city —— 决策归因依据
     confidence: float    # 同档内排序用，永不跨档
     reason: str          # 可归因说明（命中哪条硬约束/哪条分流规则）
     pending: PendingDisambiguation | None   # action=clarify 时携带
 ```
 
-- orchestrator 及所有 Handler 只消费 `DecisionResult`，不直接读
-  resolver 原始记录；后续意图接管都在 decision.py 内扩展。
-- `confidence` 只在同档内使用（如消歧候选展示排序），任何硬约束失败
-  直接定档，分数不参与跨档救回（§3）。
+**冻结原则（v3.2，最高优先级）：**
+
+1. **五档 status = DecisionEngine 的实体决策状态**（实体验证后处于
+   什么状态：confirmed/ambiguous/unverified/rejected/skipped）；
+   **六档 action = Orchestrator 的运行时路由动作**（下一步允许做什么）。
+   两者严格分离——DecisionResult 里**没有 status 字段**，status 只在
+   DecisionEngine 内部参与定档，对外只暴露 action。
+2. **没有 route 字段**：action=execute 后走哪个 Handler 由既有 intent
+   分支决定，DecisionEngine 只决策「能不能执行」，不指定具体 Handler。
+3. **没有 candidates 字段**：ambiguous 的候选信息只放
+   `pending: PendingDisambiguation`（快照），不再额外给
+   `candidates=[]`。
+4. **city 归因**：`city` 是值、`city_source` 是来源
+   （DecisionCity(value, source) 的扁平化形式）。「从上海去南京，推荐
+   几个当地餐厅」这类场景采用 departure_city 还是 destination 是决策
+   归因问题，必须显式记录，不能让后续 Handler 猜。
+5. 字段约束：`action` 六枚举；`entity` 为 None 时 action 不得为
+   execute；`pending` 仅 action=clarify 时非空；`reason` 只作影子
+   归因记录，**不决定回复文案**。
+6. orchestrator 及所有 Handler 只消费 `DecisionResult`，不直接读
+   resolver 原始记录；后续意图接管都在 decision.py 内扩展。
+7. `confidence` 只在同档内使用（如消歧候选展示排序），任何硬约束失败
+   直接定档，分数不参与跨档救回（§3）。
+
+### 2.3.1 五档 status → 六档 action 固定映射（v3.2 冻结）
+
+| 五档 status | action | 含义 |
+|---|---|---|
+| confirmed | execute | 已确认，进入原业务 |
+| ambiguous | clarify | 执行阻断，只做消歧 |
+| rejected | reject_reply | 查询/规划拒绝路径 |
+| unverified | conservative | 保守处理，不执行实体业务 |
+| skipped | category_path | 品类/泛化 Handler |
+| 任意需要延后 | deferred | 已决策但明确不接管，交回原流程 |
+
+映射固定、逐条进测试；DecisionEngine 内部五档定档逻辑变更时映射表
+不变。**deferred 双语义区分（v3.2 冻结）：**
+- 未接管（TAKEOVER=0 或批次白名单未含）→ `decide()` 返回 **None**
+  （影子记录后交回原流程）；
+- 已决策但明确不接管（TAKEOVER=1 且判断完成，但该意图无对应 action
+  路径）→ `DecisionResult(action="deferred")`。
+  **两者不混**：None = DecisionEngine 未形成结论；deferred = 形成了
+  结论但本步不消费。
 
 字段约束：`action` 六枚举；`city` 必须标注来源（query_city /
 destination / departure_city，供归因）；`entity` 为 None 时 action
@@ -207,6 +248,16 @@ llm_entity_fallback.py 的 LLM 结构化输出契约（schema_version=1）：
    text 不在原始用户输入中 → span=null（§6.2）。
 5. **城市提示不是写入**：city_hints.query_city 只作为 EntityResolver
    的验证上下文，不写 slots（HC-5）。
+6. **LLM 不参与五档状态判断**（v3.2 冻结）：唯一合法链路是
+   `LLM → 候选补全 → EntityResolver → DecisionEngine → 五档 status →
+   DecisionResult.action`。LLM 输出**不含** action / status /
+   confidence / decision / plan / destination / must_visit / poi_id /
+   actions——schema 出现这些键一律越权丢弃。`plan` / `must_visit` /
+   `destination` 三个键为**必测越权字段**（T-C 负向断言）。
+7. **触发判据不含意图兜底项**（v3.2 冻结）：不使用「OTHER / 低置信度
+   / rule conflict」类判据，唯一公式：
+   `should_fallback = rule_structure_unavailable AND llm_fallback_enabled AND cost_gate_pass`
+   （三个判据的展开见 §2.6）。
 
 ### 2.5 五档状态转换表（v3.1 补录）
 
@@ -235,6 +286,20 @@ rejected ← 双源适用且独立均空（HC-6 证据闸）
 ambiguous → rejected（静默降档）；confirmed → unverified（证据不
 灭）；任何状态 → must_visit（HC-4）。
 
+**skipped 入口严格收紧（v3.2 冻结）**：「没有具体实体」≠ skipped。
+「推荐一家酒店」这类无候选表达应走 unverified/conservative 或澄清
+链；只有 §2.1 判定为**品类词 / 城市 / 空候选对应的泛化请求**才
+skipped → category_path。断言形式：`entity status ≠ skipped` 与
+`任何状态 ≠ must_visit` 同级列为必测负向。
+
+**跨轮状态机验收用例（v3.2 冻结，语料必含）：**
+
+| Case | 第一轮 | 第二轮 | 预期 |
+|---|---|---|---|
+| A | 介绍一下海贝皇大排档 → ambiguous | 南京那家 → 消费 pending 快照 | confirmed → execute |
+| B | 介绍一下 XX 餐厅 → unverified | 就在南京夫子庙附近 → 补充城市重验证 | confirmed → execute |
+| C | 查一下不存在的 XX → rejected | 还是这家 | **不复活**，仍 rejected → reject_reply |
+
 ### 2.6 LLM 兜底触发条件（v3.1 成文）
 
 三个条件**同时满足**才调用（§2 ①②③ 的可执行判据）：
@@ -249,6 +314,41 @@ ambiguous → rejected（静默降档）；confirmed → unverified（证据不
    触发与否、结果、耗时全部记入影子数据。
 
 不满足任一条件 → 静默跳过，走 §2.1 的 unverified/澄清保守路径。
+
+### 2.7 收敛总图（v3.2 冻结：五档在 Engine 内部，action 对外路由）
+
+```
+用户输入
+   │
+   ▼
+parse_utterance（parser.py）
+   │
+   ▼
+CandidateExtractor ─┐  统一候选集合（candidate_source=user/llm）
+LLMCandidateAdapter ┘  （LLM 仅在 §2.6 三条件满足时补候选）
+   │
+   ▼
+EntityResolver（存在性/城市/类型/归并；evidence_sources=kb/online）
+   │
+   ▼
+DecisionEngine（decision.py）—— 五档 status 定档只发生在内部
+   │      ┌────────────┼────────────┐
+   │   五档状态    LLM fallback 候选   HC-1~HC-7 硬约束
+   │      └────────────┼────────────┘
+   ▼
+DecisionResult（action / intent / entity / city+city_source /
+   confidence / reason / pending）—— 无 status、无 route、无 candidates
+   │
+   ├─ execute      → 既有 intent 路由 → 原业务 Handler
+   ├─ clarify      → 消歧通道（pending 快照）→ 消费后原业务 Handler
+   ├─ reject_reply → 拒绝回复（规定范围内没找到 + 引导换说法）
+   ├─ conservative → 保守回复（暂无法核实，请求补充信息）
+   ├─ category_path→ 泛化链（品类 Handler / DataService）
+   └─ deferred     → 原流程（decide 返回 None 为未接管的另一形态）
+```
+
+TAKEOVER=0（默认）：decide() 只影子记录，返回 None，**行为零改变**；
+TAKEOVER=1 + 批次白名单：才按上表消费 action。
 
 ## 3. 硬约束清单（先检查能否确认，再算分）
 
@@ -593,11 +693,23 @@ plan_trip / 不动行程节点 / 不静默选分店）。
 其中 ⑥ 是本阶段最重要防线之一：三城市字段拆分后任何路由都不得把
 query_city 写进 destination。⑭⑮ 是 T-A 的真实语料落地形式。
 
-### T-K 验收语料 v5 全表（v3.1 补录，30 条 = T-J 15 条 + 覆盖 T-A~T-I 的 15 条）
+### T-K 验收语料 v5 全表（v3.1 补录；v3.2 升级为状态机断言）
 
 语料文件 tests/corpus_v5.tsv，列格式沿用 v4（id / 期望 /
 utterance / context / kb / probe_spec / expect_resolved / note）；
-KB 与探测全部注入、纯离线运行。以下为编号 16–30（补全 30 条）：
+KB 与探测全部注入、纯离线运行。**v3.2 断言升级**：每条从「意图分类
+是否正确」升级为逐项断言——
+
+- **必测正向**：confirmed → execute、ambiguous → clarify、
+  rejected → reject_reply、unverified → conservative、
+  skipped → category_path（映射表 §2.3.1 逐格）；
+- **必测负向**：unverified ≠ rejected、ambiguous ≠ rejected、
+  confirmed ≠ unverified、`entity status ≠ skipped`、
+  `任何状态 ≠ must_visit`；
+- 每条断言四元组：`expect_action / expect_status / expect_turn(单轮或
+  跨轮) / 权限检查（是否越权、是否错误执行）`。
+
+以下为编号 16–30（补全 30 条）：
 
 | # | 病例 | 预期要点 | 对应测试组 |
 |---|---|---|---|
@@ -611,15 +723,22 @@ KB 与探测全部注入、纯离线运行。以下为编号 16–30（补全 30
 | 23 | 我想去南京那家海贝皇 | 城市+品牌引用消费 active pending（快照内 ID） | T-D |
 | 24 | 算了不去海贝皇了 | pending → cancelled，清除不执行 | T-D |
 | 25 | （过期后）选第2家 | pending expired → 拒绝执行，如实告知 | T-D |
-| 26 | 南京天气怎么样 | 无 POI 候选，不进实体验证 | T-J⑨⑩ 同类 |
-| 27 | 帮我排两天的行程 | 无实体候选，规划框架意图不触发 DecisionEngine 实体路径 | §9.1 |
-| 28 | 附近有什么好吃的 | 泛化 nearby，不进验证，走既有 Handler | §9.1 |
+| 26 | 南京天气怎么样 | 无 POI 候选且意图不需要实体 → **decide 返回 None（未接管），不是 skipped** | §2.3.1 deferred 双语义 |
+| 27 | 帮我排两天的行程 | 无实体候选，规划框架意图 → deferred 或 None；**不判 skipped** | §2.3.1 / §2.5 |
+| 28 | 附近有什么好吃的 | 品类词泛化请求 → **skipped → category_path**（skipped 入口的合法形态） | §2.5 |
 | 29 | （LLM mock）南京那个民国时候的广播台旧址介绍一下 | 规则候选不全 → LLM 兜底产 candidate_source=llm、span=null → Resolver 验证 → confirmed → POI QA | T-C/T-I |
 | 30 | （LLM mock 输出含 destination 字段） | 越权字段丢弃 + notes 记录；destination 不被改写 | T-C 六红线 |
 
 断言规则：30 条逐条含 **新旧链路差异三分类标注**（修复旧缺陷 /
 合理决策差异 / 新系统回归），后者阻断接管；高风险四项零容忍断言
 （§9.3）嵌入语料检查。
+
+### T-L 跨轮状态机（v3.2 新增）
+
+§2.5 跨轮验收用例 Case A/B/C 逐轮断言：第一轮 expect_action /
+expect_status，第二轮 expect_action（含 pending 消费原子性、补充信息
+重验证、rejected 不复活）；加一轮负向：Case A 第二轮说「上海那家」
+（与快照城市不符）→ 不消费，重新 ambiguous 并提示。
 
 ## 12. 明确不做（阶段边界）
 
@@ -645,5 +764,9 @@ KB 与探测全部注入、纯离线运行。以下为编号 16–30（补全 30
 | 2026-11-18 | v3.1（本文） | §2.1 五档运行时路由表（confirmed 直接执行不掉泛推荐、ambiguous 执行阻断、rejected/unverified 分行为、skipped 品类路径） | 开发指令要求五档成为真正的运行时状态 |
 | 2026-11-18 | v3.1 | §2.2 模块职责表（decision.py / llm_entity_fallback.py 命名对齐）、§2.3 DecisionResult 契约（action/intent/entity/city/confidence/reason/pending），orchestrator 只消费 DecisionResult | 开发指令：不再在 _turn_impl 里堆 if/elif |
 | 2026-11-18 | v3.1 | §11 新增 T-J 重点病例 15 条（含 ⑥ query_city/destination 防线、⑭⑮ rejected/unverified 真实语料） | 开发指令点名的重点测试病例 |
+| 2026-11-18 | v3.2（冻结版） | **五档/六档分离**：§2.3 冻结原则明确 status=Engine 内部实体决策状态、action=Orchestrator 运行时路由动作；DecisionResult 无 status/route/candidates；新增 city_source 字段（归因） | 评审：confirmed 与 execute 混用会导致状态机与路由混乱 |
+| 2026-11-18 | v3.2 | §2.3.1 五档→六档固定映射表 + deferred 双语义（None=未接管 / deferred=已决策不接管，不混） | 评审：灰度迁移需要区分两种「不接管」 |
+| 2026-11-18 | v3.2 | §2.4 LLM 不参与五档判断写死；越权必测字段（plan/must_visit/destination）；触发判据删除 OTHER/低置信度，唯一 should_fallback 公式 | 评审：LLM 权限收紧到只补候选 |
+| 2026-11-18 | v3.2 | §2.5 skipped 入口收紧（没有实体≠skipped）+ 跨轮验收用例 Case A/B/C；§11 T-K 升级为状态机断言（四元组+必测正负向）；§11 新增 T-L 跨轮状态机组；§2.7 收敛总图 | 评审：验收从分类题升级为状态机题 |
 | 2026-11-18 | v3.1 | §10.1 长期路线 Phase 6–8 定版；DEP-001 留待 Phase 6，第五阶段完全不碰 | 开发指令的路线定版要求 |
 | 2026-11-18 | v3.1 | §2.4 LLM fallback schema（白名单五键、越权字段丢弃、适配器校验、city_hints 不写入）；§2.5 五档状态转换表（轮内转换 + 跨轮迁移 + 禁止转换）；§2.6 触发条件可执行判据（三条件 + 成本闸，默认关）；§9.4 Orchestrator 三接入点只增不改 + 开关矩阵；§11 T-K 语料 v5 全表 30 条（16–30 覆盖 T-A~T-I，含三分类标注） | 「六项怎么设计」评审问答落地：一次定死 DecisionResult / schema / 触发条件 / 状态转换 / 接入点 / 验收语料 |
