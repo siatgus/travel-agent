@@ -1,12 +1,12 @@
-# Phase 5 P2.4 开工申请（修订版 r3）：PendingInterceptor 单点接入（消费通道）
+# Phase 5 P2.4 开工申请（修订版 r4）：PendingInterceptor 单点接入（消费通道）
 
-> 状态：**修订版申请待批**（r3）。本文档为开工申请，未写任何业务代码。
+> 状态：**修订版申请待批**（r4）。本文档为开工申请，未写任何业务代码。
 > 前序：P2.3 最终验收通过（最终提交链 797bf76 → a913289 → 0773ad9 → 79b1c04）。
-> 修订记录：r2 补入 R1 `active_pending_id` 追踪机制（§3）与 Runtime 按
-> sid 隔离（§4）。r3 按评审意见闭合：① `_latest_pending_id()` 查询范围
-> 与终态记录语义（§3.2 补）；② memory Runtime 淘汰保护覆盖「到期未处理
-> 的 Pending」与「重复选择窗口内的消费记录」（§4.2 重写 + §4.3 专项
-> 判定方法）；测试 A/B 纳入 §6。
+> 修订记录：r2 补入 R1 追踪机制（§3）与 sid 隔离（§4）；r3 闭合
+> `_latest_pending_id()` 查询语义与 memory Runtime 业务状态保留淘汰。
+> r4 按评审意见补齐两项边界约束：① 同一 sid 单有效 Pending 不变量
+> 与遮蔽边界测试（§3.6）；② 保留检查与淘汰的并发同步约束、窗口
+> 比较符与 P2.3 严格一致（§4.4）；测试 A/B 边界断言补强（§6）。
 
 ## 0. 一句话范围
 
@@ -198,6 +198,27 @@ shadow 警告。拦截器自身不猜测身份。（备选：给 Orchestrator.ha
 并在 `Session.restore` 回填，恢复后仍走 §3.2 解析顺序（store 为准）。
 该要求已记入生产者接口契约（§3.4），防遗漏。
 
+### 3.6 单有效 Pending 不变量（r4 新增，评审边界约束 ①）
+
+**约束：同一 sid 任意时刻最多存在一个业务有效（status=open）的
+Pending。** 该不变量由既有已验收机制保证，r4 明确为设计约束并加
+边界测试：
+
+- P1.5 规则 8：存在 active open 时 `create_pending` 一律拒绝；
+- P2.2：部分唯一索引 `ux_pending_open(session_id) WHERE status='open'`
+  在 DB 层兜底；`create_pending` 事务内先自动过期本 sid 旧 open
+  （阻断项①）——因此「新 Pending 创建时旧 Pending」只会发生
+  open→expired 一种状态转换，遵守既定规则，绝无静默并存。
+
+**遮蔽不变量**：由上述机制可推导——若本 sid 存在 open Pending，
+则它必是 `created_at` 最新的记录（更晚的创建要么被拒、要么先把旧
+open 转为 expired），故 `_latest_pending_id()` 返回终态记录时，
+**不可能存在被遮蔽的 open Pending**；反之为真。评审场景
+（P1 open 10:00 / P2 consumed 10:05）在该不变量下不可构造：P2 能
+创建即证明 P1 已非 open。边界测试锁定此推导（见 §6 多 Pending 组）：
+穷举 create→consume→create、open 阻断、过期+create 等序列，断言
+任一序列后「open 存在 ⇒ open 是最新记录」成立。
+
 ## 4. R2：Runtime 按 sid 隔离与缓存清理（评审开工条件 ②）
 
 ### 4.1 隔离结构
@@ -253,6 +274,36 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
   机制，**不在 P2.4 顺手扩大范围**（评审冻结）。
 - channel=0 时 dict 永不创建、永不增长。
 
+### 4.4 保留检查与淘汰的并发同步约束（r4 新增，评审边界约束 ②）
+
+**竞态场景（评审指出）**：LRU 扫描判定某 runtime 无保留状态 → 并发
+请求恰好向该 runtime 创建 Pending → LRU 按旧判断淘汰 → 新 Pending
+的运行时上下文丢失。冻结约束：
+
+- **检查与淘汰必须在同一临界区内原子完成**，且该临界区与该 runtime
+  store 的状态写入（create / consume / cancel / expire / 消费记录写入）
+  共用**同一把锁**——memory 实现即 `PendingStore._lock`；SQLite 实现
+  用既有 `BEGIN IMMEDIATE` 事务边界 + store 级锁，不引入新并发架构；
+- 具体协议：淘汰线程先取得候选 runtime store 的锁 → 锁内执行
+  `_has_runtime_retention_state(now)` → 保留态则放行下一个候选；
+  可淘汰则在**同一临界区内**完成「从 `_pending_runtimes` 移除 +
+  关闭连接（SQLite）」再释放锁——锁外绝不依据过期的保留判断执行
+  淘汰动作；
+- 这样竞态只有两种可序列化结果：① 创建先于锁获取 → 保留检查看到
+  新 Pending（True，不淘汰）；② 淘汰先完成 → 并发创建进入按 §4.1
+  新建的 runtime（该 Pending 尚不存在，新建无损）；不存在「创建成功
+  但 runtime 被淘汰」的第三种交错；
+- `PendingRuntime` 装配（§4.1）对同一 sid 的并发首次访问用 dict 操作
+  原子性 + 双检，保证同 sid 只建一个实例；
+- **双实现对拍覆盖相同输入状态与相同时间边界**（评审冻结）：保留态
+  判定、淘汰决策、窗口临界点行为逐位一致。
+
+**窗口比较符一致性（评审特别强调）**：`_has_runtime_retention_state`
+的「窗口内」判定与 P2.3 `PendingInterceptor` 重复选择识别的窗口判定
+**必须使用完全相同的比较表达式**（同一常量、同一比较符，实现上共用
+同一函数/常量定义），绝不允许一处 `<`、一处 `<=`；测试在
+`consumed_at + window == now` 临界点断言两处判定结果一致。
+
 ## 5. 风险清单与对策
 
 | # | 风险 | 对策 |
@@ -278,12 +329,25 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
 - **R2**：多 Session（A/B 交错请求）各自独立 runtime、store 隔离
   （B 查不到 A 的 pending）；共享单例 store 规避手法被测试拦截；
   LRU 上限与保留态保护；channel=0 时 dict 为空；
-- **测试 A（r3 评审冻结）**：Pending 到期未登记 → 推入 LRU 淘汰压力
-  → runtime 不得因 `get_active_pending() is None` 被淘汰（memory）；
-  随后用户选择 → 仍正确产出 `expired_reply`；
-- **测试 B（r3 评审冻结）**：消费成功后处于重复选择窗口内 → 推入
-  淘汰压力 → runtime 不得被淘汰（memory）；随后「第一个」→ 仍能
-  识别原消费记录并产出 `duplicate_select`；窗口刚过 → 允许淘汰。
+- **测试 A（r3 评审冻结，r4 补断言）**：Pending 到期未登记 → 推入
+  LRU 淘汰压力 → runtime 不得因 `get_active_pending() is None` 被淘汰
+  （memory）；随后用户选择 → 仍正确产出 `expired_reply`；
+  **r4 边界断言**：淘汰压力前后 Pending ID、候选快照六字段与原始
+  状态（open）逐位一致（store 查询对比，非对象引用）；
+- **测试 B（r3 评审冻结，r4 补时间边界）**：消费成功后处于重复选择
+  窗口内 → 推入淘汰压力 → runtime 不得被淘汰（memory）；随后
+  「第一个」→ 仍识别原消费记录产出 `duplicate_select`；
+  **r4 边界断言**：`consumed_at + window == now` 临界点**以内必须
+  保留、以外允许淘汰**，且该比较符与 P2.3 重复选择识别严格一致
+  （同一常量/表达式，两处判定在临界点结果相同）；
+- **多 Pending 遮蔽边界组（r4 新增）**：穷举
+  create→consume→create、open 阻断 create、过期+create 自动登记
+  等序列，断言「本 sid 存在 open ⇒ open 必为 `_latest_pending_id()`
+  所指」的不变量成立（终态记录绝不遮蔽仍有效的旧记录，§3.6）；
+- **保留-淘汰并发竞态组（r4 新增）**：多线程交错「LRU 扫描 vs
+  create_pending」注入，断言只有两种可序列化结果（创建先至则不淘汰
+  / 淘汰先至则新建无损），不存在创建成功但 runtime 被淘汰的交错
+  （§4.4）；双实现同输入同时间边界对拍保留态判定与淘汰决策。
 
 **P2.4b 组（verdict 行为与集成）**：
 - 九类 verdict 全路径（§2.5 表逐行）：consume 成功短路 + 只确认消歧
