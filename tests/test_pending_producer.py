@@ -65,15 +65,18 @@ def fixed_ids():
 
 
 class CountingStore(PendingStore):
-    """create/cancel 调用计数桩（契约不变，仅观测）。"""
+    """create/cancel/expire 调用计数桩（契约不变，仅观测）。"""
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.create_calls = 0
         self.cancel_calls = 0
+        self.expire_calls = 0
         self.last_created_id = None
         self.cancel_raise = None
         self.cancel_ok_override = None
+        self.expire_raise = None
+        self.expire_ok_override = None
 
     def create_pending(self, *a, **kw):
         self.create_calls += 1
@@ -85,10 +88,19 @@ class CountingStore(PendingStore):
         self.cancel_calls += 1
         if self.cancel_raise is not None:
             raise self.cancel_raise
-        out = super().cancel_pending(pending_id)
         if self.cancel_ok_override is not None:
-            out.ok = self.cancel_ok_override
-        return out
+            # 状态一致的失败模拟：不实际取消（真实 cancel ok=False
+            # 语义 = rowcount 0，Pending 保持 open），仅返回失败结果
+            return SimpleNamespace(ok=False, reason="注入：cancel ok=False")
+        return super().cancel_pending(pending_id)
+
+    def expire_pending(self, pending_id):
+        self.expire_calls += 1
+        if self.expire_raise is not None:
+            raise self.expire_raise
+        if self.expire_ok_override is not None:
+            return SimpleNamespace(ok=False, reason="注入：expire ok=False")
+        return super().expire_pending(pending_id)
 
 
 def _produce(producer, store, matches, reply_builder=None):
@@ -236,9 +248,10 @@ def test_p3_orphan_compensation_matrix() -> None:
     pr2 = PendingProducer(id_gen=fixed_ids())
     store2 = CountingStore(session_id="s-p3b", now=fixed_clock())
     store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    store2.expire_raise = RuntimeError("注入：expire 失败")  # 双终结
     out2 = _produce(pr2, store2, [m("南京", "A店"), m("上海", "B店")],
                     reply_builder=failing_builder(fail_count=1))
-    check("[P3②] 取消失败 → 保守拦截（绝不交回原链路）",
+    check("[P3②] 双终结失败 → 保守拦截（绝不交回原链路）",
           out2.reply is not None
           and _ORPHAN_NOTICE in str(out2.reply), str(out2))
     check("[P3②] pending_id 保留（孤儿可见可排查）",
@@ -252,9 +265,10 @@ def test_p3_orphan_compensation_matrix() -> None:
     pr3 = PendingProducer(id_gen=fixed_ids())
     store3 = CountingStore(session_id="s-p3c", now=fixed_clock())
     store3.cancel_ok_override = False
+    store3.expire_ok_override = False                     # 双终结 ok=False
     out3 = _produce(pr3, store3, [m("南京", "A店")],
                     reply_builder=failing_builder(fail_count=1))
-    check("[P3③'] cancel ok=False → 保守拦截",
+    check("[P3③'] 双终结 ok=False → 保守拦截",
           out3.reply is not None
           and _ORPHAN_NOTICE in str(out3.reply), str(out3))
 
@@ -343,11 +357,12 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
               and "None" in r["detail"] for r in pr1.shadow_log),
           str(pr1.shadow_log))
 
-    # ② builder 必然抛异常 + cancel 也抛异常 → 第二层自建 Reply，
-    #    绝不传播异常、绝不交回原链路、孤儿身份保留
+    # ② builder 必然抛异常 + cancel/expire 双终结故障 → 第二层自建
+    #    Reply，绝不传播异常、绝不交回原链路、孤儿身份保留
     pr2 = PendingProducer(id_gen=fixed_ids())
     store2 = CountingStore(session_id="s-r2b", now=fixed_clock())
     store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    store2.expire_raise = RuntimeError("注入：expire 失败")
     out2 = _produce(pr2, store2, [m("南京", "A店")],
                     reply_builder=always_failing_builder())
     check("[R2②] 双重失败仍返回保守回复（异常未传播）",
@@ -363,10 +378,11 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
               and r["pending_id"] == out2.pending_id for r in pr2.shadow_log),
           str(pr2.shadow_log))
 
-    # ③ builder 必然返回 None + cancel ok=False → 同保守拦截（第二层）
+    # ③ builder 必然返回 None + 双终结 ok=False → 同保守拦截（第二层）
     pr3 = PendingProducer(id_gen=fixed_ids())
     store3 = CountingStore(session_id="s-r2c", now=fixed_clock())
     store3.cancel_ok_override = False
+    store3.expire_ok_override = False
     out3 = _produce(pr3, store3, [m("南京", "A店")],
                     reply_builder=none_builder())
     check("[R2③] None+ok=False → 保守拦截（非 None 非 str-空）",
@@ -378,6 +394,7 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
     pr4 = PendingProducer(id_gen=fixed_ids())
     store4 = CountingStore(session_id="s-r2d", now=fixed_clock())
     store4.cancel_raise = RuntimeError("注入：cancel 失败")
+    store4.expire_raise = RuntimeError("注入：expire 失败")
     out4 = _produce(pr4, store4, [m("南京", "A店")],
                     reply_builder=raise_then_none_builder())
     check("[R2④] 首层二次失败 → 第二层兜底（异常未传播）",
@@ -388,6 +405,7 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
     pr5 = PendingProducer(id_gen=fixed_ids())
     store5 = CountingStore(session_id="s-r2e", now=fixed_clock())
     store5.cancel_ok_override = False
+    store5.expire_ok_override = False
     out5 = _produce(pr5, store5, [m("南京", "A店")],
                     reply_builder=always_failing_builder())
     check("[R2⑤] 异常+ok=False → 保守拦截（第二层）",
@@ -413,6 +431,7 @@ def test_p3r3_reply_contract_terminal_failure() -> None:
     pr1 = PendingProducer(id_gen=fixed_ids())
     store1 = CountingStore(session_id="s-r3a", now=fixed_clock())
     store1.cancel_raise = RuntimeError("注入：cancel 失败")
+    store1.expire_raise = RuntimeError("注入：expire 失败")   # 双终结→保守拦截
     out1 = _produce(pr1, store1, [m("南京", "A店")],
                     reply_builder=always_failing_builder())
     r = out1.reply
@@ -434,6 +453,7 @@ def test_p3r3_reply_contract_terminal_failure() -> None:
     pr2 = PendingProducer(id_gen=fixed_ids())
     store2 = CountingStore(session_id="s-r3b", now=fixed_clock())
     store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    store2.expire_raise = RuntimeError("注入：expire 失败")   # 双终结→保守拦截
     orig_reply_cls = _pp_mod.Reply
     def boom_reply(**kw):
         raise RuntimeError("注入：Reply 构造失败（模拟不可达）")
@@ -463,6 +483,7 @@ def test_p3r3_reply_contract_terminal_failure() -> None:
     # ③ monkeypatch 恢复后回归正常（隔离无残留）
     store3 = CountingStore(session_id="s-r3c", now=fixed_clock())
     store3.cancel_raise = RuntimeError("注入：cancel 失败")
+    store3.expire_raise = RuntimeError("注入：expire 失败")   # 双终结→保守拦截
     out3 = _produce(pr2, store3, [m("南京", "A店")],
                     reply_builder=always_failing_builder())
     check("[R3③] 恢复后保守路径回归 Reply 终层",
@@ -484,11 +505,103 @@ def test_shadow_isolation() -> None:
     pr2 = PendingProducer(id_gen=fixed_ids(), shadow_sink=bad_sink)
     store2 = CountingStore(session_id="s-sh2", now=fixed_clock())
     store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    store2.expire_raise = RuntimeError("注入：expire 失败")  # 双终结
     out2 = _produce(pr2, store2, [m("南京", "A")],
                     reply_builder=failing_builder(fail_count=1))
     check("[影子] sink 异常不影响补偿矩阵分支",
           out2.reply is not None
           and _ORPHAN_NOTICE in str(out2.reply), str(out2))
+
+
+# ================================================== P3-R4 L1 二线终结补偿
+# （§11.R3.1 批准增量 2026-11-19：cancel 失败 → 二线 expire 终结；
+#   R4 修正定性：尽力而为，双终结失败无即时隔离保证）
+
+
+def test_p3r4_second_line_terminal() -> None:
+    """P3-R4：L1 二线终结补偿四变体 + R4 场景二定位证据 + L2 边界。"""
+    # ① 单终结故障：cancel 抛异常 + expire 成功 → 孤儿终态 → 交回
+    #    原链路；隔离效果由权威定位判 None 可验证（§11.R3.1 判据）
+    pr1 = PendingProducer(id_gen=fixed_ids())
+    store1 = CountingStore(session_id="s-r4a", now=fixed_clock())
+    store1.cancel_raise = RuntimeError("注入：cancel 失败")
+    out1 = _produce(pr1, store1, [m("南京", "A店"), m("上海", "B店")],
+                    reply_builder=failing_builder(fail_count=1))
+    check("[R4①] 二线 expire 成功 → 交回原链路",
+          out1.reply is None and out1.pending_id is None, str(out1))
+    check("[R4①] 孤儿已终态（expired）",
+          store1.get_pending_by_id(store1.last_created_id).status
+          == "expired", "")
+    check("[R4①] 隔离可验证：权威定位判 None",
+          store1.get_active_pending() is None, "")
+    check("[R4①] cancel/expire 各恰一次",
+          store1.cancel_calls == 1 and store1.expire_calls == 1,
+          f"cancel={store1.cancel_calls} expire={store1.expire_calls}")
+    check("[R4①] shadow 记 orphan_terminal_retry 含孤儿 ID",
+          any(r["action"] == "produce_orphan_terminal_retry"
+              and r["pending_id"] == store1.last_created_id
+              for r in pr1.shadow_log), str(pr1.shadow_log))
+
+    # ② cancel ok=False 形态 + expire 成功 → 同①
+    pr2 = PendingProducer(id_gen=fixed_ids())
+    store2 = CountingStore(session_id="s-r4b", now=fixed_clock())
+    store2.cancel_ok_override = False
+    out2 = _produce(pr2, store2, [m("南京", "A店")],
+                    reply_builder=failing_builder(fail_count=1))
+    check("[R4②] cancel ok=False → 二线 expire 成功 → 交回",
+          out2.reply is None and out2.pending_id is None, str(out2))
+    check("[R4②] 孤儿已终态 + 定位 None",
+          store2.get_pending_by_id(store2.last_created_id).status
+          == "expired" and store2.get_active_pending() is None, "")
+
+    # ③ 双终结故障（cancel+expire 均抛异常）→ 保守拦截，绝不交回；
+    #    按 R4 冻结定性：无即时消费隔离保证，残余窗口如实暴露
+    pr3 = PendingProducer(id_gen=fixed_ids())
+    clock3 = {"t": datetime(2026, 11, 19, 12, 0, 0)}
+    store3 = CountingStore(session_id="s-r4c", now=lambda: clock3["t"])
+    store3.cancel_raise = RuntimeError("注入：cancel 失败")
+    store3.expire_raise = RuntimeError("注入：expire 失败")
+    out3 = _produce(pr3, store3, [m("南京", "A店")],
+                    reply_builder=failing_builder(fail_count=1))
+    check("[R4③] 双终结失败 → 保守拦截（绝不交回原链路）",
+          out3.reply is not None
+          and _ORPHAN_NOTICE in str(out3.reply), str(out3))
+    check("[R4③] 孤儿仍 open（未伪造隔离成功）",
+          store3.get_pending_by_id(store3.last_created_id).status
+          == "open", "")
+    check("[R4③] shadow 记 terminal_retry_failed 含孤儿 ID",
+          any(r["action"] == "produce_orphan_terminal_retry_failed"
+              and r["pending_id"] == store3.last_created_id
+              for r in pr3.shadow_log), str(pr3.shadow_log))
+
+    # ③' 双终结 ok=False 形态 → 同③
+    pr4 = PendingProducer(id_gen=fixed_ids())
+    store4 = CountingStore(session_id="s-r4d", now=fixed_clock())
+    store4.cancel_ok_override = False
+    store4.expire_ok_override = False
+    out4 = _produce(pr4, store4, [m("南京", "A店")],
+                    reply_builder=failing_builder(fail_count=1))
+    check("[R4③'] 双终结 ok=False → 保守拦截",
+          out4.reply is not None
+          and _ORPHAN_NOTICE in str(out4.reply), str(out4))
+
+    # R4 场景二（故障恢复）：双终结失败后，下一轮存储读取正常——
+    # 按裁定明确边界：**停在定位证据层**，验证残余窗口存在（孤儿
+    # TTL 内仍可被权威定位），绝不进入消费流程、绝不写成必然不消费
+    clock3["t"] = datetime(2026, 11, 19, 12, 0, 30)   # 存储恢复（TTL 内）
+    check("[R4场景二] 故障恢复后孤儿仍可被权威定位（残余窗口证据）",
+          store3.get_active_pending() is not None
+          and store3.get_active_pending().pending_id
+          == store3.last_created_id, "")
+    check("[R4场景二] shadow 双通道保留孤儿身份",
+          [r["pending_id"] for r in pr3.shadow_log
+           if r["action"].startswith("produce_orphan")]
+          == [store3.last_created_id, store3.last_created_id],
+          str(pr3.shadow_log))
+    # L2 最终清理边界（R4 定性：到期后不可经权威定位进入消费链路）
+    clock3["t"] = datetime(2026, 11, 19, 12, 6, 0)    # TTL 300s 已过
+    check("[R4场景二] TTL 到期后权威定位判 None（最终清理边界）",
+          store3.get_active_pending() is None, "")
 
 
 # ================================================== main
@@ -500,6 +613,7 @@ def main() -> int:
     test_p3_orphan_compensation_matrix()
     test_p3r2_none_and_double_failure_boundary()
     test_p3r3_reply_contract_terminal_failure()
+    test_p3r4_second_line_terminal()
     test_p4_rule8_rejection()
     test_shadow_isolation()
     print(f"\npending producer P2.5a: {_PASS} pass / {_FAIL} fail")

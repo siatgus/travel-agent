@@ -1884,8 +1884,9 @@ def test_p25a_compensation_boundary_integration() -> None:
                       for x in orc._producer.shadow_log), "")
         check("[R2集成B] lease 已归还", rt2.active_ops == 0, "")
 
-        # 形态 C：builder 二次构造也失败 + cancel 失败（注入）→ 第二层
-        # 自建 Reply 保守拦截，绝不交回原链路，lease 仍归还
+        # 形态 C（§11.R3.1 双终结形态）：builder 二次构造也失败 +
+        # cancel/expire 双终结故障（注入）→ 第二层自建 Reply 保守拦截，
+        # 绝不交回原链路，lease 仍归还
         calls = {"n": 0}
         def always_boom(session, text):
             calls["n"] += 1
@@ -1894,14 +1895,19 @@ def test_p25a_compensation_boundary_integration() -> None:
         s3 = _produce_session(orc, "s-r2c")
         rt3 = orc._pending_runtime("s-r2c")    # 预装配（acquire 一次）
         orig_cancel = rt3.store.cancel_pending
+        orig_expire = rt3.store.expire_pending
         def cancel_boom(pending_id):
             raise RuntimeError("注入：cancel 失败")
+        def expire_boom(pending_id):
+            raise RuntimeError("注入：expire 失败")
         rt3.store.cancel_pending = cancel_boom
+        rt3.store.expire_pending = expire_boom
         orc._pending_manager.release(rt3)      # 归还预获取 lease（仅注入用）
         try:
             r3 = orc.handle(s3, "海贝皇大排档哪家好")
         finally:
             rt3.store.cancel_pending = orig_cancel
+            rt3.store.expire_pending = orig_expire
         rt3 = orc._pending_manager.runtime("s-r2c")
         check("[R2集成C] handle 正常返回（异常未传播）",
               r3 is not None, str(r3))
@@ -1923,6 +1929,232 @@ def test_p25a_compensation_boundary_integration() -> None:
     finally:
         _orch_mod._resolve_entities = old_resolve
         _orch_mod.answer_reply = old_answer
+        set_env()
+
+
+def test_p25a_orphan_terminal_integration() -> None:
+    """§11.R3.1 批准增量集成（r4 裁定 2026-11-19）：L1 二线终结补偿
+    真实 handle 链路——单终结故障 expire 成功 → 可验证隔离后交回；
+    双终结故障 → 保守拦截；R4 场景二停在定位证据层、场景一持续
+    故障走 P2.4b fail-closed。"""
+    set_env(channel="1", store_kind="memory")
+    old_resolve = _orch_mod._resolve_entities
+    old_answer = _orch_mod.answer_reply
+    try:
+        stub = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        _orch_mod._resolve_entities = stub
+
+        # 形态 D：builder 必然失败 + cancel 注入失败 + expire 真实成功
+        # → 二线终结 → 孤儿终态 → 交回原链路（隔离可验证：定位判 None）
+        _orch_mod.answer_reply = lambda session, text: None
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-r4d")
+        rt = orc._pending_runtime("s-r4d")     # 预装配注入
+        orig_cancel = rt.store.cancel_pending
+        def cancel_boom(pending_id):
+            raise RuntimeError("注入：cancel 失败")
+        rt.store.cancel_pending = cancel_boom
+        orc._pending_manager.release(rt)
+        try:
+            r = orc.handle(s, "海贝皇大排档哪家好")
+        finally:
+            rt.store.cancel_pending = orig_cancel
+        rt = orc._pending_manager.runtime("s-r4d")
+        check("[形态D] 二线终结成功 → 交回原链路",
+              orc.last_ctx.route != "pending_produce", str(r))
+        check("[形态D] 隔离可验证：权威定位判 None（孤儿已终态）",
+              rt.store.get_active_pending() is None, "")
+        check("[形态D] shadow 记 orphan_terminal_retry",
+              any(x["action"] == "produce_orphan_terminal_retry"
+                  for x in orc._producer.shadow_log),
+              str(orc._producer.shadow_log))
+        check("[形态D] lease 已归还", rt.active_ops == 0, "")
+
+        # 形态 E：双终结故障（cancel+expire 均注入失败）→ 保守拦截
+        orc2 = Orchestrator()
+        s2 = _produce_session(orc2, "s-r4e")
+        rt2 = orc2._pending_runtime("s-r4e")
+        orig_cancel2 = rt2.store.cancel_pending
+        orig_expire2 = rt2.store.expire_pending
+        def cancel_boom2(pending_id):
+            raise RuntimeError("注入：cancel 失败")
+        def expire_boom2(pending_id):
+            raise RuntimeError("注入：expire 失败")
+        rt2.store.cancel_pending = cancel_boom2
+        rt2.store.expire_pending = expire_boom2
+        orc2._pending_manager.release(rt2)
+        try:
+            r2 = orc2.handle(s2, "海贝皇大排档哪家好")
+        finally:
+            rt2.store.cancel_pending = orig_cancel2
+            rt2.store.expire_pending = orig_expire2
+        rt2 = orc2._pending_manager.runtime("s-r4e")
+        check("[形态E] 双终结失败 → pending_produce 保守拦截短路",
+              orc2.last_ctx.route == "pending_produce"
+              and _ORPHAN_NOTICE in str(r2), str(r2))
+        check("[形态E] 返回对象满足 Reply 契约",
+              hasattr(r2, "render") and getattr(r2, "mode", None) == "answer"
+              and not isinstance(r2, str), str(type(r2)))
+        check("[形态E] 孤儿 open 保留（未伪造隔离成功）",
+              rt2.store.get_active_pending() is not None, "")
+        check("[形态E] shadow 记 terminal_retry_failed 含孤儿 ID",
+              any(x["action"] == "produce_orphan_terminal_retry_failed"
+                  and x["pending_id"]
+                  for x in orc2._producer.shadow_log),
+              str(orc2._producer.shadow_log))
+        check("[形态E] lease 已归还", rt2.active_ops == 0, "")
+
+        # R4 场景二（故障恢复）：双终结失败后存储读取正常——按裁定
+        # 边界**停在定位证据层**：孤儿 TTL 内仍可被权威定位（残余
+        # 窗口存在性证据），shadow 双通道保留孤儿身份；绝不进入
+        # 消费/选择解析/Handler 执行（本测试到此为止，不再 handle）
+        check("[场景二] 故障恢复后权威定位仍可达（残余窗口证据）",
+              rt2.store.get_active_pending() is not None, "")
+        orphan_id = rt2.store.get_active_pending().pending_id
+        check("[场景二] shadow 双通道孤儿身份（cancel_failed + "
+              "terminal_retry_failed 同 ID）",
+              all(any(x["action"] == a and x["pending_id"] == orphan_id
+                      for x in orc2._producer.shadow_log)
+                  for a in ("produce_orphan_cancel_failed",
+                            "produce_orphan_terminal_retry_failed")),
+              str(orc2._producer.shadow_log))
+
+        # R4 场景一（持续故障）：双终结失败后下一轮 store 读取持续
+        # 故障 → P2.4b 消费侧边界：绝不消费孤儿（fail-closed）
+        orc3 = Orchestrator()
+        s3 = _produce_session(orc3, "s-r4f")
+        stub2 = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        _orch_mod._resolve_entities = stub2
+        rt3 = orc3._pending_runtime("s-r4f")
+        orig_cancel3 = rt3.store.cancel_pending
+        orig_expire3 = rt3.store.expire_pending
+        orig_getact = rt3.store.get_active_pending
+        rt3.store.cancel_pending = cancel_boom2
+        rt3.store.expire_pending = expire_boom2
+        orc3._pending_manager.release(rt3)
+        try:
+            orc3.handle(s3, "海贝皇大排档哪家好")   # 保守拦截轮
+        finally:
+            rt3.store.cancel_pending = orig_cancel3
+            rt3.store.expire_pending = orig_expire3
+        pid3 = rt3.store.get_active_pending().pending_id
+        # 下一轮：读取持续故障（get_active_pending 抛异常）
+        def getact_boom():
+            raise RuntimeError("注入：store 读取持续故障")
+        rt3.store.get_active_pending = getact_boom
+        try:
+            orc3.handle(s3, "第1个")
+            raised3 = False
+        except RuntimeError:
+            raised3 = True
+        finally:
+            rt3.store.get_active_pending = orig_getact
+        rt3 = orc3._pending_manager.runtime("s-r4f")
+        check("[场景一] 持续故障轮异常按 P2.4b 冻结边界向上传播"
+              "（绝不静默消费）", raised3, "")
+        check("[场景一] 孤儿 Pending 未被消费（仍 open、零消费记录）",
+              rt3.store.get_pending_by_id(pid3).status == "open"
+              and rt3.store._latest_consumption() is None, "")
+        check("[场景一] lease 已归还（异常路径 finally 生效）",
+              rt3.active_ops == 0, str(rt3.active_ops))
+    finally:
+        _orch_mod._resolve_entities = old_resolve
+        _orch_mod.answer_reply = old_answer
+        set_env()
+
+
+def test_p25a_channel0_clarify_decision_bitwise() -> None:
+    """§11.R3.5 增补（r4 裁定）：decision 逐位对比覆盖 channel=0 时
+    本轮真实 clarify 场景——decide 未接管分支 + D1 放行 hunk 的
+    零影子行为差（真实 parse + 真实 ambiguous resolve 输入）。"""
+    from travel_agent.decision import DecisionEngine
+    from travel_agent.parser import parse_utterance
+
+    # 真实 clarify 输入：真实 parse（本轮问句）+ 真实 ambiguous 形态
+    s0 = Session(use_llm=False)
+    parse0 = parse_utterance("海贝皇大排档哪家好", context=s0,
+                             today=s0.today)
+    resolved = [_amb_rc("海贝皇大排档（南京店）", "南京",
+                        "海贝皇大排档（上海店）", "上海")]
+    rctx = {"slots": {}, "trip_dest": "", "last_city": ""}
+
+    old_chan = os.environ.get("TRAVEL_PENDING_CHANNEL")
+    try:
+        # 基线：P2.5a 引入前语义（CHANNEL 未设）→ decide None + 影子
+        os.environ.pop("TRAVEL_PENDING_CHANNEL", None)
+        eng_base = DecisionEngine()
+        d_base = eng_base.decide(parse0, resolved, dict(rctx),
+                                 intent=(parse0.intent or "") or None)
+        # channel=0：D1 放行条件不满足 → 原行为逐位保持
+        os.environ["TRAVEL_PENDING_CHANNEL"] = "0"
+        eng0 = DecisionEngine()
+        d0 = eng0.decide(parse0, resolved, dict(rctx),
+                         intent=(parse0.intent or "") or None)
+        # channel=1 + TAKEOVER=0：D1 单点放行（影子仍零差）
+        os.environ["TRAVEL_PENDING_CHANNEL"] = "1"
+        eng1 = DecisionEngine()
+        d1 = eng1.decide(parse0, resolved, dict(rctx),
+                         intent=(parse0.intent or "") or None)
+
+        check("[逐位] channel=0 真实 clarify 场景 decide 返回与基线一致"
+              "（None，未形成消费）", d_base is None and d0 is None,
+              f"base={d_base} ch0={d0}")
+        check("[逐位] channel=0 影子记录与基线逐位一致",
+              eng0.shadow_log == eng_base.shadow_log,
+              f"{eng0.shadow_log}\n{eng_base.shadow_log}")
+        check("[逐位] D1 放行分支（channel=1）影子记录与基线逐位一致"
+              "（放行零影子差）",
+              eng1.shadow_log == eng_base.shadow_log,
+              f"{eng1.shadow_log}\n{eng_base.shadow_log}")
+        check("[逐位] D1 单点放行：clarify DecisionResult 离开影子",
+              d1 is not None and d1.action == "clarify"
+              and "歧义" in d1.reason, str(d1))
+        # D1 契约：clarify 结果本身不携带 pending（消歧载荷由
+        # producer 从本轮 fresh matches 构建，D1 绝不从历史恢复）
+        check("[逐位] D1 放行结果 pending=None（载荷由生产侧从本轮 "
+              "fresh matches 构建，绝不从历史/旧 Pending 恢复）",
+              d1.pending is None, str(d1))
+        # 放行结果确定性：同输入重放逐位一致
+        os.environ["TRAVEL_PENDING_CHANNEL"] = "1"
+        eng2 = DecisionEngine()
+        d2 = eng2.decide(parse0, resolved, dict(rctx),
+                         intent=(parse0.intent or "") or None)
+        check("[逐位] 放行结果重放逐位一致（确定性构造）",
+              repr(d2) == repr(d1), f"{d2}\n{d1}")
+    finally:
+        if old_chan is None:
+            os.environ.pop("TRAVEL_PENDING_CHANNEL", None)
+        else:
+            os.environ["TRAVEL_PENDING_CHANNEL"] = old_chan
+
+    # channel=0 全链路逐位：真实 ambiguous 问句输出与无 pending
+    # 基础设施基线逐位一致（producer/decider/manager 零构造）
+    set_env(channel="0")
+    try:
+        old = _orch_mod._resolve_entities
+        _orch_mod._resolve_entities = _StubResolver([ResolveResult(
+            resolved=[_amb_rc("海贝皇大排档（南京店）", "南京",
+                              "海贝皇大排档（上海店）", "上海")])])
+        try:
+            orc_a = Orchestrator()
+            s_a = _produce_session(orc_a, "s-bit0")
+            r_a = orc_a.handle(s_a, "海贝皇大排档哪家好")
+            orc_b = Orchestrator()
+            s_b = Session(use_llm=False)      # 无任何 pending 身份
+            r_b = orc_b.handle(s_b, "海贝皇大排档哪家好")
+            check("[逐位] channel=0 真实 clarify 问句输出与无 pending "
+                  "基线逐位一致", str(r_a) == str(r_b),
+                  f"{str(r_a)[:80]} / {str(r_b)[:80]}")
+            check("[逐位] channel=0 零构造（producer/decider/manager）",
+                  orc_a._producer is None and orc_a._decider is None
+                  and orc_a._pending_manager is None, "")
+        finally:
+            _orch_mod._resolve_entities = old
+    finally:
         set_env()
 
 
@@ -2420,6 +2652,8 @@ def main() -> int:
                test_p25a_non_clarify_not_produced,
                test_p25a_decision_chain_failure,
                test_p25a_compensation_boundary_integration,
+               test_p25a_orphan_terminal_integration,
+               test_p25a_channel0_clarify_decision_bitwise,
                test_p25b_a3_confirmed_controlled_flow,
                test_p25b_a4_plan_confirmed_no_plan_write,
                test_p25b_a5_ambiguous_new_pending,

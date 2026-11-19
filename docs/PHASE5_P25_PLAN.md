@@ -1759,3 +1759,100 @@ shadow 通道同构。
 ### 18.6 本节边界
 
 纯设计文档；开关 0/0/0；P2.5b PASS 归档维持冻结；P2.6/P3 未授权。
+
+## 19. P2.5a 独立整改实施记录（开工批准 2026-11-19，待代码验收）
+
+> 开工批准（2026-11-19）：批准范围为 P2.5a 独立整改，按 §11.R3.6
+> 增量清单实施——开发授权，非生产启用授权。交付须含独立 commit、
+> 完整 diff、测试原始输出、channel=0 逐位对比证据。
+
+### 19.1 增量 1+2：producer 补偿矩阵 L1 二线终结 + shadow 归因
+
+- 落点：pending_producer.py 新增 `_second_line_terminal` 方法
+  （producer 模块内，批准边界）；`_compensate_orphan` cancel 失败
+  两个分支（异常 / ok=False）统一改走二线终结；
+- 机制：cancel 失败 → **立即调用既有 `expire_pending`（契约④
+  接口，独立事务）**：
+  - expire 成功 → shadow 记 `produce_orphan_terminal_retry`
+    （含孤儿 ID + cancel 失败原因）→ **交回原链路**（ProduceOutcome
+    (None, None)）——孤儿已终态（expired），隔离效果由权威定位门
+    `get_active_pending() 判 None` 直接可验证；
+  - expire 失败（异常或 ok=False）→ shadow 记
+    `produce_orphan_terminal_retry_failed`（含孤儿 ID + 双终结失败
+    原因 + 残余窗口声明）→ 保守拦截，绝不交回原链路；
+- **R4 冻结定性落实**：方法 docstring 与模块头同步改写——二线终结
+  为尽力而为补偿；双终结失败时无即时消费隔离保证（L2 TTL 到期前
+  仍可定位 / L3 仅持续故障生效 / L4 单槽只阻创建不阻消费），残余
+  窗口由 §11.R3.2 生产开关冻结规避（channel=0 恒不进入本模块）；
+- 不新增 store 状态、不新增接口、不触碰契约五方法（批准边界）。
+
+### 19.2 增量 3：两种独立负向测试（R4 修正预期）
+
+**producer 单元（test_pending_producer.py，58→72 断言）**：
+
+- 测试桩升级：CountingStore 增 expire 计数/故障注入；
+  `cancel_ok_override`/`expire_ok_override` 修正为**状态一致的
+  纯失败模拟**（不实际取消/过期——原实现先真取消再覆盖 ok，状态
+  与模拟结果不一致，如实申报此桩缺陷并已修正）；
+- 新增 `test_p3r4_second_line_terminal`：①cancel 异常+expire 成功
+  → 交回原链路 + expired + 定位判 None + cancel/expire 各恰一次
+  + shadow 记 retry 含孤儿 ID；②cancel ok=False+expire 成功同①；
+  ③双终结异常 → 保守拦截 + 孤儿仍 open + shadow 记 retry_failed
+  （**未伪造隔离成功**）；③'双终结 ok=False 同③；
+  **R4 场景二**：故障恢复后权威定位仍可达（残余窗口证据）+ shadow
+  双通道孤儿身份 + TTL 到期后定位判 None（L2 最终清理边界可验证）
+  ——**停在定位证据层，不进入消费流程**（裁定边界 1）；
+- **既有测试预期同步修正**（新契约：保守拦截仅由双终结失败触达）：
+  P3②/P3③'/R2②③④⑤/R3①②③/影子隔离 共 9 处单终结形态升级为
+  双终结形态——原「cancel 失败 → 保守拦截」预期改为「二线终结
+  成功 → 交回」或「双终结失败 → 保守拦截」，无断言放宽。
+
+**集成（test_pending_channel.py，308→330 断言）**：
+
+- 既有形态 C 升级双终结注入（原 cancel 单终结在 L1 下会交回）；
+- 新增 `test_p25a_orphan_terminal_integration`：形态 D（单终结+
+  expire 真实成功 → 交回 + 定位判 None + shadow retry）、形态 E
+  （双终结 → pending_produce 短路 + Reply 契约 + 孤儿 open + 
+  shadow retry_failed + lease 归还）、**R4 场景二**（定位证据层
+  收口：权威定位可达 + shadow 双通道同 ID）、**R4 场景一**（下一
+  轮 get_active_pending 持续故障 → 异常按 P2.4b 冻结边界向上传播，
+  孤儿仍 open、零消费记录、lease finally 归还——fail-closed）；
+- 既有 R2 集成形态 A/B（补偿成功交回）不变、仍通过。
+
+### 19.3 增量 4：channel=0 真实 clarify 场景逐位对比
+
+新增 `test_p25a_channel0_clarify_decision_bitwise`：
+
+- **decide 层逐位**（真实 parse + 真实 ambiguous resolve 输入）：
+  基线（CHANNEL 未设）/ channel=0 / channel=1+TAKEOVER=0 三台
+  独立 DecisionEngine 同输入决策——channel=0 返回与基线一致
+  （None），**影子记录三台逐位相等**（dict 全字段比较：intent/
+  takeover/batch_enabled/action/reason/entity_text/statuses）——
+  证明 D1 放行 hunk 零影子行为差；D1 单点放行（channel=1）返回
+  clarify DecisionResult 且 pending=None（消歧载荷由 producer 从
+  本轮 fresh matches 构建，绝不从历史/旧 Pending 恢复）、重放逐位
+  一致（确定性构造）；
+- **全链路逐位**：channel=0 下真实 ambiguous 问句 handle 输出与
+  无 pending 基础设施基线会话**逐位一致**（str(reply) 相等）+
+  producer/decider/manager 零构造。
+
+### 19.4 增量 5：生产开关冻结条款保留确认
+
+- §11.R3.2 四条全部有效：本轮 diff 不含 orchestrator.py 与
+  decision.py（git 复核冻结清单全零 diff，两处开关读取点
+  orchestrator.py:91 / decision.py:167 未触碰）；开关运行时
+  0/0/0（测试全程 set_env 控制并 finally 恢复）；
+- **裁定验收细节 2 落实**：仓库扫描不能替代生产部署核查——生产
+  启用前的独立验收门槛（部署配置/启动脚本/容器环境变量/CI 注入
+  全查）已在 §11.R4.3 记录，不阻碍本次开发验收。
+
+### 19.5 验证结果
+
+- 专项：producer **72**/0（58→72）、channel **330**/0（308→330）、
+  pending 契约 60/0、interceptor 150/0（零 diff 无扰动）；
+- 全量回归 **17 套件全绿**（exit=0 原始输出见
+  P25aR4_evidence_logs.txt）；x3 连续复跑通过；
+- 冻结模块零 diff：decision / interceptor / runtime / resolver /
+  pending / pending_store_sqlite / revalidator / dialogue /
+  orchestrator 全部为空；改动仅 3 文件（producer + 两测试）；
+- 开关 0/0/0；P2.5b 相关代码零触碰；P2.6/P3 未授权。

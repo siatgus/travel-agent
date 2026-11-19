@@ -13,8 +13,10 @@
   交回原链路（保守）；
 - §10.2：展示内容**先于创建**构造（步骤 1 产出成品字符串，构造
   失败零副作用），创建后绑定/返回失败 → 立即取消孤儿 Pending；
-  取消也失败 → 保守拦截回复，**绝不交回原链路**（防 open 孤儿被
-  下轮误消费）。
+  取消也失败 → **二线 expire 终结补偿**（§11.R3.1 / R4 定性：
+  尽力而为，成功 → 孤儿终态、隔离可验证 → 交回原链路；失败 →
+  无后续隔离保证 → 保守拦截回复，**绝不交回原链路**，残余窗口
+  由生产开关冻结规避——§11.R3.2）。
 
 禁止清单：不修改 store 五方法契约；不触碰 evaluate/act；不读
 shadow 决策记录；无 Handler / Resolver 依赖。
@@ -255,28 +257,79 @@ class PendingProducer:
 
     def _compensate_orphan(self, store, pending_id: str,
                            reply_builder) -> ProduceOutcome:
-        """孤儿 Pending 补偿（§10.2 失败矩阵第三行）。
+        """孤儿 Pending 补偿（§10.2 失败矩阵第三行 + §11.R3.1 L1）。
 
         立即尝试取消孤儿；取消成功 → shadow 记录 + 交回原链路；
-        取消也失败 → 保守拦截回复（恒 Reply 契约形态），**绝不交回
-        原链路**（防 open 孤儿被下轮误消费）+ shadow 记录 orphan
-        Pending。保守回复经 _conservative_reply 两层构造，二次失败
-        不再向上传播（P2.5a-R2：缺口 2）；终层构造失败（理论不可达）
-        以 PendingProduceError 明确失败（P2.5a-R3）。"""
+        取消失败（异常或 ok=False）→ **L1 二线终结补偿**
+        `_second_line_terminal`（既有 expire_pending 接口，独立事务，
+        覆盖瞬时单笔故障）。保守回复经 _conservative_reply 两层构造，
+        二次失败不再向上传播（P2.5a-R2：缺口 2）；终层构造失败
+        （理论不可达）以 PendingProduceError 明确失败（P2.5a-R3）。
+
+        R4 冻结定性（§11.R4）：二线终结属尽力而为补偿——双终结均
+        失败时**不存在即时消费隔离保证**，残余窗口（TTL 内孤儿仍可
+        被权威定位）由 §11.R3.2 生产开关冻结规避（channel=0 恒不
+        进入本模块）。"""
         try:
             out = store.cancel_pending(pending_id)
         except Exception as exc:
             self._shadow("produce_orphan_cancel_failed",
                          detail=f"cancel 抛异常 {type(exc).__name__}: {exc}",
                          pending_id=pending_id)
-            return self._conservative_intercept(pending_id, reply_builder)
+            return self._second_line_terminal(
+                store, pending_id,
+                f"cancel 抛异常 {type(exc).__name__}: {exc}",
+                reply_builder)
         if getattr(out, "ok", False):
             self._shadow("produce_orphan_cancelled",
                          pending_id=pending_id)
             return ProduceOutcome(None, None)      # 孤儿已安全取消
         # cancel 返回 ok=False：状态异常（rowcount=0 同源语义）→
-        # 无法确认孤儿已被移出可消费态 → 保守拦截，绝不交回原链路
+        # 走 L1 二线终结补偿
+        detail = str(getattr(out, "reason", "cancel ok=False"))
         self._shadow("produce_orphan_cancel_failed",
-                     detail=str(getattr(out, "reason", "cancel ok=False")),
+                     detail=detail, pending_id=pending_id)
+        return self._second_line_terminal(store, pending_id, detail,
+                                          reply_builder)
+
+    def _second_line_terminal(self, store, pending_id: str,
+                              cancel_detail: str,
+                              reply_builder) -> ProduceOutcome:
+        """L1 二线终结补偿（§11.R3.1 新增批准增量；R4 修正定性）。
+
+        cancel 失败后**立即调用既有 expire_pending（契约④接口）**：
+        两笔终结为独立事务（sqlite 侧各自 connect + BEGIN IMMEDIATE），
+        瞬时单笔故障下第二次调用有效。分支：
+        - expire 成功 → 孤儿终态（expired）→ get_active_pending()
+          返回 None → 权威定位①不可达，隔离效果由消费定位门直接
+          判 None **可验证** → 交回原链路（shadow 记
+          produce_orphan_terminal_retry）；
+        - expire 失败（异常或 ok=False）→ 按 R4 冻结定性**无后续
+          隔离保证**（L2 TTL 为最终清理边界、到期前仍可被定位；
+          L3 仅持续故障生效；L4 单槽只阻创建不阻消费）→ 保守拦截，
+          绝不交回原链路，shadow 记 produce_orphan_terminal_retry_
+          failed 双通道保留孤儿身份。
+        本方法不新增 store 状态、不新增接口（批准边界）。"""
+        try:
+            out2 = store.expire_pending(pending_id)
+        except Exception as exc:
+            self._shadow("produce_orphan_terminal_retry_failed",
+                         detail=f"cancel 失败（{cancel_detail}）"
+                                f"+ expire 抛异常 "
+                                f"{type(exc).__name__}: {exc}",
+                         pending_id=pending_id)
+            return self._conservative_intercept(pending_id, reply_builder)
+        if getattr(out2, "ok", False):
+            self._shadow("produce_orphan_terminal_retry",
+                         detail=f"cancel 失败（{cancel_detail}），"
+                                "二线 expire 成功 → 孤儿终态 "
+                                "（隔离可验证：权威定位判 None）",
+                         pending_id=pending_id)
+            return ProduceOutcome(None, None)      # 孤儿已安全终态
+        detail2 = str(getattr(out2, "reason", "expire ok=False"))
+        self._shadow("produce_orphan_terminal_retry_failed",
+                     detail=f"cancel 失败（{cancel_detail}）"
+                            f"+ expire ok=False（{detail2}）"
+                            "——残余窗口：TTL 内孤儿仍可被权威定位",
                      pending_id=pending_id)
         return self._conservative_intercept(pending_id, reply_builder)
