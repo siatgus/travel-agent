@@ -218,3 +218,11 @@ P2.4 未授权不启动。
    （两实现运行时本就返回冻结对象，属标注回归）；补
    `candidate_as_dict()` 兼容垫片（六字段 dict 拷贝，失败为 None）；
    双实现测试锁定冻结结构与垫片行为。
+
+   4. **replace() 提前（复验最后确认项）**：状态对象构造
+      （`replace(p, status=...)` 会重跑可失败的 `__post_init__`）
+      已提前到前置段；迁移段只剩 `append(record)` 与
+      `self._active = consumed` 两次纯写入。新增确定性故障注入：
+      临时替换 `PendingDisambiguation.__post_init__` 抛异常，验证
+      构造失败时消费记录绝不先写入、pending 保持 open、恢复后可
+      正常消费（pending 56→60）。

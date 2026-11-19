@@ -353,6 +353,34 @@ def test_consume_atomicity_fault_injection() -> None:
     check("R1 非法时钟后无消费记录",
           st3._latest_consumption() is None, "")
 
+    # ---- R1 变体：状态对象构造（replace → __post_init__）失败 ----
+    # 验证 replace() 已提前到前置段：构造失败时记录也绝不先写入
+    import travel_agent.pending as _pmod
+    orig_post = _pmod.PendingDisambiguation.__post_init__
+
+    def _boom_post(self):
+        raise RuntimeError("状态对象构造故障注入")
+
+    clock5, _ = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
+    st5 = PendingStore(ttl_seconds=300, now=clock5)
+    p5 = st5.create_pending("排海贝皇大排档", "plan_modify",
+                            "must_visit", SNAP)
+    _pmod.PendingDisambiguation.__post_init__ = _boom_post
+    try:
+        st5.consume_pending(p5.pending_id, "c1")
+        raised5 = False
+    except RuntimeError:
+        raised5 = True
+    finally:
+        _pmod.PendingDisambiguation.__post_init__ = orig_post
+    check("R1 状态对象构造失败 → 异常抛出", raised5, "")
+    check("R1 构造失败后 pending 仍 open",
+          st5.get_pending_by_id(p5.pending_id).status == PENDING_OPEN, "")
+    check("R1 构造失败后无消费记录（记录绝不先于状态写入）",
+          st5._latest_consumption() is None, "")
+    out5b = st5.consume_pending(p5.pending_id, "c1")
+    check("R1 构造恢复后消费成功", out5b.ok, str(out5b))
+
     # ---- R2：candidate 冻结契约 + dict 兼容垫片 ----
     clock4, _ = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
     st4 = PendingStore(ttl_seconds=300, now=clock4)

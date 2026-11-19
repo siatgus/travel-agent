@@ -314,9 +314,10 @@ class PendingStore:
                     ok=False, pending_id=pending_id,
                     reason="candidate_id 不在原快照内，一律拒绝（规则 9）")
             # ---- P2.3-R1 原子性：先完成全部可失败前置步骤 ----
-            # （候选读取、时间获取、消费记录构造），任何一步抛异常
-            # 都不改变 pending 状态（等效 P2.2 的单事务 ROLLBACK：
-            # 绝无「pending 已 consumed 但记录缺失」的半成功状态）。
+            # （候选读取、时间获取、消费记录构造、**状态对象构造**），
+            # 任何一步抛异常都不改变 pending 状态（等效 P2.2 的单事务
+            # ROLLBACK：绝无「pending 已 consumed 但记录缺失」或反向
+            # 「记录已写但状态未变」的半成功状态）。
             cand = p.candidate_by_id(candidate_id)
             consumed_at = _epoch(self._now())   # 时钟/epoch 异常在此抛出
             record = {
@@ -328,10 +329,13 @@ class PendingStore:
                 "selected_name": cand.name if cand is not None else "",
                 "selected_city": cand.city if cand is not None else None,
             }
+            # replace 会重跑 __post_init__（可失败），因此同样提前到
+            # 前置段完成构造
+            consumed = replace(p, status=PENDING_CONSUMED)
             # ---- 条件迁移：检查与写入同锁，open→consumed 单次成功 ----
-            # 记录写入与状态迁移背靠背完成（两者之间无任何可失败步骤）
+            # 迁移段只剩两次纯写入，之间无任何可失败步骤
             self._consumptions.append(record)
-            self._active = replace(p, status=PENDING_CONSUMED)
+            self._active = consumed
             return _ConsumeOutcome(
                 ok=True, pending_id=pending_id, candidate=cand)
 
