@@ -1166,3 +1166,188 @@ orchestrator 步骤 1.77（orchestrator.py:587）
 - 冻结零触碰：decision.py / interceptor / runtime / resolver /
   Handler / dialogue / producer / **orchestrator** diff 为空；
 - 开关保持 0/0/0；P2.6 / P3 未授权未实施。
+
+## 17. P2.5b-R1 验收补证包（复审 2026-11-19 六项 R1 清单，不改生产代码）
+
+> 复审裁定：R1 实质性修复获认可（RV-01/02/04/08 通过），暂缓签
+> PASS，要求先提交补证包（R1-01～R1-06）。本节全部为**只读证据
+> 与仅测试文件的断言补强**，生产代码零 diff（git 复核见 17.6）。
+
+### 17.1 R1-01 `_rollback()` 完整实现（pending_store_sqlite.py:254-259）
+
+```python
+@staticmethod
+def _rollback(con: sqlite3.Connection) -> None:
+    try:
+        con.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+```
+
+- 实现为 **`con.execute("ROLLBACK")` 语句路径**（不是
+  `con.rollback()` 方法）——因此复审指出的测试代理对象
+  （BoomMidTxnCon / RollbackBoomCon，未实现 `rollback()` 属性，
+  仅透传 `execute(sql)`）**可以正常透传 ROLLBACK**，事务中途异常
+  测试（RV-03③）确实执行了数据库级回滚，不存在 AttributeError
+  假回滚；
+- 该实现自 P2.2 起冻结使用（cancel/expire/consume 半成功防线同一
+  助手），本阶段零 diff；
+- 异常边界：`except sqlite3.Error` 覆盖真实 sqlite3 连接
+  `con.execute()` 可能抛出的**完整异常族**（sqlite3 所有异常均
+  派生自 sqlite3.Error）——对真实连接，ROLLBACK 失败不可能以非
+  sqlite3.Error 形态抛出，契约 4 边界对真实连接是闭合的；
+  唯一能出现非 sqlite3 异常的场景是连接对象本身非 sqlite3 实现
+  （仅测试代理可构造），如实申报不掩饰；
+- **新增故障测试**（test_pending_sqlite.py
+  test_revalidation_sqlite_multirow_and_non_sqlite_fault 第 ④ 段）：
+  UPDATE 0 行命中 → 进入 ROLLBACK 阶段 → 注入
+  `sqlite3.OperationalError` → `_rollback` 内部吞掉 → 方法仍返回
+  False、异常不传播。按复审要求，该测试**不断言数据状态**（回滚
+  失败时数据是否残留属不确定状态，不伪装成断言），只锁定「返回
+  False + 异常不传播」契约边界。
+
+### 17.2 R1-02 回填三列完整断言（仅测试文件，已完成）
+
+- test_pending_revalidator.py「[RV-01] 时钟异常 → 三列零写入」
+  补齐 `revalidate_probe_status is None`（原先只断言两列，检查名
+  与断言数不符的问题如实更正）；
+- test_pending_sqlite.py「[RV-03] 时钟异常 → 三列零写入」同步补齐
+  probe 列（同一问题在 sqlite 侧的镜像）；
+- 修正后：revalidator 78/0、sqlite **95**/0（+1 回滚故障测试）。
+
+### 17.3 R1-03 RV-05 hints 语义（对照原文 + 代码库先例，交评审裁定）
+
+**批准文本三处原文（逐字）：**
+
+1. PHASE5_DESIGN.md:378 HC-1 硬约束本体：城市归属按**意图选城市
+   字段**（查询类 query_city、规划类 destination），`query_city ≠
+   destination` 绝不判冲突——**HC-1 本体根本没有 hints 的位置**；
+2. PHASE5_DESIGN.md:691（P2 前置风险项②原文）：「city_hints 注入
+   边界——经 HC-1 意图城市字段路径传入验证上下文，**不写
+   slots**；三级区分：用户明确 query_city（可参与判定）＞LLM
+   city_hints（仅辅助线索，不得升级为用户明确指定）＞destination
+   （规划目的地，LLM 提示绝不覆盖）」；
+3. PHASE5_P25_PLAN.md §1.3/§10.3 与上引同文。
+
+**两种读法的实质差异（如实呈现，不替评审关闭）：**
+
+- 读法甲（只记录）：「仅辅助线索」修饰的是 hints 的**权限上限**
+  （不得升级为用户明确指定、不覆盖 destination），未赋予其任何
+  判定参与权 → 当前实现合规；
+- 读法乙（低优先级参与检索）：三级是优先级链，hints 在无明确
+  query_city 时可作为辅助期望城市参与 Resolver 判定（但仍不得
+  升级、不覆盖 destination）→ 当前实现未完整落实。
+
+**决定性代码事实（本轮只读核查新增）：**
+
+- `grep -rn "\.city_hints"`（排除定义模块）：**全代码库零下游
+  消费点**。LLM fallback 产出 hints（llm_entity_fallback.py:53，
+  白名单仅收 query_city、destination 出现即越权丢弃
+  :36/:187-190），但 parse 产出后**没有任何生产模块读取它**——
+  orchestrator / producer / decision / resolver 均不消费。即
+  「hints 辅助参与检索」在既有生产链路**从未存在过**；
+- P2.5a 生产钩子的 resolve 上下文（orchestrator
+  _pending_produce → resolve_ctx）同样不含 hints；
+- Resolver 冻结（§10.5）：`resolve()` 无 hints 入参；为读法乙
+  补通道须**先批最小适配点**。
+
+**实现方立场（供裁定，不视为关闭）：** 读法甲与全代码库现状一致
+（hints 自 P1.5 引入以来从未有消费通道），且 G3 测试已锁定「不得
+升级」；读法乙是**新增行为**而非恢复既有语义。若评审裁定读法乙，
+需要的最小变更是：resolve ctx 增加一个独立辅助键（如
+`aux_city_hints`）+ Resolver 内部在无期望城市时仅用于**辅助归因
+记录**（不参与命中判定）——属冻结区单点授权变更，按 §10.5 程序
+单独申请，不在本轮修复范围。
+
+### 17.4 R1-04 RV-06 检索范围只读调用链证据
+
+**两探测分支的实际查询范围（poi_sources.py 只读核验）：**
+
+- attraction 分支 `find_spot`（:363-402）与 restaurant/hotel 分支
+  `search_amap_keyword`（:325-360）调用**同一个高德接口**
+  `place/text`，参数形态一致：`keywords={name}`、`city={city}`、
+  `citylimit=true`——**均无 types 过滤，查询范围 = 全城全品类
+  关键词检索**。两个分支的 API 层检索范围完全相同；
+- 差异仅在**结果后处理**，如实申报两点：
+  1. `find_spot` 返回**单个最优**（完全相等 3.0 分 > 双向包含
+     2.0 分，同分取离城心最近）；`search_amap_keyword` 返回最多
+     5 条（resolver 传 limit=5）。因此 unknown 候选在 KB 未命中+
+     在线探测路径下，同名多分店场景的 matches 数量为 1 而非 5——
+     对单候选重验证，理论上存在「typed=ambiguous / unknown=取最优
+     单条」的分流差异。方向性影响：unknown 路径**不会误判
+     rejected**（空结果判定与分支无关），但 matches 多样性信息
+     少于 typed 路径，如实申报不作掩饰；
+  2. category 标注差异（`_amap_row(p, kind, ...)`）仅影响
+     MatchRow.category 字段值，不影响命中/未命中判定；
+- **unknown 是否可能遗漏餐饮/酒店实体**：不会——place/text 关键
+  词检索对全品类 POI 生效，餐饮酒店实体同名即在结果内（复审问询
+  的「attraction=最宽」表述修正为：attraction 与 restaurant/hotel
+  分支**查询范围等宽**，差异在结果条数与标注）；
+- **KB 与在线探测的合并逻辑**（entity_resolver.py:384-453）：
+  **不合并**。KB 命中即短路（probe_status=not_applicable，
+  matches=kb_hits）；KB 未命中才在线探测，`rc.matches =
+  online_hits`（替换而非叠加）；主源命中即分流，复核源只对
+  `etype ∈ {"attraction"}` 启用（:66 `_REVIEW_APPLICABLE_TYPES`，
+  unknown → skipped/type_not_covered）。即 unknown 候选**永远走
+  不到双源 rejected**（单源空证据 → unverified，保守方向）——
+  这正是重验证测试 ②' 用例验证过的 Resolver 冻结行为。
+
+### 17.5 R1-05 RV-07 fresh entity 一致性（设计契约材料，交评审裁定）
+
+**批准文本原文（逐字）：**
+
+1. PHASE5_DESIGN.md:638-642（§9.4 决策结果消费）：「**每个分支
+   入口先看接入点 A 是否给出 DecisionResult**：给了且
+   action=execute → **走该 Handler 受控链路**；clarify → 进消歧
+   通道；reject_reply → 按措辞约束回复不执行；conservative →
+   保守话术不执行；category_path / deferred → 交回」；
+2. PHASE5_P25_PLAN.md §4.4 开头引述冻结要求：「走 §9.4 接入点 A
+   既有消费路径，**Handler 拿到的仍是 DecisionResult，不新增任何
+   Handler 接口**」；方案甲定版：「gate 产出 DecisionResult 后，
+   在既有 if/elif 分支入口的 DecisionResult 消费点注入（该消费点
+   结构 §9.4 已冻结），但放行条件为 TRAVEL_PENDING_CHANNEL=1 且
+   来源标记=pending_consume，不读 TAKEOVER……**实现落点在
+   orchestrator 分支入口消费点一处（只增判断条件），Handler 零
+   改动**」。
+
+**两种读法与内部一致性分析（不替评审裁定）：**
+
+- 读法甲（授权+选链）：DecisionResult 在**分支入口**被消费——
+  决定「是否放行、走哪条受控链路」；「走该 Handler」指进入该
+  Handler 的既有业务链。entity 不需要进入 Handler 执行数据流。
+  支持证据：§9.4 消费表全部动作（clarify/reject_reply/
+  conservative/category_path/deferred）都是**路由决策**，无一涉及
+  向 Handler 传实体数据；方案甲明文「Handler 零改动」；
+- 读法乙（entity 为执行依据）：Handler 执行须以 decision.entity
+  为数据源。与「不新增任何 Handler 接口」**直接冲突**——Handler
+  现接口为 `(session, utterance)`（QA Handler 层自晴航 2.0 冻结），
+  传实体必新增参数或改业务方法签名，两个冻结条款在读法乙下无法
+  同时成立。
+
+**实现方立场：** 读法甲是唯一使 §4.4 与 §9.4 两处冻结文本自洽的
+解释；P3（DecisionEngine 接管）才是实体驱动执行的既定路线（
+TAKEOVER=1 时 decide 产出直接消费），P2.5 的 confirmed 受控流转
+是「授权+选链」性质的预演。**若评审裁定读法乙**，在不破坏冻结的
+前提下存在一个可评审的方案选项：利用已批准的 ctx 载体
+（pending_decision 本轮已在 ctx 上），由 **orchestrator 在
+_allow_handler_consume 内**（触点 2 既有代码块内，不进 Handler）
+对业务执行结果与 fresh entity 做一致性校验（如 resolve_city 结果
+≠ decision.city → 丢弃执行结果回退确认话术）——落点仍在触点 2
+一处、Handler 零改动；该方案改变触点 2 行为语义，须评审批准后才
+实施，本轮不动。
+
+### 17.6 R1-06 Git / 开关 / 回归原始证据
+
+见随附原始输出存档 `P25bR1_evidence_logs.txt`（本轮生成），包含：
+
+- 提交链：`git log --oneline -3`（3c1af27 = R1 修复，1fce3f3 =
+  P2.5b 交付，83de409 = P2.5a 归档基线）；
+- 冻结模块 diff 空证明：`git diff 1fce3f3..3c1af27 --name-only`
+  全量改动清单（7 文件，冻结模块不在其中）+ 冻结路径逐项
+  `git diff` 空输出；
+- 三开关：`TRAVEL_PENDING_CHANNEL`（orchestrator.py:91，默认
+  "0"）、`TRAVEL_DECISION_TAKEOVER`（decision.py:145，默认空串≠
+  "1"）代码读取点证据；`TRAVEL_PENDING_TAKEOVER` **全代码库零
+  读取点**（纯预留开关，语义未接线未改）；运行时
+  `env | grep TRAVEL` 输出（三项均未设置 → 全部走默认关闭）；
+- 全量回归 17 套件原始运行输出（非摘要）。

@@ -665,8 +665,10 @@ def test_backfill_memory_unique_match_and_clock_fault() -> None:
     check("[RV-01] 时钟异常 → False（契约 4：不抛出到业务）",
           okf is False, repr(okf))
     recf = stm2._latest_consumption()
-    check("[RV-01] 时钟异常 → 三列零写入（revalidate_status NULL）",
+    check("[RV-01] 时钟异常 → 三列零写入（revalidate_status/"
+          "probe_status/revalidated_at 全 NULL）",
           recf["revalidate_status"] is None
+          and recf["revalidate_probe_status"] is None
           and recf["revalidated_at"] is None, str(recf))
     check("[RV-01] 消费结果不被时钟异常撤销",
           stm2.get_pending_by_id(pm2.pending_id).status == "consumed",

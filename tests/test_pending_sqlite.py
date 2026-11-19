@@ -722,8 +722,9 @@ def test_revalidation_sqlite_multirow_and_non_sqlite_fault() -> None:
     check("[RV-03] 非 sqlite3 异常（时钟故障）→ False",
           oke is False, repr(oke))
     r3 = raw_consumptions(st3._db, p3.pending_id)
-    check("[RV-03] 时钟异常 → 三列零写入",
+    check("[RV-03] 时钟异常 → 三列零写入（status/probe/epoch 全 NULL）",
           len(r3) == 1 and r3[0]["revalidate_status"] is None
+          and r3[0]["revalidate_probe_status"] is None
           and r3[0]["revalidated_at"] is None,
           str([dict(x) for x in r3]))
 
@@ -786,6 +787,49 @@ def test_revalidation_sqlite_multirow_and_non_sqlite_fault() -> None:
           and r4[0]["revalidate_probe_status"] is None
           and r4[0]["revalidated_at"] is None,
           str([dict(x) for x in r4]))
+
+    # ---- ④ R1-01：ROLLBACK 自身故障的异常边界 ----
+    # UPDATE 0 行命中 → 进入 _rollback 阶段 → 注入 ROLLBACK 执行
+    # 异常（sqlite3.OperationalError——真实 sqlite3 连接 con.execute
+    # 可能抛出的异常族）→ _rollback 内部吞掉（except sqlite3.Error
+    # pass）→ 方法仍返回 False，绝不向业务层传播。
+    # 注：回滚失败时本测试不断言数据状态（不确定状态不伪装成断言），
+    # 只锁定「返回 False + 异常不传播」这一契约边界。
+    class RollbackBoomCon:
+        """ROLLBACK 执行即抛 sqlite3 异常的代理连接（BEGIN/UPDATE
+        透传——代理不实现 rollback() 属性，_rollback 走
+        con.execute("ROLLBACK") 语句路径，本代理可完整透传）。"""
+        def __init__(self, real):
+            self._real = real
+        def execute(self, sql, params=None):
+            if sql.strip().upper() == "ROLLBACK":
+                raise sqlite3.OperationalError("注入：ROLLBACK 故障")
+            return self._real.execute(sql) if params is None \
+                else self._real.execute(sql, params)
+        def close(self):
+            self._real.close()
+
+    st5 = SQLitePendingStore("s-mr5", db_path=temp_db(), now=clock)
+    p5 = st5.create_pending("排海贝皇大排档", "poi_query", "query", SNAP)
+    st5.consume_pending(p5.pending_id, "c1")
+    real5 = sqlite3.connect(st5._db, timeout=10.0, isolation_level=None)
+    real5.row_factory = sqlite3.Row
+    st5._connect = lambda: RollbackBoomCon(real5)
+    okr = None
+    try:
+        okr = st5.record_revalidation("s-mr5", "不存在-pid", "c1",
+                                      "confirmed", None)   # 0 行命中
+    except Exception as e:
+        check("[R1-01] ROLLBACK 故障被吞（不抛出到业务）", False,
+              f"{type(e).__name__}: {e}")
+    finally:
+        st5._connect = orig_connect
+        try:
+            real5.close()
+        except Exception:
+            pass
+    check("[R1-01] ROLLBACK 自身异常 → 仍返回 False（绝不伪装成功）",
+          okr is False, repr(okr))
 
 
 def main() -> int:
