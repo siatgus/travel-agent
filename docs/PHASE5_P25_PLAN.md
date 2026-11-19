@@ -559,3 +559,79 @@ P2.5b 重验证侧
 | 模块权限表 + channel=0 逐位标准 | §10.5 |
 | 实施顺序 + 退出条件 | §10.6 |
 
+
+---
+
+## 11. P2.5a 独立开工申请（生产侧，2026-11-19）
+
+> 设计基线：`4171095`（P2.5 设计 r2 PASS）。代码基线：`f914072`
+> （P2.4b 关闭）。**本申请仅覆盖 P2.5a 生产侧；P2.5b（重验证侧）
+> 待 P2.5a 验收通过后另行申请。**
+
+### 11.1 范围（一件事）
+
+ambiguous 执行阻断 → 创建 Pending → 首轮展示快照，含展示失败的
+孤儿 Pending 生命周期补偿（§10.2 全矩阵）。**不含**重验证、回填、
+AllowHandler 受控流转（全部属 P2.5b）。
+
+### 11.2 文件修改清单（精确到落点）
+
+| 文件 | 修改 | 对应冻结条款 |
+|---|---|---|
+| `pending_producer.py`（新增） | ①候选构建：clarify fresh matches → 六字段 dict（candidate_id 生成、display_order 1..N 按 Resolver 既有排序、HC-4 角色排除）；②展示内容先行构造（§10.2 步骤 1，成品字符串先于创建）；③create + 绑定返回 + 补偿矩阵（§10.2） | §3.1 / §10.2 |
+| `decision.py`（一处） | clarify 影子外出口：仅当 channel=1 且本轮结论为 clarify 时返回本轮真实 DecisionResult（关联候选来自本轮 resolver 结果）；channel=0 影子行为逐位不变；其余 action 门控一字不改 | §10.1 D1 两硬约束 |
+| `orchestrator.py`（一处生产钩子） | 接入点 A 决策调用后的 clarify 分支：producer 装配 + 短路返回；规则 8 拒绝时捕获并交回原链路（不覆盖不轮换） | §3.1 |
+| `tests/test_pending_producer.py`（新增） | 生产侧专项测试（见 11.3） | — |
+| `tests/test_pending_channel.py`（扩展） | 生产钩子集成用例 + channel=0 逐位对比扩展 | §10.5 |
+| `docs/PHASE5_P25_PLAN.md` | §12 实施记录 | — |
+
+**禁止触碰（P2.5a 零修改）**：pending_interceptor.py、
+pending_runtime.py、pending.py、pending_store_sqlite.py（生产侧
+不需要新 store 方法——create/查询既有接口已够用）、Handler 全部、
+Resolver、decision.py 其余分支、TAKEOVER 两开关语义、
+P2.4b 九类 verdict 接线与四项异常边界。
+
+### 11.3 测试清单（P2.5a 交付判定）
+
+**生产专项（test_pending_producer.py）**：
+- P1 候选构建：fresh matches → 六字段、1..N 序号冻结、candidate_id
+  唯一可引用；HC-4（negated/remove）角色排除负向；
+- P2 展示内容先于创建：构造失败时 create **不被调用**（零副作用）；
+- P3 补偿矩阵三行：①绑定/返回失败 → 立即 cancel 孤儿 → shadow
+  记录 + 交回原链路；②cancel 也失败 → 保守拦截回复、**绝不交回
+  原链路** + orphan 警告；③正常路径 Pending ID 与展示内容绑定；
+- P4 规则 8 拒绝：已有 active pending 时新 clarify → create 拒绝
+  → 交回原链路，原 Pending 状态不变。
+
+**集成（test_pending_channel.py 扩展）**：
+- A1 八步前两步：ambiguous → clarify → 创建 → 展示 1..N（快照
+  冻结、ID 可引用）；
+- A2 展示轮后新问题 → cancel_new_question → 原链路（验证 P2.3
+  拦截器在生产侧 Pending 上照常工作）；
+- C1 channel=0 时 clarify → 纯影子、零 Pending 创建（管理器/存储
+  零构造）；
+- C2 channel=1 仅 clarify 进生产侧：execute/conservative 等其余
+  action 仍走原门控（D1 约束②负向）；
+- D1 约束①：clarify 结果为本轮真实判定——mock 本轮 KB 变化，
+  快照随本轮 matches 变化，与上轮/影子记录无关。
+
+**回归门槛**：全套件绿（13 组既有 + 新增）+ **channel=0 逐位
+回归标准（§10.5）全项**：B10 式对比扩展到「pending 存在/hint
+存在/clarify 场景」；git diff 断言——orchestrator 仅生产钩子
+一处、decision.py 仅 clarify 放行一处。
+
+### 11.4 基线与回滚方案
+
+- **基线**：设计 `4171095` / 代码 `f914072`；P2.5a 交付为单commit
+  （或 producer+decision+orchestrator 一体单提交，含测试与记录）。
+- **回滚**：①运行时回退——`TRAVEL_PENDING_CHANNEL=0` 即生产侧
+  完全旁路（decide 恢复全影子、orchestrator 钩子首行返回），
+  无需回滚代码；②代码回退——单 commit revert 即恢复 `f914072`
+  行为（新文件 pending_producer.py 独立，revert 无残留耦合）。
+- **风险预案**：clarify 出口若与本轮 resolve 时序有实测偏差
+  （P2 方案 §8 风险一），接入位置允许在钩子内部实测调整，仍只增
+  不改，偏差记入 §12 实施记录。
+
+**申请结论**：按本清单申请 P2.5a 开工；批准后开始编码，交付后
+独立提交 + 独立回归 + 独立代码验收；P2.5b 申请待 P2.5a 验收
+通过后提交。
