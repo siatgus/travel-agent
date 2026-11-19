@@ -1,10 +1,12 @@
-# Phase 5 P2.4 开工申请（修订版 r2）：PendingInterceptor 单点接入（消费通道）
+# Phase 5 P2.4 开工申请（修订版 r3）：PendingInterceptor 单点接入（消费通道）
 
-> 状态：**修订版申请待批**（r2）。本文档为开工申请，未写任何业务代码。
+> 状态：**修订版申请待批**（r3）。本文档为开工申请，未写任何业务代码。
 > 前序：P2.3 最终验收通过（最终提交链 797bf76 → a913289 → 0773ad9 → 79b1c04）。
-> 修订记录：r2 补入评审两项开工条件——R1 `active_pending_id` 追踪/清理/
-> 恢复机制（§3）、Runtime 按 sid 隔离与缓存清理策略（§4）；并按评审意见
-> 冻结 P2.4a/P2.4b 验收边界（§5）。
+> 修订记录：r2 补入 R1 `active_pending_id` 追踪机制（§3）与 Runtime 按
+> sid 隔离（§4）。r3 按评审意见闭合：① `_latest_pending_id()` 查询范围
+> 与终态记录语义（§3.2 补）；② memory Runtime 淘汰保护覆盖「到期未处理
+> 的 Pending」与「重复选择窗口内的消费记录」（§4.2 重写 + §4.3 专项
+> 判定方法）；测试 A/B 纳入 §6。
 
 ## 0. 一句话范围
 
@@ -152,10 +154,20 @@ shadow 警告。拦截器自身不猜测身份。（备选：给 Orchestrator.ha
   有效——有效性（open/过期/归属）最终全部由 Store 判定（evaluate/act
   内部经 session_id 条件与状态机校验，P2.2/P2.3 已验收机制）。
 - **store 新增内部方法** `_latest_pending_id()`（下划线，不进公共契约，
-  沿用 `_latest_consumption` 先例）：按 sid 取 `created_at` 最新一条
-  pending 的 ID，任何状态；内存桩与 SQLite 同语义，纳入双实现对拍。
-  重启恢复依赖此方法（SQLite 持久化跨进程；内存 store 进程内失效，
-  重启后返回 None，属预期）。
+  沿用 `_latest_consumption` 先例）。**查询语义（r3 冻结）：**
+  - **严格按当前 store 绑定的 session_id 查询**，绝不接受外部传入
+    sid（防跨会话读取）；
+  - **记录范围**：本 sid `created_at` 最新一条 pending 记录，**包含
+    全部状态**（open / expired / consumed / cancelled）——终态记录
+    也返回，因为它仍是「该会话最近一次 pending 交互」的线索；
+  - **返回值仅作 evaluate 的解析线索**，绝不被视为有效待处理对象：
+    终态记录传入 evaluate 后由 P2.3 冻结状态机产出 `none`（consumed /
+    cancelled → none，不重复消费、不触发 duplicate_select——重复选择
+    识别只走 `_latest_consumption()`，两者数据源分离）；expired 记录
+    → `expired_reply`；open → 正常判定；
+  - 内存桩与 SQLite 同语义，纳入双实现对拍；重启恢复依赖此方法
+    （SQLite 持久化跨进程；内存 store 进程内失效，重启后返回 None，
+    属预期）。
 - 解析顺序第 3 步仅在 SQLite store 下生效语义完整；memory store 重启
   即清空，第 3 步天然返回 None，行为一致。
 
@@ -201,16 +213,44 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
   session_id SQL 条件保证）；
 - 独立 `PendingInterceptor`（无共享可变状态，独立装配防串扰）。
 
-### 4.2 缓存清理策略（冻结）
+### 4.2 缓存清理策略（r3 重写：按「业务状态保留」判定，不看 open）
 
-- 容量上限：`TRAVEL_PENDING_RUNTIME_MAX`（默认 256），LRU 淘汰
-  （OrderedDict，命中移尾）。
-- **淘汰保护**：淘汰前检查候选 runtime 的 store 是否仍有 open pending
-  （`get_active_pending() is not None`）→ 有则跳过，顺位淘汰下一个；
-  若全部持有 open pending 导致超限，**允许暂时超上限不淘汰**并记一条
-  shadow 警告（宁可靠内多缓存，不丢活跃会话的 Pending）。
-- SQLite runtime 被淘汰是安全的（状态在 DB，下次按 §3.2 重建）；
-  memory runtime 被淘汰即状态丢弃——与「进程内存退出即失效」同语义。
+评审阻断项闭合——`get_active_pending() is None` **不能**作为可淘汰
+依据：到期未登记的 Pending 底层仍是 open、刚消费的记录仍在重复选择
+窗口内，两者被淘汰都会造成状态丢失（expired_reply / duplicate_select
+失效）。冻结如下：
+
+**SQLite runtime**：任意时刻均可安全淘汰（Pending 与消费记录均持久化
+在 DB，重建后经 `_latest_pending_id()` / `_latest_consumption()` 完整
+恢复，淘汰不删除任何数据库记录）。
+
+**memory runtime**（数据随淘汰丢失，必须更严格）——仅当满足
+`_has_runtime_retention_state(now) is False` 才允许淘汰：
+
+| runtime 状态 | memory 是否允许淘汰 |
+|---|---|
+| 无 Pending，也无重复选择窗口内的消费记录 | **允许** |
+| 存在未终结 Pending（status=open，**含已到期但尚未处理**的） | **不允许** |
+| 存在仍处于重复选择识别窗口内（默认 10 分钟）的消费记录 | **不允许** |
+
+### 4.3 `_has_runtime_retention_state(now)`（内部只读判定，r3 新增）
+
+- 两个 store 均提供同语义实现（下划线内部方法，不进公共 Store API，
+  沿用 `_latest_consumption` 先例），纳入双实现对拍；
+- 语义：`True` 表示该 runtime 仍承载必须由它承担的业务状态——
+  ① 本 sid 存在 status='open' 的 Pending（**按库内原始状态判断，
+  不做时间过滤**，因此到期未登记的 open 记录同样命中）；
+  ② 最近一条消费记录的 `consumed_at` 距今 < `TRAVEL_PENDING_RESELECT_WINDOW`
+  （epoch 比较，与 P2.3 重复选择同一窗口口径）；
+- ①② 任一成立 → `True`（保留）；全部失效 → `False`（允许淘汰）；
+- 该方法**只读**，绝不产生状态迁移或时间登记副作用；
+- 淘汰算法：LRU（OrderedDict，上限 `TRAVEL_PENDING_RUNTIME_MAX`
+  默认 256）顺位扫描候选，memory runtime 处于保留态则跳过淘汰下一个；
+  若全部 memory runtime 均处于保留态导致超限，**允许暂时超上限不
+  淘汰**并记 shadow 警告（宁可靠内多缓存，不丢会话状态）；memory
+  Runtime 淘汰 = 状态丢弃，与「进程内存退出即失效」同语义。
+- 未来若需在容量压力下淘汰 memory runtime，须另行设计持久化/迁移
+  机制，**不在 P2.4 顺手扩大范围**（评审冻结）。
 - channel=0 时 dict 永不创建、永不增长。
 
 ## 5. 风险清单与对策
@@ -237,7 +277,13 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
   终态迁移成功清 hint / 失败保留 hint；
 - **R2**：多 Session（A/B 交错请求）各自独立 runtime、store 隔离
   （B 查不到 A 的 pending）；共享单例 store 规避手法被测试拦截；
-  LRU 上限与 open-pending 保护；channel=0 时 dict 为空。
+  LRU 上限与保留态保护；channel=0 时 dict 为空；
+- **测试 A（r3 评审冻结）**：Pending 到期未登记 → 推入 LRU 淘汰压力
+  → runtime 不得因 `get_active_pending() is None` 被淘汰（memory）；
+  随后用户选择 → 仍正确产出 `expired_reply`；
+- **测试 B（r3 评审冻结）**：消费成功后处于重复选择窗口内 → 推入
+  淘汰压力 → runtime 不得被淘汰（memory）；随后「第一个」→ 仍能
+  识别原消费记录并产出 `duplicate_select`；窗口刚过 → 允许淘汰。
 
 **P2.4b 组（verdict 行为与集成）**：
 - 九类 verdict 全路径（§2.5 表逐行）：consume 成功短路 + 只确认消歧
