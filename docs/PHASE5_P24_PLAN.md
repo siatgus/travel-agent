@@ -1,12 +1,14 @@
-# Phase 5 P2.4 开工申请（修订版 r4）：PendingInterceptor 单点接入（消费通道）
+# Phase 5 P2.4 开工申请（修订版 r5）：PendingInterceptor 单点接入（消费通道）
 
-> 状态：**修订版申请待批**（r4）。本文档为开工申请，未写任何业务代码。
+> 状态：**修订版申请待批**（r5）。本文档为开工申请，未写任何业务代码。
 > 前序：P2.3 最终验收通过（最终提交链 797bf76 → a913289 → 0773ad9 → 79b1c04）。
-> 修订记录：r2 补入 R1 追踪机制（§3）与 sid 隔离（§4）；r3 闭合
-> `_latest_pending_id()` 查询语义与 memory Runtime 业务状态保留淘汰。
-> r4 按评审意见补齐两项边界约束：① 同一 sid 单有效 Pending 不变量
-> 与遮蔽边界测试（§3.6）；② 保留检查与淘汰的并发同步约束、窗口
-> 比较符与 P2.3 严格一致（§4.4）；测试 A/B 边界断言补强（§6）。
+> 修订记录：r2 R1 追踪机制 + sid 隔离；r3 memory Runtime 业务状态保留
+> 淘汰；r4 单有效 Pending 不变量 + 保留-淘汰同临界区。r5 按评审意见
+> 闭合最后一项阻断——**Runtime 引用获取与淘汰之间的生命周期竞态**：
+> 新增 Runtime Manager 层 lease 引用计数与统一锁顺序（§4.5），明确
+> Python 层对象生命周期与 SQLite 事务层职责分离（§4.5.3）；并发专项
+> 测试（§6）覆盖「已取得引用但未进入 store 锁」场景；`created_at`
+> 同时间戳确定性排序（§3.2 补）。十二项冻结决策与七条执行边界不变。
 
 ## 0. 一句话范围
 
@@ -167,7 +169,11 @@ shadow 警告。拦截器自身不猜测身份。（备选：给 Orchestrator.ha
     → `expired_reply`；open → 正常判定；
   - 内存桩与 SQLite 同语义，纳入双实现对拍；重启恢复依赖此方法
     （SQLite 持久化跨进程；内存 store 进程内失效，重启后返回 None，
-    属预期）。
+    属预期）；
+  - **排序确定性（r5 补）**：按 `(created_at, 决序依据)` 排序取最新
+    ——`created_at` 精度不足出现同时间戳时，以入库递增序号
+    （SQLite rowid / 内存 append 顺序）作确定性次序依据，绝不允许
+    同时间戳时查询结果不确定。
 - 解析顺序第 3 步仅在 SQLite store 下生效语义完整；memory store 重启
   即清空，第 3 步天然返回 None，行为一致。
 
@@ -304,6 +310,85 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
 同一函数/常量定义），绝不允许一处 `<`、一处 `<=`；测试在
 `consumed_at + window == now` 临界点断言两处判定结果一致。
 
+### 4.5 Runtime 生命周期同步（r5 新增，最后一项阻断闭合）
+
+**评审指出的第三种交错**：请求 A 已从 `_pending_runtimes` 取得
+Runtime 引用、但尚未进入 store 锁时，请求 B 持 store 锁完成
+「无保留状态判定 → 移除 → 关闭连接」——A 恢复后使用已关闭的
+runtime。store 锁只保护已进入锁的操作，保护不了「持引用未入锁」
+的窗口。**§4.4 的「两种可序列化结果」缺少生命周期同步前提**，本节补齐。
+
+#### 4.5.1 机制：Runtime Manager lease（引用计数，改动最小方案）
+
+Orchestrator 增加一把 **manager 锁**（`threading.Lock`），统一保护
+`_pending_runtimes` dict 与每个 runtime 的 `active_ops` 计数：
+
+```
+获取（_pending_runtime）：
+  manager_lock:
+    lookup / 惰性创建 runtime（同 sid 双检，§4.4）
+    runtime.active_ops += 1          # 取得 lease
+    return runtime
+  # manager 锁随即释放；lease 保证本请求期间该 runtime 不被淘汰
+
+业务执行（evaluate / act / _resolve_pending_id / _latest_consumption）：
+  直接调用 runtime.store 方法（各自内部进 store 锁）——
+  期间**不持有 manager 锁**，锁内不做任何阻塞业务操作
+
+释放（finally）：
+  manager_lock:
+    runtime.active_ops -= 1          # 归还 lease
+```
+
+#### 4.5.2 淘汰协议（lease + 保留态双闸）
+
+```
+LRU 淘汰扫描：
+  manager_lock:
+    按 LRU 顺位取候选 runtime
+    闸 1：active_ops > 0 → 跳过（有请求持 lease，包括
+          「已取得引用尚未进 store 锁」的请求——正是被修补的窗口）
+    闸 2（memory）：manager_lock 之下再取 store 锁，
+          _has_runtime_retention_state(now) 为 True → 跳过
+    可淘汰 → 同一 manager 临界区内：
+          从 _pending_runtimes 移除 + 关闭连接（SQLite）→ 释放锁
+```
+
+**竞态收敛证明**：lease 在 manager 锁内授予/归还，淘汰扫描也在
+manager 锁内判 active_ops——「持引用未入 store 锁」的请求必然
+active_ops>0，闸 1 必跳过。三种可序列化结果：
+① 业务写入先于扫描进入 store 锁 → 闸 2 看到保留态，不淘汰；
+② 淘汰先于请求获取 lease → 请求经 manager 锁取得**新建 runtime**
+（无损，Pending 尚不存在）；
+③ 请求已持 lease → 闸 1 跳过淘汰，A 恢复后安全使用原 runtime。
+不存在「淘汰关闭 runtime 时仍有请求持 lease」的交错。
+
+#### 4.5.3 两层职责分离与统一锁顺序（评审特别确认项）
+
+| 层 | 保护对象 | 机制 |
+|---|---|---|
+| Python 对象层 | Runtime 的获取、lease、移除、连接关闭 | manager 锁 + active_ops |
+| DB 事务层 | SQLite 写事务竞争、session 隔离 SQL 条件 | `BEGIN IMMEDIATE` + store 锁（不变） |
+
+`BEGIN IMMEDIATE` 只解决 DB 写事务竞争，**不解决** Python 层对象
+生命周期——两层不得混为一谈。**统一锁顺序：manager 锁 → store 锁
+（→ DB 事务）**，全程单向、绝不逆向持有（业务路径持 store 锁时
+绝不取 manager 锁；store 方法对 manager 无感知），无死锁环。
+锁内不做任何网络/模型调用等慢操作，lease 区间尽量短。
+
+#### 4.5.4 专项并发测试（r5 新增，双实现覆盖）
+
+1. **持引用未入锁场景（评审第 4 条）**：请求 A 经 `_pending_runtime`
+   取得 lease 后在 barrier 处暂停（尚未进 store 锁）→ 请求 B 执行
+   LRU 淘汰 → 断言 B 被闸 1 跳过 → A 放行完成 evaluate/act，操作
+   安全、绝不访问已关闭 runtime → A 释放 lease → B 再次淘汰成功；
+2. **淘汰原子性**：B 完成淘汰后，新请求经 manager 锁取得**新建**
+   runtime；旧 runtime 对象不再被 map 引用（memory 状态随之丢弃属
+   预期语义）；
+3. **lease 泄漏防护**：gate 全路径（含 act 失败、store 抛异常、
+   shadow sink 异常）finally 归还 lease，计数归零可淘汰；
+4. memory 与 SQLite 两实现跑同一组并发脚本，判定结果一致。
+
 ## 5. 风险清单与对策
 
 | # | 风险 | 对策 |
@@ -340,14 +425,21 @@ self._pending_runtimes: dict[str, PendingRuntime]   # key = sid
   **r4 边界断言**：`consumed_at + window == now` 临界点**以内必须
   保留、以外允许淘汰**，且该比较符与 P2.3 重复选择识别严格一致
   （同一常量/表达式，两处判定在临界点结果相同）；
-- **多 Pending 遮蔽边界组（r4 新增）**：穷举
-  create→consume→create、open 阻断 create、过期+create 自动登记
-  等序列，断言「本 sid 存在 open ⇒ open 必为 `_latest_pending_id()`
-  所指」的不变量成立（终态记录绝不遮蔽仍有效的旧记录，§3.6）；
-- **保留-淘汰并发竞态组（r4 新增）**：多线程交错「LRU 扫描 vs
-  create_pending」注入，断言只有两种可序列化结果（创建先至则不淘汰
-  / 淘汰先至则新建无损），不存在创建成功但 runtime 被淘汰的交错
-  （§4.4）；双实现同输入同时间边界对拍保留态判定与淘汰决策。
+- **多 Pending 遮蔽边界组（r4 新增，r5 定型断言）**：四条序列
+  create→consume→create（旧终态新 open）/ open 状态下再 create
+  （被拒）/ expired→create（旧先过期新 open）/
+  create→consume→create→consume（全程至多一个 open），每条统一
+  断言：`若存在 open Pending，则 _latest_pending_id() 所指记录的
+  status == "open"`（终态记录绝不遮蔽仍有效的旧记录，§3.6）；
+- **保留-淘汰并发竞态组（r4 新增，r5 扩展）**：多线程交错「LRU 扫描
+  vs create_pending」注入，断言只有两种可序列化结果（创建先至则不
+  淘汰 / 淘汰先至则新建无损）；**r5 新增 §4.5.4 四项生命周期测试**
+  （持引用未入锁、淘汰原子性、lease 泄漏防护、双实现同脚本）；
+  双实现同输入同时间边界对拍保留态判定与淘汰决策；
+- **窗口临界点验收表（r5 定型）**：`时间关系 | 重复选择识别 |
+  Runtime 保留`——临界点之前 true/true；**恰好等于临界点：与 P2.3
+  重复选择识别判定完全一致（同一比较表达式，两处同值）**；临界点
+  之后 false/false。三种时间关系两处判定逐位对拍。
 
 **P2.4b 组（verdict 行为与集成）**：
 - 九类 verdict 全路径（§2.5 表逐行）：consume 成功短路 + 只确认消歧
