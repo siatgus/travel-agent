@@ -1896,6 +1896,11 @@ def test_p25a_compensation_boundary_integration() -> None:
         check("[R2集成C] 保守拦截 = pending_produce 短路",
               orc.last_ctx.route == "pending_produce"
               and _ORPHAN_NOTICE in str(r3), str(r3))
+        check("[R2集成C] 返回对象满足 Reply 契约（服务层属性访问安全）",
+              hasattr(r3, "render") and hasattr(r3, "mode")
+              and getattr(r3, "mode", None) == "answer"
+              and not isinstance(r3, str)
+              and _ORPHAN_NOTICE == getattr(r3, "render", None), str(r3))
         check("[R2集成C] 孤儿 open 保留可排查",
               rt3.store.get_active_pending() is not None, "")
         check("[R2集成C] lease 已归还", rt3.active_ops == 0, "")

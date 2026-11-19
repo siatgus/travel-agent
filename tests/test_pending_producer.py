@@ -16,8 +16,11 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from travel_agent.entity_resolver import MatchRow, ResolvedCandidate
+from travel_agent.dialogue import Reply
+import travel_agent.pending_producer as _pp_mod
 from travel_agent.pending import PendingStore
 from travel_agent.pending_producer import (_ORPHAN_NOTICE, PendingProducer,
+                                           PendingProduceError,
                                            ProduceOutcome)
 
 _PASS = 0
@@ -350,8 +353,9 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
     check("[R2②] 双重失败仍返回保守回复（异常未传播）",
           out2.reply is not None, str(out2))
     check("[R2②] 保守回复 = 自建 Reply（mode=answer/render=通告）",
-          getattr(out2.reply, "mode", None) == "answer"
-          and getattr(out2.reply, "render", "") == _ORPHAN_NOTICE,
+          isinstance(out2.reply, Reply)
+          and out2.reply.mode == "answer"
+          and out2.reply.render == _ORPHAN_NOTICE,
           str(out2.reply))
     check("[R2②] 孤儿 pending_id 保留", out2.pending_id is not None, "")
     check("[R2②] shadow 记录 orphan",
@@ -399,6 +403,72 @@ def test_p3r2_none_and_double_failure_boundary() -> None:
           and store6.cancel_calls == 0, str(out6))
 
 
+def test_p3r3_reply_contract_terminal_failure() -> None:
+    """P3-R3（契约核验 2026-11-19）：保守拦截路径返回类型恒为 Reply
+    （绝不字符串/None）；终层 Reply 构造失败（理论不可达）→
+    PendingProduceError 携带孤儿身份，明确失败而非静默交回。"""
+    # ① 终层形态：builder 必然失败 + cancel 失败 → 返回真 Reply 实例，
+    #    且其字段满足服务层消费契约（mode/turn_no/ask_rounds/slots/
+    #    render/plan/assumptions/trace/fetched 全部可属性访问）
+    pr1 = PendingProducer(id_gen=fixed_ids())
+    store1 = CountingStore(session_id="s-r3a", now=fixed_clock())
+    store1.cancel_raise = RuntimeError("注入：cancel 失败")
+    out1 = _produce(pr1, store1, [m("南京", "A店")],
+                    reply_builder=always_failing_builder())
+    r = out1.reply
+    check("[R3①] 保守回复是真 Reply 实例（非 str/None）",
+          isinstance(r, Reply) and not isinstance(r, str), str(type(r)))
+    check("[R3①] 服务层消费字段全部可属性访问",
+          r.mode == "answer" and r.render == _ORPHAN_NOTICE
+          and isinstance(r.slots, dict) and r.plan is None
+          and isinstance(r.trace, list) and r.turn_no == 0
+          and r.ask_rounds == 0 and isinstance(r.fetched, dict)
+          and isinstance(r.assumptions, list), str(r.as_dict()))
+    check("[R3①] as_dict 可序列化（服务层 dict 消费形态）",
+          isinstance(r.as_dict(), dict)
+          and r.as_dict()["mode"] == "answer", str(r.as_dict()))
+
+    # ② 终层构造失败（monkeypatch Reply 抛异常，理论不可达路径）→
+    #    PendingProduceError 明确失败，异常消息携带孤儿 Pending ID，
+    #    绝不返回 None/字符串静默交回
+    pr2 = PendingProducer(id_gen=fixed_ids())
+    store2 = CountingStore(session_id="s-r3b", now=fixed_clock())
+    store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    orig_reply_cls = _pp_mod.Reply
+    def boom_reply(**kw):
+        raise RuntimeError("注入：Reply 构造失败（模拟不可达）")
+    _pp_mod.Reply = boom_reply
+    try:
+        try:
+            _produce(pr2, store2, [m("南京", "A店")],
+                     reply_builder=always_failing_builder())
+            check("[R3②] 终层失败 → PendingProduceError", False,
+                  "未抛异常（静默交回？）")
+        except PendingProduceError as exc:
+            check("[R3②] 终层失败 → PendingProduceError（明确失败）",
+                  True, "")
+            check("[R3②] 异常消息携带孤儿 Pending ID",
+                  store2.last_created_id is not None
+                  and store2.last_created_id in str(exc), str(exc))
+            check("[R3②] shadow 已记录 orphan（身份双通道保留）",
+                  any(x["action"] == "produce_orphan_cancel_failed"
+                      and x["pending_id"] == store2.last_created_id
+                      for x in pr2.shadow_log), str(pr2.shadow_log))
+        except Exception as exc:
+            check("[R3②] 终层失败 → PendingProduceError", False,
+                  f"异常类型错误: {type(exc).__name__}")
+    finally:
+        _pp_mod.Reply = orig_reply_cls
+
+    # ③ monkeypatch 恢复后回归正常（隔离无残留）
+    store3 = CountingStore(session_id="s-r3c", now=fixed_clock())
+    store3.cancel_raise = RuntimeError("注入：cancel 失败")
+    out3 = _produce(pr2, store3, [m("南京", "A店")],
+                    reply_builder=always_failing_builder())
+    check("[R3③] 恢复后保守路径回归 Reply 终层",
+          isinstance(out3.reply, Reply), str(type(out3.reply)))
+
+
 # ================================================== 影子隔离
 
 
@@ -429,6 +499,7 @@ def main() -> int:
     test_p2_display_before_create()
     test_p3_orphan_compensation_matrix()
     test_p3r2_none_and_double_failure_boundary()
+    test_p3r3_reply_contract_terminal_failure()
     test_p4_rule8_rejection()
     test_shadow_isolation()
     print(f"\npending producer P2.5a: {_PASS} pass / {_FAIL} fail")

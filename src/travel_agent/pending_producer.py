@@ -38,6 +38,17 @@ _HC4_ROLES = ("negated", "remove")
 _ORPHAN_NOTICE = "系统暂时无法处理您的选择请求，请稍后重试。"
 
 
+class PendingProduceError(RuntimeError):
+    """保守拦截回复构造失败（理论不可达）时的明确失败信号。
+
+    P2.5a-R3 契约核验：保守拦截路径的返回类型恒为 Reply——绝不
+    返回 None 或字符串（server.py / Session.turn 对 handle 返回值
+    直接属性访问 reply.render/mode/plan/slots/...，非 Reply 即
+    AttributeError → 500）。若连自建 Reply 也失败（全默认字段
+    dataclass + 常量参数，确定性构造，理论不可达），以本异常明确
+    失败并携带孤儿 Pending ID，绝不静默交回原链路。"""
+
+
 @dataclass
 class ProduceOutcome:
     """produce() 的返回值。
@@ -207,43 +218,58 @@ class PendingProducer:
 
         §10.2 缺口 2：保守回复若再次依赖刚刚失败过的同一 reply_builder，
         二次失败会向上传播异常，导致既无保守拦截回复、孤儿身份也丢失。
-        构造顺序（自外向内逐层降级）：
+        构造顺序（P2.5a-R3 契约核验后定版：返回类型恒为 Reply）：
         1) reply_builder(_ORPHAN_NOTICE)——与展示同源（刚失败过，
            但兜底文案构造通常更简单，可能已恢复）；
-        2) producer 自建最小 Reply（不经任何外部构造器，静态数据，
-           实际不可能失败）；
-        3) 纯字符串通告（最后防线——短路文本仅经 str() 入 history）。
-        任一层成功即返回；全部失败（理论不可达）返回字符串层兜底，
-        绝不把 None 或异常当成普通结果交回原链路。"""
+        2) producer 自建最小 Reply（终层）：mode="answer" 为服务层
+           既有合法形态（answer_reply 同款），Reply 为全默认字段
+           dataclass、无 __post_init__ 校验，常量参数为确定性构造。
+        原第三层纯字符串兜底已移除——server.py 对 handle 返回值直接
+        属性访问（reply.render/mode/plan/slots/...），字符串会
+        AttributeError → 500，违反既有返回类型契约。若第 2 层也失败
+        （理论不可达），异常向上传播并由 _compensate_orphan 转为
+        携带孤儿身份的 PendingProduceError：明确失败，绝不静默交回
+        None/字符串。"""
         try:
             reply = reply_builder(_ORPHAN_NOTICE)
             if reply is not None:
                 return reply
         except Exception:
             pass                      # 首层失败 → 降级自建，绝不传播
+        return Reply(mode="answer", render=_ORPHAN_NOTICE)
+
+    def _conservative_intercept(self, pending_id: str,
+                                reply_builder) -> ProduceOutcome:
+        """保守拦截终点（P2.5a-R3）：恒产出 Reply 形态的 ProduceOutcome。
+
+        _conservative_reply 两层均失败（理论不可达）时转 PendingProduceError
+        ——异常消息携带孤儿 Pending ID（身份保留），本轮明确失败，
+        绝不把 None/字符串当成普通结果交回原链路。"""
         try:
-            return Reply(mode="answer", render=_ORPHAN_NOTICE)
-        except Exception:
-            pass
-        return _ORPHAN_NOTICE
+            reply = self._conservative_reply(reply_builder)
+        except Exception as exc:
+            raise PendingProduceError(
+                f"保守拦截回复构造失败（孤儿 Pending={pending_id} 保留 "
+                "open，本轮明确失败，绝不静默交回原链路）") from exc
+        return ProduceOutcome(reply, pending_id)
 
     def _compensate_orphan(self, store, pending_id: str,
                            reply_builder) -> ProduceOutcome:
         """孤儿 Pending 补偿（§10.2 失败矩阵第三行）。
 
         立即尝试取消孤儿；取消成功 → shadow 记录 + 交回原链路；
-        取消也失败 → 保守拦截回复，**绝不交回原链路**（防 open 孤儿
-        被下轮误消费）+ shadow 记录 orphan Pending。保守回复经
-        _conservative_reply 三层构造，二次失败不再向上传播
-        （P2.5a-R2：缺口 2）。"""
+        取消也失败 → 保守拦截回复（恒 Reply 契约形态），**绝不交回
+        原链路**（防 open 孤儿被下轮误消费）+ shadow 记录 orphan
+        Pending。保守回复经 _conservative_reply 两层构造，二次失败
+        不再向上传播（P2.5a-R2：缺口 2）；终层构造失败（理论不可达）
+        以 PendingProduceError 明确失败（P2.5a-R3）。"""
         try:
             out = store.cancel_pending(pending_id)
         except Exception as exc:
             self._shadow("produce_orphan_cancel_failed",
                          detail=f"cancel 抛异常 {type(exc).__name__}: {exc}",
                          pending_id=pending_id)
-            return ProduceOutcome(self._conservative_reply(reply_builder),
-                                  pending_id)
+            return self._conservative_intercept(pending_id, reply_builder)
         if getattr(out, "ok", False):
             self._shadow("produce_orphan_cancelled",
                          pending_id=pending_id)
@@ -253,5 +279,4 @@ class PendingProducer:
         self._shadow("produce_orphan_cancel_failed",
                      detail=str(getattr(out, "reason", "cancel ok=False")),
                      pending_id=pending_id)
-        return ProduceOutcome(self._conservative_reply(reply_builder),
-                              pending_id)
+        return self._conservative_intercept(pending_id, reply_builder)
