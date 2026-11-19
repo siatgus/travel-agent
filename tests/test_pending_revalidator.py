@@ -108,6 +108,7 @@ def test_boundary_checks() -> None:
     rec = st._latest_consumption()
     check("[边界①] 不回填（三列保持 NULL）",
           rec["revalidate_status"] is None
+          and rec["revalidate_probe_status"] is None
           and rec["revalidated_at"] is None, str(rec))
     # ② pending 不可回查（错误 ID）→ B3 路径
     out2 = rv.revalidate(st, session_id="s-rv", pending_id="nope",
@@ -132,7 +133,9 @@ def test_boundary_checks() -> None:
           out4.status == "" and "RuntimeError" in out4.detail
           and st4.get_pending_by_id(pid4).status == "consumed", str(out4))
     check("[边界④] 异常不回填（契约 6：三列 NULL）",
-          st4._latest_consumption()["revalidate_status"] is None, "")
+          st4._latest_consumption()["revalidate_status"] is None
+          and st4._latest_consumption()["revalidate_probe_status"] is None
+          and st4._latest_consumption()["revalidated_at"] is None, "")
     check("[边界④] shadow 记录异常",
           any(x["action"] == "revalidate_exception" for x in rv.shadow_log),
           str(rv.shadow_log[-2:]))
@@ -557,6 +560,8 @@ def test_branch_unverified_and_rejected() -> None:
     check("[skipped 防御] 保守回复 + 不回填（三列 NULL）",
           o3.status == "unverified"
           and st3._latest_consumption()["revalidate_status"] is None
+          and st3._latest_consumption()["revalidate_probe_status"] is None
+          and st3._latest_consumption()["revalidated_at"] is None
           and "skipped" in o3.detail, str(o3))
 
 
