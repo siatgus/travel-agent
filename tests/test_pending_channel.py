@@ -1566,6 +1566,7 @@ def test_b10_channel0_bitwise_with_pending() -> None:
 import travel_agent.orchestrator.orchestrator as _orch_mod
 from travel_agent.entity_resolver import (MatchRow, ResolvedCandidate,
                                           ResolveResult)
+from travel_agent.pending_producer import _ORPHAN_NOTICE
 
 
 class _StubResolver:
@@ -1817,6 +1818,96 @@ def test_p25a_decision_chain_failure() -> None:
         _orch_mod._resolve_entities = old
         set_env()
 
+
+def test_p25a_compensation_boundary_integration() -> None:
+    """P2.5a-R2 集成（§10.2 缺口 1/2）：真实 handle 下 reply_builder
+    返回 None / 抛异常 → 钩子触发补偿矩阵——孤儿被取消或保守拦截，
+    任何路径 lease 均经 finally 归还、绝不静默交回 open 孤儿。"""
+    set_env(channel="1", store_kind="memory")
+    old_resolve = _orch_mod._resolve_entities
+    old_answer = _orch_mod.answer_reply
+    try:
+        stub = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        _orch_mod._resolve_entities = stub
+        orc = Orchestrator()
+
+        # 形态 A：builder 返回 None → 补偿取消孤儿 → 交回原链路
+        _orch_mod.answer_reply = lambda session, text: None
+        s = _produce_session(orc, "s-r2a")
+        r = orc.handle(s, "海贝皇大排档哪家好")
+        rt = orc._pending_manager.runtime("s-r2a")
+        check("[R2集成A] route 非 pending_produce（补偿后交回）",
+              orc.last_ctx.route != "pending_produce", str(r))
+        check("[R2集成A] 孤儿已被取消（无 open Pending）",
+              rt.store.get_active_pending() is None, "")
+        check("[R2集成A] lease 已归还", rt.active_ops == 0, "")
+        check("[R2集成A] producer 影子记录 bind_failed(None)",
+              any(x["action"] == "produce_bind_failed"
+                  and "None" in x["detail"]
+                  for x in orc._producer.shadow_log),
+              str(orc._producer.shadow_log))
+
+        # 形态 B：builder 首次（展示构造）抛异常 + cancel 成功 →
+        # 取消后才允许交回原链路；原链路自身的构造恢复成功
+        b_calls = {"n": 0}
+        def boom_once_answer(session, text):
+            b_calls["n"] += 1
+            if b_calls["n"] == 1:
+                raise RuntimeError("注入：首次 Reply 构造失败")
+            from travel_agent.dialogue import Reply
+            return Reply(mode="answer", turn_no=session.turn_no,
+                         ask_rounds=session.ask_rounds,
+                         slots=dict(session.slots), render=text)
+        _orch_mod.answer_reply = boom_once_answer
+        s2 = _produce_session(orc, "s-r2b")
+        r2 = orc.handle(s2, "海贝皇大排档哪家好")
+        rt2 = orc._pending_manager.runtime("s-r2b")
+        check("[R2集成B] route 非 pending_produce（取消后交回）",
+              orc.last_ctx.route != "pending_produce", str(r2))
+        check("[R2集成B] 孤儿已被取消",
+              rt2.store.get_active_pending() is None
+              and any(x["action"] == "produce_orphan_cancelled"
+                      for x in orc._producer.shadow_log), "")
+        check("[R2集成B] lease 已归还", rt2.active_ops == 0, "")
+
+        # 形态 C：builder 二次构造也失败 + cancel 失败（注入）→ 第二层
+        # 自建 Reply 保守拦截，绝不交回原链路，lease 仍归还
+        calls = {"n": 0}
+        def always_boom(session, text):
+            calls["n"] += 1
+            raise RuntimeError(f"注入：第 {calls['n']} 次构造失败")
+        _orch_mod.answer_reply = always_boom
+        s3 = _produce_session(orc, "s-r2c")
+        rt3 = orc._pending_runtime("s-r2c")    # 预装配（acquire 一次）
+        orig_cancel = rt3.store.cancel_pending
+        def cancel_boom(pending_id):
+            raise RuntimeError("注入：cancel 失败")
+        rt3.store.cancel_pending = cancel_boom
+        orc._pending_manager.release(rt3)      # 归还预获取 lease（仅注入用）
+        try:
+            r3 = orc.handle(s3, "海贝皇大排档哪家好")
+        finally:
+            rt3.store.cancel_pending = orig_cancel
+        rt3 = orc._pending_manager.runtime("s-r2c")
+        check("[R2集成C] handle 正常返回（异常未传播）",
+              r3 is not None, str(r3))
+        check("[R2集成C] 保守拦截 = pending_produce 短路",
+              orc.last_ctx.route == "pending_produce"
+              and _ORPHAN_NOTICE in str(r3), str(r3))
+        check("[R2集成C] 孤儿 open 保留可排查",
+              rt3.store.get_active_pending() is not None, "")
+        check("[R2集成C] lease 已归还", rt3.active_ops == 0, "")
+        check("[R2集成C] shadow 记录 orphan + 双次 bind/conservative 失败",
+              any(x["action"] == "produce_orphan_cancel_failed"
+                  for x in orc._producer.shadow_log)
+              and calls["n"] >= 2, str(orc._producer.shadow_log))
+    finally:
+        _orch_mod._resolve_entities = old_resolve
+        _orch_mod.answer_reply = old_answer
+        set_env()
+
 # ================================================== main
 
 
@@ -1855,7 +1946,8 @@ def main() -> int:
                test_p25a_rule8_and_freshness,
                test_p25a_channel0_zero_side_effect,
                test_p25a_non_clarify_not_produced,
-               test_p25a_decision_chain_failure):
+               test_p25a_decision_chain_failure,
+               test_p25a_compensation_boundary_integration):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

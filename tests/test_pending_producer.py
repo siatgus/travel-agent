@@ -292,6 +292,113 @@ def test_p4_rule8_rejection() -> None:
               for r in pr.shadow_log), str(pr.shadow_log[-2:]))
 
 
+# ================================================== P3-R2 补偿返回值边界
+# （P2.5a-R2 验收裁定 2026-11-19：空返回值与二次构造失败两缺口）
+
+
+def none_builder():
+    """永远返回 None 的 builder（不抛异常——缺口 1 形态）。"""
+    return lambda text: None
+
+
+def always_failing_builder():
+    """永远抛异常的 builder（保守层首层必失败——缺口 2 形态）。"""
+    def builder(text):
+        raise RuntimeError("注入：构造必然失败")
+    return builder
+
+
+def raise_then_none_builder():
+    """首次抛异常、其后返回 None（保守层首层二次失败形态）。"""
+    state = {"n": 0}
+
+    def builder(text):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("注入：首次构造失败")
+        return None
+    return builder
+
+
+def test_p3r2_none_and_double_failure_boundary() -> None:
+    """P3-R2：reply_builder 返回 None 视为绑定失败；保守回复三层
+    构造永不交 None、永不传播异常；孤儿身份始终保留。"""
+    # ① builder 返回 None + cancel 成功 → 取消孤儿后交回原链路
+    pr1 = PendingProducer(id_gen=fixed_ids())
+    store1 = CountingStore(session_id="s-r2a", now=fixed_clock())
+    out1 = _produce(pr1, store1, [m("南京", "A店"), m("上海", "B店")],
+                    reply_builder=none_builder())
+    check("[R2①] None 返回 → 触发补偿（cancel 恰好一次）",
+          store1.cancel_calls == 1, str(store1.cancel_calls))
+    check("[R2①] 孤儿已被取消",
+          store1.get_pending_by_id(store1.last_created_id).status
+          == "cancelled", "")
+    check("[R2①] 补偿成功 → 交回原链路（reply/pending_id 全 None）",
+          out1.reply is None and out1.pending_id is None, str(out1))
+    check("[R2①] shadow 记录 bind_failed(None)",
+          any(r["action"] == "produce_bind_failed"
+              and "None" in r["detail"] for r in pr1.shadow_log),
+          str(pr1.shadow_log))
+
+    # ② builder 必然抛异常 + cancel 也抛异常 → 第二层自建 Reply，
+    #    绝不传播异常、绝不交回原链路、孤儿身份保留
+    pr2 = PendingProducer(id_gen=fixed_ids())
+    store2 = CountingStore(session_id="s-r2b", now=fixed_clock())
+    store2.cancel_raise = RuntimeError("注入：cancel 失败")
+    out2 = _produce(pr2, store2, [m("南京", "A店")],
+                    reply_builder=always_failing_builder())
+    check("[R2②] 双重失败仍返回保守回复（异常未传播）",
+          out2.reply is not None, str(out2))
+    check("[R2②] 保守回复 = 自建 Reply（mode=answer/render=通告）",
+          getattr(out2.reply, "mode", None) == "answer"
+          and getattr(out2.reply, "render", "") == _ORPHAN_NOTICE,
+          str(out2.reply))
+    check("[R2②] 孤儿 pending_id 保留", out2.pending_id is not None, "")
+    check("[R2②] shadow 记录 orphan",
+          any(r["action"] == "produce_orphan_cancel_failed"
+              and r["pending_id"] == out2.pending_id for r in pr2.shadow_log),
+          str(pr2.shadow_log))
+
+    # ③ builder 必然返回 None + cancel ok=False → 同保守拦截（第二层）
+    pr3 = PendingProducer(id_gen=fixed_ids())
+    store3 = CountingStore(session_id="s-r2c", now=fixed_clock())
+    store3.cancel_ok_override = False
+    out3 = _produce(pr3, store3, [m("南京", "A店")],
+                    reply_builder=none_builder())
+    check("[R2③] None+ok=False → 保守拦截（非 None 非 str-空）",
+          out3.reply is not None
+          and _ORPHAN_NOTICE in str(out3.reply), str(out3))
+    check("[R2③] 孤儿 pending_id 保留", out3.pending_id is not None, "")
+
+    # ④ 首次抛异常、保守层首层返回 None → 第二层兜底
+    pr4 = PendingProducer(id_gen=fixed_ids())
+    store4 = CountingStore(session_id="s-r2d", now=fixed_clock())
+    store4.cancel_raise = RuntimeError("注入：cancel 失败")
+    out4 = _produce(pr4, store4, [m("南京", "A店")],
+                    reply_builder=raise_then_none_builder())
+    check("[R2④] 首层二次失败 → 第二层兜底（异常未传播）",
+          out4.reply is not None
+          and getattr(out4.reply, "render", "") == _ORPHAN_NOTICE, str(out4))
+
+    # ⑤ builder 必然抛异常 + cancel ok=False → 同保守拦截（第二层）
+    pr5 = PendingProducer(id_gen=fixed_ids())
+    store5 = CountingStore(session_id="s-r2e", now=fixed_clock())
+    store5.cancel_ok_override = False
+    out5 = _produce(pr5, store5, [m("南京", "A店")],
+                    reply_builder=always_failing_builder())
+    check("[R2⑤] 异常+ok=False → 保守拦截（第二层）",
+          out5.reply is not None
+          and getattr(out5.reply, "render", "") == _ORPHAN_NOTICE, str(out5))
+
+    # ⑥ 正常路径不受影响：builder 正常返回时第二/三层永不介入
+    pr6 = PendingProducer(id_gen=fixed_ids())
+    store6 = CountingStore(session_id="s-r2f", now=fixed_clock())
+    out6 = _produce(pr6, store6, [m("南京", "A店")])
+    check("[R2⑥] 正常路径逐位不变",
+          out6.reply is not None and out6.pending_id is not None
+          and store6.cancel_calls == 0, str(out6))
+
+
 # ================================================== 影子隔离
 
 
@@ -321,6 +428,7 @@ def main() -> int:
     test_p1_build_candidates_shape()
     test_p2_display_before_create()
     test_p3_orphan_compensation_matrix()
+    test_p3r2_none_and_double_failure_boundary()
     test_p4_rule8_rejection()
     test_shadow_isolation()
     print(f"\npending producer P2.5a: {_PASS} pass / {_FAIL} fail")

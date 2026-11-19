@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass
 
 from .decision import ACTION_CLARIFY, DecisionResult  # noqa: F401  (契约引用)
+from .dialogue import Reply   # P2.5a-R2：保守回复第二层自建用（只读不修改）
 from .entity_resolver import STATUS_AMBIGUOUS
 
 # HC-4 角色红线（§3.1）：与 decision._HC4_ROLES 同值。decision 的
@@ -180,6 +181,10 @@ class PendingProducer:
             return ProduceOutcome(None, None)
 
         # ---- 步骤 3：绑定返回（失败 → 孤儿补偿矩阵）----
+        # P2.5a-R2（验收裁定 2026-11-19）：reply_builder **返回 None**
+        # 与抛异常同视为绑定失败——此时 Pending 已 open，直接把 None
+        # 交回原链路会遗留 open 孤儿（§10.2 缺口 1）。两种形态都必须
+        # 先走补偿矩阵，只有孤儿被安全取消后才允许交回原链路。
         try:
             reply = reply_builder(text)
         except Exception as exc:
@@ -188,8 +193,39 @@ class PendingProducer:
                          pending_id=p.pending_id)
             return self._compensate_orphan(store, p.pending_id,
                                            reply_builder)
+        if reply is None:
+            self._shadow("produce_bind_failed",
+                         detail="reply_builder returned None",
+                         pending_id=p.pending_id)
+            return self._compensate_orphan(store, p.pending_id,
+                                           reply_builder)
 
         return ProduceOutcome(reply, p.pending_id)
+
+    def _conservative_reply(self, reply_builder):
+        """保守拦截回复（P2.5a-R2：三层构造，绝不返回 None、绝不抛异常）。
+
+        §10.2 缺口 2：保守回复若再次依赖刚刚失败过的同一 reply_builder，
+        二次失败会向上传播异常，导致既无保守拦截回复、孤儿身份也丢失。
+        构造顺序（自外向内逐层降级）：
+        1) reply_builder(_ORPHAN_NOTICE)——与展示同源（刚失败过，
+           但兜底文案构造通常更简单，可能已恢复）；
+        2) producer 自建最小 Reply（不经任何外部构造器，静态数据，
+           实际不可能失败）；
+        3) 纯字符串通告（最后防线——短路文本仅经 str() 入 history）。
+        任一层成功即返回；全部失败（理论不可达）返回字符串层兜底，
+        绝不把 None 或异常当成普通结果交回原链路。"""
+        try:
+            reply = reply_builder(_ORPHAN_NOTICE)
+            if reply is not None:
+                return reply
+        except Exception:
+            pass                      # 首层失败 → 降级自建，绝不传播
+        try:
+            return Reply(mode="answer", render=_ORPHAN_NOTICE)
+        except Exception:
+            pass
+        return _ORPHAN_NOTICE
 
     def _compensate_orphan(self, store, pending_id: str,
                            reply_builder) -> ProduceOutcome:
@@ -197,14 +233,17 @@ class PendingProducer:
 
         立即尝试取消孤儿；取消成功 → shadow 记录 + 交回原链路；
         取消也失败 → 保守拦截回复，**绝不交回原链路**（防 open 孤儿
-        被下轮误消费）+ shadow 记录 orphan Pending。"""
+        被下轮误消费）+ shadow 记录 orphan Pending。保守回复经
+        _conservative_reply 三层构造，二次失败不再向上传播
+        （P2.5a-R2：缺口 2）。"""
         try:
             out = store.cancel_pending(pending_id)
         except Exception as exc:
             self._shadow("produce_orphan_cancel_failed",
                          detail=f"cancel 抛异常 {type(exc).__name__}: {exc}",
                          pending_id=pending_id)
-            return ProduceOutcome(reply_builder(_ORPHAN_NOTICE), pending_id)
+            return ProduceOutcome(self._conservative_reply(reply_builder),
+                                  pending_id)
         if getattr(out, "ok", False):
             self._shadow("produce_orphan_cancelled",
                          pending_id=pending_id)
@@ -214,4 +253,5 @@ class PendingProducer:
         self._shadow("produce_orphan_cancel_failed",
                      detail=str(getattr(out, "reason", "cancel ok=False")),
                      pending_id=pending_id)
-        return ProduceOutcome(reply_builder(_ORPHAN_NOTICE), pending_id)
+        return ProduceOutcome(self._conservative_reply(reply_builder),
+                              pending_id)
