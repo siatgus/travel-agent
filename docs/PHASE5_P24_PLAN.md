@@ -683,3 +683,31 @@ PendingRuntimeManager（含 R1）、lease/淘汰/锁顺序、Handler、
   首查放行）。
 - 开关语义不变：`TRAVEL_PENDING_CHANNEL` 生产默认 0（默认旁路），
   TAKEOVER=0，未新增开关。
+
+### 12.5 P2.4b 最终验收关闭记录（评审裁定 2026-11-19 10:53）
+
+**PASS。批准 1d051fd，P2.4b 验收完成，阶段正式关闭。**
+
+- 五项阻断级审查全部通过：①migrated 来源（out.ok + 迁移类 verdict
+  双条件；异常路径读 store 实际状态）；②store 状态保守判定（查询
+  异常/不存在/未知状态均不误判为消费成功）；③提交边界异常（依据
+  实际状态处理，不盲目交回原链路）；④回复构造失败（不撤销已完成
+  消费、不回退普通意图路由）；⑤lease 释放（acquire 后立即
+  try/finally，内部各出口经同一释放点）。
+- 评审确认双重 hint 条件（终态 + verdict ∈ _MIGRATING_VERDICTS）
+  为有意设计，与冻结规则一致，非遗漏。
+- B1–B12 验收报告通过；实施范围符合冻结边界；Runtime Manager /
+  Store / Interceptor 零扩大修改；channel 默认 0、TAKEOVER 0 保持；
+  未决阻断项：无。
+
+### 12.6 技术债登记（非阻断，不属 P2.4b 遗留）
+
+| # | 事项 | 来源 | 处置时机 |
+|---|---|---|---|
+| 1 | 非整数 TRAVEL_PENDING_RESELECT_WINDOW：helper 回落默认 600 vs P2.3 拦截器 int() 抛 ValueError——未来允许修改拦截器时复用 reselect_window_seconds() 统一解析入口 | P2.4a 验收登记 | 单独健壮性改进 |
+| 2 | answer_reply 兜底失败残余风险：_fallback_confirm_reply 中 answer_reply 抛异常时向上传播（lease 仍释放、状态自洽、不回退原链路），用户侧收到上层异常而非兜底文案；不包第二层 try（避免新吞异常行为） | P2.4b 最终评审登记 | 单独健壮性改进 |
+
+阶段基线链（Phase 5 P2 线）：P2.1=589ebe4 → P2.2=67843fc →
+P2.3=79b1c04 → P2.4a=3fb910b+R1 5966d02 → P2.4b=1d051fd（关闭）。
+生产消费通道保持关闭（channel=0）；下一阶段（P2.5/P3）须单独提交
+开工申请与设计方案，经评审后方可实施。
