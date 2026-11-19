@@ -1376,3 +1376,170 @@ _allow_handler_consume 内**（触点 2 既有代码块内，不进 Handler）
 RV-03时钟:725/RV-03中途:786/parity:629）均为三字段独立有效断言。
 验证：revalidator 78/0、sqlite 95/0、channel 308/0（补强仅收紧，
 断言数不变，无放宽）。
+
+## 18. RV-07 独立设计方案：fresh DecisionResult 对最终执行实体的强约束（设计申请，零生产代码）
+
+> 裁定（2026-11-19）：P2.5b-R1 补证工作有条件接受，P2.5b 不签
+> PASS；先交 RV-07 独立设计方案，核心命题——**Handler 接口完全
+> 不变的条件下，让 Handler 最终使用的实体受 fresh DecisionResult
+> 强约束，而非仅调用前比较一次**。设计级证明之前不批触点 2 生产
+> 代码修改。本节纯设计文档，无任何生产代码 diff。
+>
+> RV-05 裁定（读法乙：低优先级辅助上下文）已记录；其 Resolver
+> 适配点按 §10.5 程序另案单独申请，不在本节范围。
+
+### 18.1 命题与验收口径
+
+A3（§10.3/§10.4 冻结）：执行路径必须能够保证 Handler 使用本轮
+fresh DecisionResult/entity，并保留 pending_id、candidate_id 归因。
+
+按裁定口径，「强约束」必须满足三个判据：
+
+- **J1 实际使用约束**：被链路实际用于检索/作答的实体 = fresh
+  entity，且该等式由机制构造保证（不是由执行前的一次预测比较）；
+- **J2 分歧不可达**：即使链内发生任何形式的实体偏移，偏移结果
+  既不能呈现给用户、也不能写入持久状态（KB）；
+- **J3 归因保留**：pending_id / candidate_id / decision.reason 全程
+  可溯。
+
+### 18.2 执行链代码事实（本轮只读取证，全部给出处）
+
+**实体解析点分布**（poi 白名单三类意图 → QA_HANDLERS["poi"] →
+POIHandler → 细分链，最终全部委托 Session 业务方法）：
+
+| 路径 | 实体如何产生 | 出处 |
+|---|---|---|
+| 点名景点/POI | `intent.spot_mention(utterance, city)` 从问句重解析 | dialogue.py:495 |
+| 周边/路线 | `intent.nearby_route_ends` + `_resolve_spot(city, name)` 按名查库 | dialogue.py:585-594 |
+| 餐厅 | `intent.food_keyword` 品类/片区词检索（非单一实体） | dialogue.py:1244 |
+| 酒店 | 城市级在售酒店清单（无单一实体） | dialogue.py:1291 |
+| 泛推荐兜底 | `intent.poi_answer(city)` 城市级列表 | poi_handler.py:88 |
+
+**副作用清单**（链内真实发生的持久/状态写入）：
+
+1. `session.last_city = city`（poi_handler.py:80）；
+2. KB 写入三处：`autofetch.ensure_spot`（dialogue.py:967，点名
+   POI 查不到时联网补录**入库**）、`get_data_service().ensure`
+   （dialogue.py:787 / :1258 / :1291，餐厅/酒店定向补库）、
+   `autofetch.ensure_city_data`（intent.py poi_answer 内，泛推荐
+   兜底也会补库）；
+3. LLM 调用（措辞组织 `_speak`、`unknown_spot_reply`）与
+   websearch（`_general_answer`）。
+
+**决定性事实——数据面不止一个咽喉点**：`agent.dispatch
+("search_poi")`（mock_tools.py:301 / real_tools.py:1181 兼容入口）、
+`DataService` 进程单例（services/__init__.py:32，
+get_pois/get_restaurants/get_hotels/ensure）、`tools.search_poi`
+（intent.py poi_answer 内独立引用）、`autofetch.*`、websearch/LLM
+**五个互不隶属的访问面**。任何「运行时拦截面」方案都必须同拦全部
+五面才完备。
+
+**实体参数化入口已存在**：`_spot_qa(city, spot)`（dialogue.py:956）
+与 `intent.spot_answer(city, spot, pois)`（intent.py:1042）中实体均
+为**函数实参**；spot_answer 渲染品类自适应（restaurant 走人均口径，
+intent.py:1076-1078），对 attraction/restaurant/hotel/unknown 四类
+候选统一适用。
+
+### 18.3 候选机制对比（含被否决项的否决理由）
+
+| 机制 | 思路 | 判定 |
+|---|---|---|
+| A 事后验收丢弃 | 先走链，执行后核对回复含 fresh entity，不符即丢弃 | **否决**：KB 入库等副作用在核对前已发生（18.2 副作用清单），事后不可撤销——J2 不满足 |
+| B 执行前预演等值门 | 用冻结解析器预演 spot_mention 等与 fresh 比对 | **否决**：即裁定明示不接受的「仅调用前比较一次」；且兜底链+副作用+LLM 使预演不可证完备 |
+| C 数据面作用域代理 | 运行时替换五访问面为 fresh-entity 过滤代理 | 可行但**面大脆弱**：须同拦五面（18.2 决定性事实）、模块级全局替换、恢复窗口管理；列备选 |
+| D Handler 接口扩展 | Handler 增实体参数 | **否决**：违反 §4.4/§9.4「Handler 零改动、不新增任何 Handler 接口」冻结 |
+| **E 实体参数化直调**（推荐） | 控制路径不经 POIHandler 模糊链，**把 fresh entity 作为函数实参直调业务方法** | 见 18.4；实体按构造钉死，J1/J2 由构造保证 |
+
+### 18.4 机制 E 详细设计（本次裁定申请的核心）
+
+**落点**：触点 2 `_allow_handler_consume` 五条件全过分支的**内部
+行为变更**——`session._answer(kind, orig_ut)` 改为实体参数化直调。
+不新增逻辑触点（§10.5 配额不变），变更范围为触点 2 既有代码块内；
+须评审批准触点 2 语义变更（即本申请）。
+
+**执行策略**：
+
+```
+fresh entity = decision.entity（name/city，fresh resolve 产出）
+utterance    = ctx.pending_decision_utterance（原问句，仅用于
+               「周边」语义检测，不参与实体解析）
+
+统一入口：session._spot_qa(fresh_city, fresh_name)
+  ├─ 问句含「周边/附近」→ session._nearby_qa(fresh_city, fresh_name)
+  │   （同为实体实参化入口，钉死性质不变）
+  └─ 其余 → _spot_qa：KB 按 keyword=fresh_name 检索 →
+      spot_answer(fresh_city, fresh_name, items) 渲染
+      （品类自适应：restaurant 人均 / attraction 门票口径）
+```
+
+**三条设计不变量（设计级证明核心）**：
+
+- **I1 实体钉死**：执行主题 = 实参 fresh_name。直调路径不存在
+  `spot_mention`/`refine_intent` 等任何从问句重解析实体的步骤——
+  实体进入执行的唯一通道是函数实参，而实参只来自 fresh
+  DecisionResult（触点 2 五条件已锁定 decision 来源为可信内部流）；
+- **I2 分歧不可达（按构造，非按检测）**：既然不存在重解析步骤，
+  「内部实体 ≠ fresh entity」这一状态**在构造上不可发生**——不是
+  被检测出来后拦截，而是根本无法产生。这直接回应裁定「不能仅在
+  执行前比较一次、之后仍让 Handler 从原始问句重新解析」的否决点；
+- **I3 失败保守 + 闭环验收**：`_spot_qa` 查不到 fresh entity →
+  保守话术（dialogue.py:984-999，不编造）；触点 2 保留**回复一致
+  性验收位**：fresh_name 未出现于回复、或出现 other_city 型歧义
+  信号（dialogue.py:973-983）→ 丢弃执行结果、回退冻结确认话术——
+  该验收是**兜底**而非唯一约束（与机制 A 的本质区别：A 里它是
+  唯一约束且副作用已发生；E 里实体已被钉死，验收位只处理
+  数据缺失类失败）。
+
+**副作用处置**：
+
+- KB autofetch：直调路径唯一可能的写入是针对 **fresh entity
+  本身**的补录（查不到时）——语义对齐：fresh resolve 刚确认其
+  存在，入库使 KB 与 fresh 结论一致，不存在「错误实体入库」路径
+  （错误实体连检索词都进不去）；
+- `session.last_city`：由 orchestrator 按 fresh_city 显式设置
+  （语义与 POIHandler.handle:80 一致，落点在触点 2 内）；
+- `_rest_fetched`/`_hotel_fetched` 会话缓存：直调不经过餐厅/酒店
+  清单方法，不触发。
+
+**归因保留（J3）**：DecisionResult.reason 已携带
+`pending_revalidate:` 前缀归因（pending_id/candidate_id，五条件⑤
+消费）；触点 2 执行前后 shadow 各记一条（execute_begin/execute_
+done，含 pending_id/candidate_id/entity/reply 摘要），与既有
+shadow 通道同构。
+
+**与冻结条款的相容性（如实申报偏差点）**：
+
+- Handler 类与接口：**零改动**（控制路径不调用 Handler，Handler
+  于普通路由的冻结行为原样保留）；
+- §9.4 消费表动作语义：execute→执行 / clarify/reject/conservative
+  →不执行——不变；
+- **偏差点**：§9.4「走该 Handler 受控链路」与 §10.1 D2 方案甲
+  「经既有入口 session._answer」的字面（经 QA_HANDLERS 链）改为
+  「直调该链最终委托的同一业务方法」。论证：A3 的实质是 fresh
+  entity 成为**执行依据**——机制 E 以实参绑定在构造上满足；链式
+  路径（当前实现）恰恰是裁定认定不满足 A3 的形态。该偏差即本次
+  申请请求裁定的事项。
+
+**残余风险如实申报**：
+
+1. 细分措辞损失：原链的 refine_intent 细分（品类问句、关键词
+   推荐）在 confirmed 消费轮不可达——但消费轮的用户问句本就是
+   关于候选实体的单一问句（pending 由它产生），点名 QA 是主语义；
+   「周边」变体已由 _nearby_qa 分支覆盖（见执行策略）；
+2. `spot_answer` 的 `_speak` LLM 措辞非确定性——只影响措辞，
+   不影响实体选择（实体已钉死），I1 不受影响；
+3. `_spot_qa` 的 other_city 分支可能告知「实体在别的城市」——
+   这是 fresh resolve 有效城市与 KB 归属的真实分歧，属 I3 验收位
+   处理的保守失败，回退确认话术，绝不呈现错误归属。
+
+### 18.5 裁定请求
+
+1. 机制 E（实体参数化直调）是否批准为触点 2 语义变更的设计基础？
+2. 若裁定必须字面保留「经 QA_HANDLERS 链」，则机制 C 为备选——
+   但须接受五访问面同拦的复杂度与模块级全局替换的脆弱性（18.3）。
+3. 批准后实施仍须开工申请（含测试设计：分歧不可达性用「构造性
+   证明 + 注入式反证」双路测试），生产代码在本申请获批前零改动。
+
+### 18.6 本节边界
+
+纯设计文档；开关 0/0/0；P2.5b PASS 归档维持冻结；P2.6/P3 未授权。
