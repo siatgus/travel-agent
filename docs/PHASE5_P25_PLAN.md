@@ -779,3 +779,136 @@ diff 与测试实跑报告完成静态复核；评审方未在仓库中独立执
 | `32b2e63` | P2.5a 生产侧实施（按 00880ed 批准范围，§12） |
 | `74754f1` | R2：孤儿补偿返回值缺口修正（None 视为绑定失败 + 保守回复独立构造路径） |
 | `4a639a8` | R3：Reply 类型契约定版（移除字符串兜底 + PendingProduceError 明确失败） |
+
+---
+
+## 14. P2.5b 独立开工申请（重验证侧，2026-11-19）
+
+> 设计基线：`4171095`（P2.5 设计 r2 PASS，§10 定版条款优先）。
+> 代码基线：`83de409`（P2.5a 验收关闭归档；生产侧终态 32b2e63 +
+> R2 `74754f1` + R3 `4a639a8`）。**本申请仅覆盖 §10.6 实施顺序
+> 第 4–6 步（P2.5b 重验证侧）；P2.6 影子观察与 P3 不在本申请范围。**
+
+### 14.1 范围（一件事）
+
+消费成功（P2.4b 短路决定性依据不变）→ gate consume ok 分支内、
+确认回复构造**之前**插入 fresh 重验证（§4.1 铁律：重验证只决定
+「之后交给谁」，绝不反向改变 Pending 状态，原 Pending 保持
+consumed）→ 四分支流转（§4.3）+ confirmed 查询类经 AllowHandler
+五条件受控流转（§10.1 D2 方案甲）+ 回填三列（§10.1 D3 修订 SQL +
+六契约）。
+
+### 14.2 文件修改清单（精确到落点）
+
+| 文件 | 修改 | 对应冻结条款 |
+|---|---|---|
+| `pending_revalidator.py`（新增） | PendingRevalidator：①输入边界——selected candidate_id ∈ 原快照**再次校验**（不重复信任消费事务）、candidate city 仅作身份属性、query context city 按 HC-1 既有规则构建（明确 query_city ＞ LLM hints 仅辅助 ＞ destination，绝不覆盖/替代，冲突走 Resolver 既有规则重判，§10.3 双概念）；②fresh resolve——全新调用既有 `resolve()`，不复用旧 matches/旧 DecisionResult，probe_status 如实标注；③四分支产出（§4.3 全表：confirmed 查询类构造 DecisionResult(execute) 含全链归因 reason / 规划类只确认话术；ambiguous→新候选快照交 producer 创建新 Pending；unverified→保守回复绝不 rejected；rejected→规定话术保留原始表达）；④B3 兜底延续——重验证任何异常 → 既有 `_fallback_confirm_reply` 确认短路，消费事实不撤销；⑤回填调用——按六契约调用 record_revalidation，rowcount=0/异常仅 shadow 归因不改业务流 | §4.1–4.3 / §10.1 D3 / §10.3 |
+| `pending.py`（Memory store） | 新增 `record_revalidation(...)` 方法（条件更新语义：按 pending_id+session_id+candidate_id 定位**既有**消费记录，命中恰一条才写三列并返回 True；未命中/异常返回 False，绝不插入新记录）；消费记录七字段→十字段（+revalidate_status/revalidate_probe_status/revalidated_at，默认 None；七字段名与语义逐位不变；`_latest_consumption` 返回扩容） | §10.1 D3 六契约 / §4.5 |
+| `pending_store_sqlite.py` | 新增同名 `record_revalidation`：单条条件 UPDATE（§10.1 修订版，WHERE 含 candidate_id 候选归属数据库层验证）SET 三列；rowcount=1 → True / 0 → False；无 DDL（三列自 P2.2 冻结建表预留）；与 Memory 逐位一致（字段名/合法值/epoch 语义） | §10.1 D3 |
+| `orchestrator.py`（两逻辑触点，配额内） | ①**重验证接入**：`_dispatch` V_CONSUME ok 分支内、确认回复构造之前——原静态确认回复改为「重验证 → 四分支产出」；其余八类 verdict 分支**逐位不动**；②**AllowHandler 受控消费点**（D2 方案甲首次落地）：五条件 AND（ChannelEnabled ∧ SourcePendingConsume ∧ ActionExecute ∧ IntentInQueryWhitelist[规划类永不] ∧ RevalidationConfirmed），全过 → 注入既有业务分支入口执行 Handler（Handler 零改动、GuardPipeline/权限/前置条件不绕过）；任一条件不满足 → 确认话术交回；注入失败/实体缺失 → 回退确认话术，绝不裸调 Handler | §10.1 D2 / §10.5 |
+| `tests/test_pending_revalidator.py`（新增） | 重验证专项（见 14.3 第一组） | — |
+| `tests/test_pending_sqlite.py`（扩展） | record_revalidation 双实现对拍（见 14.3 第三组） | §10.1 D3 |
+| `tests/test_pending_channel.py`（扩展） | 集成与负向（见 14.3 第二组） | §10.4 |
+| `docs/PHASE5_P25_PLAN.md` | §15 实施记录 | — |
+
+**禁止触碰**：pending_interceptor.py（evaluate/act 九类 verdict 判定
+与执行原样）、pending_runtime.py（含 R1）、decision.py（**本阶段零
+改动**——D1 已在 P2.5a 完成）、Handler 全部、entity_resolver.py
+（只调用既有 resolve()，HC-1 上下文经既有 context 参数传递，无适配
+点则零改动；若实测需最小适配点，先停手单独申报评审）、
+create_pending/consume_pending 等既有五方法契约、SQLite 建表语句、
+P2.4b 四项异常边界与其余八类 verdict 接线、两 TAKEOVER 开关语义。
+
+### 14.3 测试清单（P2.5b 交付判定）
+
+**第一组：重验证专项（test_pending_revalidator.py）**
+- 输入边界：candidate_id 不在原快照 → 拒绝重验证（B3 兜底）；
+  快照 city 仅作身份属性、query context city 按 HC-1 三级构建的
+  单元级断言；
+- G1–G5 城市矩阵（§10.3 五条，resolve 数据源桩 + 真实判定链）；
+- B1 fresh：mock KB 变化 → 重验证结果跟随变化（成文断言不复用旧
+  matches）；B2 探测缓存命中 / quota_exceeded / unavailable 路径
+  probe_status 如实标注；
+- 四分支产出单元：confirmed(execute DecisionResult 归因齐全) /
+  ambiguous(新快照+新旧 pending_id 关联影子) / unverified(保守话术)
+  / rejected(规定话术)；
+- 回填六契约逐条：条件更新不插入 / 命中 1 行成功 / 0 行 False+shadow /
+  异常不改消费 / 双实现逐位 / 合法值四枚举、异常与未探测保持 NULL。
+
+**第二组：集成与负向（test_pending_channel.py 扩展）**
+- A3（强化断言）：选择 → 消费 → 重验证 confirmed → 查询类
+  DecisionResult 进既有分支 Handler——Handler 收到**重验证后构造**
+  的 DecisionResult、entity 为 fresh confirmed 实体、reason 含
+  pending_id/candidate_id/重验证归因、同一轮无重复意图解析重复执行
+  （route/影子锁定）；
+- A4 规划类 confirmed → 只回确认话术，行程状态深拷贝对比零写入；
+- A5（强化）：ambiguous → 新 Pending（新 ID ≠ 旧 ID、新 TTL、新
+  快照来自 fresh matches；旧 Pending 保持 consumed 不复活、不重复
+  消费）；
+- A6 unverified → 保守回复、绝不 rejected 话术、Handler 调用 0 次；
+- A7 rejected → 「规定数据源与检索范围内没有找到」、保留原始表达；
+- D1 重验证抛异常 → B3 兜底确认短路（消费不撤销）；D2 回填失败 →
+  回复与状态不变、shadow 归因；D3 重验证期间 store 异常 → 保守路径；
+- E1 四分支全部回填三列（memory 桩十字段实读断言）；E2 失败分支
+  影子含原 pending_id/candidate_id/重验证结果；
+- F1 非 confirmed → 原 Pending 保持 consumed、Handler 调用 0 次；
+  F2 ambiguous 重建失败（规则 8 撞车）→ 不执行 Handler、不复活旧
+  Pending、不伪造成功；F3 confirmed 但 Guard/权限拒绝 → 服从原规则
+  不绕过；F4 回填失败与业务流分离（不改变四分支结果、无重复消费/
+  重复 Handler）；
+- channel=0 逐位：重验证侧零触发（回填零调用、消费回复与 P2.4b
+  基线逐位一致）。
+
+**第三组：双实现对拍（test_pending_sqlite.py 扩展）**
+- record_revalidation 双实现：命中 1 行（三列落库、revalidated_at
+  为 INTEGER UTC epoch）/ 0 行（跨 session、跨 pending、candidate_id
+  不符三形态全 False）/ store 异常 → False 不抛出；
+- 十字段对拍：_latest_consumption 双实现字段名与值逐位一致、七字段
+  语义不变（duplicate_select 话术回归不受影响）。
+
+**回归门槛**：全套件绿 + channel=0 全量逐位（§10.5 全项，含新增
+影子字段清单）+ git diff 断言：decision.py 零 diff；orchestrator
+限两逻辑触点（重验证接入 + AllowHandler 消费点）；store 限
+record_revalidation + 十字段。
+
+### 14.4 新增影子字段预申报（§10.5 要求的清单）
+
+| 载体 | 新增字段 | 对既有字段影响 |
+|---|---|---|
+| revalidator 影子记录 | stage="revalidator" / action / detail / pending_id / candidate_id / revalidate_status（可选） | 纯新增独立 log，不影响 gate/producer 影子 |
+| 内存桩消费记录 | revalidate_status / revalidate_probe_status（TEXT，默认 None）/ revalidated_at（INTEGER，默认 None） | 七字段名与语义逐位不变（D3 已批契约升级） |
+| SQLite | 无 DDL、无新列 | UPDATE 仅写三列预留列 |
+
+### 14.5 预期偏差预申报（如发生，记入 §15 并如实报告）
+
+1. **AllowHandler 消费点为该结构的首次落地**：§9.4 所述「既有分支
+   入口的 DecisionResult 消费点」在当前代码中尚不存在（同 P2.5a
+   偏差 1 的成因——decide() 在 P2.5a 前无调用方）。P2.5b 将按设计
+   在分支入口建立该消费点并注入重验证 DecisionResult，属于设计
+   授权范围内的建立而非改动既有结构；orchestrator 预计 hunks 数
+   以实交为准、如实申报（逻辑触点两处，配额内）。
+2. **重验证接入点在 P2.4b 冻结接线区内的一处授权修改**：consume ok
+   分支为 §10.5 允许清单明示的「重验证接入」落点；修改后其余八类
+   verdict 分支逐位不变由既有 150 项 interceptor/channel 断言 +
+   新增对比锁定。
+3. **测试数据源桩沿用 P2.5a 风格**：真实 KB 无测试歧义实体，
+   resolve 数据源用桩、extract/decide/Resolver 判定链保持真实执行
+   （A3/BD/E/F/G 各组同风格）。
+
+### 14.6 基线与回滚方案
+
+- **基线**：设计 `4171095` / 代码 `83de409`；P2.5b 交付单 commit
+  （revalidator + 双 store + orchestrator 两触点 + 测试 + §15 记录）。
+- **回滚**：①运行时——`TRAVEL_PENDING_CHANNEL=0` 即重验证与受控
+  流转完全旁路（consume ok 分支行为需回退确认路径由设计保证逐位
+  等效 P2.4b 基线）；②代码——单 commit revert 恢复 `83de409`
+  （pending_revalidator.py 独立新文件；store 新方法独立，revert 无
+  残留耦合）。
+- **风险预案**：重验证 resolve 延迟（在线模式）→ 既有探测缓存与
+  限额约束内，超时降级 unverified 保守路径（§9 既有风险条款）；
+  链式 ambiguous 多轮 → 规则 8 保证单 active，链式状态泄漏由 A5
+  强化断言锁定。
+
+**申请结论**：按本清单申请 P2.5b 开工；批准后开始编码，交付后
+独立提交 + 独立回归 + 独立代码验收；P2.6 影子观察与 P3 不因本
+阶段通过而自动启动。
