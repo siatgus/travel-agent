@@ -16,9 +16,13 @@
 
 from __future__ import annotations
 
+import os
+
 from .. import llm
 from ..dialogue import Reply
 from ..parser import parse_utterance
+from ..pending import PendingStore
+from ..pending_runtime import PendingRuntimeManager
 from .context import TurnContext
 from .guard import GuardPipeline
 from .handlers import QA_HANDLERS
@@ -35,6 +39,65 @@ class Orchestrator:
         self.guards = GuardPipeline()
         self.plan_handler = PlanHandler()
         self.last_ctx: TurnContext | None = None   # 最近一轮的观测点（排查/测试用）
+        # P2.4a：pending 消费通道 runtime 管理器（延迟构造——
+        # TRAVEL_PENDING_CHANNEL 关闭时永不创建，完全旁路零开销）
+        self._pending_manager: PendingRuntimeManager | None = None
+        self._pending_warnings: list[str] = []     # shadow 警告（旁路等）
+
+    # -------------------------------------------------- P2.4a pending gate
+
+    @staticmethod
+    def _channel_enabled() -> bool:
+        """TRAVEL_PENDING_CHANNEL 开关（默认 0 = 完全旁路）。"""
+        return os.environ.get("TRAVEL_PENDING_CHANNEL", "0").strip() == "1"
+
+    def _pending_runtime(self, sid: str):
+        """延迟装配 Runtime Manager（首个 channel=1 请求时构造）。"""
+        if self._pending_manager is None:
+            self._pending_manager = PendingRuntimeManager()
+        return self._pending_manager.acquire(sid)
+
+    def _resolve_pending_id(self, session, store) -> str | None:
+        """Pending ID 解析（§3.2 冻结四步顺序；hint 非权威，store 为准）。"""
+        p = store.get_active_pending()
+        if p is not None:                      # ① open 且未过期
+            session.active_pending_id = p.pending_id   # hint 刷新
+            return p.pending_id
+        hint = getattr(session, "active_pending_id", None)
+        if hint:                               # ② hint（过期/终态识别）
+            return hint
+        return store._latest_pending_id()      # ③ 重启恢复线索
+
+    def _pending_gate(self, session, utterance: str, ctx) -> Reply | None:
+        """唯一拦截点（步骤 1.75）：pending 消费通道。
+
+        P2.4a 边界：开关关闭完全旁路（不构造 runtime、不查 store、
+        不 evaluate/act）；开关打开时**只接消费侧、不创建 Pending**
+        （生产者仍冻结），本阶段为**观察模式**——evaluate 纯判定 +
+        影子记录后一律返回 None 交回原链路；verdict 分发/回复行为
+        （含 consume 成功短路）属 P2.4b，本阶段绝不执行 act。
+        """
+        if not self._channel_enabled():
+            return None                        # 完全旁路（§2.2）
+        sid = getattr(session, "pending_session_id", None)
+        if not sid or not str(sid).strip():
+            # 会话身份缺失 → 旁路 + shadow 警告（绝不猜测身份，§2.3）
+            self._pending_warnings.append(
+                "pending gate bypass: session 身份未注入（pending_session_id 缺失）")
+            return None
+        rt = self._pending_runtime(str(sid))
+        try:
+            pid = self._resolve_pending_id(session, rt.store)
+            if pid is None:                    # ④ 无任何线索 → 旁路
+                return None
+            # evaluate 纯判定零副作用（shadow_sink 异常隔离在拦截器内）；
+            # hint 非权威：错误 hint 由 store 状态机产出 none，无误消费
+            rt.interceptor.evaluate(utterance, getattr(ctx, "parse", None),
+                                    session_pending_id=pid)
+            return None                        # P2.4b 才接管 verdict 分发
+        finally:
+            # lease 归还：此时全部 store 锁已释放（批准条件冻结时序）
+            self._pending_manager.release(rt)
 
     # -------------------------------------------------- 调度入口
     def handle(self, session, utterance: str,
@@ -57,6 +120,15 @@ class Orchestrator:
         ctx.parse = parse_utterance(utterance, context=session,
                                     today=session.today)
         session.query_city = ctx.parse.query_city
+
+        # ---- 1.75 pending 消费通道（P2.4a 单点接入，唯一拦截点）----
+        # 落点冻结：统一解析之后、周边咨询 gate 之前——保证「第一个」
+        # 等选择话术不被下游 gate 抢答；返回 None 时原链路一行不改。
+        gated = self._pending_gate(session, utterance, ctx)
+        if gated is not None:
+            session.history.append({"role": "agent", "content": str(gated)})
+            ctx.route, ctx.handled = "pending_consume", True
+            return gated
 
         # ---- 2. 明确咨询预判：周边问句分流（找吃的/找住的/两点路线）----
         # 「宽窄巷子附近有什么好吃的」一旦被当成「问宽窄巷子这个景点」，

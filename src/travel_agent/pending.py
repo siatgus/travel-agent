@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,35 @@ SNAPSHOT_FIELDS = ("candidate_id", "display_order", "entity_id",
 
 # 默认有效期（P2 可配置；过期后不得继续执行）
 DEFAULT_TTL_SECONDS = 300
+
+# 重复选择识别窗口（P2.3 冻结；r5 冻结：Runtime 保留态判定与拦截器
+# 重复选择识别共用同一常量与同一比较表达式，绝不允许两处口径分叉）
+DEFAULT_RESELECT_WINDOW = 600   # 秒（TRAVEL_PENDING_RESELECT_WINDOW 覆盖）
+
+
+def reselect_window_seconds() -> int:
+    """重复选择窗口秒数（唯一读取入口；两处判定共用）。"""
+    raw = os.environ.get("TRAVEL_PENDING_RESELECT_WINDOW",
+                         str(DEFAULT_RESELECT_WINDOW))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RESELECT_WINDOW
+
+
+def in_reselect_window(consumed_at, now_epoch, window=None) -> bool:
+    """消费时刻是否仍处于重复选择窗口内（r5 冻结的唯一比较表达式）。
+
+    窗口内 ⇔ now - consumed_at <= window（**边界等值仍算窗口内**，
+    与 P2.3 PendingInterceptor「now - consumed_at > window → 超窗」
+    完全同一口径）；非法输入保守返回 False（不保留）。"""
+    if window is None:
+        window = reselect_window_seconds()
+    try:
+        c, n, w = int(consumed_at), int(now_epoch), int(window)
+    except (TypeError, ValueError):
+        return False
+    return n - c <= w
 
 
 def _iso(dt: datetime) -> str:
@@ -381,6 +411,39 @@ class PendingStore:
         with self._lock:
             return dict(self._consumptions[-1]) \
                 if self._consumptions else None
+
+    def _latest_pending_id(self) -> str | None:
+        """P2.4a 内部查询（不进公共契约，§3.2 解析顺序第 3 步）。
+
+        本 sid 最新一条 pending 的 ID——内存桩只保留当前槽位对象
+        （含全部状态，open/expired/consumed/cancelled），被新 create
+        覆盖的更旧记录不可恢复，属预期（「最新」语义仍成立）；
+        无任何 pending 返回 None。"""
+        with self._lock:
+            return self._active.pending_id \
+                if self._active is not None else None
+
+    def _has_runtime_retention_state(self, now=None) -> bool:
+        """P2.4a 内部只读判定（§4.3，Runtime 保留态；不进公共契约）。
+
+        True = 该 runtime 仍承载必须由它承担的业务状态：
+        ① 存在 status='open' 的 Pending——**按原始状态判断、不做
+          时间过滤**（到期未登记的 open 同样命中）；
+        ② 最近一条消费记录仍在重复选择窗口内（r5 冻结：与拦截器
+          共用 in_reselect_window 同一表达式，边界等值算窗口内）。
+        只读零副作用；now 可注入（manager 时钟，与 store 时钟解耦）。
+        """
+        with self._lock:
+            if self._active is not None and \
+                    self._active.status == PENDING_OPEN:
+                return True
+            if self._consumptions:
+                last = self._consumptions[-1]
+                n = _epoch(now) if now is not None \
+                    else _epoch(self._now())
+                if in_reselect_window(last.get("consumed_at"), n):
+                    return True
+            return False
 
     def _is_expired(self, p: PendingDisambiguation) -> bool:
         """到期判定（P2.3 验收补丁冻结语义）：

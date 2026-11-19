@@ -349,6 +349,15 @@ class Session:
         self.last_plan: dict | None = None
         # 阶段回调（服务端注入，用于等待页进度）；None 表示不上报
         self.on_phase = None
+        # P2.4a pending 消费通道（冻结：两字段严格分离，绝不混用）：
+        # pending_session_id = 会话身份（server 以 sid 注入，PendingStore
+        #   绑定与隔离的唯一依据）；
+        # active_pending_id = 当前待选择 Pending ID 的**提示值**（非权威，
+        #   有效性最终由 store 判定；生产者创建成功后写入，本阶段由
+        #   测试预置）。均不入存档 schema（生产者落地时随 snapshot/
+        #   restore 持久化，见 PHASE5_P24_PLAN.md §3.4/§3.5）。
+        self.pending_session_id: str | None = None
+        self.active_pending_id: str | None = None
 
     # -------------------------------------------------- 存档（历史行程/续聊）
     # 上下文范围 = 一次对话（一个 sid 一个 Session）。存档让这份上下文在进程

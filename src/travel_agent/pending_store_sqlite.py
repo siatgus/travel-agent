@@ -49,7 +49,7 @@ from travel_agent.pending import (DEFAULT_TTL_SECONDS, PENDING_OPEN,
                                   PENDING_CONSUMED,
                                   PendingDisambiguation,
                                   _ConsumeOutcome, _candidate_from_dict,
-                                  _epoch)
+                                  _epoch, in_reselect_window)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_disambiguation (
@@ -171,6 +171,54 @@ class SQLitePendingStore:
         d = dict(row)
         d["consumed_at"] = int(d["consumed_at"])
         return d
+
+    def _latest_pending_id(self) -> str | None:
+        """P2.4a 内部查询（不进公共契约，§3.2 解析顺序第 3 步）。
+
+        本 sid 最新一条 pending 的 ID（**任意状态**：open/expired/
+        consumed/cancelled 都算——终态记录仅作 evaluate 解析线索，
+        绝不视为有效待处理对象）。严格按本 store 绑定的 session_id
+        查询，绝不接受外部 sid。同时间戳以 rowid（入库序）作确定性
+        次序依据（r5 冻结）。"""
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT pending_id FROM pending_disambiguation"
+                " WHERE session_id = ?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (self._session_id,)).fetchone()
+        finally:
+            con.close()
+        return row["pending_id"] if row is not None else None
+
+    def _has_runtime_retention_state(self, now=None) -> bool:
+        """P2.4a 内部只读判定（§4.3，Runtime 保留态；不进公共契约）。
+
+        True = 该 runtime 仍承载必须由它承担的业务状态：
+        ① 存在 status='open' 的 Pending（**原始状态，无时间过滤**，
+          到期未登记的 open 同样命中）；
+        ② 最近一条消费记录仍在重复选择窗口内（与拦截器共用
+          in_reselect_window 同一表达式，边界等值算窗口内）。
+        只读零副作用；now 可注入（manager 时钟）。"""
+        con = self._connect()
+        try:
+            open_row = con.execute(
+                "SELECT 1 FROM pending_disambiguation"
+                " WHERE session_id = ? AND status = 'open' LIMIT 1",
+                (self._session_id,)).fetchone()
+            if open_row is not None:
+                return True
+            row = con.execute(
+                "SELECT consumed_at FROM pending_consumption"
+                " WHERE session_id = ?"
+                " ORDER BY consumed_at DESC, rowid DESC LIMIT 1",
+                (self._session_id,)).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return False
+        n = _epoch(now) if now is not None else self._now_epoch()
+        return in_reselect_window(int(row["consumed_at"]), n)
 
     # -------------------------------------------------- 行重建
 

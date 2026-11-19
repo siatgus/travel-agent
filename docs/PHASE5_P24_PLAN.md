@@ -376,6 +376,19 @@ active_ops>0，闸 1 必跳过。三种可序列化结果：
 绝不取 manager 锁；store 方法对 manager 无感知），无死锁环。
 锁内不做任何网络/模型调用等慢操作，lease 区间尽量短。
 
+**SQLite Runtime 关闭时序（批准条件补明确）**：SQLite runtime 的
+连接关闭/资源释放必须在该淘汰线程已持有 manager 锁、且（如需进入
+store 内部）按 manager → store 顺序取得锁之后执行，绝不反向。
+当前 `SQLitePendingStore` 的连接为**逐操作建立/关闭**（无长持
+连接），因此淘汰时的「关闭」落实为：确认无进行中事务后丢弃引用
+（任何未完成写事务由 `BEGIN IMMEDIATE` 先行提交/回滚完毕）。
+
+**lease 归还时序（批准条件补明确）**：lease 归还必须发生在该请求
+**全部 store 锁释放之后**——gate 的 finally 在所有 store 方法调用
+返回后才取 manager 锁归还，绝不持 store 锁时归还 lease；由此保证
+归还瞬间该 runtime 上没有任何进行中的业务操作，「计数归零即无人在
+用」成立。
+
 #### 4.5.4 专项并发测试（r5 新增，双实现覆盖）
 
 1. **持引用未入锁场景（评审第 4 条）**：请求 A 经 `_pending_runtime`
@@ -483,3 +496,33 @@ extractor 36）全绿 + dialog/server 相关既有套件不回归。
 已批准决策（拦截点 1.5↔2、server 注入身份、consume 成功短路失败
 回退、两阶段实施、默认关）全部保留。申请批准 **P2.4a** 开工；
 P2.4b 待 P2.4a 独立验收通过后另行申请。
+
+## 10. P2.4a 实施记录（设计与实现差异说明）
+
+1. **观察模式（最重要差异）**：§2.1 伪码中 gate 含 evaluate→act→
+   回复决策；按 P2.4a 执行边界「不提前引入 P2.4b 接管行为」，本阶段
+   gate 为**观察模式**——evaluate（纯判定零副作用）+ 影子记录后一律
+   返回 None 交回原链路，**绝不执行 act、绝不短路**（待短路回复为
+   专项测试锁定）。act/verdict 分发/reply 属 P2.4b。
+2. **Runtime Manager 独立模块**：§2.1 允许「实现为 Orchestrator
+   私有方法，不新建文件亦可」；实现选择独立模块
+   `pending_runtime.py`（PendingRuntime + PendingRuntimeManager，
+   仅装配层，无业务逻辑），便于并发专项测试直接驱动。
+3. **窗口比较符共享方式**：未改动拦截器业务逻辑（其表达式
+   `now - consumed_at > window → 超窗` 原样保留）；共享通过
+   `pending.py` 新增 `in_reselect_window()`（窗口内 ⇔ `<=`，边界
+   等值算窗口内）与 `reselect_window_seconds()`（唯一 env 读取口），
+   两个 store 的保留态判定使用之；测试在临界点断言两处判定同值。
+4. **SQLite「关闭连接」落实**：`SQLitePendingStore` 连接为逐操作
+   建立/关闭（无长持连接），淘汰时的关闭 = manager 锁内确认无进行
+   中事务后丢弃引用（批准条件已写入 §4.5.3）。
+5. **淘汰触发点**：acquire 超限触发之外，release 归还 lease 后容量
+   可能释放，同一 manager 锁内补触发一轮淘汰扫描。
+6. **时钟注入**：manager 可注入时钟，经 `_epoch` 归一（datetime/
+   数值均可）；`Session` 新增 `pending_session_id`/`active_pending_id`
+   两属性（不改 `__init__` 签名、不入存档 schema，§2.3/§3.5）。
+7. **测试结果**：test_pending_channel 92/92（含四项生命周期并发、
+   测试 A/B 及边界断言、多 Pending 遮蔽四序列统一断言、双实现
+   保留态/淘汰同输入同时间边界对拍、真实 handle 集成）；全量回归
+   pending 60 / sqlite 66 / interceptor 150 / decision 51 / adapter 32 /
+   resolver 79 / corpus v4 50 / parser 62 / extractor 36 全绿。
