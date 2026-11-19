@@ -155,11 +155,13 @@ def test_channel_on_missing_sid_bypass() -> None:
         set_env()
 
 
-def test_observation_mode_no_act() -> None:
-    """P2.4a 观察模式：evaluate + 影子记录，绝不 act、状态不变。"""
+def test_b1_consume_ok_shortcircuit() -> None:
+    """B1/B6：consume ok → 短路确认（规则 7 只确认消歧）+ 消费记录 +
+    hint 清空（以真实迁移结果为准）。原观察模式断言随 P2.4b 激活
+    更新为接管语义。"""
     set_env(channel="1", store_kind="memory")
     try:
-        clock, advance = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         orc = Orchestrator()
         s = Session(use_llm=False)
         s.pending_session_id = "s1"
@@ -173,18 +175,29 @@ def test_observation_mode_no_act() -> None:
                             last_used=int(clock().timestamp()))
         mgr._runtimes["s1"] = rt
         orc._pending_manager = mgr
-        v = orc._pending_gate(s, "第一个", make_ctx("第一个"))
-        check("[观察] gate 返回 None（不短路，P2.4b 才接管）", v is None, "")
-        check("[观察] 影子记录判定 consume",
-              rt.interceptor.shadow_log
-              and rt.interceptor.shadow_log[-1]["verdict"] == V_CONSUME,
-              str(rt.interceptor.shadow_log[-1:]))
-        check("[观察] pending 状态仍 open（未 act）",
-              store.get_pending_by_id(p.pending_id).status == "open", "")
-        check("[观察] 无消费记录", store._latest_consumption() is None, "")
-        check("[观察] lease 已归还", rt.active_ops == 0, "")
-        check("[观察] hint 刷新为 open pending 的 ID",
-              s.active_pending_id == p.pending_id, "")
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B1 consume ok] 短路回复非 None", r is not None, str(r))
+        check("[B1 consume ok] 确认文案引用所选候选与城市",
+              r is not None and "海贝皇大排档（南京店）" in str(r)
+              and "南京" in str(r), str(r))
+        check("[B1 consume ok] 只确认消歧（不产生行程动作文案）",
+              r is not None and "行程已生成" not in str(r)
+              and "已为您规划" not in str(r), str(r))
+        check("[B1 consume ok] pending 已消费",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        rec = store._latest_consumption()
+        check("[B1 consume ok] 七字段消费记录完整",
+              rec is not None and rec["selected_name"]
+              == "海贝皇大排档（南京店）"
+              and rec["selected_city"] == "南京"
+              and rec["candidate_id"] == "c1"
+              and rec["pending_id"] == p.pending_id
+              and rec["session_id"] == "s1"
+              and "consumed_at" in rec and "original_intent" in rec,
+              str(rec))
+        check("[B1/B6] hint 已清空（真实迁移成功）",
+              s.active_pending_id is None, str(s.active_pending_id))
+        check("[B1] lease 已归还", rt.active_ops == 0, "")
     finally:
         set_env()
 
@@ -672,16 +685,21 @@ def test_gate_and_store_integration_real_handle() -> None:
                             last_used=int(clock().timestamp()))
         mgr._runtimes["s-live"] = rt
         orc2._pending_manager = mgr
-        # 真实 handle：观察模式只评估不 act，回复与无 pending 时同链路
+        # 真实 handle：P2.4b 激活——consume 短路，原链路不执行
         r = orc2.handle(s, "第一个")
-        check("[集成 on] handle 正常走原链路（gate 未短路）",
-              r is not None, "")
-        check("[集成 on] pending 保持 open",
-              store.get_pending_by_id(p.pending_id).status == "open", "")
-        check("[集成 on] 影子记录 consume（观察）",
+        check("[集成 on] consume 短路回复（route=pending_consume）",
+              r is not None and "已确认" in str(r)
+              and orc2.last_ctx.route == "pending_consume"
+              and orc2.last_ctx.handled is True,
+              f"{r} route={getattr(orc2.last_ctx, 'route', None)}")
+        check("[集成 on] pending 已消费（原链路未重复处理）",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        check("[集成 on] 影子记录 consume 判定",
               rt.interceptor.shadow_log
               and rt.interceptor.shadow_log[-1]["verdict"] == V_CONSUME,
               str(rt.interceptor.shadow_log[-1:]))
+        check("[集成 on] hint 已清空（真实迁移成功）",
+              s.active_pending_id is None, "")
         check("[集成 on] lease 已归还", rt.active_ops == 0, "")
     finally:
         set_env()
@@ -952,6 +970,596 @@ def test_acquire_clock_failure_no_lease_leak() -> None:
         set_env()
 
 
+# ================================================== 7. P2.4b：verdict 行为与消费接管（B1–B12）
+
+from travel_agent.pending import _ConsumeOutcome  # noqa: E402
+
+
+def _gate_harness(clock, sid="s1", store=None, interceptor=None):
+    """B 组测试装具：注入式 manager + 预置 store 的 gate 测试环境。"""
+    orc = Orchestrator()
+    s = Session(use_llm=False)
+    s.pending_session_id = sid
+    if store is None:
+        store = PendingStore(session_id=sid, now=clock)
+    if interceptor is None:
+        interceptor = PendingInterceptor(store)
+    mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
+    rt = PendingRuntime(sid, store, interceptor,
+                        last_used=int(clock().timestamp()))
+    mgr._runtimes[sid] = rt
+    orc._pending_manager = mgr
+    return orc, s, store, rt, mgr
+
+
+class _FailConsumeStore(PendingStore):
+    """act 如实失败（不抛异常）：consume_pending 返回 ok=False。"""
+
+    def consume_pending(self, pending_id, candidate_id):
+        return _ConsumeOutcome(ok=False, pending_id=pending_id,
+                               reason="注入：如实失败")
+
+
+class _RaiseBeforeConsumeStore(PendingStore):
+    """act 抛异常且确认未迁移（B2：store 状态仍 open）。"""
+
+    def consume_pending(self, pending_id, candidate_id):
+        raise RuntimeError("注入：consume 前异常")
+
+
+class _RaiseAfterCommitStore(PendingStore):
+    """提交边界异常（B4）：真实迁移已完成后 act 再抛。"""
+
+    def consume_pending(self, pending_id, candidate_id):
+        out = super().consume_pending(pending_id, candidate_id)
+        if out.ok:
+            raise RuntimeError("注入：提交后异常")
+        return out
+
+
+class _RaiseAndHideStore(_RaiseBeforeConsumeStore):
+    """无法判定（B4）：act 抛异常，且**其后的**状态查询也失败
+    （首次查询放行给 evaluate，第二次起失败 → gate 无法判定）。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._status_queries = 0
+
+    def get_pending_by_id(self, pending_id):
+        self._status_queries += 1
+        if self._status_queries >= 2:
+            raise RuntimeError("注入：状态查询失败")
+        return super().get_pending_by_id(pending_id)
+
+
+class _PureCuePR:
+    """纯选择线索解析桩（真实 parse 会抽出具名候选，P2.3 冻结规则）。"""
+    poi_candidates = []
+    intent_coarse = ""
+
+
+class _DestChangedPR:
+    destination_new = "上海"
+    destination_writable = True
+    poi_candidates = []
+    intent_coarse = ""
+
+
+class _StubCand:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _NewQuestionPR:
+    poi_candidates = [_StubCand("夫子庙")]
+    intent_coarse = ""
+
+
+def test_b1_consume_fail_no_shortcircuit() -> None:
+    """B1/B2：act 如实失败 → 不短路、不改选、不伪造，交回原链路。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc, s, store, rt, _ = _gate_harness(clock, store=_FailConsumeStore())
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B1 consume 失败] 不短路（交回原链路）", r is None, str(r))
+        check("[B1 consume 失败] pending 保持 open（可重试）",
+              store.get_pending_by_id(p.pending_id).status == "open", "")
+        check("[B1 consume 失败] 无消费记录",
+              store._latest_consumption() is None, "")
+        check("[B1/B6] act 失败 hint 保留",
+              s.active_pending_id == p.pending_id, "")
+        check("[B1] 失败已降级进 shadow log",
+              any(getattr(e, "get", lambda k: None)("action")
+                  == "consume_failed_not_shortcircuit"
+                  for e in rt.interceptor.shadow_log),
+              str(rt.interceptor.shadow_log[-1:]))
+        check("[B1] lease 已归还", rt.active_ops == 0, "")
+    finally:
+        set_env()
+
+
+def test_b2_act_exception_open_status() -> None:
+    """B2：act 抛异常且确认未迁移（store 仍 open）→ 安全降级原链路。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc, s, store, rt, _ = _gate_harness(
+            clock, store=_RaiseBeforeConsumeStore())
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B2 act 异常] 不短路", r is None, str(r))
+        check("[B2 act 异常] store 确认 open → 原链路安全",
+              store.get_pending_by_id(p.pending_id).status == "open", "")
+        check("[B2/B6] 未迁移 → hint 保留",
+              s.active_pending_id == p.pending_id, "")
+        gate_recs = [e for e in rt.interceptor.shadow_log
+                      if getattr(e, "get", lambda k: None)("stage") == "gate"]
+        check("[B2] act 异常记入 shadow（含 store 实际状态）",
+              gate_recs and gate_recs[-1]["action"] == "act_exception"
+              and gate_recs[-1]["store_status"] == "open",
+              str(gate_recs[-1:]))
+        check("[B2] lease 已归还（异常路径）", rt.active_ops == 0, "")
+    finally:
+        set_env()
+
+
+def test_b4_commit_boundary_exception() -> None:
+    """B4：提交边界异常（迁移已真实完成）→ 兜底确认短路，绝不交回
+    原链路造成重复业务处理。memory 与 SQLite 双实现。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc, s, store, rt, _ = _gate_harness(
+            clock, store=_RaiseAfterCommitStore())
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B4 提交边界] 兜底确认短路（不进原链路）",
+              r is not None and "已确认" in str(r), str(r))
+        check("[B4 提交边界] store 已真实迁移 consumed",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        check("[B4/B6] 迁移已确认 → hint 清空",
+              s.active_pending_id is None, "")
+        check("[B4] 兜底不伪造候选细节（不引用不可靠数据）",
+              r is not None and "海贝皇大排档" not in str(r), str(r))
+        check("[B4] lease 已归还", rt.active_ops == 0, "")
+    finally:
+        set_env()
+
+    # SQLite 实现：真实 DB 提交后再抛（连接逐操作，独立核验）
+    from travel_agent.pending_store_sqlite import SQLitePendingStore
+    import tempfile
+    fd, dbp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+
+    class _RaiseAfterCommitSQLite(SQLitePendingStore):
+        def consume_pending(self, pending_id, candidate_id):
+            out = super().consume_pending(pending_id, candidate_id)
+            if out.ok:
+                raise RuntimeError("注入：SQLite 提交后异常")
+            return out
+
+    set_env(channel="1", store_kind="sqlite")   # 独立设回开关（B4 sqlite）
+    clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+    try:
+        st = _RaiseAfterCommitSQLite("s1", db_path=dbp, now=clock)
+        orc, s, store, rt, _ = _gate_harness(clock, store=st)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B4 sqlite 提交边界] 兜底确认短路",
+              r is not None and "已确认" in str(r), str(r))
+        check("[B4 sqlite 提交边界] DB 行状态 consumed",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        check("[B4 sqlite 提交边界] hint 清空",
+              s.active_pending_id is None, "")
+    finally:
+        set_env()
+
+
+def test_b4_undeterminable_conservative() -> None:
+    """B4：act 异常且状态无法判定 → 保守拦截：不伪造成功、不交回
+    原链路（防不确定状态下的重复业务处理），hint 保留。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc, s, store, rt, _ = _gate_harness(
+            clock, store=_RaiseAndHideStore())
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B4 无法判定] 保守回复（不交回原链路）",
+              r is not None and "无法确认" in str(r), str(r))
+        check("[B4 无法判定] 不伪造消费成功",
+              r is not None and "已确认您的选择" not in str(r), str(r))
+        check("[B4/B6] 无法判定 → hint 保留（不误清）",
+              s.active_pending_id == p.pending_id, "")
+        check("[B4] 保守拦截记入 warnings",
+              any("无法判定" in w for w in orc._pending_warnings),
+              str(orc._pending_warnings))
+        check("[B4] lease 已归还", rt.active_ops == 0, "")
+    finally:
+        set_env()
+
+
+def test_b1_cancel_and_new_question_verdicts() -> None:
+    """B1：cancel_explicit / cancel_dest_changed / cancel_new_question
+    → 不短路交回原链路 + 终态迁移成功清 hint。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        # cancel_explicit
+        orc, s, store, rt, _ = _gate_harness(clock)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "算了，取消", make_ctx("算了，取消"))
+        check("[B1 cancel_explicit] 不短路", r is None, str(r))
+        check("[B1 cancel_explicit] pending 已取消",
+              store.get_pending_by_id(p.pending_id).status == "cancelled", "")
+        check("[B1/B6] cancel 迁移成功 → hint 清空",
+              s.active_pending_id is None, "")
+        # cancel_dest_changed（解析桩：明确新目的地 + writable）
+        orc2, s2, store2, rt2, _ = _gate_harness(clock, sid="s2")
+        p2 = store2.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s2.active_pending_id = p2.pending_id
+        ctx2 = make_ctx("改成去上海")
+        ctx2.parse = _DestChangedPR()
+        r2 = orc2._pending_gate(s2, "改成去上海", ctx2)
+        check("[B1 cancel_dest] 不短路", r2 is None, str(r2))
+        check("[B1 cancel_dest] pending 已取消",
+              store2.get_pending_by_id(p2.pending_id).status == "cancelled",
+              "")
+        check("[B1/B6] cancel_dest 迁移成功 → hint 清空",
+              s2.active_pending_id is None, "")
+        # cancel_new_question（解析桩：快照外具名新实体）
+        orc3, s3, store3, rt3, _ = _gate_harness(clock, sid="s3")
+        p3 = store3.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s3.active_pending_id = p3.pending_id
+        ctx3 = make_ctx("帮我查一下夫子庙")
+        ctx3.parse = _NewQuestionPR()
+        r3 = orc3._pending_gate(s3, "帮我查一下夫子庙", ctx3)
+        check("[B1 cancel_new_question] 不短路", r3 is None, str(r3))
+        check("[B1 cancel_new_question] pending 已取消",
+              store3.get_pending_by_id(p3.pending_id).status == "cancelled",
+              "")
+        check("[B1/B6] new_question 迁移成功 → hint 清空",
+              s3.active_pending_id is None, "")
+    finally:
+        set_env()
+
+
+def test_b1_expired_restate_handback_duplicate_none() -> None:
+    """B1：expired_reply / restate / hand_back / duplicate_select / none
+    五类 verdict 全路径（回复与状态逐项断言）。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, advance = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        # expired_reply：到期未登记 + 选择语境 → 短路告知过期
+        orc, s, store, rt, _ = _gate_harness(clock)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        advance(301)
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B1 expired_reply] 短路如实告知过期",
+              r is not None and "过期" in str(r), str(r))
+        check("[B1 expired_reply] pending 已登记 expired",
+              store.get_pending_by_id(p.pending_id).status == "expired", "")
+        check("[B1/B6] expired 迁移成功 → hint 清空",
+              s.active_pending_id is None, "")
+        # restate：显式重述请求 → 短路重述候选 1..N，零状态变化
+        orc2, s2, store2, rt2, _ = _gate_harness(clock, sid="s2")
+        p2 = store2.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s2.active_pending_id = p2.pending_id
+        r2 = orc2._pending_gate(s2, "再说一遍", make_ctx("再说一遍"))
+        check("[B1 restate] 短路重述候选列表",
+              r2 is not None and "1." in str(r2) and "2." in str(r2)
+              and "海贝皇大排档（南京店）" in str(r2)
+              and "海贝皇大排档（上海店）" in str(r2), str(r2))
+        check("[B1 restate] 快照顺序与候选一致（1..N）",
+              r2 is not None and str(r2).find("南京店")
+              < str(r2).find("上海店"), str(r2))
+        check("[B1 restate] pending 保持 open（零状态变化）",
+              store2.get_pending_by_id(p2.pending_id).status == "open", "")
+        check("[B1/B6] restate → hint 保留",
+              s2.active_pending_id == p2.pending_id, "")
+        # hand_back：询问/评价标记 → 保守交回原链路
+        r2b = orc2._pending_gate(s2, "南京那家怎么样", make_ctx("南京那家怎么样"))
+        check("[B1 hand_back] 不短路（保守红线）", r2b is None, str(r2b))
+        check("[B1 hand_back] pending 仍 open",
+              store2.get_pending_by_id(p2.pending_id).status == "open", "")
+        check("[B1/B6] hand_back → hint 保留",
+              s2.active_pending_id == p2.pending_id, "")
+        # duplicate_select：先消费，窗口内纯选择线索 → 短路告知已确认
+        orc3, s3, store3, rt3, _ = _gate_harness(clock, sid="s3")
+        p3 = store3.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s3.active_pending_id = p3.pending_id
+        r3a = orc3._pending_gate(s3, "第一个", make_ctx("第一个"))
+        check("[B1 duplicate 前置] 首次消费成功短路",
+              r3a is not None and "已确认" in str(r3a), str(r3a))
+        ctx3 = make_ctx("第一个")
+        ctx3.parse = _PureCuePR()
+        r3b = orc3._pending_gate(s3, "第一个", ctx3)
+        check("[B1 duplicate_select] 短路告知已确认（引用真实记录）",
+              r3b is not None and "已确认过" in str(r3b)
+              and "海贝皇大排档（南京店）" in str(r3b), str(r3b))
+        check("[B1 duplicate_select] 不重复消费（记录仍 1 条）",
+              store3._latest_consumption() is not None
+              and store3.get_pending_by_id(p3.pending_id).status
+              == "consumed", "")
+        check("[B1/B6] duplicate → hint 保持 None（零状态）",
+              s3.active_pending_id is None, "")
+        # none：pending 不可消费（已登记 expired）且非重复选择语境
+        # → 原链路，零状态变化，hint 保留（open pending 下「你好」
+        # 会因新实体证据产出 cancel_new_question，见 P2.3 冻结规则）
+        orc4, s4, store4, rt4, _ = _gate_harness(clock, sid="s4")
+        p4 = store4.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s4.active_pending_id = p4.pending_id
+        store4.expire_pending(p4.pending_id)   # 显式登记 expired
+        r4 = orc4._pending_gate(s4, "你好", make_ctx("你好"))
+        check("[B1 none] 不短路", r4 is None, str(r4))
+        check("[B1 none] pending 保持 expired（零状态变化）",
+              store4.get_pending_by_id(p4.pending_id).status == "expired",
+              "")
+        check("[B1/B6] none → hint 保留",
+              s4.active_pending_id == p4.pending_id, "")
+    finally:
+        set_env()
+
+
+def test_b3_reply_construction_failure_still_shortcircuit() -> None:
+    """B3：consume 成功后 _pending_reply 抛异常 → 仍短路（兜底确认），
+    绝不撤销消费、绝不回退普通意图路由；非迁移 verdict 回复构造失败
+    → 零状态保守交回原链路。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc, s, store, rt, _ = _gate_harness(clock)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+
+        def _boom(*a, **kw):
+            raise RuntimeError("注入：回复构造失败")
+
+        orc._pending_reply = _boom
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B3] 回复构造失败仍短路（兜底确认）",
+              r is not None and "已确认" in str(r), str(r))
+        check("[B3] 消费未被撤销",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        check("[B3/B6] 迁移成功 → hint 清空（不回退路由）",
+              s.active_pending_id is None, "")
+        check("[B3] 构造失败记入 shadow",
+              any(getattr(e, "get", lambda k: None)("action")
+                  == "reply_construction_failed"
+                  for e in rt.interceptor.shadow_log),
+              str(rt.interceptor.shadow_log[-1:]))
+        check("[B3] lease 已归还", rt.active_ops == 0, "")
+        # 非迁移 verdict（restate）回复构造失败 → 零状态交回原链路
+        orc2, s2, store2, rt2, _ = _gate_harness(clock, sid="s2")
+        p2 = store2.create_pending("排海贝皇大排档", "plan_modify",
+                                   "must_visit", SNAP)
+        s2.active_pending_id = p2.pending_id
+        orc2._pending_reply = _boom
+        r2 = orc2._pending_gate(s2, "再说一遍", make_ctx("再说一遍"))
+        check("[B3 非迁移] 回复构造失败 → 保守交回原链路",
+              r2 is None, str(r2))
+        check("[B3 非迁移] pending 保持 open（零状态）",
+              store2.get_pending_by_id(p2.pending_id).status == "open", "")
+        check("[B3/B6 非迁移] hint 保留",
+              s2.active_pending_id == p2.pending_id, "")
+    finally:
+        set_env()
+
+
+def test_b5_shadow_sink_exception_isolated() -> None:
+    """B5：shadow sink 异常不影响主链路 / lease 归还 / verdict 行为；
+    装配层 _shadow_gate 自身吞掉一切记录异常。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+
+        def _bad_sink(rec):
+            raise RuntimeError("注入：shadow sink 异常")
+
+        store = PendingStore(session_id="s1", now=clock)
+        orc, s, store, rt, _ = _gate_harness(
+            clock, sid="s1", store=store,
+            interceptor=PendingInterceptor(store, shadow_sink=_bad_sink))
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        r = orc._pending_gate(s, "第一个", make_ctx("第一个"))
+        check("[B5] sink 异常不影响短路回复",
+              r is not None and "已确认" in str(r), str(r))
+        check("[B5] sink 异常不影响消费",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        check("[B5] lease 已归还", rt.active_ops == 0, "")
+
+        class _BadLog(list):
+            def append(self, item):
+                raise RuntimeError("注入：shadow 记录失败")
+
+        orc._shadow_gate(rt, "x", "y", detail="d", store_status=None,
+                         pending_id="p")     # 必须静默吞掉，不得抛出
+        check("[B5] 装配层 shadow 记录异常被隔离", True, "")
+    finally:
+        set_env()
+
+
+def test_b7_b8_real_handle_route_and_no_snatch() -> None:
+    """B7：短路落点 route=pending_consume / handled=True / history 追加；
+    B8：pending 选择不被下游 gate 抢答（含周边 gate 前的真实 handle）。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        s.pending_session_id = "s1"
+        store = PendingStore(session_id="s1", now=clock)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s.active_pending_id = p.pending_id
+        mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
+        rt = PendingRuntime("s1", store, PendingInterceptor(store),
+                            last_used=int(clock().timestamp()))
+        mgr._runtimes["s1"] = rt
+        orc._pending_manager = mgr
+        # B8：含名称+选择话术的句子 → 消费通道接管，不被周边 gate 抢答
+        r = orc.handle(s, "排海贝皇大排档，第一个")
+        check("[B8] 名称+序号选择不被下游 gate 抢答",
+              orc.last_ctx.route == "pending_consume"
+              and orc.last_ctx.handled is True,
+              str(getattr(orc.last_ctx, "route", None)))
+        check("[B8] 短路回复为消费确认",
+              r is not None and "已确认" in str(r), str(r))
+        check("[B8] pending 已消费（下游未重复处理）",
+              store.get_pending_by_id(p.pending_id).status == "consumed", "")
+        # B7：短路落点契约——history 追加 agent 消息
+        check("[B7] history 已追加 agent 消息",
+              s.history and s.history[-1]["role"] == "agent"
+              and str(r) in s.history[-1]["content"], str(s.history[-1:]))
+        # 对照：无 pending 时同类句子走原链路（无 pending 不误触发）
+        s2 = Session(use_llm=False)
+        r2 = orc.handle(s2, "你好")
+        check("[B7 对照] 无 pending 会话零接管",
+              orc.last_ctx.route != "pending_consume", str(r2)[:40])
+    finally:
+        set_env()
+
+
+def test_b9_cross_session_isolation_both_impls() -> None:
+    """B9：跨 Session 隔离——A 消费不影响 B；memory 与 SQLite 双实现。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc = Orchestrator()
+        mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
+        orc._pending_manager = mgr
+        sa = Session(use_llm=False)
+        sa.pending_session_id = "s-A"
+        sb = Session(use_llm=False)
+        sb.pending_session_id = "s-B"
+        sta = PendingStore(session_id="s-A", now=clock)
+        stb = PendingStore(session_id="s-B", now=clock)
+        rta = PendingRuntime("s-A", sta, PendingInterceptor(sta),
+                             last_used=int(clock().timestamp()))
+        rtb = PendingRuntime("s-B", stb, PendingInterceptor(stb),
+                             last_used=int(clock().timestamp()))
+        mgr._runtimes["s-A"] = rta
+        mgr._runtimes["s-B"] = rtb
+        pa = sta.create_pending("排海贝皇大排档", "plan_modify",
+                                "must_visit", SNAP)
+        pb = stb.create_pending("排海贝皇大排档", "plan_modify",
+                                "must_visit", SNAP)
+        sa.active_pending_id = pa.pending_id
+        sb.active_pending_id = pb.pending_id
+        ra = orc._pending_gate(sa, "第一个", make_ctx("第一个"))
+        # hand_back 话术（零状态变化）：open pending 下「你好」会因新实体
+        # 证据产出 cancel_new_question（P2.3 冻结规则），不适合隔离对照
+        rb = orc._pending_gate(sb, "南京那家怎么样", make_ctx("南京那家怎么样"))
+        check("[B9] A 消费成功短路", ra is not None and "已确认" in str(ra),
+              str(ra))
+        check("[B9] B 未受影响（pending 仍 open）",
+              stb.get_pending_by_id(pb.pending_id).status == "open", "")
+        check("[B9] B 无 A 的消费记录",
+              stb._latest_consumption() is None, "")
+        check("[B9] B 的 none verdict 不短路", rb is None, str(rb))
+        check("[B9] 双 lease 已归还",
+              rta.active_ops == 0 and rtb.active_ops == 0, "")
+    finally:
+        set_env()
+
+    # SQLite 双实现
+    from travel_agent.pending_store_sqlite import SQLitePendingStore
+    import tempfile
+    fd, dbp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    set_env(channel="1", store_kind="sqlite")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        orc = Orchestrator()
+        mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
+        orc._pending_manager = mgr
+        sta = SQLitePendingStore("s-A", db_path=dbp, now=clock)
+        stb = SQLitePendingStore("s-B", db_path=dbp, now=clock)
+        rta = PendingRuntime("s-A", sta, PendingInterceptor(sta),
+                             last_used=int(clock().timestamp()))
+        rtb = PendingRuntime("s-B", stb, PendingInterceptor(stb),
+                             last_used=int(clock().timestamp()))
+        mgr._runtimes["s-A"] = rta
+        mgr._runtimes["s-B"] = rtb
+        pa = sta.create_pending("排海贝皇大排档", "plan_modify",
+                                "must_visit", SNAP)
+        pb = stb.create_pending("排海贝皇大排档", "plan_modify",
+                                "must_visit", SNAP)
+        sa = Session(use_llm=False)
+        sa.pending_session_id = "s-A"
+        sa.active_pending_id = pa.pending_id
+        sb = Session(use_llm=False)
+        sb.pending_session_id = "s-B"
+        sb.active_pending_id = pb.pending_id
+        ra = orc._pending_gate(sa, "第一个", make_ctx("第一个"))
+        # hand_back 话术（零状态变化）：open pending 下「你好」会因新实体
+        # 证据产出 cancel_new_question（P2.3 冻结规则），不适合隔离对照
+        rb = orc._pending_gate(sb, "南京那家怎么样", make_ctx("南京那家怎么样"))
+        check("[B9 sqlite] A 消费成功短路",
+              ra is not None and "已确认" in str(ra), str(ra))
+        check("[B9 sqlite] A 的 DB 行 consumed",
+              sta.get_pending_by_id(pa.pending_id).status == "consumed", "")
+        check("[B9 sqlite] B 的 pending 仍 open",
+              stb.get_pending_by_id(pb.pending_id).status == "open", "")
+        check("[B9 sqlite] B 无 A 的消费记录",
+              stb._latest_consumption() is None, "")
+        check("[B9 sqlite] B 的 none 不短路", rb is None, str(rb))
+    finally:
+        set_env()
+
+
+def test_b10_channel0_bitwise_with_pending() -> None:
+    """B10：channel=0 时即便存在 pending/hint 也与无 pending 基线逐位
+    一致，manager 不构造。"""
+    set_env(channel="0")
+    try:
+        orc = Orchestrator()
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        # 带 pending + hint 的会话
+        s1 = Session(use_llm=False)
+        s1.pending_session_id = "s1"
+        store = PendingStore(session_id="s1", now=clock)
+        p = store.create_pending("排海贝皇大排档", "plan_modify",
+                                 "must_visit", SNAP)
+        s1.active_pending_id = p.pending_id
+        r1 = orc.handle(s1, "你好")
+        # 无 pending 的对照会话
+        s2 = Session(use_llm=False)
+        r2 = orc.handle(s2, "你好")
+        check("[B10] channel=0 输出与无 pending 基线逐位一致",
+              str(r1) == str(r2), f"{str(r1)[:60]} / {str(r2)[:60]}")
+        check("[B10] channel=0 不消费（pending 保持 open）",
+              store.get_pending_by_id(p.pending_id).status == "open", "")
+        check("[B10] channel=0 manager 未构造",
+              orc._pending_manager is None, "")
+    finally:
+        set_env()
+
+
 # ================================================== main
 
 
@@ -959,7 +1567,7 @@ def main() -> int:
     for fn in (test_channel_off_full_bypass,
                test_channel_on_no_pending_bypass,
                test_channel_on_missing_sid_bypass,
-               test_observation_mode_no_act,
+               test_b1_consume_ok_shortcircuit,
                test_resolve_order_and_expired_hint,
                test_wrong_hint_non_authoritative,
                test_multi_session_isolation,
@@ -974,9 +1582,20 @@ def main() -> int:
                test_real_thread_lease_blocks_eviction,
                test_real_thread_acquire_release_evict_stress,
                test_gate_evaluate_exception_returns_lease,
-               test_acquire_clock_failure_no_lease_leak):
+               test_acquire_clock_failure_no_lease_leak,
+               test_b1_consume_fail_no_shortcircuit,
+               test_b2_act_exception_open_status,
+               test_b4_commit_boundary_exception,
+               test_b4_undeterminable_conservative,
+               test_b1_cancel_and_new_question_verdicts,
+               test_b1_expired_restate_handback_duplicate_none,
+               test_b3_reply_construction_failure_still_shortcircuit,
+               test_b5_shadow_sink_exception_isolated,
+               test_b7_b8_real_handle_route_and_no_snatch,
+               test_b9_cross_session_isolation_both_impls,
+               test_b10_channel0_bitwise_with_pending):
         fn()
-    print(f"\npending channel P2.4a(+R1): {_PASS} pass / {_FAIL} fail")
+    print(f"\npending channel P2.4a(+R1+P2.4b): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
 
 

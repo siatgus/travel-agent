@@ -21,7 +21,12 @@ import os
 from .. import llm
 from ..dialogue import Reply
 from ..parser import parse_utterance
-from ..pending import PendingStore
+from ..pending import (PendingStore, PENDING_CANCELLED, PENDING_CONSUMED,
+                       PENDING_EXPIRED, PENDING_OPEN)
+from ..pending_interceptor import (PendingInterceptor, V_CANCEL_DEST_CHANGED,
+                                   V_CANCEL_EXPLICIT, V_CANCEL_NEW_QUESTION,
+                                   V_CONSUME, V_DUPLICATE_SELECT,
+                                   V_EXPIRED_REPLY, V_RESTATE)
 from ..pending_runtime import PendingRuntimeManager
 from .context import TurnContext
 from .guard import GuardPipeline
@@ -29,6 +34,19 @@ from .handlers import QA_HANDLERS
 from .handlers.plan_handler import PlanHandler
 from .intent_router import IntentRouter, QA_KINDS
 from .result import answer_reply
+
+# ---- P2.4b 冻结常量（评审 2026-11-19 CONDITIONAL PASS） ----
+
+# 可产生终态迁移的 verdict：hint 清理只对这些 verdict 且**真实迁移
+# 成功**（§3.3）时执行，绝不仅凭 verdict 类型清理
+_MIGRATING_VERDICTS = frozenset((V_CONSUME, V_CANCEL_NEW_QUESTION,
+                                 V_CANCEL_EXPLICIT, V_CANCEL_DEST_CHANGED,
+                                 V_EXPIRED_REPLY))
+# 过期告知文案（规则 5：如实告知过期，提示重新提问）
+_EXPIRED_NOTICE = "您之前的选择已经过期失效了，请重新提问，我再为您推荐。"
+# act 异常且无法判定 store 状态时的保守回复（B4：既不伪造消费成功，
+# 也不交回原链路造成不确定状态下的重复业务处理）
+_UNDETERMINED_NOTICE = "系统暂时无法确认您的选择状态，请稍后重试。"
 
 
 class Orchestrator:
@@ -69,13 +87,22 @@ class Orchestrator:
         return store._latest_pending_id()      # ③ 重启恢复线索
 
     def _pending_gate(self, session, utterance: str, ctx) -> Reply | None:
-        """唯一拦截点（步骤 1.75）：pending 消费通道。
+        """唯一拦截点（步骤 1.75）：pending 消费通道（P2.4b 激活）。
 
-        P2.4a 边界：开关关闭完全旁路（不构造 runtime、不查 store、
-        不 evaluate/act）；开关打开时**只接消费侧、不创建 Pending**
-        （生产者仍冻结），本阶段为**观察模式**——evaluate 纯判定 +
-        影子记录后一律返回 None 交回原链路；verdict 分发/回复行为
-        （含 consume 成功短路）属 P2.4b，本阶段绝不执行 act。
+        边界（评审冻结）：开关关闭完全旁路；只接消费侧、不创建
+        Pending（生产者仍冻结）；evaluate/act 业务逻辑、两个 store、
+        Runtime Manager（含 R1 异常安全）零修改——本方法只做装配层
+        分发：evaluate → act → _sync_active_hint → _pending_reply。
+
+        异常边界（评审冻结四项）：
+        ① 消费成功是短路的决定性依据——act 成功后 _pending_reply
+          构造失败必须兜底确认短路，绝不撤销消费、绝不回退普通意图
+          路由（防同一条输入被原链路重复处理）；
+        ② act 异常 ≠ 一定未迁移——按 store 实际状态安全判定；无法
+          判定时保守拦截（不伪造成功、不交回原链路）；
+        ③ shadow 永不影响主链路（拦截器已隔离 sink 异常，本方法
+          _shadow_gate 亦吞掉一切记录异常）；
+        ④ hint 同步以真实迁移结果为准（_sync_active_hint）。
         """
         if not self._channel_enabled():
             return None                        # 完全旁路（§2.2）
@@ -90,14 +117,174 @@ class Orchestrator:
             pid = self._resolve_pending_id(session, rt.store)
             if pid is None:                    # ④ 无任何线索 → 旁路
                 return None
-            # evaluate 纯判定零副作用（shadow_sink 异常隔离在拦截器内）；
-            # hint 非权威：错误 hint 由 store 状态机产出 none，无误消费
-            rt.interceptor.evaluate(utterance, getattr(ctx, "parse", None),
-                                    session_pending_id=pid)
-            return None                        # P2.4b 才接管 verdict 分发
+            # evaluate 纯判定零副作用（P2.3 冻结契约）；hint 非权威：
+            # 错误 hint 由 store 状态机产出 none，无误消费
+            v = rt.interceptor.evaluate(utterance,
+                                        getattr(ctx, "parse", None),
+                                        session_pending_id=pid)
+            name = v.verdict
+            out = None
+            try:
+                out = rt.interceptor.act(v)    # act 如实返回，失败不伪装
+            except Exception as exc:           # 评审冻结约束 ②（B2/B4）
+                status = self._store_status_safe(rt, pid)
+                self._shadow_gate(rt, name, "act_exception",
+                                  detail=f"{type(exc).__name__}: {exc}",
+                                  store_status=status, pending_id=pid)
+                if status == PENDING_CONSUMED:
+                    # 提交边界异常但迁移已确认成功 → 兜底确认短路，
+                    # 绝不交回原链路（防重复业务处理）
+                    self._sync_active_hint(session, name, True)
+                    return self._fallback_confirm_reply(session)
+                if status == PENDING_EXPIRED:
+                    self._sync_active_hint(session, name, True)
+                    if name == V_EXPIRED_REPLY:
+                        return answer_reply(session, _EXPIRED_NOTICE)
+                    return None                # 其余 → 原链路（§2.5）
+                if status == PENDING_CANCELLED:
+                    self._sync_active_hint(session, name, True)
+                    return None                # cancel → 原链路（§2.5）
+                if status == PENDING_OPEN:
+                    self._sync_active_hint(session, name, False)
+                    return None                # 确认未迁移 → 安全失败
+                # 无法判定（pending 不存在或状态查询失败）→ 保守拦截
+                self._sync_active_hint(session, name, False)
+                self._pending_warnings.append(
+                    "pending gate: act 异常且无法判定 store 状态"
+                    "（保守拦截，hint 保留）")
+                return answer_reply(session, _UNDETERMINED_NOTICE)
+            migrated = bool(out is not None and getattr(out, "ok", False)) \
+                and name in _MIGRATING_VERDICTS
+            self._sync_active_hint(session, name, migrated)
+            try:
+                # 消费成功是短路的决定性依据（评审冻结规则 ①，B3）
+                return self._pending_reply(out, v, session, rt)
+            except Exception as exc:
+                self._shadow_gate(rt, name, "reply_construction_failed",
+                                  detail=f"{type(exc).__name__}: {exc}",
+                                  pending_id=pid)
+                if migrated:
+                    return self._fallback_confirm_reply(session)
+                return None        # 未迁移零状态 → 保守交回原链路
         finally:
             # lease 归还：此时全部 store 锁已释放（批准条件冻结时序）
             self._pending_manager.release(rt)
+
+    # ---------------------------------------------- P2.4b 装配私有方法
+
+    @staticmethod
+    def _sync_active_hint(session, verdict_name: str, migrated: bool) -> None:
+        """hint 同步（§3.3 冻结）：以**真实终态迁移结果**为准——迁移
+        成功且属迁移类 verdict 才清空；失败/零状态 verdict 一律保留。"""
+        if migrated and verdict_name in _MIGRATING_VERDICTS:
+            session.active_pending_id = None
+
+    @staticmethod
+    def _store_status_safe(rt, pending_id: str) -> str | None:
+        """act 异常后的安全判定（评审冻结约束 ②）：读取 store 实际
+        状态；pending 不存在或查询失败 → None（无法判定，保守处理）。"""
+        try:
+            p = rt.store.get_pending_by_id(pending_id)
+            return p.status if p is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _shadow_gate(rt, verdict_name: str, action: str,
+                     detail: str = "", store_status: str | None = None,
+                     pending_id: str | None = None) -> None:
+        """装配层影子记录（评审冻结约束 ③，B5）：shadow 是观察记录，
+        绝不影响主链路——记录本身的一切异常在此吞掉。"""
+        try:
+            rt.interceptor.shadow_log.append({
+                "stage": "gate", "verdict": verdict_name,
+                "action": action, "detail": detail,
+                "store_status": store_status, "pending_id": pending_id})
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fallback_confirm_reply(session, selected_name: str = "",
+                                selected_city: str | None = None) -> Reply:
+        """B3/B4 兜底消费确认（评审冻结规则 ①）：不依赖复杂业务数据。
+        消费成功后回复构造失败/提交边界异常时**仍然短路**，绝不交回
+        原链路、绝不伪造超出「已确认选择」的内容。"""
+        if selected_name:
+            where = f"（{selected_city}）" if selected_city else ""
+            text = f"已确认您的选择：{selected_name}{where}。"
+        else:
+            text = "已确认您的选择，消歧完成。"
+        return answer_reply(session, text)
+
+    def _pending_reply(self, out, v, session, rt) -> Reply | None:
+        """§2.5 冻结接线表：verdict → 回复行为（九类逐一，不增不减）。
+
+        需要短路但无法按冻结格式构造内容（如 consume 成功但候选信息
+        缺失、duplicate 记录缺失）时抛异常，由 gate 按 B3 规则兜底——
+        绝不拼造数据、绝不伪造消费结果。"""
+        name = v.verdict
+        pid = v.pending_id
+        if name == V_CONSUME:
+            if out is not None and out.ok:
+                cand = getattr(out, "candidate", None)
+                cname = getattr(cand, "name", "") \
+                    if cand is not None else ""
+                ccity = getattr(cand, "city", None) \
+                    if cand is not None else None
+                if not cname:
+                    raise ValueError(
+                        "consume 成功但缺少候选信息，无法按冻结格式构造确认")
+                # 规则 7：只确认消歧，不产生行程动作
+                return answer_reply(
+                    session,
+                    f"已确认：{cname}" + (f"（{ccity}）" if ccity else "")
+                    + "。消歧完成，如需调整行程请直接告诉我。")
+            # 失败 → 不短路：降级进 shadow，交回原链路（不改选不伪造）
+            self._shadow_gate(rt, name, "consume_failed_not_shortcircuit",
+                              detail=str(getattr(out, "reason", "")),
+                              pending_id=pid)
+            return None
+        if name in (V_CANCEL_NEW_QUESTION, V_CANCEL_EXPLICIT,
+                    V_CANCEL_DEST_CHANGED):
+            # §2.5：cancel ok → 不短路（本轮按原链路处理新问题/取消/
+            # 改目的地）；失败同样不短路（保守交回原链路），仅记影子
+            if out is None or not getattr(out, "ok", False):
+                self._shadow_gate(rt, name, "cancel_not_ok",
+                                  detail=str(getattr(out, "reason", "")),
+                                  pending_id=pid)
+            return None
+        if name == V_EXPIRED_REPLY:
+            if out is not None and out.ok:
+                return answer_reply(session, _EXPIRED_NOTICE)
+            self._shadow_gate(rt, name, "expired_register_failed",
+                              detail=str(getattr(out, "reason", "")),
+                              pending_id=pid)
+            return None
+        if name == V_RESTATE:
+            p = rt.store.get_pending_by_id(pid or "")
+            if p is None or p.status != PENDING_OPEN:
+                self._shadow_gate(rt, name, "restate_snapshot_unavailable",
+                                  pending_id=pid)
+                return None            # 快照不可用 → 保守交回原链路
+            cands = sorted(p.candidates,
+                           key=lambda c: (c.display_order is None,
+                                          c.display_order))
+            lines = [f"{i}. {c.name}" + (f"（{c.city}）" if c.city else "")
+                     for i, c in enumerate(cands, 1)]
+            return answer_reply(session, "当前候选如下：\n"
+                                + "\n".join(lines) + "\n回复序号即可确认。")
+        if name == V_DUPLICATE_SELECT:
+            rec = rt.store._latest_consumption()   # 冻结七字段真实记录
+            if not rec or not rec.get("selected_name"):
+                self._shadow_gate(rt, name, "duplicate_record_missing",
+                                  pending_id=pid)
+                return None            # 无法引用真实记录 → 不拼造，交回原链路
+            city = rec.get("selected_city")
+            return answer_reply(session, "您刚刚已确认过「"
+                                + str(rec["selected_name"])
+                                + (f"（{city}）" if city else "")
+                                + "」，无需重复选择。")
+        return None                    # hand_back / none → 原链路（保守红线）
 
     # -------------------------------------------------- 调度入口
     def handle(self, session, utterance: str,

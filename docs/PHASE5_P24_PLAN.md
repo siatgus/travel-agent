@@ -606,3 +606,80 @@ cancel_* 成功后进入原链路、集成级故障注入（store 抛异常）�
 不创建 Pending；不接入生产者；不改 Handler；不改 P2.3
 evaluate/act 业务逻辑；`TRAVEL_PENDING_CHANNEL` 生产默认 0；
 TAKEOVER=0；不进 P2.5/P3。申请批准 P2.4b 开工。
+
+## 12. P2.4b 实施记录（按评审 CONDITIONAL PASS 交付）
+
+评审基线：2026-11-19 P2.4b 评审 CONDITIONAL PASS，B1–B12 约束与
+四项冻结异常边界。修改范围严格限于允许清单：`Orchestrator.
+_pending_gate`（观察模式退役为完整接管）+ 私有装配方法
+`_sync_active_hint` / `_pending_reply` + 静态辅助 `_store_status_safe`
+/ `_shadow_gate` / `_fallback_confirm_reply` + 专项测试 + 本记录。
+**禁止清单零触碰**：拦截器 evaluate/act、两个 store、
+PendingRuntimeManager（含 R1）、lease/淘汰/锁顺序、Handler、
+生产者、Pending 创建、TAKEOVER、开关默认值全部未动。
+
+### 12.1 四项冻结异常边界的落实
+
+1. **回复构造失败（B3）**：短路判定与回复构造解耦——gate 以
+   `migrated`（act 结果 ok 且 verdict 属迁移类）为短路决定性依据；
+   `_pending_reply` 构造异常时 migrated=True → `_fallback_confirm_reply`
+   兜底确认短路（不依赖业务数据、不伪造超出「已确认选择」的内容），
+   绝不撤销消费、绝不回退普通意图路由；migrated=False（零状态
+   verdict 构造失败）→ shadow 记录 + 保守交回原链路。
+2. **act 异常安全判定矩阵（B2/B4）**：act 抛异常 ≠ 一定未迁移，
+   gate 经 `_store_status_safe` 读取 store 实际状态后分支：
+   `consumed` → 兜底确认短路（提交边界异常下绝不交回原链路）；
+   `expired` → expired_reply 短路告知、其余 verdict 原链路；
+   `cancelled` → 原链路；`open` → 确认未迁移 → 安全失败原链路；
+   `None`（pending 不存在或状态查询失败，无法判定）→ 保守拦截
+   回复（既不伪造消费成功、也不交回原链路造成不确定状态下的重复
+   业务处理）+ hint 保留 + shadow 警告。测试覆盖 memory 与 SQLite
+   真实提交边界（super() 真实提交后再抛，非 mock act）。
+3. **shadow 双层隔离（B5）**：拦截器 shadow_sink 异常既有隔离
+   保留；装配层 `_shadow_gate` 记录自身吞掉一切异常；shadow 不
+   参与 verdict、不影响 lease 归还、不改变短路判定。
+4. **hint 同步（B6）**：`_sync_active_hint(session, verdict, migrated)`
+   以**真实迁移结果** `migrated` 为准（act 返回 ok 或 act 异常路径
+   经 store 状态确认），且 verdict 必须属 `_MIGRATING_VERDICTS`——
+   双条件缺一不可，绝不仅凭 verdict 类型清理。
+
+### 12.2 回复文案矩阵（装配层新增，全部只读引用冻结数据源）
+
+| 场景 | 文案数据来源 | 失败降级 |
+|---|---|---|
+| consume ok 确认 | out.candidate（name/city） | 信息缺失 → 抛出 → B3 兜底 |
+| expired 告知 | 固定文案（规则 5） | — |
+| restate 重述 | store 快照 display_order 排序 1..N | 快照不可用 → 原链路 |
+| duplicate 告知 | `_latest_consumption` 七字段真实记录 | 记录缺失 → 原链路（不拼造） |
+| 兜底确认（B3/B4） | 仅 selected_name/city（可选） | 恒可构造 |
+| 无法判定（B4） | 固定保守文案 | 恒可构造 |
+
+### 12.3 B1–B12 验收映射（全部有专项测试锁定）
+
+| 编号 | 落点（test_pending_channel.py） | 结果 |
+|---|---|---|
+| B1 | consume ok / 失败 / cancel×3 / expired / restate / hand_back / duplicate / none 全路径 | 通过 |
+| B2 | test_b2_act_exception_open_status（open → 安全降级） | 通过 |
+| B3 | test_b3_reply_construction_failure_still_shortcircuit（含非迁移分支） | 通过 |
+| B4 | test_b4_commit_boundary_exception（memory+SQLite 真实提交边界）+ test_b4_undeterminable_conservative | 通过 |
+| B5 | test_b5_shadow_sink_exception_isolated（sink + 装配层双层） | 通过 |
+| B6 | 各 verdict 测试内 hint 清空/保留断言（真实迁移结果键控） | 通过 |
+| B7 | test_b7_b8_real_handle_route_and_no_snatch（route/handled/history） | 通过 |
+| B8 | 同上（「排海贝皇大排档，第一个」不被下游 gate 抢答；无 pending 不误触发） | 通过 |
+| B9 | test_b9_cross_session_isolation_both_impls（memory+SQLite） | 通过 |
+| B10 | test_b10_channel0_bitwise_with_pending + 全量回归（channel=0） | 通过 |
+| B11 | R1 120 条并发/异常安全测试原样保留并通过 | 通过 |
+| B12 | 全量回归：pending 60 / sqlite 66 / interceptor 150 / decision 51 / adapter 32 / resolver 79 / corpus v4 50 / parser 62 / extractor 36 / dialog 244 / server 52 / conversations 21 全绿 | 通过 |
+
+### 12.4 测试结果与修正说明
+
+- test_pending_channel：92 → 120（R1）→ **202**（P2.4b），连续
+  三轮全绿；全量回归全绿。
+- 测试修正（均为测试脚本问题，非生产代码）：① none 场景修正——
+  open pending 下「你好」按 P2.3 冻结规则产出 cancel_new_question
+  （「你好」被解析为快照外新实体），none 改用已登记 expired 的
+  不可消费 pending 验证；② B4/B9 SQLite 子段补设 channel 环境
+  变量；③ B4「无法判定」桩改为仅第二次状态查询失败（evaluate
+  首查放行）。
+- 开关语义不变：`TRAVEL_PENDING_CHANNEL` 生产默认 0（默认旁路），
+  TAKEOVER=0，未新增开关。
