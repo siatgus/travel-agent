@@ -723,3 +723,59 @@ P2.4b 九类 verdict 接线与四项异常边界、两开关语义——全部�
 `TRAVEL_DECISION_TAKEOVER` 默认 0 且语义未动；未新增开关；TAKEOVER
 执行类接管语义逐位保持（TAKEOVER=1 时 decide 分支整体不进入）。
 P2.5b（重验证 + 回填 + AllowHandler 受控流转）未授权未实施。
+
+---
+
+## 13. P2.5a 验收关闭记录（2026-11-19 评审裁定）
+
+### 13.1 裁定结果
+
+**P2.5a：PASS，验收关闭。** 最终修正提交 `4a639a8`（R3 契约修正）。
+本裁定不构成 P2.5b 或 P3 的开发授权——下一阶段仍需单独提交申请
+与实施方案。
+
+| 项 | 状态 |
+|---|---|
+| P2.5a 生产侧（32b2e63 + 74754f1 + 4a639a8） | 验收通过，关闭 |
+| P2.5b 重验证侧 | 尚未授权启动 |
+| P3 | 未启动 |
+| TRAVEL_PENDING_CHANNEL | 0（不变） |
+| TRAVEL_PENDING_TAKEOVER / TRAVEL_DECISION_TAKEOVER | 0 / 0（不变） |
+
+### 13.2 验收过程（三轮）
+
+1. **初验（32b2e63）**：commit 身份/范围/冻结零触碰/测试证据摘要符合；
+   五 hunk 偏差待裁定 → 补交 1111 行完整 diff 与原始测试日志。
+2. **CONDITIONAL PASS #1（R2 = 74754f1）**：五个 orchestrator hunk
+   裁定接受——§10.5「三处以内」为 P2.5 全阶段逻辑触点约束（生产钩子
+   + 重验证接入 + AllowHandler 消费点），P2.5a 仅占用其一，P2.5b 配额
+   完整保留。孤儿补偿两缺口需修正：①reply_builder 返回 None 同视为
+   绑定失败进补偿矩阵；②保守回复不再依赖刚失败过的同一 builder。
+3. **CONDITIONAL PASS #2（R3 = 4a639a8）**：契约核验裁定——服务层
+   （Session.turn / server.py /api/chat）对 handle 返回值直接属性访问
+   reply.render/mode/plan/slots/turn_no/ask_rounds/assumptions/trace/
+   fetched 九类字段，纯字符串兜底违反返回类型契约；修正为
+   _conservative_reply 两层定版（builder 同源层 → 自建 Reply 终层，
+   mode="answer" 与 answer_reply 同款）+ 终层理论不可达失败以
+   PendingProduceError（携带孤儿 Pending ID）明确失败，绝不静默交回。
+
+### 13.3 最终验收清单（评审逐项裁定）
+
+None 返回触发孤儿补偿 ✓ / builder 异常触发孤儿补偿 ✓ / 取消失败后
+保守拦截 ✓ / 保守回复恒符合 Reply 类型契约 ✓ / 终层构造失败明确抛出
+PendingProduceError ✓ / 孤儿 Pending ID 可追踪（异常消息 + shadow_log
+双通道）✓ / 冻结文件零触碰（orchestrator 五 hunk 接受、decision 1 hunk、
+interceptor/runtime/pending/双 store/resolver/dialogue 零 diff）✓ /
+producer 专项 58/0 ×3、channel 专项 254/0 ×3 ✓ / 14 套件全量回归全绿 ✓
+
+**验收证据边界（评审声明）**：本次裁定基于提交方提供的原始代码、完整
+diff 与测试实跑报告完成静态复核；评审方未在仓库中独立执行 Git 命令
+或复现测试。
+
+### 13.4 修正提交链
+
+| commit | 内容 |
+|---|---|
+| `32b2e63` | P2.5a 生产侧实施（按 00880ed 批准范围，§12） |
+| `74754f1` | R2：孤儿补偿返回值缺口修正（None 视为绑定失败 + 保守回复独立构造路径） |
+| `4a639a8` | R3：Reply 类型契约定版（移除字符串兜底 + PendingProduceError 明确失败） |
