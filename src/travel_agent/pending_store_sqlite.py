@@ -478,11 +478,15 @@ class SQLitePendingStore:
                    revalidated_at=?
              WHERE pending_id=? AND session_id=? AND candidate_id=?
 
-        - rowcount == 1 → True；rowcount == 0（跨 session / 跨
-          pending / 候选不符 / 无消费记录）→ False，绝不当作成功；
+        - rowcount == 1 → **先校验后提交**：UPDATE 后先检查 rowcount，
+          恰等于 1 才 commit 并返回 True；rowcount == 0（跨 session /
+          跨 pending / 候选不符 / 无消费记录）或 **rowcount > 1（多行
+          命中，唯一命中校验失败）** → **rollback**（绝不把多行修改
+          提交进库）并返回 False，绝不当作成功；
         - revalidate_status 非四枚举合法值 → False（契约 6）；
-        - 任何 SQLite 异常 → False（契约 4：回填异常不抛出到业务
-          链路，不改已完成的消费结果）；
+        - **任何异常**（含非 SQLite 异常：时钟故障、连接关闭、任意
+          RuntimeError 等，契约 4：回填异常不抛出到业务链路，不改已
+          完成的消费结果）→ rollback（在事务防护内）+ False；
         - revalidated_at = INTEGER UTC epoch（self._now_epoch()，
           与 consumed_at 同源时钟，契约 5 时间语义逐位一致）。
         """
@@ -491,6 +495,11 @@ class SQLitePendingStore:
         con = None
         try:
             con = self._connect()
+            # 显式事务（与 _terminal_transition 同范式——连接为
+            # isolation_level=None 显式管理模式，裸 UPDATE 会即时
+            # 自动提交，rollback 无法撤销；必须 BEGIN 包住 UPDATE
+            # 才能实现「先校验 rowcount 后提交」的原子性）
+            con.execute("BEGIN IMMEDIATE")
             cur = con.execute(
                 "UPDATE pending_consumption"
                 "   SET revalidate_status = ?,"
@@ -501,18 +510,27 @@ class SQLitePendingStore:
                 (revalidate_status, revalidate_probe_status,
                  self._now_epoch(), pending_id, str(session_id),
                  candidate_id))
-            con.commit()
-            return cur.rowcount == 1
-        except sqlite3.Error:
+            # RV-02 修正（验收 2026-11-19）：先校验后提交——恰更新
+            # 一行才 COMMIT；0 行（未命中）或多行命中（唯一性被破坏）
+            # 一律 ROLLBACK，绝不把错误的多行修改落库后再返回 False
+            if cur.rowcount != 1:
+                self._rollback(con)
+                return False
+            con.execute("COMMIT")
+            return True
+        except Exception:
+            # RV-03 修正：不限于 sqlite3.Error——_now_epoch() 时钟
+            # 故障、connect/close 失败等任意异常一律不向业务层传播
+            # （契约 4）；事务若已开启则先回滚再返回 False
             if con is not None:
-                try:
-                    con.rollback()
-                except sqlite3.Error:
-                    pass
+                self._rollback(con)
             return False
         finally:
             if con is not None:
-                con.close()
+                try:
+                    con.close()
+                except Exception:
+                    pass
 
     # -------------------------------------------------- ④⑤ cancel / expire
 

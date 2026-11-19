@@ -394,13 +394,16 @@ class PendingStore:
         """重验证结果回填（§10.1 D3 修订六契约）。
 
         - **条件更新**：按 pending_id+candidate_id 定位**既有**消费
-          记录（session_id 还须与本 store 会话一致），命中恰一条才写
-          三列并返回 True；绝不插入新记录；
+          记录（session_id 还须与本 store 会话一致），**命中恰一条**
+          才写三列并返回 True；命中 0 条或 **多条**（唯一命中校验，
+          与 SQLite rowcount==1 契约逐位对齐——多条命中绝不改写任何
+          记录）→ False，不写任何数据；
         - 未命中（跨 session / 跨 pending / 候选不符 / 无消费记录）
           → False，不写任何数据；
         - revalidate_status 非四枚举合法值 → False（契约 6：绝不把
           异常/未探测伪装成业务结果）；
-        - 任何异常 → False（回填失败不抛出到业务链路，契约 4）；
+        - 任何异常（含 _epoch(self._now()) 时钟故障）→ False（回填
+          失败不抛出到业务链路，契约 4）；
         - revalidated_at = INTEGER UTC epoch（与 consumed_at 同源时钟，
           契约 5 时间语义逐位一致）。
         """
@@ -408,16 +411,23 @@ class PendingStore:
             if revalidate_status not in REVALIDATE_STATUSES:
                 return False
             with self._lock:
-                for rec in reversed(self._consumptions):
-                    if (rec.get("pending_id") == pending_id
+                hits = [rec for rec in self._consumptions
+                        if (rec.get("pending_id") == pending_id
                             and rec.get("candidate_id") == candidate_id
-                            and rec.get("session_id") == str(session_id)):
-                        rec["revalidate_status"] = revalidate_status
-                        rec["revalidate_probe_status"] = \
-                            revalidate_probe_status
-                        rec["revalidated_at"] = _epoch(self._now())
-                        return True
-                return False
+                            and rec.get("session_id")
+                            == str(session_id))]
+                if len(hits) != 1:      # 0 条 / 多条 → 一律不写
+                    return False
+                rec = hits[0]
+                # 唯一可失败步骤（时钟/epoch）提前到任何写入之前——
+                # 异常时三列零写入（契约 4 半成功防线，与 consume
+                # 前置段同范式：先算后写，绝不先改再算）
+                ts = _epoch(self._now())
+                rec["revalidate_status"] = revalidate_status
+                rec["revalidate_probe_status"] = \
+                    revalidate_probe_status
+                rec["revalidated_at"] = ts
+                return True
         except Exception:
             return False
 

@@ -2195,10 +2195,14 @@ def test_p25b_a6_a7_unverified_rejected() -> None:
         orc2, s2, store2, p2 = _preset_orc("s-a7", lambda: datetime(2026, 11, 19, 10, 0, 0))
         calls2 = _count_answers(s2)
         r2 = orc2.handle(s2, "第1个")
-        check("[A7] 规定话术 + 保留原始表达",
+        check("[A7] 规定话术 + 保留原始表达（RV-08 强化：原始问句与"
+              "候选名分别出现且二者不同）",
               orc2.last_ctx.route == "pending_consume"
               and "规定数据源与检索范围内没有找到" in str(r2)
-              and "海贝皇大排档（南京店）" in str(r2), str(r2))
+              and "哪家海贝皇大排档好" in str(r2)
+              and "海贝皇大排档（南京店）" in str(r2)
+              and "哪家海贝皇大排档好" != "海贝皇大排档（南京店）",
+              str(r2))
         check("[A7/F1] Handler 调用 0 次 + 原 Pending consumed",
               calls2["n"] == 0
               and store2.get_pending_by_id(p2.pending_id).status

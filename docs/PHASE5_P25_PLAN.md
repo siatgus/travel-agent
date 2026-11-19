@@ -1006,3 +1006,163 @@ producer 零触碰（git diff 复核为空）；P2.6 与 P3 未授权未实施�
 store 新方法独立；orchestrator 触点集中在 V_CONSUME ok 分支与 1.77
 调用块；context.py 三字段默认 None 无行为耦合；测试扩展独立段落。
 运行时回退：channel=0 即整体旁路。
+
+## 16. P2.5b-R1 修复记录（验收 FAIL 2026-11-19 的整改，待复审）
+
+> 评审裁定（2026-11-19）：P2.5b 当前代码验收 **FAIL**，不归档 PASS；
+> 设计批准保持有效；P2.6/P3 未授权；三开关保持关闭。修复严格限定
+> 在已批准范围内，冻结模块（Resolver/Handler/interceptor/runtime/
+> decision.py）零修改（git diff 复核为空）。
+
+### 16.1 P0 缺陷修复（回填双实现）
+
+**RV-01 内存 Store（pending.py record_revalidation）**
+- **唯一命中校验**：原实现 `for ... reversed` 命中即写（多条命中时
+  只改最后一条并返回 True）→ 改为统计命中数，`len(hits) != 1`
+  （0 条或多条）一律 False 零写入，与 SQLite rowcount==1 唯一性
+  语义逐位对齐；
+- **半成功防线**：测试暴露 `_epoch(self._now())` 在写入
+  revalidate_status/probe_status 之后执行，时钟异常时前两列已被
+  改写（违反契约 4「异常零写入」）→ 唯一可失败步骤提前到任何写入
+  之前（先算后写，与 consume_pending 前置段同范式）；
+- **异常返回 False**：复核确认当前提交（1fce3f3）已有整体
+  `except Exception → False`（pending.py 原 407–422 行），裁定中
+  「异常直接抛出」基于的早期 diff 版本与最终提交不一致，本项在
+  修复前已满足，专项测试（时钟 RuntimeError 注入）在 1fce3f3 与
+  本修复提交下均通过。
+
+**RV-02 SQLite Store 提交顺序（pending_store_sqlite.py）**
+- 原实现 `con.commit()` 后才 `return cur.rowcount == 1`：多行命中
+  时两行已修改且已提交、最后才返回 False——数据被错误落库；
+- 修正为**先校验后提交**：`BEGIN IMMEDIATE`（与
+  `_terminal_transition` 同范式；连接 isolation_level=None 显式
+  事务模式，裸 UPDATE 会即时自动提交，rollback 无法撤销——故必须
+  显式 BEGIN 包住 UPDATE）→ UPDATE → `rowcount != 1`（0 行或多行）
+  → `ROLLBACK` + False；恰一行 → `COMMIT` + True；
+- 新增专项测试：无 PK 测试 schema 造双行同键记录 → False 且两行
+  三列保持 NULL（全部回滚）；恢复唯一后 True 正常落库。生产 DDL
+  以 pending_id 为 PRIMARY KEY，正常链路不可能多行命中——本测试
+  证明防线在唯一性被破坏的历史库上依然生效。
+
+**RV-03 SQLite 异常边界**
+- `except sqlite3.Error` → `except Exception`（含 _now_epoch 时钟
+  故障、连接层任意 RuntimeError 等，契约 4 不向业务层传播）；
+- 事务中途异常（UPDATE 已执行、事务已开启）→ `self._rollback(con)`
+  撤销已修改行（复用既有 `_rollback` 静态助手）再返回 False；
+- 新增专项测试三类：时钟 RuntimeError → False 三列 NULL；连接层
+  RuntimeError → False；UPDATE 后注入异常（事务已开启）→ 已修改
+  行被 ROLLBACK（三列 NULL，绝不半成功提交）。
+
+### 16.2 P1 修复与证据（RV-04/05/06/07/08）
+
+**RV-04/RV-08 rejected 保留原始表达（pending_revalidator.py）**
+- 原实现 `_REJECTED_TMPL.format(name=candidate_name)`，
+  original_utterance 未传入 rejected 分支——与 §4.3/A7 冻结口径
+  「按『规定数据源与检索范围内没有找到』话术回复，保留原始表达」
+  不符；
+- 修正：`_branch_rejected` 增加 `original_utterance` 参数（取自
+  原 Pending 快照，消费成功前必非空；空值降级为仅候选名形式），
+  话术改为「在规定数据源与检索范围内没有找到与您的问题
+  「{utterance}」对应的「{name}」。」——原始问句为句子主体，
+  候选名附带说明；
+- 测试修正（A7/RV-08）：原始问句「哪家海贝皇大排档好」与候选名
+  「海贝皇大排档（南京店）」天然不同，断言二者**分别出现**且原始
+  问句先于候选名（不再是只证明候选名保留的弱断言）。
+
+**RV-05 LLM city hints 辅助语义（对照 HC-1 原文）**
+- 批准原文（§1.3）：「用户明确 query_city（可参与判定）＞ LLM
+  city_hints（仅辅助线索，不得升级为用户明确指定）＞ destination
+  （规划目的地，LLM 提示绝不覆盖）」；§10.3 表格同口径。
+- 当前实现（pending_revalidator.py ② 段）：hints 仅清洗后记录进
+  shadow（`hints=...（仅辅助不入期望城市）`），**不参与
+  effective_city 构建**（query_city ＞ destination ＞ ""），不传入
+  resolve ctx。定位：**只记录、不参与任何判定输入**。
+- 依据：EntityResolver 冻结（§10.5：「若 HC-1 上下文传递需最小
+  适配点，先在设计中列明再单独评审，不得擅改」）——resolve() 无
+  hints 入参，未经评审授权不得新增传参通道；G3 测试已锁定「hint
+  仅辅助不得升级」。此为保守实现，若评审裁定 hints 须以某种非权威
+  形式参与判定，需先批 Resolver 适配点，不在本轮修复范围。
+
+**RV-06 entity_type="unknown" 检索范围（entity_resolver.py 证据，
+冻结模块只读核验）**
+- `resolve()` 入口（entity_resolver.py:363）：
+  `etype = c.get("entity_type") or "unknown"`——unknown 是**缺省
+  兜底值**，所有未标注类型的候选（含生产链路 parse 产出）同此
+  处理，非重验证专属特殊类型；
+- 检索范围不受 unknown 影响：KB 匹配（:377–381）按 name 精确/
+  双向包含检索，`idx.get(name)` / `_partial_hits(name, idx)` 与
+  entity_type 无关；在线探测（:218–219）
+  `kind = {"restaurant": ..., "hotel": ...}.get(entity_type,
+  "attraction")`——unknown 落 **attraction（find_spot 泛检索）**，
+  是最宽的默认分支，只选择探测 API 变体、不缩小范围；
+- skip 条件（:366）仅对 `etype in ("category", "city")` 生效，
+  unknown 走完整验证管线。结论：unknown 不会意外缩小或改变检索
+  范围。
+
+**RV-07 `_answer()` 到 Handler 的完整调用链（P1-7 证据）**
+```
+orchestrator 步骤 1.77（orchestrator.py:587）
+  → _allow_handler_consume（:401–462）：五条件 AND 全过
+    → session._answer(kind="poi", orig_ut)（:452）
+      → dialogue.py:419–430 Session._answer：委托
+        QA_HANDLERS[kind].handle(session, utterance)
+        （handlers/__init__.py:35–42：QA_HANDLERS["poi"]=POIHandler）
+      → poi_handler.py:76–88 POIHandler.handle：
+        city = resolve_city(session, utterance)
+              （_base.py:6–14：本句城市 > slots.destination
+                > last_city > trip_dest）
+        → intent.refine_intent(utterance, city) 细分路由
+        → 各细分 Handler.handle(session, city, utterance)
+          → Session._*_answer（复用既有业务方法，KB/真实工具）
+```
+- **如实语义声明**：fresh DecisionResult 在本链路中的作用是
+  （a）五条件放行判定（:428–437）与（b）kind 选择
+  （`_QUERY_INTENT_KIND[decision.intent]`，:440–441）；其 entity
+  字段**未注入** Handler 执行——业务执行按批准设计（§4.4 方案甲
+  「Handler 零改动」「不新增任何 Handler 接口」；§9.4 冻结结构
+  「每个分支入口先看接入点 A 是否给出 DecisionResult：给了且
+  action=execute → 走该 Handler 受控链路」）经既有入口重走
+  Handler 链。即 DecisionResult 是**授权与选链依据**，不是向
+  Handler 传数据的载体——这与 §9.4 原文「走该 Handler」字面一致；
+  裁定所指「Handler 真正使用 fresh entity / 没有重新解析」在当前
+  批准设计下**不可成立**（Handler 冻结、接口不新增），残留风险
+  如实申报：业务执行基于原 utterance 重解析，其结果与 fresh
+  confirmed 实体可能不一致（同一 utterance + 既有链路，理论一致
+  但无强约束）。若评审裁定须把 fresh entity 注入执行依据，属
+  Handler 接口变更，需单独评审授权，不在本轮修复范围。
+
+### 16.3 P2 复核项证据
+
+- **Context 生命周期**：ctx 每轮新建（_turn_impl 内构造），
+  pending_decision/source/utterance 三载体仅在触点 1（步骤 1.75
+  内 consume-ok 分支）写入、仅触点 2（步骤 1.77）读取；gate 短路
+  轮（返回 Reply）直接 return，ctx 不跨轮存活，无泄漏路径；
+- **DEFAULT_BATCHES 成员与映射**：decision.py:66
+  `DEFAULT_BATCHES = ("poi_query", "poi_qa", "poi_location_query")`
+  （冻结值）；orchestrator.py:65
+  `_QUERY_INTENT_KIND = {b: "poi" for b in DEFAULT_BATCHES}` →
+  QA_HANDLERS["poi"] = POIHandler（handlers/__init__.py:37）→
+  POIHandler.handle 链（见 16.2 RV-07 调用链），规划类
+  （plan_*）不在 DEFAULT_BATCHES，永不放行（④ 条件）；
+- **Orchestrator 逻辑触点计数**：本轮修复 orchestrator.py 零 diff
+  ——仍为批准的两处：触点 1 = consume-ok 分支调
+  `_revalidate_after_consume`（:263），触点 2 = 步骤 1.77 调
+  `_allow_handler_consume`（:587）。§10.5 配额不变。
+
+### 16.4 验证结果
+
+- test_pending_revalidator.py：71 → **78** 断言（+RV-04 双出现/
+  顺序断言 2、+RV-01 内存唯一命中/恢复/时钟故障 6）；
+- test_pending_sqlite.py：85 → **94** 断言（+RV-02 多行命中回滚/
+  恢复唯一/恢复落库 3、+RV-03 时钟/连接层/事务中途异常 6）；
+- test_pending_channel.py：308 不变（A7 集成断言同步强化为 RV-08
+  口径——原始问句「哪家海贝皇大排档好」与候选名分别断言；仅加强
+  条件，未放宽任何既有断言）；
+- x3 连续全绿 + 全量回归 17 套件全绿（pending 60 / producer 58 /
+  revalidator 78 / sqlite 94 / channel 308 / interceptor 150 /
+  decision / orchestrator 33 / routing 49 / reply 28 / resolver /
+  corpus v4 / parser 62 / extractor 36 / dialog 244 / server 52 /
+  conversations 21）；
+- 冻结零触碰：decision.py / interceptor / runtime / resolver /
+  Handler / dialogue / producer / **orchestrator** diff 为空；
+- 开关保持 0/0/0；P2.6 / P3 未授权未实施。

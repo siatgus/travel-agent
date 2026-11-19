@@ -519,10 +519,17 @@ def test_branch_unverified_and_rejected() -> None:
                         resolver=lambda cands, ctx=None, **kw:
                             ResolveResult(resolved=[rejected_rc]),
                         reply_builder=rb()[0])
-    check("[rejected] 规定话术 + 保留原始表达",
+    check("[rejected] 规定话术 + 保留原始表达（RV-04/RV-08：原始问句"
+          "与候选名均出现，且二者不同）",
           o2.status == "rejected" and o2.reply is not None
           and "规定数据源与检索范围内没有找到" in str(o2.reply)
-          and name2 in str(o2.reply), str(o2.reply))
+          and "哪家海贝皇大排档好" in str(o2.reply)
+          and name2 in str(o2.reply)
+          and "哪家海贝皇大排档好" != name2, str(o2.reply))
+    check("[rejected] 原始问句先于候选名出现（保留原始表达为句子主体）",
+          str(o2.reply).find("哪家海贝皇大排档好") >= 0
+          and str(o2.reply).find("哪家海贝皇大排档好")
+          < str(o2.reply).find(name2), str(o2.reply))
     check("[rejected] 回填 rejected + probe 溯源",
           st2._latest_consumption()["revalidate_status"] == "rejected"
           and st2._latest_consumption()["revalidate_probe_status"]
@@ -619,6 +626,53 @@ def test_backfill_six_contracts() -> None:
           and rec6["revalidated_at"] is None, str(rec6))
 
 
+def test_backfill_memory_unique_match_and_clock_fault() -> None:
+    """RV-01 修正验收（内存 Store）：唯一命中校验 + 时钟异常返回
+    False 不向业务层传播（契约 4）+ 与 SQLite 唯一性语义逐位对齐。"""
+    # ① 多条命中（唯一性被破坏）→ False，任何记录都不改写
+    stm = PendingStore(session_id="s-rv1", now=fixed_clock())
+    pm = stm.create_pending("哪家海贝皇大排档好", "poi_query", "query", SNAP)
+    stm.consume_pending(pm.pending_id, "c1")
+    # 人为复制一条同键消费记录（模拟历史数据唯一性破坏）
+    dup = dict(stm._latest_consumption())
+    stm._consumptions.append(dup)
+    before = [dict(r) for r in stm._consumptions]
+    okm = stm.record_revalidation("s-rv1", pm.pending_id, "c1",
+                                  "confirmed", "not_applicable")
+    check("[RV-01] 内存多条命中 → False（绝不改写）", okm is False,
+          str(okm))
+    check("[RV-01] 多条命中时记录逐位零变化",
+          [dict(r) for r in stm._consumptions] == before, "")
+    # ② 修复唯一性后（删除重复条）→ 恰一条命中 → True
+    stm._consumptions.pop()
+    okm2 = stm.record_revalidation("s-rv1", pm.pending_id, "c1",
+                                   "confirmed", "not_applicable")
+    check("[RV-01] 恢复唯一命中 → True",
+          okm2 is True
+          and stm._latest_consumption()["revalidate_status"]
+          == "confirmed", str(okm2))
+    # ③ 时钟故障注入（非异常传播路径）→ False，不抛出到业务层
+    stm2 = PendingStore(session_id="s-rv2", now=fixed_clock())
+    pm2 = stm2.create_pending("哪家海贝皇大排档好", "poi_query",
+                              "query", SNAP)
+    stm2.consume_pending(pm2.pending_id, "c1")
+
+    def boom_now():
+        raise RuntimeError("注入：时钟故障")
+    stm2._now = boom_now
+    okf = stm2.record_revalidation("s-rv2", pm2.pending_id, "c1",
+                                   "confirmed", "not_applicable")
+    check("[RV-01] 时钟异常 → False（契约 4：不抛出到业务）",
+          okf is False, repr(okf))
+    recf = stm2._latest_consumption()
+    check("[RV-01] 时钟异常 → 三列零写入（revalidate_status NULL）",
+          recf["revalidate_status"] is None
+          and recf["revalidated_at"] is None, str(recf))
+    check("[RV-01] 消费结果不被时钟异常撤销",
+          stm2.get_pending_by_id(pm2.pending_id).status == "consumed",
+          "")
+
+
 def test_f4_backfill_business_separation() -> None:
     """F4：回填失败与业务流分离——不改变四分支结果、无重复消费。"""
     kb = [kbrow("南京", "海贝皇大排档（南京店）", source="e-nj")]
@@ -674,6 +728,7 @@ def main() -> int:
     test_branch_ambiguous_rebuild_failure()
     test_branch_unverified_and_rejected()
     test_backfill_six_contracts()
+    test_backfill_memory_unique_match_and_clock_fault()
     test_f4_backfill_business_separation()
     print(f"\npending revalidator P2.5b: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

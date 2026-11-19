@@ -56,8 +56,13 @@ _PLAN_PREFIX = "plan"
 _CONSERVATIVE_TMPL = ("暂时查不到「{name}」的可靠信息，"
                       "您可以告诉我它所在的城市或更具体的位置，"
                       "我再帮您确认。")
-# rejected 规定话术（保留用户原始表达）
-_REJECTED_TMPL = "在规定数据源与检索范围内没有找到「{name}」。"
+# rejected 规定话术（§4.3/A7 冻结口径：保留用户原始表达——原始
+# 问句为句子主体，候选名附带说明，二者不等价，测试须分别断言）
+_REJECTED_TMPL = ("在规定数据源与检索范围内没有找到与您的问题"
+                  "「{utterance}」对应的「{name}」。")
+# 原始问句不可用时（理论不可达：original_utterance 来自原 Pending
+# 快照，消费成功前必非空）的降级形式——仍不引入未证实表述
+_REJECTED_NO_UTT_TMPL = "在规定数据源与检索范围内没有找到「{name}」。"
 # ambiguous 重建失败（规则 8 撞车 / store 异常）的保守重试话术
 # （§4.3：不覆盖、不轮换、不静默、绝不伪装成 confirmed）
 _RETRY_NOTICE = ("系统暂时无法完成重新确认，请稍后重试；"
@@ -304,9 +309,10 @@ class PendingRevalidator:
                 backfill_ok=backfill_ok)
         # STATUS_REJECTED
         return self._branch_rejected(
-            candidate_name, probe_status=probe_status,
-            reply_builder=reply_builder, backfill_ok=backfill_ok,
-            pending_id=pending_id, candidate_id=candidate_id)
+            candidate_name, original_utterance=original_utterance,
+            probe_status=probe_status, reply_builder=reply_builder,
+            backfill_ok=backfill_ok, pending_id=pending_id,
+            candidate_id=candidate_id)
 
     # -------------------------------------------------- 分支实现
 
@@ -409,11 +415,17 @@ class PendingRevalidator:
                                    candidate_id, probe_status,
                                    backfill_ok, detail="新 Pending 创建未成功")
 
-    def _branch_rejected(self, candidate_name, *, probe_status,
-                         reply_builder, backfill_ok, pending_id,
-                         candidate_id) -> RevalidationOutcome:
-        """rejected：规定话术（保留用户原始表达），不执行 Handler。"""
-        text = _REJECTED_TMPL.format(name=candidate_name)
+    def _branch_rejected(self, candidate_name, *, original_utterance,
+                         probe_status, reply_builder, backfill_ok,
+                         pending_id, candidate_id) -> RevalidationOutcome:
+        """rejected：规定话术（保留用户原始表达——§4.3/A7 冻结口径，
+        原始问句与候选名均出现在回复中），不执行 Handler。"""
+        ut = str(original_utterance or "").strip()
+        if ut:
+            text = _REJECTED_TMPL.format(name=candidate_name,
+                                         utterance=ut)
+        else:
+            text = _REJECTED_NO_UTT_TMPL.format(name=candidate_name)
         reply = reply_builder(text) if reply_builder is not None else text
         self._shadow("revalidate_rejected_reply",
                      detail=f"probe={probe_status}（cross_source_empty 溯源）",

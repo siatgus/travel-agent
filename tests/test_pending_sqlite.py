@@ -631,6 +631,163 @@ def test_revalidation_backfill_parity() -> None:
           f"mem={m}\nsql={s}")
 
 
+def test_revalidation_sqlite_multirow_and_non_sqlite_fault() -> None:
+    """RV-02/RV-03 修正验收（验收 2026-11-19）：
+
+    - RV-02：多行命中（唯一性被破坏的历史库）→ 先校验后提交——
+      ROLLBACK 全部撤销，两行三列保持 NULL，返回 False，绝不把多行
+      修改落库；
+    - RV-03：非 sqlite3 异常（时钟故障 RuntimeError / 连接层任意
+      异常）一律 False 不向业务层传播；
+    - 事务中途异常（UPDATE 已执行、事务已开启）→ ROLLBACK 撤销已
+      修改行，绝不半成功提交（先校验后提交的事务纪律）。"""
+    clock, _ = fixed_clock(datetime(2026, 11, 18, 17, 0, 0))
+
+    # ---- ① RV-02：多行命中 → False + 全部回滚 ----
+    #  生产 DDL 以 pending_id 为 PRIMARY KEY（唯一性由 schema 保证，
+    #  正常链路不可能多行命中）；本测试用无 PK 的测试 schema 模拟
+    #  「历史数据唯一性被破坏」场景，验证 store 层防线仍然生效。
+    db = temp_db()
+    st = SQLitePendingStore("s-mr", db_path=db, now=clock)
+    con = sqlite3.connect(db)
+    try:
+        con.executescript("""
+            DROP TABLE pending_consumption;
+            CREATE TABLE pending_consumption (
+                pending_id              TEXT,
+                session_id              TEXT,
+                candidate_id            TEXT,
+                consumed_at             INTEGER,
+                original_intent         TEXT,
+                selected_name           TEXT,
+                selected_city           TEXT,
+                revalidate_status       TEXT,
+                revalidate_probe_status TEXT,
+                revalidated_at          INTEGER);
+            INSERT INTO pending_consumption VALUES
+              ('p-mr','s-mr','c1',1000,'poi_query',
+               '海贝皇大排档（南京店）','南京',NULL,NULL,NULL),
+              ('p-mr','s-mr','c1',2000,'poi_query',
+               '海贝皇大排档（南京店）','南京',NULL,NULL,NULL);
+        """)
+        con.commit()
+    finally:
+        con.close()
+    ok2 = st.record_revalidation("s-mr", "p-mr", "c1", "confirmed",
+                                 "not_applicable")
+    check("[RV-02] 多行命中 → False（绝不当作成功）", ok2 is False,
+          str(ok2))
+    rows = raw_consumptions(db, "p-mr")
+    check("[RV-02] 多行命中 → 两行全部回滚（三列保持 NULL）",
+          len(rows) == 2
+          and all(r["revalidate_status"] is None
+                  and r["revalidate_probe_status"] is None
+                  and r["revalidated_at"] is None for r in rows),
+          str([dict(r) for r in rows]))
+    # 修复唯一性（只留一行）→ 恰一行命中 → True 正常提交
+    con = sqlite3.connect(db)
+    try:
+        con.execute("DELETE FROM pending_consumption"
+                    " WHERE consumed_at = 2000")
+        con.commit()
+    finally:
+        con.close()
+    ok2b = st.record_revalidation("s-mr", "p-mr", "c1", "confirmed",
+                                  "not_applicable")
+    rows2 = raw_consumptions(db, "p-mr")
+    check("[RV-02] 恢复唯一命中 → True + 三列落库",
+          ok2b is True and len(rows2) == 1
+          and rows2[0]["revalidate_status"] == "confirmed"
+          and isinstance(rows2[0]["revalidated_at"], int),
+          str([dict(r) for r in rows2]))
+
+    # ---- ② RV-03：非 sqlite3 异常一律 False（契约 4）----
+    st3 = SQLitePendingStore("s-mr3", db_path=temp_db(), now=clock)
+    p3 = st3.create_pending("排海贝皇大排档", "poi_query", "query", SNAP)
+    out3 = st3.consume_pending(p3.pending_id, "c1")
+    check("[RV-03] 前置消费成功", out3.ok, str(out3))
+    orig_epoch = st3._now_epoch
+
+    def boom_epoch():
+        raise RuntimeError("注入：时钟故障（非 sqlite3.Error）")
+    st3._now_epoch = boom_epoch
+    oke = None
+    try:
+        oke = st3.record_revalidation("s-mr3", p3.pending_id, "c1",
+                                      "confirmed", None)
+    except Exception as e:
+        check("[RV-03] 时钟异常被吞（不抛出到业务）", False, str(e))
+    finally:
+        st3._now_epoch = orig_epoch
+    check("[RV-03] 非 sqlite3 异常（时钟故障）→ False",
+          oke is False, repr(oke))
+    r3 = raw_consumptions(st3._db, p3.pending_id)
+    check("[RV-03] 时钟异常 → 三列零写入",
+          len(r3) == 1 and r3[0]["revalidate_status"] is None
+          and r3[0]["revalidated_at"] is None,
+          str([dict(x) for x in r3]))
+
+    orig_connect = st3._connect
+
+    def boom_connect():
+        raise RuntimeError("注入：连接层故障（非 sqlite3.Error）")
+    st3._connect = boom_connect
+    okc = None
+    try:
+        okc = st3.record_revalidation("s-mr3", p3.pending_id, "c1",
+                                      "unverified", None)
+    except Exception as e:
+        check("[RV-03] 连接层异常被吞（不抛出到业务）", False, str(e))
+    finally:
+        st3._connect = orig_connect
+    check("[RV-03] 非 sqlite3 异常（连接层）→ False", okc is False,
+          repr(okc))
+
+    # ---- ③ 事务中途异常 → ROLLBACK 撤销已修改行（绝不半成功）----
+    class BoomMidTxnCon:
+        """UPDATE 执行成功后抛非 sqlite3 异常（事务已开启）。"""
+        def __init__(self, real):
+            self._real = real
+        def execute(self, sql, params=None):
+            cur = self._real.execute(sql, params) if params is not None \
+                else self._real.execute(sql)
+            if sql.lstrip().upper().startswith("UPDATE"):
+                raise RuntimeError("注入：UPDATE 后异常")
+            return cur
+        def execute_implicit(self, sql):        # BEGIN/COMMIT 透传
+            return self._real.execute(sql)
+        def close(self):
+            self._real.close()
+
+    st4 = SQLitePendingStore("s-mr4", db_path=temp_db(), now=clock)
+    p4 = st4.create_pending("排海贝皇大排档", "poi_query", "query", SNAP)
+    st4.consume_pending(p4.pending_id, "c1")
+    real_conn = sqlite3.connect(st4._db, timeout=10.0,
+                                isolation_level=None)
+    real_conn.row_factory = sqlite3.Row
+    st4._connect = lambda: BoomMidTxnCon(real_conn)
+    okm = None
+    try:
+        okm = st4.record_revalidation("s-mr4", p4.pending_id, "c1",
+                                      "confirmed", None)
+    except Exception as e:
+        check("[RV-03] 事务中途异常被吞（不抛出到业务）", False, str(e))
+    finally:
+        st4._connect = orig_connect
+        try:
+            real_conn.close()
+        except Exception:
+            pass
+    check("[RV-03] 事务中途异常 → False", okm is False, repr(okm))
+    r4 = raw_consumptions(st4._db, p4.pending_id)
+    check("[RV-03] 事务中途异常 → 已修改行被 ROLLBACK（三列 NULL，"
+          "绝不半成功提交）",
+          len(r4) == 1 and r4[0]["revalidate_status"] is None
+          and r4[0]["revalidate_probe_status"] is None
+          and r4[0]["revalidated_at"] is None,
+          str([dict(x) for x in r4]))
+
+
 def main() -> int:
     for fn in (test_time_contract_and_schema,
                test_parity_memory_vs_sqlite,
@@ -643,7 +800,8 @@ def main() -> int:
                test_expiry_boundary_epoch_compare,
                test_latest_consumption_parity,
                test_expiry_boundary_and_fail_closed,
-               test_revalidation_backfill_parity):
+               test_revalidation_backfill_parity,
+               test_revalidation_sqlite_multirow_and_non_sqlite_fault):
         fn()
     print(f"\npending sqlite store: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
