@@ -526,3 +526,83 @@ P2.4b 待 P2.4a 独立验收通过后另行申请。
    保留态/淘汰同输入同时间边界对拍、真实 handle 集成）；全量回归
    pending 60 / sqlite 66 / interceptor 150 / decision 51 / adapter 32 /
    resolver 79 / corpus v4 50 / parser 62 / extractor 36 全绿。
+
+## 10.1 P2.4a 最终验收（阶段关闭）
+
+- 交付：3fb910b（装配层）+ 5966d02（R1 补丁）。**最终验收通过，
+  P2.4a 正式关闭**（评审 2026-11-19 裁定）。
+- R1 补丁内容（评审两项阻断项）：① acquire/release 异常安全——
+  时钟换算先于任何租约状态变更（fail-before-mutate 同源原则），
+  acquire 增量后 try/except 计数回滚（同锁内无并发归还、绝不与
+  正常 release 重复），`_evict_locked` 增可选 now_e 参数；② 真实
+  线程并发测试（§4.5.4 落地为真 threading）：Barrier 持 lease 阻止
+  淘汰（测试 A）、多 worker + 独立淘汰线程交错压力（测试 B）、
+  真实 gate 异常路径 lease 归还（测试 C）、时钟注入三路径专项。
+  channel 92→120，连续 5 轮全绿；全量回归全绿。
+- 遗留登记（非阻断，后续配置健壮性事项）：`reselect_window_seconds()`
+  解析失败回落默认 600，P2.3 拦截器 `__init__` 解析失败抛
+  ValueError——两处为冻结边界内的既存差异，未来允许修改 P2.3
+  冻结代码时由拦截器复用统一读取口消除。
+
+## 11. P2.4b 开工申请（verdict 回复与消费行为）
+
+依据 §8 验收边界「P2.4a 通过后才能申请 P2.4b」提交本申请。
+设计基线 = r5（c9ead95）既有冻结条款，无新增设计、无推翻项。
+
+### 11.1 范围（严格限于装配层激活）
+
+P2.4a 观察模式gate（evaluate → 一律 None）补全为 §2.1 伪码的
+完整形态：evaluate → act → `_sync_active_hint` → `_pending_reply`。
+新增实现集中在 `Orchestrator._pending_gate` 与两个私有方法；
+**拦截器 evaluate/act 业务逻辑、两个 store、Runtime Manager
+（含 R1 异常安全）、Handler、生产者全部零修改**。
+
+### 11.2 冻结接线表（= §2.5，逐行重申不增不减）
+
+| verdict | act 结果 | 行为 |
+|---|---|---|
+| consume | ok | 短路：消费确认（引用 selected_name/城市；规则 7 只确认消歧、不产生行程动作） |
+| consume | 失败 | **不短路**：失败原因降级进 shadow log，交回原链路（不改选、不伪造成功） |
+| act 抛异常 | — | **不短路**：异常降级进 shadow log，交回原链路（等同失败路径） |
+| cancel_new_question / cancel_explicit / cancel_destination_changed | ok | 不短路：pending 已取消，本轮按原链路处理 |
+| expired_reply | ok | 短路：如实告知已过期（规则 5），提示重新提问 |
+| restate | 零状态变化 | 短路：重述候选列表（快照冻结顺序 1..N） |
+| hand_back | 零状态变化 | **不短路**：交回原链路（保守红线） |
+| duplicate_select | 零状态变化 | 短路：告知已确认过（引用 `_latest_consumption` 七字段） |
+| none | — | 不短路 |
+
+### 11.3 hint 同步（= §3.3，冻结）
+
+gate 在 act 之后执行：consume / cancel_* / expired_reply **终态迁移
+成功** → `session.active_pending_id = None`；失败或零状态变化
+verdict → 保留。过期 Pending ID 不因 get_active_pending() 返回
+None 而丢弃。
+
+### 11.4 短路回复落点（复用 P2.4a 已就位结构，零结构改动）
+
+`Orchestrator.handle` 步骤 1.75 的 gated 分支（history 追加 agent
+消息、`ctx.route="pending_consume"`、`ctx.handled=True`）在 P2.4a
+已实现但因 gated 恒 None 未激活；P2.4b 仅激活之，原链路步骤 2~7
+一行不改。
+
+### 11.5 开关语义（需评审确认的一项）
+
+沿用 §2.2：`TRAVEL_PENDING_CHANNEL=1` 即启用完整消费行为（含
+接管）；`0` 仍为完全旁路。**不新增开关**：`TRAVEL_PENDING_TAKEOVER`
+语义属 DecisionEngine 生产者接管（仍冻结为 0，本阶段不触碰）。
+channel=0 逐位对比回归测试继续锁定。
+
+### 11.6 测试计划（= §6 P2.4b 组，逐行）
+
+九类 verdict 全路径（§11.2 表逐行，含 act 抛异常不影响原链路）、
+consume 成功短路后原链路不执行、restate 顺序与快照一致（1..N）、
+duplicate_select 不重复消费、expired_reply 后不可继续消费、
+cancel_* 成功后进入原链路、集成级故障注入（store 抛异常）、
+跨 Session 隔离双实现各跑一遍、gate 抢答负向、channel=0 逐位
+对比。回归门槛：现有全套件全绿（含 dialog/server 既有套件）。
+
+### 11.7 边界重申
+
+不创建 Pending；不接入生产者；不改 Handler；不改 P2.3
+evaluate/act 业务逻辑；`TRAVEL_PENDING_CHANNEL` 生产默认 0；
+TAKEOVER=0；不进 P2.5/P3。申请批准 P2.4b 开工。
