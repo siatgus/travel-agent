@@ -687,6 +687,271 @@ def test_gate_and_store_integration_real_handle() -> None:
         set_env()
 
 
+# ================================================== 6. P2.4a-R1：真实线程并发 + acquire 异常安全
+
+
+def test_real_thread_lease_blocks_eviction() -> None:
+    """R1 测试 A（真实线程）：持 lease 线程暂停在 Barrier 期间，
+    淘汰扫描被闸 1 阻止、runtime 未被移除；恢复后照常使用（观察
+    模式合法只读路径，绝不引入 act），归还后淘汰恢复可用。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        mgr = PendingRuntimeManager(max_runtimes=1, now=clock)
+        met1 = threading.Barrier(2, timeout=5)   # 持 lease 暂停点
+        met2 = threading.Barrier(2, timeout=5)   # 淘汰断言完成点
+        errors = []
+        shared = {}
+
+        def holder():
+            try:
+                rt = mgr.acquire("s1")
+                shared["rt"] = rt
+                met1.wait()                  # 暂停：持 lease 未做操作
+                # 恢复：持 lease 期间照常使用（只读 evaluate，无 act）
+                v = rt.interceptor.evaluate("你好", None)
+                shared["verdict"] = v.verdict
+                met2.wait()
+                mgr.release(rt)
+            except BaseException as e:
+                errors.append(e)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        met1.wait()      # 此刻 holder 已持 lease 暂停
+        # 制造 LRU 压力：第二个 acquire 使 len 2 > max 1 → 触发淘汰扫描
+        rt2 = mgr.acquire("s2")
+        check("[线程A] 持 lease 的 s1 未被淘汰（闸 1，对象未被移除）",
+              mgr.runtime("s1") is not None
+              and mgr.runtime("s1") is shared.get("rt"),
+              str(type(mgr.runtime("s1"))))
+        check("[线程A] runtime store 实例未被替换（未关闭/未重建）",
+              shared.get("rt") is not None
+              and mgr.runtime("s1").store is shared["rt"].store, "")
+        mgr.release(rt2)
+        met2.wait()      # holder 恢复执行只读操作并归还
+        t.join(timeout=5)
+        check("[线程A] 无死锁（holder 线程按时结束）",
+              not t.is_alive(), f"alive={t.is_alive()} errors={errors}")
+        check("[线程A] 线程无异常", errors == [], str(errors))
+        check("[线程A] 暂停恢复后只读 evaluate 正常产出 verdict",
+              shared.get("verdict") == V_NONE, str(shared.get("verdict")))
+        # 归还后淘汰恢复：holder 的 release 可能已触发过一轮淘汰
+        # （归还时容量释放即淘汰，§4.5 release 语义）——此处重新制造
+        # 压力，断言 s1（LRU 最旧、无保留态）可被正常逐出
+        rt3 = mgr.acquire("s3")
+        snap = mgr.snapshot()
+        check("[线程A] 归还后淘汰恢复（s1 被逐出）",
+              "s1" not in snap and "s3" in snap, str(list(snap)))
+        mgr.release(rt3)
+        # 淘汰原子性：重新获取得到全新 runtime（store 新实例）
+        rt1b = mgr.acquire("s1")
+        check("[线程A] 重建后 store 为全新实例",
+              rt1b.store is not shared["rt"].store, "")
+        mgr.release(rt1b)
+    finally:
+        set_env()
+
+
+def test_real_thread_acquire_release_evict_stress() -> None:
+    """R1 测试 B（真实线程）：多线程 acquire/release 与淘汰扫描交错
+    压力——active_ops 不出现 <1 的持 lease 计数（无负数、无重复
+    归还）、持 lease 的 runtime 绝不被淘汰替换、无死锁、结束后
+    全部计数归零、manager 仍可用。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
+        mgr = PendingRuntimeManager(max_runtimes=2, now=clock)
+        errors = []
+        ops = {"acq": 0, "rel": 0}
+        ops_lock = threading.Lock()
+        sids = [f"w{i}" for i in range(4)]    # 4 个 sid 挤 max=2 → 持续压力
+
+        def worker(i: int) -> None:
+            try:
+                for round_ in range(50):
+                    sid = sids[(i + round_) % len(sids)]
+                    rt = mgr.acquire(sid)
+                    with ops_lock:
+                        ops["acq"] += 1
+                    if rt.active_ops < 1:
+                        raise AssertionError(
+                            f"acquire 后计数 <1（重复归还/负数）: "
+                            f"{rt.active_ops}")
+                    if mgr.runtime(sid) is not rt:
+                        raise AssertionError(
+                            "持 lease 的 runtime 被淘汰替换（闸 1 失效）")
+                    rt.store.get_active_pending()    # 只读业务操作
+                    time.sleep(0)                    # 让出 GIL 放大交错
+                    mgr.release(rt)
+                    with ops_lock:
+                        ops["rel"] += 1
+            except BaseException as e:
+                errors.append(e)
+
+        def evictor() -> None:
+            try:
+                for _ in range(300):
+                    mgr.evict()
+                    time.sleep(0)
+            except BaseException as e:
+                errors.append(e)
+
+        ws = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        ev = threading.Thread(target=evictor)
+        for w in ws:
+            w.start()
+        ev.start()
+        for w in ws:
+            w.join(timeout=15)
+        ev.join(timeout=15)
+        alive = [w.is_alive() for w in ws] + [ev.is_alive()]
+        check("[线程B] 无死锁（全部线程按时结束）", not any(alive),
+              f"alive={alive}")
+        check("[线程B] 全线程无异常（计数/替换不变量成立）",
+              errors == [], str(errors[:3]))
+        check("[线程B] acquire/release 严格成对",
+              ops["acq"] == ops["rel"] and ops["acq"] > 0, str(ops))
+        snap = mgr.snapshot()
+        check("[线程B] 结束后全部 lease 归零",
+              all(v[0] == 0 for v in snap.values()), str(snap))
+        # manager 仍可用（状态一致，无泄漏残留）
+        rt = mgr.acquire("w0")
+        check("[线程B] 压力后 manager 仍可用", rt.active_ops == 1,
+              str(rt.active_ops))
+        mgr.release(rt)
+        check("[线程B] 再归还后计数归零", rt.active_ops == 0,
+              str(rt.active_ops))
+    finally:
+        set_env()
+
+
+def test_gate_evaluate_exception_returns_lease() -> None:
+    """R1 测试 C：真实 gate 路径（handle → _pending_gate）中 evaluate
+    抛异常 → finally 确实归还 lease，异常向上传播（当前设计），
+    manager 状态一致、可继续使用。非独立 finally 模拟片段。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        s.pending_session_id = "s-err"
+        # 预置 open pending：否则 gate 在第 ④ 步（无任何线索）即旁路，
+        # evaluate 根本不会执行——必须让异常发生在真实 evaluate 路径
+        mgr = PendingRuntimeManager()
+        orc._pending_manager = mgr
+        rt0 = mgr.acquire("s-err")
+        p = rt0.store.create_pending("排海贝皇大排档", "plan_modify",
+                                     "must_visit", SNAP)
+        mgr.release(rt0)
+        s.active_pending_id = p.pending_id
+        orig = PendingInterceptor.evaluate
+
+        def boom(self, utterance, parse_result=None, **kw):
+            raise RuntimeError("evaluate 注入异常")
+
+        PendingInterceptor.evaluate = boom
+        raised = False
+        try:
+            try:
+                orc.handle(s, "你好")
+            except RuntimeError:
+                raised = True
+        finally:
+            PendingInterceptor.evaluate = orig
+        check("[gate异常] 异常沿真实 gate 路径向上传播", raised, "")
+        check("[gate异常] manager 已构造（异常前完成 acquire）",
+              mgr is not None, "")
+        snap = mgr.snapshot() if mgr is not None else {}
+        check("[gate异常] lease 已归还（ops=0）",
+              "s-err" in snap and snap["s-err"][0] == 0, str(snap))
+        # 异常后 manager 状态一致：可重新获取并正常归还
+        rt = mgr.acquire("s-err")
+        check("[gate异常] 异常后可重新获取（计数=1）",
+              rt.active_ops == 1, str(rt.active_ops))
+        mgr.release(rt)
+        check("[gate异常] 再归还后计数=0", rt.active_ops == 0,
+              str(rt.active_ops))
+    finally:
+        set_env()
+
+
+def test_acquire_clock_failure_no_lease_leak() -> None:
+    """R1：注入时钟在 acquire 中途抛异常 → 绝不产生半租约（计数
+    不泄漏）；回滚不与正常归还重复；manager 恢复可用。覆盖
+    新建路径 / 已存在路径 / 淘汰扫描回滚三条异常路径。"""
+    set_env(channel="1", store_kind="memory")
+    try:
+        base = datetime(2026, 11, 19, 10, 0, 0)
+        state = {"n": 0, "fail_on": None}    # 第 fail_on 次调用起抛异常
+
+        def flaky_clock():
+            state["n"] += 1
+            if state["fail_on"] is not None \
+                    and state["n"] >= state["fail_on"]:
+                raise RuntimeError("时钟注入异常")
+            return base
+
+        mgr = PendingRuntimeManager(max_runtimes=4, now=flaky_clock)
+        # 场景1（新建路径）：第 1 次时钟调用在 PendingRuntime 构造内
+        # 成功，第 2 次（now_e 换算）抛异常 → 异常先于计数变更
+        state["fail_on"] = 2
+        failed = False
+        try:
+            mgr.acquire("x")
+        except RuntimeError:
+            failed = True
+        check("[时钟异常] 新建路径 acquire 抛出异常", failed, "")
+        rt = mgr.runtime("x")
+        check("[时钟异常] 新建路径无半租约（未持有或计数=0）",
+              rt is None or rt.active_ops == 0, str(rt))
+        # 恢复后可正常获取、正常归还（计数不残留）
+        state["n"], state["fail_on"] = 0, None
+        rt = mgr.acquire("x")
+        check("[时钟异常] 恢复后正常获取（计数=1）",
+              rt.active_ops == 1, str(rt.active_ops))
+        # 场景2（已存在路径）：时钟异常先于计数增加，计数不被污染
+        state["n"], state["fail_on"] = 0, 1
+        failed = False
+        try:
+            mgr.acquire("x")
+        except RuntimeError:
+            failed = True
+        check("[时钟异常] 已存在路径 acquire 抛出异常", failed, "")
+        check("[时钟异常] 已存在路径计数未被污染（仍=1）",
+              rt.active_ops == 1, str(rt.active_ops))
+        state["n"], state["fail_on"] = 0, None
+        mgr.release(rt)
+        check("[时钟异常] 异常路径后正常归还（计数=0）",
+              rt.active_ops == 0, str(rt.active_ops))
+        # 场景3（淘汰扫描回滚）：增量之后异常（_evict_locked 注入）
+        # → 计数必须回滚，且绝不与正常归还重复
+        mgr2 = PendingRuntimeManager(max_runtimes=1, now=flaky_clock)
+        rt_y = mgr2.acquire("y")
+        orig_evict = mgr2._evict_locked
+
+        def broken_evict(now_e=None):
+            raise RuntimeError("淘汰扫描注入异常")
+
+        mgr2._evict_locked = broken_evict
+        failed = False
+        try:
+            mgr2.acquire("z")        # len 2 > max 1 → 淘汰扫描抛异常
+        except RuntimeError:
+            failed = True
+        check("[时钟异常] 增量后淘汰扫描异常向外传播", failed, "")
+        rt_z = mgr2.runtime("z")
+        check("[时钟异常] 回滚生效（z 计数=0，无泄漏）",
+              rt_z is None or rt_z.active_ops == 0, str(rt_z))
+        check("[时钟异常] 回滚不误伤他人（y 计数仍=1）",
+              rt_y.active_ops == 1, str(rt_y.active_ops))
+        mgr2._evict_locked = orig_evict
+        mgr2.release(rt_y)
+        check("[时钟异常] 回滚后正常归还仍工作（y=0）",
+              rt_y.active_ops == 0, str(rt_y.active_ops))
+    finally:
+        set_env()
+
+
 # ================================================== main
 
 
@@ -705,9 +970,13 @@ def main() -> int:
                test_overflow_warning_when_all_retained,
                test_lease_lifecycle,
                test_multi_pending_invariant_sequences,
-               test_gate_and_store_integration_real_handle):
+               test_gate_and_store_integration_real_handle,
+               test_real_thread_lease_blocks_eviction,
+               test_real_thread_acquire_release_evict_stress,
+               test_gate_evaluate_exception_returns_lease,
+               test_acquire_clock_failure_no_lease_leak):
         fn()
-    print(f"\npending channel P2.4a: {_PASS} pass / {_FAIL} fail")
+    print(f"\npending channel P2.4a(+R1): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
 
 

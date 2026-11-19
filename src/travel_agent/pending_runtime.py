@@ -17,6 +17,11 @@
 - **统一锁顺序：manager 锁 → store 锁（→ DB 事务）**，全程单向
   绝不逆向；lease 归只发生在全部 store 锁释放之后（批准条件冻结）。
 
+P2.4a-R1（评审裁定补丁）：acquire 异常安全——时钟换算先于任何
+租约状态变更，增量后异常路径强制计数回滚（同锁内无并发归还，
+绝不与正常 release 重复）；release 同源前置。不加锁、不改双闸
+与淘汰协议，无架构变更。
+
 本模块属装配层适配：不修改 P2.3 evaluate/act 业务逻辑，不创建
 Pending（生产者仍冻结），不接 Handler。
 """
@@ -109,11 +114,22 @@ class PendingRuntimeManager:
                                     PendingInterceptor(store),
                                     last_used=self._now())
                 self._runtimes[sid] = rt
+            # P2.4a-R1 异常安全（评审阻断项修复）：时钟换算先于任何
+            # 租约状态变更——注入时钟抛异常时绝不产生「计数已加、
+            # 调用方未拿到引用」的半租约。
+            now_e = _epoch(self._now())
             rt.active_ops += 1
-            rt.last_used = _epoch(self._now())   # datetime/数值均可
-            self._runtimes.move_to_end(sid)
-            if len(self._runtimes) > self._max:
-                self._evict_locked()
+            try:
+                rt.last_used = now_e
+                self._runtimes.move_to_end(sid)
+                if len(self._runtimes) > self._max:
+                    self._evict_locked(now_e)
+            except BaseException:
+                # 计数回滚：本临界区内调用方必然未拿到引用、无并发
+                # release，回滚绝不与正常归还重复执行；新插入的
+                # runtime 保持计数 0（可淘汰、无泄漏）
+                rt.active_ops -= 1
+                raise
             return rt
 
     def release(self, runtime: PendingRuntime) -> None:
@@ -122,11 +138,14 @@ class PendingRuntimeManager:
         批准条件冻结时序：调用方必须在**全部 store 锁释放之后**才
         调用本方法（gate 的 finally 保证）；本方法只取 manager 锁，
         绝不在持 store 锁时被调用。"""
+        # P2.4a-R1：时钟换算先于任何状态变更（与 acquire 同源原则，
+        # 计数已减后淘汰扫描绝不因时钟异常中途失败）
+        now_e = _epoch(self._now())
         with self._lock:
             runtime.active_ops = max(0, runtime.active_ops - 1)
             # 归还后容量可能释放：超限即触发淘汰（同一 manager 锁内）
             if len(self._runtimes) > self._max:
-                self._evict_locked()
+                self._evict_locked(now_e)
 
     # -------------------------------------------------- 淘汰（双闸）
 
@@ -135,11 +154,15 @@ class PendingRuntimeManager:
         with self._lock:
             self._evict_locked()
 
-    def _evict_locked(self) -> None:
-        """淘汰扫描（调用方必须已持 manager 锁；§4.5.2 双闸）。"""
+    def _evict_locked(self, now_e: int | None = None) -> None:
+        """淘汰扫描（调用方必须已持 manager 锁；§4.5.2 双闸）。
+
+        P2.4a-R1：now_e 可由调用方在租约状态变更前预先换算传入，
+        使注入时钟异常发生在任何状态变更之前（异常安全前置原则）。"""
         while len(self._runtimes) > self._max:
             evicted = False
-            now_e = _epoch(self._now())
+            if now_e is None:
+                now_e = _epoch(self._now())
             for sid, rt in list(self._runtimes.items()):
                 # 闸 1：lease 活跃（含「已取得引用尚未进 store 锁」）
                 # → 跳过，绝不淘汰持引用的 runtime
