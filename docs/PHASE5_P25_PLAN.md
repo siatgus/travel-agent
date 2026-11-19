@@ -1,6 +1,8 @@
 # 第五阶段 P2.5 开工申请与设计方案：消歧运行时验证（八步完整链路 + 重验证四分支）
 
 > 申请日期：2026-11-19。设计基线：`f914072`（P2.4b 关闭归档）。
+> **版本：r2（2026-11-19 评审 CONDITIONAL PASS 修订定版，§10 为
+> 裁决定版条款，与 §0–§9 冲突时以 §10 为准）。**
 > 冻结基线链：P2.1 `589ebe4` / P2.2 `67843fc` / P2.3 `79b1c04` /
 > P2.4a `3fb910b`+R1 `5966d02` / P2.4b `1d051fd`。
 > **本文档为开工申请，未经批准不写任何业务代码。**
@@ -349,3 +351,211 @@ resolver 79 / corpus v4 50 / parser 62 / extractor 36 / dialog 244
 P2.5b（重验证：四分支 + 回填 + confirmed 受控流转），各自独立
 commit、独立回归、独立验收；生产开关保持默认 0，不提前进入
 P2.6 / P3。
+
+---
+
+## 10. r2 设计修订（评审 CONDITIONAL PASS 定版，2026-11-19）
+
+> 评审裁定：方向认可；D1/D2 选方案甲；D3 修订后冻结；两处设计
+> 缺口（§10.2 展示失败补偿、§10.3 HC-1 双概念城市）必须先闭合；
+> F1–F4 负向测试补齐；允许/禁止清单按评审模块权限表定版。
+> **本节条款与 §0–§9 冲突时，以本节为准。**未授权前不写业务代码。
+
+### 10.1 D1 / D2 / D3 评审裁决（定版）
+
+**D1 = 方案甲（仅 clarify 放行）**，附两条硬约束：
+- `decide()` 放行 clarify 时返回的必须是**本轮真实 DecisionResult**，
+  其关联 ResolvedCandidate 来源于**本轮 resolver 结果**——绝不从
+  历史 shadow 记录、旧 Pending 或上轮 DecisionResult 恢复；
+- channel=0 时原有影子行为**逐位保持**；channel=1 时**仅 clarify**
+  进入生产侧；execute / reject_reply / conservative / deferred /
+  category_path 仍遵守原 TAKEOVER 门控语义，一字不改。
+
+**D2 = 方案甲（独立受控消费路径）**，放行条件正式冻结为五条件
+**同时成立**（缺一不可）：
+
+```
+AllowHandler = ChannelEnabled
+             ∧ SourcePendingConsume      # 可信内部控制流产生，
+                                         # 绝不由用户输入/LLM 输出伪造
+             ∧ ActionExecute
+             ∧ IntentInQueryWhitelist    # 规划类 intent 永不进入
+             ∧ RevalidationConfirmed
+```
+
+补充冻结：①不得因重验证 confirmed 就直接调用 Handler——必须
+继续经过**原有业务分支入口**；②原有角色权限、GuardPipeline、
+参数校验与 Handler 前置条件**不得绕过**；③
+`TRAVEL_DECISION_TAKEOVER` 默认值与语义不改；④消歧只确认实体
+身份，不授予行程修改权限。
+
+**D3 = 接受十字段扩展，回填 SQL 修订后冻结**。原方案 §4.5 的
+WHERE 子句缺 candidate_id（方法参数含 candidate_id 但 SQL 未
+使用，无法在数据库层验证归属），修订为：
+
+```sql
+UPDATE pending_consumption
+   SET revalidate_status = ?,
+       revalidate_probe_status = ?,
+       revalidated_at = ?
+ WHERE pending_id = ?
+   AND session_id = ?
+   AND candidate_id = ?          -- 候选归属数据库层验证
+```
+
+`pending_consumption.candidate_id TEXT NOT NULL` 自 P2 方案 §2
+冻结建表即存在，双实现消费记录均含该字段，无需 DDL 变更。
+
+**回填六条契约（定版，实现阶段不得再议）**：
+1. 必须是**条件更新**，绝不插入新的消费记录；
+2. 更新行数 = 1 才算回填成功；
+3. 更新行数 = 0 **不得当作成功**（shadow 记录 + 警告）；
+4. 回填异常**不得改变已完成的消费结果**（异常吞掉 + shadow 归因
+   兜底，业务流不感知）；
+5. Memory 与 SQLite 对字段名、合法状态值、时间语义（revalidated_at
+   为 INTEGER UTC epoch）**逐位一致**；
+6. `revalidate_status` 合法值**固定**为 confirmed / ambiguous /
+   unverified / rejected——**仅在重验证真实完成且 resolve 产出
+   业务结论时回填**；异常或未执行探测时三列保持 NULL（绝不把
+   异常/未探测伪装成四种业务结果之一），异常详情进 shadow。
+
+### 10.2 首轮展示失败的 Pending 生命周期补偿（修订 §3.3，闭合缺口 4.1）
+
+**评审指出的风险**：create_pending 成功但 clarify_reply 构造失败
+→ 用户未看到快照，服务端却持有 open Pending 并继续接受选择判断
+——用户可见状态与服务端状态不一致。
+
+**冻结原则：不能让用户看不到快照，却让该快照对应的 Pending 继续
+正常接受选择。**
+
+**定版顺序（展示内容优先于创建）**：
+1. **先构造**候选数据与完整展示内容（话术文本在创建前即为可验证
+   的成品字符串）；
+2. **再创建** Pending（`create_pending`）；
+3. **绑定返回**：Pending ID 与展示内容绑定后短路返回。
+
+**失败补偿矩阵**：
+
+| 失败点 | 处置 |
+|---|---|
+| 展示内容构造失败（步骤 1） | 未创建，零副作用，交回原链路 |
+| create_pending 失败 / 规则 8 拒绝 | 交回原链路（现有契约） |
+| 步骤 2 成功后绑定/返回环节失败 | **立即尝试 cancel 该 Pending**（安全取消孤儿）；取消成功 → shadow 记录 + 交回原链路；**取消也失败 → 保守拦截回复**（告知系统暂时无法处理选择请求），**绝不交回原链路**（防 open 孤儿被下轮误消费）+ shadow 记录 orphan Pending + 警告 |
+
+### 10.3 重验证城市上下文的 HC-1 双概念拆分（修订 §4.2，闭合缺口 4.2）
+
+**评审指出**：快照候选 city 是被选中实体的冻结属性，**不应自动
+等同**于用户明确指定的 query_city——原方案用候选 city 直接充当
+验证期望城市锚点，未完整落实 HC-1 三级区分。
+
+**定版：重验证输入拆为两个正交概念，缺一不可**：
+
+| 概念 | 来源 | 用途 |
+|---|---|---|
+| **selected candidate city** | 快照候选的冻结 city 字段 | 候选身份与地理属性约束（候选是谁、在哪） |
+| **query context city** | 按 HC-1 既有规则构建：用户明确 query_city ＞ LLM city_hints（仅辅助，绝不升级）＞ destination（绝不覆盖用户明确指定） | 参与 Resolver 的城市判定 |
+
+- 绝不用候选 city 直接替代 query context city；绝不让 LLM hint
+  覆盖用户明确指定的城市；
+- 若本轮存在用户明确 query_city，按既有 Resolver 规则参与判定；
+  无明确城市时 query context city 按既有回退链构建（与首轮一致）；
+- **若明确 query_city 与候选快照 city 冲突：按既有 Resolver 规则
+  重新判断，绝不因 Pending 已消费就强行 confirmed**（冲突导致的
+  非 confirmed 结果按四分支如实流转）。
+
+**补充城市矩阵测试五条**（G1–G5）：
+- G1 用户明确城市 = 候选城市 → 按既有规则判定；
+- G2 用户明确城市 ≠ 候选城市 → Resolver 既有规则重判，不强行
+  confirmed；
+- G3 无明确城市、仅有 LLM city_hints → hint 仅辅助，不得升级；
+- G4 无明确城市无 hints、仅 destination → 按既有回退链，不覆盖；
+- G5 三者同时存在 → 优先级不变（明确 ＞ hints ＞ destination）。
+
+### 10.4 测试清单补齐（修订 §6）
+
+**新增负向验收 F1–F4**：
+
+| 编号 | 必须证明的行为 |
+|---|---|
+| F1 | 消费后重验证结果非 confirmed → 原 Pending 保持 consumed，**Handler 调用次数为 0** |
+| F2 | ambiguous 重建 Pending 失败（规则 8 撞车等）→ 不执行 Handler、不复活旧 Pending、不伪造新 Pending 成功 |
+| F3 | confirmed 但 Handler 前置权限拒绝 → 继续服从原权限与 Guard 规则，**不因消歧绕过** |
+| F4 | 回填失败与业务流分离 → 回填失败不改变四分支结果、不造成重复消费或重复 Handler |
+
+**A3 断言强化**（不止「Handler 被调用」）：
+- Handler 接收的是**重验证后构造的** DecisionResult；
+- entity 为 fresh confirmed 实体（非快照旧数据）；
+- reason 含原 pending_id、candidate_id 与重验证归因；
+- 原始 utterance / intent / role 传递符合既有规则；
+- **同一轮不再走一次普通意图解析导致重复 Handler 执行**。
+
+**A5 断言强化**：新旧 Pending 生命周期关系——旧 Pending 保持
+consumed；新 Pending 独立 ID、独立 TTL、独立候选快照。
+
+### 10.5 允许 / 禁止清单定版（修订 §7，按评审模块权限表）
+
+| 模块 | 权限 |
+|---|---|
+| pending_producer.py | 新增，允许 |
+| pending_revalidator.py | 新增，允许（独立文件，D4 定版） |
+| orchestrator.py | 允许：生产侧接入、重验证接入、受控 Handler 流转（AllowHandler 五条件消费点） |
+| decision.py | 仅按 D1 方案甲修改 clarify 放行条件（一处） |
+| Pending Store（双实现） | 仅增加重验证回填接口（§10.1 修订 SQL + 六条契约）及内存桩十字段 |
+| pending_interceptor.py | **原则上冻结**，不修改 P2.3 evaluate/act |
+| pending_runtime.py | **冻结**（含 R1） |
+| Handler | **冻结**接口与业务实现 |
+| EntityResolver | **复用既有接口，不修改判定规则**——P2.5 只调用既有 resolve()，不顺便重构；若 HC-1 上下文传递需最小适配点，**先在设计中列明再单独评审**，不得擅改 |
+| 开关 | TRAVEL_PENDING_TAKEOVER / TRAVEL_DECISION_TAKEOVER 语义均不改 |
+
+**channel=0 逐位回归标准（定版）**：
+- 全套件在 channel=0 下运行全绿（含 dialog/server/conversations）；
+- B10 式逐位对比**扩展**：含 pending 存在、hint 存在、clarify 场景
+  的会话与无 pending 基线逐位一致；
+- 影子行为与 P2.4b 基线逐位一致——本阶段新增影子字段（revalidate
+  三列、orphan 记录等）须在验收报告中**列出新增字段清单**，逐条
+  声明不影响既有字段；
+- git diff 单点断言：orchestrator 仅生产钩子 + 重验证接入 +
+  AllowHandler 消费点三处以内，decision.py 仅 clarify 放行一处。
+
+### 10.6 实施顺序与阶段退出条件（新增，评审点名补齐）
+
+**实施顺序（每子阶段独立 commit / 回归 / 验收）**：
+
+```
+P2.5a 生产侧
+  1. pending_producer：候选构建（HC-4 排除、六字段、1..N）
+     + 展示内容先行构造 + §10.2 补偿矩阵
+  2. decision.py clarify 放行（D1 方案甲 + 两条硬约束）
+  3. orchestrator 生产钩子 + 测试（A1/A2、C1–C3、G 矩阵生产侧）
+  → 独立验收后再开 P2.5b
+P2.5b 重验证侧
+  4. pending_revalidator：fresh resolve 双概念城市（§10.3）
+     + 四分支流转 + B3 兜底延续
+  5. record_revalidation 双实现（§10.1 修订 SQL + 六条契约）
+     + 内存桩七→十字段
+  6. orchestrator AllowHandler 五条件消费点 + 测试
+     （A3–A7、B1–B2、D1–D3、E1–E2、F1–F4）
+  → 独立验收；P2.6 影子观察另行申请
+```
+
+**阶段退出条件（全部满足才申请最终验收）**：
+1. 八步链路在 memory 与 SQLite 双实现下全通（A1–A7 含强化断言）；
+2. F1–F4 负向全绿；G1–G5 城市矩阵全绿；
+3. channel=0 逐位回归标准（§10.5）全部满足；
+4. 全量回归绿（既有 13 组套件 + 新增测试）；
+5. 重验证三列回填双实现对拍（含 rowcount=0 / 异常路径）；
+6. git diff 单点断言通过；实施记录写入本文档 §11。
+
+### 10.7 r2 修订记录摘要
+
+| 评审要求 | 落点 |
+|---|---|
+| D1 方案甲 + 两条硬约束 | §10.1 |
+| D2 方案甲 + AllowHandler 五条件 | §10.1 |
+| D3 SQL 补 candidate_id + 六条契约 | §10.1 |
+| 首轮展示失败生命周期补偿 | §10.2 |
+| HC-1 双概念城市 + G1–G5 | §10.3 |
+| F1–F4 + A3/A5 强化 | §10.4 |
+| 模块权限表 + channel=0 逐位标准 | §10.5 |
+| 实施顺序 + 退出条件 | §10.6 |
+
