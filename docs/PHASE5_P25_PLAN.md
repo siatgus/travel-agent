@@ -635,3 +635,91 @@ P2.4b 九类 verdict 接线与四项异常边界。
 **申请结论**：按本清单申请 P2.5a 开工；批准后开始编码，交付后
 独立提交 + 独立回归 + 独立代码验收；P2.5b 申请待 P2.5a 验收
 通过后提交。
+
+---
+
+## 12. P2.5a 实施记录（按 00880ed 批准范围交付，2026-11-19）
+
+> 开工授权：评审批准 P2.5a 按 00880ed 申请范围开工（设计基线
+> `4171095`，代码基线 `f914072`）。单 commit 交付；P2.5b 未授权。
+
+### 12.1 实施范围（六项清单对照）
+
+| 申请清单 | 交付 |
+|---|---|
+| `pending_producer.py`（新增） | PendingProducer：pick_ambiguous（HC-4 纵深排除 + 与 DecisionEngine 同档排序口径）/ build_candidates（六字段、1..N 按 matches 既有序、空 name 拒绝降质）/ clarify_reply_text（成品字符串，与 restate 接线同构）/ produce（§10.2 三步编排 + 补偿矩阵）/ _compensate_orphan（取消失败→保守拦截绝不交回）/ 影子记录（sink 异常隔离，B5 精神） |
+| `decision.py`（一处） | decide() 未接管分支内 D1 方案甲放行：`not takeover_on ∧ action==clarify ∧ channel==1` → 返回本轮真实 DecisionResult；channel=0/其他 action/TAKEOVER=1 逐位不变（1 hunk） |
+| `orchestrator.py`（生产钩子） | handle 步骤 1.8 调用点一块 + `_pending_produce` 私有方法（决策链首次接入 extract→resolve→decide + clarify 分支 + producer 装配 + lease finally）+ `_ensure_producer`/`_ensure_decider` 延迟构造 + import/字段（5 hunks，逻辑落点一处，见 12.4） |
+| `tests/test_pending_producer.py`（新增） | P1–P4 + 影子隔离共 38 断言 |
+| `tests/test_pending_channel.py`（扩展） | 第 8 节 5 个集成测试（A1 / A2+新鲜度+C1 / C1·C3 开关 / C2 双 TAKEOVER / 决策链异常），202 断言 → 241 |
+| 文档 §12 | 本记录 |
+
+**禁止清单零触碰**（git diff 核查）：pending_interceptor.py、
+pending_runtime.py、pending.py、pending_store_sqlite.py、Handler 全部、
+entity_resolver.py、decision.py 其余分支（1 hunk 之外无改动）、
+P2.4b 九类 verdict 接线与四项异常边界、两开关语义——全部未动；
+生产侧未新增任何 store 方法。
+
+### 12.2 强制验收条件逐项证据
+
+| 条件 | 证据（测试断言） |
+|---|---|
+| 展示先于创建，构造失败零副作用 | test_p2：monkeypatch 话术构造抛异常 + 空 name 候选拒绝 → create_calls==0、produce 返回 None |
+| 绑定失败 → 立即取消孤儿 | test_p3①：cancel 恰好一次、pending→cancelled、shadow produce_orphan_cancelled |
+| 取消失败 → 保守拦截绝不交回 | test_p3②③'：cancel 抛异常 / cancel ok=False（rowcount=0 同源）→ 返回 _ORPHAN_NOTICE、pending_id 保留、shadow orphan 记录 |
+| D1① 本轮真实 DecisionResult | 结构保证：producer/钩子无任何读取 shadow_log/旧 Pending/上轮结果的路径；test_p25a_rule8_and_freshness：轮 2 cancel_new_question 后新 Pending 快照=本轮桩输出（乙），绝不复用轮 1（甲） |
+| D1② channel=0 逐位 | test_p25a_channel0_zero_side_effect ×2（env 未设/0）：producer/decider/manager 全 None、stub.calls==0（决策链未调用）、route 非 pending_produce；全量回归 channel=0 全绿 |
+| C1/C2 开关负向 | test_p25a_non_clarify_not_produced：confirmed→execute 在 TAKEOVER=0 与 =1 下钩子均交回原链路、零 Pending 创建（本钩子绝不消费 execute，D2 属 P2.5b） |
+| P1–P4 | test_pending_producer 38/0 |
+| A1/A2 | test_p25a_produce_hook_integration（route=pending_produce、快照 1..2、ID 可引用、hint、decider 影子 clarify、lease 归还）/ test_p25a_rule8_and_freshness（A2 轮） |
+| 规则 8 不覆盖不轮换 | test_p4（store 层）+ test_p25a_rule8_and_freshness 轮 3（hand_back 轮钩子撞规则 8 → 原链路、原 Pending open 不变、影子记录） |
+| 全量回归 | 见 12.3 |
+| git diff 单点断言 | decision.py 1 hunk；orchestrator.py 5 hunks（12.4）；冻结文件零触碰（12.1） |
+| 决策链异常健壮性 | test_p25a_decision_chain_failure：resolve 抛异常 → 警告 + 原链路 + lease 归还 + 零 Pending 副作用 |
+
+### 12.3 测试结果（实际运行）
+
+- test_pending_producer：**38 pass / 0 fail**
+- test_pending_channel：202 → **241 pass / 0 fail，连续三轮**
+- 全量回归：pending 60 / sqlite 66 / interceptor 150 / decision 全过
+  （51 断言）/ adapter 32 / resolver 全过（79 断言）/ corpus v4 全过
+  （50 断言）/ parser 62 / extractor 36 / dialog 244 / server 52 /
+  conversations 21——全部 0 失败
+- channel=0 逐位回归：全量回归即默认 env（未设 channel）下执行，
+  加上 C1 双 env 断言与 B10 既有对比，§10.5 标准满足
+
+### 12.4 实施差异如实记录（与申请文字的偏差，均不改变冻结语义）
+
+1. **接入点 A 决策调用此前在代码中不存在**：申请 §11.2 写「接入点
+   A 决策调用后的 clarify 分支」，经核查 `decide()` 全仓无调用方
+   （P1 只交付 decision.py 与影子测试，TAKEOVER=0 下从未接入
+   orchestrator）。P2.5a 生产钩子因此包含接入点 A 决策链的**首次
+   实际落地**（extract → resolve → decide），全部收在
+   `_pending_produce` 单方法内；决策链任何异常 → 保守交回原链路
+   （专项测试锁定）。handle() 主流程仅一个调用块。
+2. **orchestrator.py diff 为 5 hunks**：import 块 2 + `__init__`
+   延迟构造字段 + `_pending_produce` 方法区 + handle 调用点——逻辑
+   落点为生产钩子一处，与「仅一处生产钩子」的申请语义一致；
+   `git diff` 断言数值如实申报为 5。
+3. **A2 集成场景的真实行为优于设计预期**：open pending 下真实
+   parse「帮我查一下夫子庙」产出 cancel_new_question（P2.3 冻结
+   规则），gate 先真实取消旧 Pending，随后生产钩子以本轮 fresh
+   结果创建新 Pending——A2（cancel 接续）与 D1①（新鲜度）在同一
+   轮集成验证；规则 8 的集成验证改由 hand_back 轮（gate 零状态
+   交回 → 钩子 clarify → create 拒绝 → 原链路）覆盖。
+4. **LLM fallback 未接入决策链**：§9.4 步骤 3 的 fallback 在现有
+   代码中为 LLMCandidateAdapter（默认关闭、P4 启用）；P2.5a 边界
+   未要求接入，决策链为 extract → resolve → decide 三步，与申请
+   测试清单一致，偏差仅为此如实记录。
+5. **memory store 单槽回查限制**：`_active` 被新 Pending 替换后旧
+   Pending 不可按 ID 回查（既有契约，SQLite 有历史）；A2 断言改用
+   间接强证明（新 Pending 创建成功 ⇔ 旧 Pending 已不在 open 态，
+   否则规则 8 拒绝）+ gate 影子 verdict 锁定。
+
+### 12.5 开关与边界保持
+
+`TRAVEL_PENDING_CHANNEL` 生产默认 0（producer/decider/manager 零
+构造、决策链不调用）；`TRAVEL_PENDING_TAKEOVER`、
+`TRAVEL_DECISION_TAKEOVER` 默认 0 且语义未动；未新增开关；TAKEOVER
+执行类接管语义逐位保持（TAKEOVER=1 时 decide 分支整体不进入）。
+P2.5b（重验证 + 回填 + AllowHandler 受控流转）未授权未实施。

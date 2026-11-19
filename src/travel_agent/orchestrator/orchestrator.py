@@ -19,7 +19,10 @@ from __future__ import annotations
 import os
 
 from .. import llm
+from ..candidate_extractor import extract as _extract_candidates
+from ..decision import ACTION_CLARIFY, DecisionEngine
 from ..dialogue import Reply
+from ..entity_resolver import resolve as _resolve_entities
 from ..parser import parse_utterance
 from ..pending import (PendingStore, PENDING_CANCELLED, PENDING_CONSUMED,
                        PENDING_EXPIRED, PENDING_OPEN)
@@ -27,6 +30,7 @@ from ..pending_interceptor import (PendingInterceptor, V_CANCEL_DEST_CHANGED,
                                    V_CANCEL_EXPLICIT, V_CANCEL_NEW_QUESTION,
                                    V_CONSUME, V_DUPLICATE_SELECT,
                                    V_EXPIRED_REPLY, V_RESTATE)
+from ..pending_producer import PendingProducer
 from ..pending_runtime import PendingRuntimeManager
 from .context import TurnContext
 from .guard import GuardPipeline
@@ -61,6 +65,9 @@ class Orchestrator:
         # TRAVEL_PENDING_CHANNEL 关闭时永不创建，完全旁路零开销）
         self._pending_manager: PendingRuntimeManager | None = None
         self._pending_warnings: list[str] = []     # shadow 警告（旁路等）
+        # P2.5a：生产侧装配（延迟构造——channel=0 永不构造，零开销旁路）
+        self._producer: PendingProducer | None = None
+        self._decider: DecisionEngine | None = None
 
     # -------------------------------------------------- P2.4a pending gate
 
@@ -286,6 +293,93 @@ class Orchestrator:
                                 + "」，无需重复选择。")
         return None                    # hand_back / none → 原链路（保守红线）
 
+    # -------------------------------------------------- P2.5a 生产钩子
+
+    def _ensure_producer(self) -> PendingProducer:
+        """延迟构造 producer（channel=0 永不构造，零开销旁路）。"""
+        if self._producer is None:
+            self._producer = PendingProducer()
+        return self._producer
+
+    def _ensure_decider(self) -> DecisionEngine:
+        """延迟构造决策引擎（同上；channel=0 永不构造）。"""
+        if self._decider is None:
+            self._decider = DecisionEngine()
+        return self._decider
+
+    def _pending_produce(self, session, utterance: str, ctx) -> Reply | None:
+        """P2.5a 生产钩子（步骤 1.8）：ambiguous → 创建 Pending → 展示。
+
+        channel=0 → 完全旁路：不调用决策链、不构造 producer/engine、
+        零开销（§10.5 逐位回归）；身份缺失 → 旁路 + 警告（§2.3，
+        绝不猜测身份）。
+
+        决策链（§9.4 固定顺序，本钩子内首次实际接入）：extract →
+        resolve → decide。decide 在 TAKEOVER=0 下经 D1 方案甲仅放行
+        clarify；其他 action（含 TAKEOVER=1 批次内的 execute 等）一律
+        交回原链路——本钩子绝不消费 execute（D2 AllowHandler 受控
+        流转属 P2.5b）。决策链任何异常 → 保守交回原链路 + 警告。
+
+        生产装配（§10.2 三步顺序 + 补偿矩阵）全部委托 producer；
+        创建成功即设 hint（非权威，store 为准）。lease 时序与 gate
+        同冻结口径：业务全部完成后 finally 归还。
+        """
+        if not self._channel_enabled():
+            return None                        # 完全旁路（零决策链开销）
+        sid = getattr(session, "pending_session_id", None)
+        if not sid or not str(sid).strip():
+            self._pending_warnings.append(
+                "pending produce bypass: session 身份未注入"
+                "（pending_session_id 缺失）")
+            return None
+        rt = self._pending_runtime(str(sid))
+        try:
+            try:
+                # 决策链输入 context（HC-1 城市三级：resolve 期望城市
+                # 走 slots.destination / trip_dest / last_city 既有规则）
+                extract_ctx = {"plan_made": bool(
+                                   getattr(session, "plan_made", False)),
+                               "slots": getattr(session, "slots", {}) or {}}
+                cands = _extract_candidates(utterance, extract_ctx)
+                rctx = {"slots": getattr(session, "slots", {}) or {},
+                        "trip_dest": (getattr(ctx.parse, "destination",
+                                              "") or ""),
+                        "last_city": (getattr(session, "query_city",
+                                              "") or "")}
+                rr = _resolve_entities(cands.poi_candidates, rctx)
+                decision = self._ensure_decider().decide(
+                    ctx.parse, rr.resolved, rctx,
+                    intent=getattr(ctx.parse, "intent", "") or None)
+            except Exception as exc:
+                self._pending_warnings.append(
+                    f"pending produce: 决策链异常 "
+                    f"{type(exc).__name__}: {exc}")
+                return None                    # 保守交回原链路
+            if decision is None or decision.action != ACTION_CLARIFY:
+                return None                    # 非 clarify → 原链路
+            top = self._ensure_producer().pick_ambiguous(rr.resolved)
+            if top is None:
+                self._pending_warnings.append(
+                    "pending produce: clarify 但 HC-4 排除后无可入快照候选")
+                return None
+            out = self._ensure_producer().produce(
+                rt.store,
+                utterance=utterance,
+                intent=decision.intent,
+                role=(top.original or {}).get("role") or "",
+                matches=top.matches,
+                reply_builder=lambda t: answer_reply(session, t))
+            if out.reply is not None:
+                # hint 加速（非权威）：错值最坏结果为 evaluate 产出
+                # none 交回原链路，无误消费（§3.3 同源语义）
+                session.active_pending_id = out.pending_id
+                return out.reply
+            return None
+        finally:
+            # lease 归还：全部 store 调用返回后（批准条件冻结时序）
+            self._pending_manager.release(rt)
+
+
     # -------------------------------------------------- 调度入口
     def handle(self, session, utterance: str,
                history_text: str | None = None) -> Reply:
@@ -316,6 +410,17 @@ class Orchestrator:
             session.history.append({"role": "agent", "content": str(gated)})
             ctx.route, ctx.handled = "pending_consume", True
             return gated
+
+        # ---- 1.8 P2.5a 生产钩子：ambiguous → 创建 Pending → 展示快照
+        # （接入点 A 决策链首次落地 + clarify 分支；channel=0 完全旁路
+        # 零开销；短路文本与 Pending ID 已由 producer 按冻结 §10.2
+        # 三步顺序与补偿矩阵完成装配）
+        produced = self._pending_produce(session, utterance, ctx)
+        if produced is not None:
+            session.history.append({"role": "agent",
+                                    "content": str(produced)})
+            ctx.route, ctx.handled = "pending_produce", True
+            return produced
 
         # ---- 2. 明确咨询预判：周边问句分流（找吃的/找住的/两点路线）----
         # 「宽窄巷子附近有什么好吃的」一旦被当成「问宽窄巷子这个景点」，

@@ -1560,6 +1560,263 @@ def test_b10_channel0_bitwise_with_pending() -> None:
         set_env()
 
 
+
+# ================================================== 8. P2.5a：生产侧集成（ambiguous → 创建 → 展示）
+
+import travel_agent.orchestrator.orchestrator as _orch_mod
+from travel_agent.entity_resolver import (MatchRow, ResolvedCandidate,
+                                          ResolveResult)
+
+
+class _StubResolver:
+    """resolve 数据源桩（真实 KB 无测试歧义实体，快照数据源必须可
+    控制——决策链 extract/decide 保持真实执行）。按调用序返回预置
+    ResolveResult；超出序列重复最后一次（新鲜度断言依赖此语义）。"""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+
+    def __call__(self, candidates, context=None, **kw):
+        self.calls += 1
+        return self.results[min(self.calls, len(self.results)) - 1]
+
+
+def _amb_rc(text_a, city_a, text_b, city_b, confidence=0.8):
+    return ResolvedCandidate(
+        original={"text": text_a.split("（")[0], "entity_type":
+                  "restaurant", "role": "query"},
+        status="ambiguous", confidence=confidence,
+        probe_status="not_applicable",
+        matches=[MatchRow(city=city_a, name=text_a,
+                          category="restaurant", source=f"e-{city_a}"),
+                 MatchRow(city=city_b, name=text_b,
+                          category="restaurant", source=f"e-{city_b}")])
+
+
+def _conf_rc(text_a, city_a):
+    return ResolvedCandidate(
+        original={"text": text_a, "entity_type": "restaurant",
+                  "role": "query"},
+        status="confirmed", confidence=0.95,
+        probe_status="not_applicable",
+        matches=[MatchRow(city=city_a, name=text_a,
+                          category="restaurant", source=f"e-{city_a}")])
+
+
+def _produce_session(orc, sid):
+    s = Session(use_llm=False)
+    s.pending_session_id = sid
+    return s
+
+
+def test_p25a_produce_hook_integration() -> None:
+    """A1（00880ed §11.3）：ambiguous → clarify → 创建 Pending →
+    展示 1..N（真实 handle，快照冻结、ID 可引用、hint 刷新）。"""
+    set_env(channel="1", store_kind="memory")
+    old = _orch_mod._resolve_entities
+    try:
+        stub = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        _orch_mod._resolve_entities = stub
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-prod")
+        r = orc.handle(s, "海贝皇大排档哪家好")
+        check("[A1] 短路返回展示回复", r is not None
+              and "1. 海贝皇大排档（南京店）" in str(r)
+              and "2. 海贝皇大排档（上海店）" in str(r), str(r))
+        check("[A1] 提示回复序号", "回复序号" in str(r), "")
+        check("[A1] route=pending_produce + handled",
+              orc.last_ctx.route == "pending_produce"
+              and orc.last_ctx.handled, str(orc.last_ctx.route))
+        rt = orc._pending_manager.runtime("s-prod")
+        p = rt.store.get_active_pending()
+        check("[A1] Pending 已创建且 open", p is not None
+              and p.status == "open", str(p))
+        check("[A1] 快照冻结 1..2、ID 可引用",
+              [c.display_order for c in p.candidates] == [1, 2]
+              and p.candidate_by_id(p.candidates[0].candidate_id)
+              is not None, str(p.as_dict()))
+        check("[A1] hint 刷新为 Pending ID",
+              s.active_pending_id == p.pending_id, "")
+        check("[A1] history 尾部为 agent 展示",
+              s.history[-1]["role"] == "agent"
+              and "当前候选如下" in s.history[-1]["content"], "")
+        check("[A1] 决策引擎影子记录 clarify",
+              orc._decider is not None
+              and orc._decider.shadow_log
+              and orc._decider.shadow_log[-1]["action"] == "clarify",
+              str(orc._decider.shadow_log[-1:] if orc._decider else None))
+        check("[A1] 决策链真实执行（resolve 桩被调用 1 次）",
+              stub.calls == 1, str(stub.calls))
+        check("[A1] lease 已归还", rt.active_ops == 0, "")
+        check("[A1] producer 影子无异常记录",
+              not orc._producer.shadow_log
+              or all("failed" not in r["action"]
+                     for r in orc._producer.shadow_log),
+              str(orc._producer.shadow_log))
+    finally:
+        _orch_mod._resolve_entities = old
+        set_env()
+
+
+def test_p25a_rule8_and_freshness() -> None:
+    """A2 集成（展示轮后新问题 → cancel_new_question → 新 clarify →
+    新 Pending）+ D1 硬约束①（快照永远来自本轮 resolver 结果）+
+    C1 集成（hand_back 轮生产钩子撞规则 8 → 原链路不覆盖不轮换）。"""
+    set_env(channel="1", store_kind="memory")
+    old = _orch_mod._resolve_entities
+    try:
+        stub = _StubResolver([
+            ResolveResult(resolved=[_amb_rc("甲大排档（南京店）", "南京",
+                                            "甲大排档（上海店）", "上海")]),
+            ResolveResult(resolved=[_amb_rc("乙餐厅（玄武店）", "南京",
+                                            "乙餐厅（浦东店）", "上海")]),
+        ])
+        _orch_mod._resolve_entities = stub
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-fresh")
+        r1 = orc.handle(s, "甲大排档哪家好")
+        rt = orc._pending_manager.runtime("s-fresh")
+        p1 = rt.store.get_active_pending()
+        check("[fresh] 轮1 创建成功（快照=甲）", p1 is not None
+              and p1.candidates[0].name == "甲大排档（南京店）", str(p1))
+        # 轮 2（A2）：新问题 → gate cancel_new_question（真实迁移）
+        # → 生产钩子 clarify → 新 Pending（快照=本轮桩输出）
+        r2 = orc.handle(s, "帮我查一下夫子庙")
+        check("[A2] 轮2 短路展示新快照（cancel 后生产接续）",
+              orc.last_ctx.route == "pending_produce"
+              and "乙餐厅（玄武店）" in str(r2), str(r2))
+        # memory store _active 单槽已被 p2 替换，p1 不可按 ID 回查
+        # （既有契约）；p2 创建成功本身即强证明 p1 已不在 open 态
+        # （否则规则 8 会拒绝创建），再以 gate 影子锁定迁移 verdict
+        check("[A2] gate 影子记录 cancel_new_question（真实迁移）",
+              rt.interceptor.shadow_log
+              and rt.interceptor.shadow_log[-1]["verdict"]
+              == "cancel_new_question"
+              and rt.interceptor.shadow_log[-1]["pending_id"]
+              == p1.pending_id, str(rt.interceptor.shadow_log[-1:]))
+        p2 = rt.store.get_active_pending()
+        check("[fresh] D1①：新 Pending 快照=本轮 resolver 结果",
+              p2 is not None and p2.pending_id != p1.pending_id
+              and p2.candidates[0].name == "乙餐厅（玄武店）"
+              and p2.candidates[1].name == "乙餐厅（浦东店）",
+              str([c.name for c in (p2.candidates if p2 else [])]))
+        check("[fresh] hint 刷新为新 ID",
+              s.active_pending_id == p2.pending_id, "")
+        # 轮 3（C1 集成）：hand_back 话术（gate 零状态交回）→ 生产钩子
+        # clarify → 规则 8 拒绝（p2 open）→ 原链路，不覆盖不轮换
+        r3 = orc.handle(s, "南京那家怎么样")
+        check("[C1] hand_back 轮规则 8 拒绝 → 原链路",
+              orc.last_ctx.route != "pending_produce", str(r3))
+        check("[C1] 原 Pending 保持 open 未被覆盖",
+              rt.store.get_active_pending().pending_id == p2.pending_id
+              and rt.store.get_pending_by_id(
+                  p2.pending_id).status == "open", "")
+        check("[C1] producer 影子记录规则 8",
+              any(x["action"] == "produce_rejected_rule8"
+                  for x in orc._producer.shadow_log),
+              str(orc._producer.shadow_log))
+    finally:
+        _orch_mod._resolve_entities = old
+        set_env()
+
+
+def test_p25a_channel0_zero_side_effect() -> None:
+    """C1/C3（开关负向）：channel=0 → 完全旁路：决策链不调用、
+    producer/decider/manager 零构造、零 Pending 创建。"""
+    for env in (None, "0"):
+        set_env(channel=env)
+        old = _orch_mod._resolve_entities
+        try:
+            stub = _StubResolver([ResolveResult(resolved=[
+                _amb_rc("海贝皇大排档（南京店）", "南京",
+                        "海贝皇大排档（上海店）", "上海")])])
+            _orch_mod._resolve_entities = stub
+            orc = Orchestrator()
+            s = _produce_session(orc, "s-off")
+            r = orc.handle(s, "海贝皇大排档哪家好")
+            check(f"[C1 env={env}] 正常出回复（原链路）",
+                  r is not None, str(r))
+            check(f"[C1 env={env}] route 非 pending_produce",
+                  orc.last_ctx.route != "pending_produce",
+                  str(orc.last_ctx.route))
+            check(f"[C1 env={env}] producer 未构造",
+                  orc._producer is None, str(orc._producer))
+            check(f"[C1 env={env}] decider 未构造（决策链未调用）",
+                  orc._decider is None and stub.calls == 0,
+                  f"{orc._decider} calls={stub.calls}")
+            check(f"[C1 env={env}] manager 未构造（零 Pending 副作用）",
+                  orc._pending_manager is None, "")
+        finally:
+            _orch_mod._resolve_entities = old
+    set_env()
+
+
+def test_p25a_non_clarify_not_produced() -> None:
+    """C2（D1 约束②负向）：仅 clarify 进生产侧——confirmed/execute
+    无论 TAKEOVER 取值一律交回原链路，钩子绝不消费 execute。"""
+    old = _orch_mod._resolve_entities
+    try:
+        # confirmed → decide(execute, takeover=0) → None → 原链路
+        set_env(channel="1", store_kind="memory")
+        stub = _StubResolver([ResolveResult(resolved=[
+            _conf_rc("唯一好店", "南京")])])
+        _orch_mod._resolve_entities = stub
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-exe")
+        r = orc.handle(s, "唯一好店怎么样")
+        check("[C2] confirmed → 原链路（execute 不被钩子消费）",
+              orc.last_ctx.route != "pending_produce", str(r))
+        rt = orc._pending_manager.runtime("s-exe")
+        check("[C2] 零 Pending 创建",
+              rt.store.get_active_pending() is None, "")
+        check("[C2] 决策影子记录 execute（决策真实形成）",
+              orc._decider.shadow_log
+              and orc._decider.shadow_log[-1]["action"] == "execute", "")
+        os.environ["TRAVEL_PENDING_DECISION_TAKEOVER_CLEAN"] = "1"
+        # TAKEOVER=1 批次内 → decide 返回 execute（原语义）→ 钩子仍交回
+        os.environ["TRAVEL_DECISION_TAKEOVER"] = "1"
+        try:
+            r2 = orc.handle(s, "唯一好店怎么样")
+            check("[C2] TAKEOVER=1 execute → 钩子仍不消费（原链路）",
+                  orc.last_ctx.route != "pending_produce", str(r2))
+        finally:
+            os.environ.pop("TRAVEL_DECISION_TAKEOVER", None)
+            os.environ.pop("TRAVEL_PENDING_DECISION_TAKEOVER_CLEAN", None)
+        check("[C2'] TAKEOVER=1 后零 Pending 创建",
+              rt.store.get_active_pending() is None, "")
+    finally:
+        _orch_mod._resolve_entities = old
+        set_env()
+
+
+def test_p25a_decision_chain_failure() -> None:
+    """决策链异常（resolve 抛出）→ 保守交回原链路 + 警告 + lease 归还。"""
+    set_env(channel="1", store_kind="memory")
+    old = _orch_mod._resolve_entities
+    try:
+        def boom(candidates, context=None, **kw):
+            raise RuntimeError("注入：resolve 故障")
+        _orch_mod._resolve_entities = boom
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-fail")
+        r = orc.handle(s, "海贝皇大排档哪家好")
+        check("[链路异常] 原链路正常出回复", r is not None, str(r))
+        check("[链路异常] route 非 pending_produce",
+              orc.last_ctx.route != "pending_produce", "")
+        check("[链路异常] 警告已记录",
+              any("决策链异常" in w for w in orc._pending_warnings),
+              str(orc._pending_warnings))
+        rt = orc._pending_manager.runtime("s-fail")
+        check("[链路异常] lease 已归还", rt.active_ops == 0, "")
+        check("[链路异常] 零 Pending 副作用",
+              rt.store.get_active_pending() is None, "")
+    finally:
+        _orch_mod._resolve_entities = old
+        set_env()
+
 # ================================================== main
 
 
@@ -1593,9 +1850,14 @@ def main() -> int:
                test_b5_shadow_sink_exception_isolated,
                test_b7_b8_real_handle_route_and_no_snatch,
                test_b9_cross_session_isolation_both_impls,
-               test_b10_channel0_bitwise_with_pending):
+               test_b10_channel0_bitwise_with_pending,
+               test_p25a_produce_hook_integration,
+               test_p25a_rule8_and_freshness,
+               test_p25a_channel0_zero_side_effect,
+               test_p25a_non_clarify_not_produced,
+               test_p25a_decision_chain_failure):
         fn()
-    print(f"\npending channel P2.4a(+R1+P2.4b): {_PASS} pass / {_FAIL} fail")
+    print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
 
 

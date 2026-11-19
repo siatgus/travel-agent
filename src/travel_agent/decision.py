@@ -153,6 +153,20 @@ class DecisionEngine:
         if not takeover_on or it not in self.batches:
             # 未接管：deferred 双语义中的 None 形态——决策已形成但本步
             # 不消费，交回原流程（旧链路行为零改变）
+            # P2.5a（D1 方案甲，评审 2026-11-19 冻结，仅此一处放行）：
+            # TAKEOVER=0 时仅 clarify 允许离开影子进入生产侧——
+            # clarify 是「请求用户消歧」，不是业务执行，不属于
+            # TAKEOVER 门控的执行类接管边界。放行返回的即本轮真实
+            # DecisionResult（关联候选来自本轮 resolver 结果，绝不从
+            # 历史 shadow 记录、旧 Pending 或上轮 DecisionResult 恢复）。
+            # channel=0 或其他 action（execute / reject_reply /
+            # conservative / deferred / category_path）：原行为逐位保持；
+            # TAKEOVER=1 时本分支整体不进入，原门控一字不改。
+            if (not takeover_on
+                    and result.action == ACTION_CLARIFY
+                    and os.environ.get("TRAVEL_PENDING_CHANNEL",
+                                       "0").strip() == "1"):
+                return result
             return None
         return result
 
