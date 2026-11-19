@@ -38,3 +38,10 @@ class TurnContext:
     route: str | None = None          # qa_nearby / qa_plan_spot / qa / plan / guard
     last_guard: str | None = None     # 命中的守卫名（便于排查与观测）
     handled: bool = False
+
+    # ---- P2.5b 触点 2 载体（AllowHandler 受控消费点，D2 方案甲）----
+    # 仅 pending 消费轮由触点 1（重验证接入）写入；普通轮恒为默认值
+    # None（逐位不变）。生命周期 = 本轮 _turn_impl，绝不跨轮。
+    pending_decision: object | None = None    # 重验证构造的 DecisionResult
+    pending_decision_source: str | None = None  # "pending_consume"（可信内部流）
+    pending_decision_utterance: str | None = None  # 原 Pending 原始问句

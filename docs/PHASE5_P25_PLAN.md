@@ -912,3 +912,97 @@ record_revalidation + 十字段。
 **申请结论**：按本清单申请 P2.5b 开工；批准后开始编码，交付后
 独立提交 + 独立回归 + 独立代码验收；P2.6 影子观察与 P3 不因本
 阶段通过而自动启动。
+
+---
+
+## 15. P2.5b 实施记录（按 §14 批准范围交付，2026-11-19）
+
+> 开工授权：评审批准 §14 申请范围（设计基线 `4171095`，代码基线
+> `83de409`）。单 commit 交付；P2.6 影子观察与 P3 未授权未实施。
+
+### 15.1 实施范围（§14.2 六项清单对照）
+
+| 清单项 | 交付 |
+|---|---|
+| `pending_revalidator.py`（新增，+335 行） | PendingRevalidator：①归属再校验（重读 Pending、candidate_id ∈ 快照再验证、非 consumed 保守 B3）；②HC-1 双概念（§10.3：query context city 按 明确 query_city ＞ hints 仅辅助不入期望城市 ＞ destination 重建；候选 city 仅身份属性入影子归因）；③fresh resolve（全新调用既有 resolve()，probe/review/kb 可注入，绝不复用旧 matches）；④四分支产出（confirmed 查询类构造 DecisionResult(execute) 全链归因 reason 含 pending_id/candidate_id/probe/规划类与 HC-4 只确认不构造 execute；ambiguous 委托 producer 重建新 Pending+失败保守重试话术；unverified 保守回复绝不伪装 rejected；rejected 规定话术保留原始表达；skipped/未知状态防御不回填）；⑤D3 六契约回填（四枚举校验、异常吞掉+shadow 归因）；⑥永不抛异常（异常 → status="" → 调用方 B3） |
+| `pending.py` | `record_revalidation`（条件更新语义：pending_id+candidate_id+session 三键定位既有记录，命中恰一条写三列；未命中/异常/非法值 False，绝不插入）；消费记录七→十字段（+revalidate_status/revalidate_probe_status/revalidated_at 默认 None；REVALIDATE_STATUSES 四枚举常量；CONSUMPTION_FIELDS 契约清单） |
+| `pending_store_sqlite.py` | 同名 `record_revalidation`：单条条件 UPDATE（§10.1 修订版 WHERE 含 candidate_id），rowcount==1 → True / 0 → False；连接与执行异常全部吞掉 → False（契约 4）；无 DDL（三列自 P2.2 预留）；`_latest_consumption` 扩容十字段（revalidated_at NULL 保持 None，落库转 int） |
+| `orchestrator.py`（两逻辑触点，配额内） | ①**重验证接入**：`_pending_reply` V_CONSUME ok 分支内、确认回复构造前调 `_revalidate_after_consume`（四分支成品回复短路；查询类 confirmed 将 DecisionResult 挂 ctx + 来源标记 `pending_consume` 返回 None 交触点 2；规划类/HC-4 confirmed → 冻结确认话术；status="" → `_fallback_confirm_reply` B3 短路消费不撤销）；②**AllowHandler 消费点**（D2 方案甲首次落地，§9.4「分支入口先看 DecisionResult」结构建立）：handle 步骤 1.77 调 `_allow_handler_consume`——五条件 AND（ChannelEnabled ∧ SourcePendingConsume ∧ ActionExecute ∧ IntentInQueryWhitelist=DEFAULT_BATCHES 规划类永不 ∧ RevalidationConfirmed=归因证据+实体非缺失），全过经既有入口 `session._answer(kind, 原 utterance)` 执行 Handler（与步骤 5 同一入口，Guard/权限零绕过），任一不满足/注入失败/Handler 未接住 → 冻结确认话术交回，绝不裸调 Handler、绝不退回普通路由；其余八类 verdict 分支逐位不动 |
+| `tests/test_pending_revalidator.py`（新增） | 输入边界四态 + G1–G5 城市矩阵 + B1 fresh（KB 变化跟随 + 链式重选）+ B2 探测四路径如实标注 + 四分支产出 + 六契约 + F4 分离，**71 断言** |
+| `tests/test_pending_sqlite.py`（扩展） | `test_revalidation_backfill_parity`：双实现命中 1 行/0 行三形态/非法值/异常吞掉/十字段逐位对拍；既有七字段断言按 D3 已批升级为十字段（**字段集断言更新，前七字段名与语义逐位不变**） |
+| `tests/test_pending_channel.py`（扩展） | 第 9 节 7 个集成测试（A3 强化断言/A4 行程深拷贝零写入/A5 新旧 Pending 生命周期/A6+A7/F1/D1-D3+F4/E2/F2/F3/channel=0 零触发），254 → **308** |
+| `docs/PHASE5_P25_PLAN.md` | 本记录 |
+
+### 15.2 实施差异如实申报（与 §14 文字的偏差）
+
+1. **TurnContext 新增三个载体字段（context.py +7 行）**：§14.2 文件
+   清单未列 context.py。触点 1 与触点 2 分处 gate 与 handle 主流程，
+   DecisionResult/来源标记/原始问句需要本轮生命周期载体
+   （`pending_decision` / `pending_decision_source` /
+   `pending_decision_utterance`，默认 None——普通轮逐位不变）。
+   属触点 2 的必要配套（§9.4 结构的 ctx 载体形式），非第三逻辑触点、
+   不触碰任何冻结模块；如评审裁定不可接受，可改为动态属性挂载
+   （零文件改动），等价语义。
+2. **orchestrator.py 源码 diff 为 10 hunks（-U0 口径）**：import 块 +
+   冻结常量 + `__init__` 延迟字段 + gate 调用点 ctx 传参（既有
+   `_pending_reply` 内部签名扩展）+ V_CONSUME ok 分支改写（触点 1）
+   + 新方法区（`_ensure_revalidator`/`_consume_confirm_reply`/
+   `_revalidate_after_consume`/`_allow_handler_consume`）+ handle
+   1.77 调用块（触点 2）。**逻辑触点恰两处**（重验证接入 +
+   AllowHandler 消费点），§10.5 配额内；hunk 数以实交为准如实申报。
+3. **冻结确认话术提取为 `_consume_confirm_reply` 共用助手**：触点 1
+   （规划类 confirmed）与触点 2（五条件不满足回退）共用同一文案来源，
+   文本与 P2.4b 冻结口径逐字一致，避免双处维护分叉。
+4. **B 段既有测试补重验证桩（兼容垫片）**：六处 P2.4b 时代消费断言
+   （集成 on / B1 duplicate 前置 / B5 / B8 / B9 双实现）在 P2.5b 后
+   消费 ok 必经重验证——真实 KB 无测试实体 → unverified 保守回复，
+   与其「冻结确认话术」断言冲突。加 `_stub_rv_confirmed` 垫片
+   （confirmed 桩 → plan 类 pending 走冻结确认话术），断言语义
+   保持原样；该行为变化本身即 P2.5b 设计目标（channel=1 消费轮
+   按 fresh 四分支流转，channel=0 逐位不变——B10 断言锁定）。
+5. **选择话术统一为「第1个」**：裸数字 "1" 非选择语境（拦截器
+   `_ORDER_RE` 冻结：序号须带锚定词，第 9 节新测试据此用合法锚定
+   形式；拦截器本身零改动）。
+6. **rejected 分支的真实链路可达性**：复核源类型适用范围为
+   attraction（Resolver 冻结行为），unknown 类型单源空证据 →
+   unverified 保守路径——rejected 产出以注入 resolver 分支级验证
+   （71 断言中锁定规定话术/保留原始表达/回填溯源），真实链路行为
+   属 Resolver 冻结范围不属本阶段。
+
+### 15.3 新增影子字段清单（§10.5 要求逐条声明不影响既有字段）
+
+| 载体 | 新增 | 影响 |
+|---|---|---|
+| revalidator 影子记录 | stage="revalidator" / action / detail / pending_id / candidate_id / revalidate_status（§14.4 预申报原样落地） | 纯新增独立 log；gate/producer 影子零改动 |
+| 内存桩消费记录 | revalidate_status / revalidate_probe_status（默认 None）/ revalidated_at（默认 None） | 七字段名与语义逐位不变（duplicate_select 话术回归不受影响——B 段断言全绿） |
+| SQLite | 无 DDL、无新列 | UPDATE 仅写三列预留列 |
+| TurnContext | pending_decision / pending_decision_source / pending_decision_utterance（默认 None） | 普通轮全默认值，逐位不变（B10/集成 off 断言锁定） |
+
+### 15.4 测试结果（实际运行）
+
+- test_pending_revalidator：**71 pass / 0 fail**，连续 3 轮
+- test_pending_channel：254 → **308 pass / 0 fail**，连续 3 轮
+- test_pending_sqlite：66 → **85 pass / 0 fail**，连续 3 轮
+- 全量回归 14 套件全绿（当日实跑、退出码全 0）：pending 60 /
+  sqlite 85 / interceptor 150 / decision 51（decision.py 零 diff
+  下全绿）/ orchestrator 33 / routing 49 / reply 28 / resolver 79 /
+  corpus v4 50 / parser 62 / extractor 36 / dialog 244 / server 52 /
+  conversations 21
+- channel=0 逐位：B10 既有对比 + 新增 `test_p25b_channel0_zero_
+  revalidation`（双 env：零构造、零 resolve 调用、零回填、原路由）
+  + 全量回归默认 env 未设 channel 下执行
+
+### 15.5 开关与边界保持
+
+`TRAVEL_PENDING_CHANNEL` 生产默认 0（重验证/受控流转完全旁路）；
+`TRAVEL_PENDING_TAKEOVER`、`TRAVEL_DECISION_TAKEOVER` 默认 0 语义
+未动；未新增开关；decision.py 零 diff（D1 已在 P2.5a 完成）；
+interceptor/runtime/pending 五方法契约/resolver/Handler/dialogue/
+producer 零触碰（git diff 复核为空）；P2.6 与 P3 未授权未实施。
+
+### 15.6 回滚
+
+单 commit revert 恢复 `83de409`：pending_revalidator.py 独立新文件；
+store 新方法独立；orchestrator 触点集中在 V_CONSUME ok 分支与 1.77
+调用块；context.py 三字段默认 None 无行为耦合；测试扩展独立段落。
+运行时回退：channel=0 即整体旁路。

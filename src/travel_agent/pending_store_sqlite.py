@@ -48,6 +48,7 @@ from travel_agent import paths
 from travel_agent.pending import (DEFAULT_TTL_SECONDS, PENDING_OPEN,
                                   PENDING_CONSUMED,
                                   PendingDisambiguation,
+                                  REVALIDATE_STATUSES,
                                   _ConsumeOutcome, _candidate_from_dict,
                                   _epoch, in_reselect_window)
 
@@ -151,16 +152,20 @@ class SQLitePendingStore:
     def _latest_consumption(self) -> dict | None:
         """P2.3 内部查询（不进公共契约）：本 Session 最近一次消费记录。
 
-        七字段 dict 与内存桩同语义（session_id/pending_id/candidate_id/
-        consumed_at/original_intent/selected_name/selected_city）；
-        无记录返回 None。绝不跨 Session 读取。
+        十字段 dict 与内存桩同语义（session_id/pending_id/candidate_id/
+        consumed_at/original_intent/selected_name/selected_city +
+        P2.5b D3 重验证三列 revalidate_status/revalidate_probe_status/
+        revalidated_at，未回填时为 None）；无记录返回 None。
+        绝不跨 Session 读取。
         """
         con = self._connect()
         try:
             row = con.execute(
                 "SELECT pending_id, session_id, candidate_id,"
                 " consumed_at, original_intent, selected_name,"
-                " selected_city FROM pending_consumption"
+                " selected_city, revalidate_status,"
+                " revalidate_probe_status, revalidated_at"
+                " FROM pending_consumption"
                 " WHERE session_id = ?"
                 " ORDER BY consumed_at DESC, rowid DESC LIMIT 1",
                 (self._session_id,)).fetchone()
@@ -170,6 +175,8 @@ class SQLitePendingStore:
             return None
         d = dict(row)
         d["consumed_at"] = int(d["consumed_at"])
+        if d.get("revalidated_at") is not None:
+            d["revalidated_at"] = int(d["revalidated_at"])
         return d
 
     def _latest_pending_id(self) -> str | None:
@@ -453,6 +460,59 @@ class SQLitePendingStore:
                                    candidate=chosen)
         finally:
             con.close()
+
+    # -------------------------------------------------- ③' revalidate
+    #      （P2.5b D3：重验证回填，六契约的 SQLite 实现——§10.1
+    #        修订版条件 UPDATE，WHERE 含 candidate_id 候选归属
+    #        数据库层验证；无 DDL，三列自 P2.2 冻结建表预留）
+
+    def record_revalidation(self, session_id: str, pending_id: str,
+                            candidate_id: str, revalidate_status: str,
+                            revalidate_probe_status: str | None) -> bool:
+        """重验证结果回填（§10.1 D3 修订六契约）。
+
+        - 单条**条件 UPDATE**（绝不 INSERT 新消费记录）：
+
+            UPDATE pending_consumption
+               SET revalidate_status=?, revalidate_probe_status=?,
+                   revalidated_at=?
+             WHERE pending_id=? AND session_id=? AND candidate_id=?
+
+        - rowcount == 1 → True；rowcount == 0（跨 session / 跨
+          pending / 候选不符 / 无消费记录）→ False，绝不当作成功；
+        - revalidate_status 非四枚举合法值 → False（契约 6）；
+        - 任何 SQLite 异常 → False（契约 4：回填异常不抛出到业务
+          链路，不改已完成的消费结果）；
+        - revalidated_at = INTEGER UTC epoch（self._now_epoch()，
+          与 consumed_at 同源时钟，契约 5 时间语义逐位一致）。
+        """
+        if revalidate_status not in REVALIDATE_STATUSES:
+            return False
+        con = None
+        try:
+            con = self._connect()
+            cur = con.execute(
+                "UPDATE pending_consumption"
+                "   SET revalidate_status = ?,"
+                "       revalidate_probe_status = ?,"
+                "       revalidated_at = ?"
+                " WHERE pending_id = ? AND session_id = ?"
+                "   AND candidate_id = ?",
+                (revalidate_status, revalidate_probe_status,
+                 self._now_epoch(), pending_id, str(session_id),
+                 candidate_id))
+            con.commit()
+            return cur.rowcount == 1
+        except sqlite3.Error:
+            if con is not None:
+                try:
+                    con.rollback()
+                except sqlite3.Error:
+                    pass
+            return False
+        finally:
+            if con is not None:
+                con.close()
 
     # -------------------------------------------------- ④⑤ cancel / expire
 

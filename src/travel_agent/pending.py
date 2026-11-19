@@ -42,6 +42,17 @@ PENDING_STATUSES = (PENDING_OPEN, PENDING_CONSUMED, PENDING_CANCELLED,
 SNAPSHOT_FIELDS = ("candidate_id", "display_order", "entity_id",
                    "name", "city", "address")
 
+# ---- P2.5b 重验证回填（D3 定版契约 6）：revalidate_status 合法值
+# 固定为四枚举；异常或未探测时三列保持 NULL，绝不伪装成业务结果。
+REVALIDATE_STATUSES = ("confirmed", "ambiguous", "unverified", "rejected")
+
+# 消费记录字段（P2.5b D3 已批契约升级：七字段 → 十字段；
+# 前七字段名与语义逐位不变，后三列默认 None 待重验证回填）
+CONSUMPTION_FIELDS = ("session_id", "pending_id", "candidate_id",
+                      "consumed_at", "original_intent", "selected_name",
+                      "selected_city", "revalidate_status",
+                      "revalidate_probe_status", "revalidated_at")
+
 # 默认有效期（P2 可配置；过期后不得继续执行）
 DEFAULT_TTL_SECONDS = 300
 
@@ -358,6 +369,11 @@ class PendingStore:
                 "original_intent": p.original_intent,
                 "selected_name": cand.name if cand is not None else "",
                 "selected_city": cand.city if cand is not None else None,
+                # P2.5b D3：重验证三列（默认 None，仅真实重验证完成时
+                # 经 record_revalidation 条件回填）
+                "revalidate_status": None,
+                "revalidate_probe_status": None,
+                "revalidated_at": None,
             }
             # replace 会重跑 __post_init__（可失败），因此同样提前到
             # 前置段完成构造
@@ -368,6 +384,42 @@ class PendingStore:
             self._active = consumed
             return _ConsumeOutcome(
                 ok=True, pending_id=pending_id, candidate=cand)
+
+    # -------------------------------------------------- ③' revalidate
+    #      （P2.5b D3：重验证回填，六契约的内存桩实现）
+
+    def record_revalidation(self, session_id: str, pending_id: str,
+                            candidate_id: str, revalidate_status: str,
+                            revalidate_probe_status: str | None) -> bool:
+        """重验证结果回填（§10.1 D3 修订六契约）。
+
+        - **条件更新**：按 pending_id+candidate_id 定位**既有**消费
+          记录（session_id 还须与本 store 会话一致），命中恰一条才写
+          三列并返回 True；绝不插入新记录；
+        - 未命中（跨 session / 跨 pending / 候选不符 / 无消费记录）
+          → False，不写任何数据；
+        - revalidate_status 非四枚举合法值 → False（契约 6：绝不把
+          异常/未探测伪装成业务结果）；
+        - 任何异常 → False（回填失败不抛出到业务链路，契约 4）；
+        - revalidated_at = INTEGER UTC epoch（与 consumed_at 同源时钟，
+          契约 5 时间语义逐位一致）。
+        """
+        try:
+            if revalidate_status not in REVALIDATE_STATUSES:
+                return False
+            with self._lock:
+                for rec in reversed(self._consumptions):
+                    if (rec.get("pending_id") == pending_id
+                            and rec.get("candidate_id") == candidate_id
+                            and rec.get("session_id") == str(session_id)):
+                        rec["revalidate_status"] = revalidate_status
+                        rec["revalidate_probe_status"] = \
+                            revalidate_probe_status
+                        rec["revalidated_at"] = _epoch(self._now())
+                        return True
+                return False
+        except Exception:
+            return False
 
     # -------------------------------------------------- ④ cancel
 
@@ -406,7 +458,9 @@ class PendingStore:
     def _latest_consumption(self) -> dict | None:
         """P2.3 内部查询（不进公共契约）：本 Session 最近一次消费记录。
 
-        与 SQLitePendingStore 同语义（七字段 dict）；无记录返回 None。
+        与 SQLitePendingStore 同语义（十字段 dict——P2.5b D3 已批契约
+        升级：七字段名与语义逐位不变 + 重验证三列默认 None）；
+        无记录返回 None。
         """
         with self._lock:
             return dict(self._consumptions[-1]) \

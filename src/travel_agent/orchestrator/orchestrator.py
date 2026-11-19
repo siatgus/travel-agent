@@ -20,7 +20,8 @@ import os
 
 from .. import llm
 from ..candidate_extractor import extract as _extract_candidates
-from ..decision import ACTION_CLARIFY, DecisionEngine
+from ..decision import (ACTION_CLARIFY, ACTION_EXECUTE, DEFAULT_BATCHES,
+                        DecisionEngine)
 from ..dialogue import Reply
 from ..entity_resolver import resolve as _resolve_entities
 from ..parser import parse_utterance
@@ -31,6 +32,7 @@ from ..pending_interceptor import (PendingInterceptor, V_CANCEL_DEST_CHANGED,
                                    V_CONSUME, V_DUPLICATE_SELECT,
                                    V_EXPIRED_REPLY, V_RESTATE)
 from ..pending_producer import PendingProducer
+from ..pending_revalidator import PendingRevalidator
 from ..pending_runtime import PendingRuntimeManager
 from .context import TurnContext
 from .guard import GuardPipeline
@@ -52,6 +54,16 @@ _EXPIRED_NOTICE = "您之前的选择已经过期失效了，请重新提问，�
 # 也不交回原链路造成不确定状态下的重复业务处理）
 _UNDETERMINED_NOTICE = "系统暂时无法确认您的选择状态，请稍后重试。"
 
+# ---- P2.5b 冻结常量（评审 2026-11-19 开工批准条件） ----
+
+# D2 方案甲：可信内部流来源标记（绝不由用户输入/LLM 输出伪造——
+# 只由触点 1 的重验证 confirmed 路径写入 ctx）
+_PENDING_DECISION_SOURCE = "pending_consume"
+# 查询类 intent → 既有 QA 分支 kind 映射（IntentInQueryWhitelist =
+# decision.DEFAULT_BATCHES，规划类永不放行；kind 须经既有分支入口
+# session._answer 进入，Handler 零改动）
+_QUERY_INTENT_KIND = {b: "poi" for b in DEFAULT_BATCHES}
+
 
 class Orchestrator:
     """单轮流程调度。Handler 复用 Session 既有业务方法（第一阶段）。"""
@@ -68,6 +80,8 @@ class Orchestrator:
         # P2.5a：生产侧装配（延迟构造——channel=0 永不构造，零开销旁路）
         self._producer: PendingProducer | None = None
         self._decider: DecisionEngine | None = None
+        # P2.5b：重验证装配（同上，channel=0 永不构造，零开销旁路）
+        self._revalidator: PendingRevalidator | None = None
 
     # -------------------------------------------------- P2.4a pending gate
 
@@ -165,7 +179,7 @@ class Orchestrator:
             self._sync_active_hint(session, name, migrated)
             try:
                 # 消费成功是短路的决定性依据（评审冻结规则 ①，B3）
-                return self._pending_reply(out, v, session, rt)
+                return self._pending_reply(out, v, session, rt, ctx)
             except Exception as exc:
                 self._shadow_gate(rt, name, "reply_construction_failed",
                                   detail=f"{type(exc).__name__}: {exc}",
@@ -223,12 +237,16 @@ class Orchestrator:
             text = "已确认您的选择，消歧完成。"
         return answer_reply(session, text)
 
-    def _pending_reply(self, out, v, session, rt) -> Reply | None:
+    def _pending_reply(self, out, v, session, rt, ctx) -> Reply | None:
         """§2.5 冻结接线表：verdict → 回复行为（九类逐一，不增不减）。
 
         需要短路但无法按冻结格式构造内容（如 consume 成功但候选信息
         缺失、duplicate 记录缺失）时抛异常，由 gate 按 B3 规则兜底——
-        绝不拼造数据、绝不伪造消费结果。"""
+        绝不拼造数据、绝不伪造消费结果。
+
+        P2.5b：V_CONSUME ok 分支在确认回复构造**之前**插入 fresh
+        重验证（触点 1，§4.1 铁律——只决定「之后交给谁」，绝不反向
+        改变已完成的消费）；其余八类 verdict 分支逐位不动。"""
         name = v.verdict
         pid = v.pending_id
         if name == V_CONSUME:
@@ -241,11 +259,15 @@ class Orchestrator:
                 if not cname:
                     raise ValueError(
                         "consume 成功但缺少候选信息，无法按冻结格式构造确认")
-                # 规则 7：只确认消歧，不产生行程动作
-                return answer_reply(
-                    session,
-                    f"已确认：{cname}" + (f"（{ccity}）" if ccity else "")
-                    + "。消歧完成，如需调整行程请直接告诉我。")
+                # ---- P2.5b 触点 1：消费成功 → fresh 重验证 ----
+                re_out = self._revalidate_after_consume(
+                    session, rt, v, cname, ccity, ctx)
+                if re_out is not None:
+                    return re_out     # 四分支成品回复 / 规划类确认话术
+                # 查询类 confirmed：DecisionResult 已挂 ctx（来源
+                # pending_consume），本轮 gate 不短路——由触点 2
+                # （AllowHandler 五条件消费点）恒产出回复
+                return None
             # 失败 → 不短路：降级进 shadow，交回原链路（不改选不伪造）
             self._shadow_gate(rt, name, "consume_failed_not_shortcircuit",
                               detail=str(getattr(out, "reason", "")),
@@ -292,6 +314,152 @@ class Orchestrator:
                                 + (f"（{city}）" if city else "")
                                 + "」，无需重复选择。")
         return None                    # hand_back / none → 原链路（保守红线）
+
+    # -------------------------------------------------- P2.5b 重验证接入
+
+    def _ensure_revalidator(self) -> PendingRevalidator:
+        """延迟构造 revalidator（channel=0 永不构造，零开销旁路）。"""
+        if self._revalidator is None:
+            self._revalidator = PendingRevalidator()
+        return self._revalidator
+
+    @staticmethod
+    def _consume_confirm_reply(session, selected_name: str,
+                               selected_city: str | None) -> Reply:
+        """P2.4b 冻结消费确认文案（规则 7：只确认消歧，不产生行程
+        动作）。触点 1（规划类 confirmed）与触点 2（五条件不满足回退）
+        共用同一来源，绝不双处维护分叉。"""
+        return answer_reply(
+            session,
+            f"已确认：{selected_name}"
+            + (f"（{selected_city}）" if selected_city else "")
+            + "。消歧完成，如需调整行程请直接告诉我。")
+
+    def _revalidate_after_consume(self, session, rt, v, cname: str,
+                                  ccity, ctx) -> Reply | None:
+        """P2.5b 触点 1：消费成功后的 fresh 重验证接入（§4.1：确认
+        回复构造之前；§4.1 铁律——只决定「之后交给谁」，绝不反向
+        改变已完成的消费）。
+
+        返回 Reply → 四分支成品回复 / 规划类确认话术 / B3 兜底短路；
+        返回 None → 查询类 confirmed，DecisionResult 已挂 ctx（来源
+        pending_consume），交触点 2 恒产出回复。"""
+        parse = getattr(ctx, "parse", None)
+        try:
+            re_out = self._ensure_revalidator().revalidate(
+                rt.store,
+                session_id=str(getattr(session, "pending_session_id",
+                                       "") or ""),
+                pending_id=str(getattr(v, "pending_id", "") or ""),
+                candidate_id=str(getattr(v, "candidate_id", "") or ""),
+                candidate_name=cname,
+                candidate_city=(ccity or ""),
+                # HC-1（§10.3）：用户明确 query_city ＞ LLM hints
+                # （仅辅助）＞ destination（既有回退链）
+                query_city=(getattr(parse, "query_city", "") or ""),
+                destination=((getattr(parse, "destination", "") or "")
+                             or ((getattr(session, "slots", {}) or {})
+                                 .get("destination") or "")),
+                reply_builder=lambda t: answer_reply(session, t))
+        except Exception as exc:               # 防御（revalidate 不抛出）
+            self._pending_warnings.append(
+                f"pending revalidate 异常 {type(exc).__name__}: {exc}")
+            return self._fallback_confirm_reply(session, cname, ccity)
+        if re_out.status == "":
+            # B3 兜底（§4.1）：重验证未产出业务结论（归属校验失败 /
+            # resolve 异常 / 话术构造异常）→ 冻结确认短路，消费事实
+            # 不撤销，shadow 归因已由 revalidator 记录
+            self._pending_warnings.append(
+                "pending revalidate: " + (re_out.detail or "未产出结论"))
+            return self._fallback_confirm_reply(session, cname, ccity)
+        if re_out.backfill_ok is False:
+            # D3 契约 3：rowcount=0 不当作成功（shadow 已记录）+ 警告
+            # （任何分支的回填失败都告警，业务流不变——F4）
+            self._pending_warnings.append(
+                "pending revalidate 回填失败: " + (re_out.detail or ""))
+        if re_out.status == "confirmed":
+            if re_out.decision is not None:
+                # 查询类 confirmed：DecisionResult（fresh entity +
+                # 全链归因 reason）挂 ctx 交触点 2（AllowHandler 五
+                # 条件消费点）；来源标记只由本路径写入（可信内部流）
+                ctx.pending_decision = re_out.decision
+                ctx.pending_decision_source = _PENDING_DECISION_SOURCE
+                ctx.pending_decision_utterance = re_out.original_utterance
+                return None
+            # 规划类 / HC-4 防御 confirmed → 只回冻结确认话术，
+            # 绝不写行程（§1.1：消歧成功 ≠ 授权修改行程，A4）
+            return self._consume_confirm_reply(session, cname, ccity)
+        # ambiguous / unverified / rejected → 成品回复短路
+        if re_out.status == "ambiguous" and re_out.new_pending_id:
+            # hint 加速（非权威，§3.3 同源语义）：指向新 Pending
+            session.active_pending_id = re_out.new_pending_id
+        return re_out.reply if re_out.reply is not None else \
+            self._fallback_confirm_reply(session, cname, ccity)
+
+    # ---------------------------------------- P2.5b AllowHandler 消费点
+
+    def _allow_handler_consume(self, session, utterance: str, ctx) \
+            -> Reply | None:
+        """P2.5b 触点 2：AllowHandler 五条件受控消费点（§10.1 D2
+        方案甲首次落地——§9.4「分支入口先看接入点 A 是否给出
+        DecisionResult」结构的建立；Handler 零改动）。
+
+        ctx.pending_decision 为 None（非 pending 消费轮）→ 返回
+        None，主流程逐位不变。五条件 AND（缺一不可）：
+        ChannelEnabled ∧ SourcePendingConsume（可信内部流，绝不由
+        用户输入/LLM 输出伪造）∧ ActionExecute ∧
+        IntentInQueryWhitelist（decision.DEFAULT_BATCHES，规划类
+        永不）∧ RevalidationConfirmed。
+
+        全过 → 经**既有业务分支入口** session._answer（与 handle
+        步骤 5 同一入口、同一 Handler 链）执行 Handler——
+        GuardPipeline / 权限 / Handler 前置条件零绕过；任一条件不
+        满足或注入失败 → 冻结确认话术交回，绝不裸调 Handler、绝不
+        退回普通路由（防选择话术被普通意图解析重复执行）。"""
+        decision = getattr(ctx, "pending_decision", None)
+        if decision is None:
+            return None                        # 非消费通道轮 → 逐位不变
+        entity = getattr(decision, "entity", None) or {}
+        ename = str(entity.get("name", "") or "")
+        ecity = entity.get("city")
+        confirm = lambda: self._consume_confirm_reply(session, ename, ecity)
+
+        # ---- 五条件 AND（§10.1 定版）----
+        allowed = (
+            self._channel_enabled()                       # ① 开关
+            and getattr(ctx, "pending_decision_source", None)
+            == _PENDING_DECISION_SOURCE                   # ② 可信内部流
+            and getattr(decision, "action", "") == ACTION_EXECUTE  # ③
+            and (getattr(decision, "intent", "") or "")
+            in DEFAULT_BATCHES                            # ④ 规划类永不
+            and "pending_revalidate:"                     # ⑤ confirmed 归因
+            in (getattr(decision, "reason", "") or "")
+            and bool(entity.get("name")))                 # 注入实体非缺失
+        if not allowed:
+            return confirm()                  # 确认话术交回（不进 Handler）
+        kind = _QUERY_INTENT_KIND.get(
+            getattr(decision, "intent", "") or "")
+        orig_ut = str(getattr(ctx, "pending_decision_utterance", "")
+                      or "").strip()
+        if kind is None or not orig_ut:
+            # 注入前置缺失 → 回退确认话术，绝不裸调 Handler
+            self._pending_warnings.append(
+                "pending consume execute: 注入前置缺失（kind/utterance）")
+            return confirm()
+        try:
+            # 既有业务分支入口（与 handle 步骤 5 同一入口同一链）；
+            # DecisionResult 经 ctx 载体随轮可溯（§9.4 结构）
+            text = session._answer(kind, orig_ut)
+        except Exception as exc:
+            self._pending_warnings.append(
+                f"pending consume execute 注入失败 "
+                f"{type(exc).__name__}: {exc}")
+            return confirm()                  # 注入失败 → 回退确认话术
+        if not text:
+            # Handler 前置条件未接住（返回 None）→ 服从原规则（F3：
+            # 不因消歧绕过权限/前置），回退确认话术
+            return confirm()
+        return answer_reply(session, text)
 
     # -------------------------------------------------- P2.5a 生产钩子
 
@@ -410,6 +578,18 @@ class Orchestrator:
             session.history.append({"role": "agent", "content": str(gated)})
             ctx.route, ctx.handled = "pending_consume", True
             return gated
+
+        # ---- 1.77 P2.5b 触点 2：AllowHandler 受控消费点（D2 方案甲，
+        # §9.4「分支入口先看 DecisionResult」结构首次落地）——仅消费
+        # 通道重验证 confirmed 轮非旁路（ctx.pending_decision 非
+        # None，触点 1 写入）；普通轮恒返回 None 逐位不变。全过 →
+        # 经既有分支入口执行 Handler；否则冻结确认话术交回。
+        controlled = self._allow_handler_consume(session, utterance, ctx)
+        if controlled is not None:
+            session.history.append({"role": "agent",
+                                    "content": str(controlled)})
+            ctx.route, ctx.handled = "pending_consume_execute", True
+            return controlled
 
         # ---- 1.8 P2.5a 生产钩子：ambiguous → 创建 Pending → 展示快照
         # （接入点 A 决策链首次落地 + clarify 分支；channel=0 完全旁路

@@ -449,17 +449,25 @@ def test_latest_consumption_parity() -> None:
               and st._latest_consumption() is not None, "")
         recs[impl] = st._latest_consumption()
         r = recs[impl]
-        check(f"[{impl}] 记录七字段齐全且值正确",
+        # P2.5b D3 已批契约升级：七字段 → 十字段（前七字段名与语义
+        # 逐位不变；重验证三列消费时默认 None，待 record_revalidation
+        # 条件回填）
+        check(f"[{impl}] 记录十字段齐全且值正确（D3 升级）",
               set(r) == {"session_id", "pending_id", "candidate_id",
                          "consumed_at", "original_intent",
-                         "selected_name", "selected_city"}
+                         "selected_name", "selected_city",
+                         "revalidate_status", "revalidate_probe_status",
+                         "revalidated_at"}
               and r["session_id"] == "s1"
               and r["pending_id"] == p.pending_id
               and r["candidate_id"] == "c1"
               and isinstance(r["consumed_at"], int)
               and r["original_intent"] == "plan_modify"
               and r["selected_name"] == "海贝皇大排档（南京店）"
-              and r["selected_city"] == "南京", str(r))
+              and r["selected_city"] == "南京"
+              and r["revalidate_status"] is None
+              and r["revalidate_probe_status"] is None
+              and r["revalidated_at"] is None, str(r))
         check(f"[{impl}] 重复消费失败不追加记录（同一 pending 一次）",
               not st.consume_pending(p.pending_id, "c2").ok
               and st._latest_consumption()["candidate_id"] == "c1", "")
@@ -541,6 +549,88 @@ def test_expiry_boundary_and_fail_closed() -> None:
           "")
 
 
+def test_revalidation_backfill_parity() -> None:
+    """P2.5b D3 六契约：record_revalidation 双实现对拍。
+
+    - 命中 1 行（三列落库、revalidated_at 为 INTEGER UTC epoch）；
+    - 0 行三形态（跨 session / 跨 pending / candidate_id 不符）全
+      False，绝不插入新记录；
+    - store 异常 → False 不抛出（契约 4）；
+    - 十字段对拍：_latest_consumption 双实现字段名与值逐位一致
+      （七字段语义不变 + 重验证三列）。"""
+    clock, _ = fixed_clock(datetime(2026, 11, 18, 16, 0, 0))
+    recs = {}
+    pids = {}
+    for impl, mk in (("memory",
+                      lambda: PendingStore(session_id="s-rb", now=clock)),
+                     ("sqlite",
+                      lambda: SQLitePendingStore("s-rb", db_path=temp_db(),
+                                                 now=clock))):
+        st = mk()
+        p = st.create_pending("排海贝皇大排档", "poi_query", "query", SNAP)
+        out = st.consume_pending(p.pending_id, "c1")
+        check(f"[{impl}] 消费成功（回填前置）", out.ok, str(out))
+        # 命中 1 行 → True + 三列落库
+        ok = st.record_revalidation("s-rb", p.pending_id, "c1",
+                                    "confirmed", "not_applicable")
+        rec = st._latest_consumption()
+        check(f"[{impl}] 回填命中 1 行 → True", ok is True, str(ok))
+        check(f"[{impl}] 三列落库（status/probe/epoch int）",
+              rec["revalidate_status"] == "confirmed"
+              and rec["revalidate_probe_status"] == "not_applicable"
+              and isinstance(rec["revalidated_at"], int), str(rec))
+        # 0 行三形态全 False（契约 3）
+        for sid, pid_, cid_, tag in (
+                ("s-other", p.pending_id, "c1", "跨session"),
+                ("s-rb", "nope", "c1", "跨pending"),
+                ("s-rb", p.pending_id, "c999", "候选不符")):
+            ok0 = st.record_revalidation(sid, pid_, cid_, "confirmed", None)
+            check(f"[{impl}] 0行·{tag} → False", ok0 is False, str(ok0))
+        # 非法值 → False（契约 6），不覆盖已回填值
+        okb = st.record_revalidation("s-rb", p.pending_id, "c1",
+                                     "skipped", None)
+        check(f"[{impl}] 非法状态值 → False（契约 6）", okb is False, "")
+        check(f"[{impl}] 非法值不写（原回填值保持）",
+              st._latest_consumption()["revalidate_status"] == "confirmed",
+              "")
+        recs[impl] = rec
+        pids[impl] = p.pending_id
+    # store 异常 → False 不抛出（契约 4）
+    st_sql = SQLitePendingStore("s-rb2", db_path=temp_db(), now=clock)
+    orig_connect = st_sql._connect
+
+    def boom_connect():
+        raise sqlite3.OperationalError("注入：db 故障")
+    st_sql._connect = boom_connect
+    try:
+        oke = st_sql.record_revalidation("s-rb2", "p-x", "c1",
+                                         "confirmed", None)
+    finally:
+        st_sql._connect = orig_connect
+    check("[sqlite] store 异常 → False 不抛出（契约 4）", oke is False, "")
+    stm = PendingStore(session_id="s-rb2", now=clock)
+    p_m = stm.create_pending("排海贝皇大排档", "poi_query", "query", SNAP)
+    stm.consume_pending(p_m.pending_id, "c1")
+
+    def boom_now():
+        raise RuntimeError("注入：时钟故障")
+    stm._now = boom_now          # 实现体内部 _epoch(self._now()) 抛出
+    okm = None
+    try:
+        okm = stm.record_revalidation("s-rb2", p_m.pending_id, "c1",
+                                      "confirmed", None)
+    except Exception as e:
+        check("[memory] 异常被吞（契约 4：不抛出到业务）", False, str(e))
+    check("[memory] store 异常 → False 不抛出（契约 4）", okm is False, "")
+    # 十字段双实现逐位对拍（ID/时间戳天然不同，其余逐位一致）
+    m, s = recs["memory"], recs["sqlite"]
+    m_cmp = dict(m, consumed_at=s["consumed_at"],
+                 pending_id=s["pending_id"],
+                 revalidated_at=s["revalidated_at"])
+    check("十字段双实现字段级一致（ID/时间戳除外）", m_cmp == s,
+          f"mem={m}\nsql={s}")
+
+
 def main() -> int:
     for fn in (test_time_contract_and_schema,
                test_parity_memory_vs_sqlite,
@@ -552,7 +642,8 @@ def main() -> int:
                test_session_isolation,
                test_expiry_boundary_epoch_compare,
                test_latest_consumption_parity,
-               test_expiry_boundary_and_fail_closed):
+               test_expiry_boundary_and_fail_closed,
+               test_revalidation_backfill_parity):
         fn()
     print(f"\npending sqlite store: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

@@ -671,6 +671,7 @@ def test_gate_and_store_integration_real_handle() -> None:
     check("[集成 off] manager 未构造", orc._pending_manager is None, "")
 
     set_env(channel="1", store_kind="memory")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         orc2 = Orchestrator()
@@ -702,6 +703,7 @@ def test_gate_and_store_integration_real_handle() -> None:
               s.active_pending_id is None, "")
         check("[集成 on] lease 已归还", rt.active_ops == 0, "")
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
 
@@ -1244,6 +1246,7 @@ def test_b1_expired_restate_handback_duplicate_none() -> None:
     """B1：expired_reply / restate / hand_back / duplicate_select / none
     五类 verdict 全路径（回复与状态逐项断言）。"""
     set_env(channel="1", store_kind="memory")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, advance = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         # expired_reply：到期未登记 + 选择语境 → 短路告知过期
@@ -1319,6 +1322,7 @@ def test_b1_expired_restate_handback_duplicate_none() -> None:
         check("[B1/B6] none → hint 保留",
               s4.active_pending_id == p4.pending_id, "")
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
 
@@ -1372,6 +1376,7 @@ def test_b5_shadow_sink_exception_isolated() -> None:
     """B5：shadow sink 异常不影响主链路 / lease 归还 / verdict 行为；
     装配层 _shadow_gate 自身吞掉一切记录异常。"""
     set_env(channel="1", store_kind="memory")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
 
@@ -1400,6 +1405,7 @@ def test_b5_shadow_sink_exception_isolated() -> None:
                          pending_id="p")     # 必须静默吞掉，不得抛出
         check("[B5] 装配层 shadow 记录异常被隔离", True, "")
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
 
@@ -1407,6 +1413,7 @@ def test_b7_b8_real_handle_route_and_no_snatch() -> None:
     """B7：短路落点 route=pending_consume / handled=True / history 追加；
     B8：pending 选择不被下游 gate 抢答（含周边 gate 前的真实 handle）。"""
     set_env(channel="1", store_kind="memory")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         orc = Orchestrator()
@@ -1441,12 +1448,14 @@ def test_b7_b8_real_handle_route_and_no_snatch() -> None:
         check("[B7 对照] 无 pending 会话零接管",
               orc.last_ctx.route != "pending_consume", str(r2)[:40])
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
 
 def test_b9_cross_session_isolation_both_impls() -> None:
     """B9：跨 Session 隔离——A 消费不影响 B；memory 与 SQLite 双实现。"""
     set_env(channel="1", store_kind="memory")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         orc = Orchestrator()
@@ -1484,6 +1493,7 @@ def test_b9_cross_session_isolation_both_impls() -> None:
         check("[B9] 双 lease 已归还",
               rta.active_ops == 0 and rtb.active_ops == 0, "")
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
     # SQLite 双实现
@@ -1492,6 +1502,7 @@ def test_b9_cross_session_isolation_both_impls() -> None:
     fd, dbp = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     set_env(channel="1", store_kind="sqlite")
+    old_rv = _stub_rv_confirmed()   # P2.5b 兼容垫片：plan 类 confirmed → 冻结确认话术
     try:
         clock, _ = fixed_clock(datetime(2026, 11, 19, 10, 0, 0))
         orc = Orchestrator()
@@ -1529,6 +1540,7 @@ def test_b9_cross_session_isolation_both_impls() -> None:
               stb._latest_consumption() is None, "")
         check("[B9 sqlite] B 的 none 不短路", rb is None, str(rb))
     finally:
+        _rv_mod._resolve_entities = old_rv
         set_env()
 
 
@@ -1913,6 +1925,457 @@ def test_p25a_compensation_boundary_integration() -> None:
         _orch_mod.answer_reply = old_answer
         set_env()
 
+
+# ============================================ 9. P2.5b：重验证侧集成（消费 → fresh 重验证 → 四分支/受控流转）
+
+import travel_agent.pending_revalidator as _rv_mod
+from travel_agent.pending_runtime import PendingRuntime
+
+
+def _conf_rc_fresh(text, city, source, confidence=0.92):
+    """confirmed 候选（entity_id 可控——fresh 与快照区分断言用）。"""
+    return ResolvedCandidate(
+        original={"text": text, "entity_type": "restaurant", "role": "query"},
+        status="confirmed", confidence=confidence,
+        probe_status="not_applicable",
+        matches=[MatchRow(city=city, name=text, category="restaurant",
+                          source=source)])
+
+
+def _unver_rc(text):
+    return ResolvedCandidate(
+        original={"text": text, "entity_type": "unknown", "role": "query"},
+        status="unverified", confidence=0.0,
+        probe_status="not_requested",
+        probe_reason="disabled_by_policy")
+
+
+def _rej_rc(text):
+    return ResolvedCandidate(
+        original={"text": text, "entity_type": "unknown", "role": "query"},
+        status="rejected", confidence=0.3, probe_status="not_found",
+        probe_reason="cross_source_empty")
+
+
+def _preset_orc(sid, clock=None, *, intent="poi_query", role="query"):
+    if clock is None:
+        clock = lambda: datetime(2026, 11, 19, 10, 0, 0)
+    """预置 store + runtime 注入 manager（B 段惯用法）。"""
+    orc = Orchestrator()
+    s = Session(use_llm=False)
+    s.pending_session_id = sid
+    store = PendingStore(session_id=sid, now=clock)
+    p = store.create_pending("哪家海贝皇大排档好", intent, role, SNAP)
+    s.active_pending_id = p.pending_id
+    mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
+    rt = PendingRuntime(sid, store, PendingInterceptor(store),
+                        last_used=int(clock().timestamp()))
+    mgr._runtimes[sid] = rt
+    orc._pending_manager = mgr
+    return orc, s, store, p
+
+
+def _count_answers(s):
+    """包装 session._answer 统计 Handler 入口调用次数（F1/A6 用）。"""
+    orig = s._answer
+    calls = {"n": 0}
+
+    def counting(kind, ut):
+        calls["n"] += 1
+        return orig(kind, ut)
+    s._answer = counting
+    return calls
+
+
+
+def _stub_rv_confirmed():
+    """P2.5b 兼容垫片：为不关心重验证的既有 B 段测试注入 confirmed
+    重验证桩——plan 类 pending 消费后走冻结确认话术，保持其原始断言
+    语义（返回原 resolve 引用供 finally 恢复）。"""
+    old = _rv_mod._resolve_entities
+    _rv_mod._resolve_entities = _StubResolver([
+        ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-nj")])])
+    return old
+
+
+def _stub_rv_unverified():
+    """B 段兼容垫片：unverified 桩（真实 KB 未命中路径的显式形式）。"""
+    old = _rv_mod._resolve_entities
+    _rv_mod._resolve_entities = _StubResolver([
+        ResolveResult(resolved=[_unver_rc("海贝皇大排档（南京店）")])])
+    return old
+
+
+def test_p25b_a3_confirmed_controlled_flow() -> None:
+    """A3（强化断言）：选择 → 消费 → 重验证 confirmed → 查询类经
+    AllowHandler 五条件进既有分支入口——Handler 收到重验证后构造的
+    DecisionResult（ctx 载体）、entity 为 fresh 实体、reason 全链
+    归因、同一轮无重复意图解析重复执行。"""
+    set_env(channel="1", store_kind="memory")
+    old_orch_resolve = _orch_mod._resolve_entities
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        # 轮 1 生产桩：ambiguous 双店（走真实 produce 链）
+        _orch_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _amb_rc("海贝皇大排档（南京店）", "南京",
+                        "海贝皇大排档（上海店）", "上海")])])
+        # 轮 2 重验证桩：confirmed 单店（fresh entity_id ≠ 快照）
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-a3")
+        r1 = orc.handle(s, "帮我查一下海贝皇大排档")   # poi_query
+        rt = orc._pending_manager.runtime("s-a3")
+        p1 = rt.store.get_active_pending()
+        check("[A3] 轮1 创建 pending（intent=poi_query 入白名单）",
+              p1 is not None and p1.original_intent == "poi_query",
+              str(p1))
+        calls = _count_answers(s)
+        r2 = orc.handle(s, "第1个")                        # 选择 c1
+        check("[A3] route=pending_consume_execute（受控流转）",
+              orc.last_ctx.route == "pending_consume_execute"
+              and orc.last_ctx.handled, str(orc.last_ctx.route))
+        d = orc.last_ctx.pending_decision
+        check("[A3] Handler 收到重验证后构造的 DecisionResult（ctx 载体）",
+              d is not None and d.action == "execute"
+              and d.intent == "poi_query", str(d))
+        check("[A3] entity 为 fresh confirmed 实体（非快照旧 entity_id）",
+              d is not None and d.entity["entity_id"] == "e-nj-fresh"
+              and d.entity["status"] == "confirmed", str(d.entity))
+        cid_a3 = p1.candidates[0].candidate_id
+        check("[A3] reason 全链归因（pending_id/candidate_id/revalidate）",
+              d is not None and p1.pending_id in d.reason
+              and cid_a3 in d.reason and "pending_revalidate" in d.reason,
+              d.reason if d else "")
+        check("[A3] 消费记录回填 confirmed（E1·confirmed 行）",
+              rt.store._latest_consumption()["revalidate_status"]
+              == "confirmed"
+              and rt.store._latest_consumption()["revalidated_at"]
+              is not None, str(rt.store._latest_consumption()))
+        check("[A3] 同一轮恰一次 Handler 入口调用（无重复执行）",
+              calls["n"] == 1, str(calls))
+        check("[A3] pending 已消费 + hint 已清空",
+              rt.store.get_pending_by_id(p1.pending_id).status == "consumed"
+              and s.active_pending_id is None, "")
+        check("[A3] lease 已归还", rt.active_ops == 0, "")
+        check("[A3] 回复非 None（Handler 产出）", r2 is not None, str(r2))
+        check("[A3] 重验证影子含 confirmed 记录（E2）",
+              any(x["action"] == "revalidate_confirmed_execute_built"
+                  and x["pending_id"] == p1.pending_id
+                  and x["candidate_id"] == cid_a3
+                  for x in orc._revalidator.shadow_log),
+              str(orc._revalidator.shadow_log[-2:]))
+    finally:
+        _orch_mod._resolve_entities = old_orch_resolve
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_a4_plan_confirmed_no_plan_write() -> None:
+    """A4：规划类 confirmed → 只回冻结确认话术，行程状态深拷贝对比
+    零写入；决策层不构造 execute（消费点不进入）。"""
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        orc, s, store, p = _preset_orc("s-a4", lambda: datetime(2026, 11, 19, 10, 0, 0),
+                                       intent="plan_modify", role="query")
+        # 预置规划状态（深拷贝对比基线）
+        s.slots = {"destination": "南京", "days": 2}
+        s.last_plan = {"city": "南京", "days": 2, "items": ["x"]}
+        import copy as _copy
+        snap = _copy.deepcopy({"slots": s.slots, "plan": s.last_plan})
+        calls = _count_answers(s)
+        r = orc.handle(s, "第1个")
+        check("[A4] 只回冻结确认话术（route=pending_consume）",
+              orc.last_ctx.route == "pending_consume"
+              and "已确认：海贝皇大排档（南京店）" in str(r), str(r))
+        check("[A4] 行程状态深拷贝对比零写入",
+              _copy.deepcopy({"slots": s.slots, "plan": s.last_plan})
+              == snap, str(s.slots))
+        check("[A4] Handler 入口调用 0 次（规划类永不放行）",
+              calls["n"] == 0, str(calls))
+        check("[A4] 决策层未构造 execute（decision 不入 ctx）",
+              orc.last_ctx.pending_decision is None, "")
+        check("[A4] 消费记录回填 confirmed（业务结论如实）",
+              store._latest_consumption()["revalidate_status"]
+              == "confirmed", "")
+    finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_a5_ambiguous_new_pending() -> None:
+    """A5（强化）：ambiguous → 新 Pending（新 ID ≠ 旧 ID、新快照来自
+    fresh matches；旧 Pending 保持 consumed 不复活、无重复消费）。"""
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _amb_rc("乙大排档（玄武店）", "南京",
+                        "乙大排档（浦东店）", "上海")])])
+        orc, s, store, p = _preset_orc("s-a5", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        consume_calls = {"n": 0}
+        orig_consume = store.consume_pending
+
+        def counting_consume(pid, cid):
+            consume_calls["n"] += 1
+            return orig_consume(pid, cid)
+        store.consume_pending = counting_consume
+        r = orc.handle(s, "第1个")
+        check("[A5] 短路展示新快照（route=pending_consume）",
+              orc.last_ctx.route == "pending_consume"
+              and "乙大排档（玄武店）" in str(r)
+              and "乙大排档（浦东店）" in str(r), str(r))
+        rt = orc._pending_manager.runtime("s-a5")
+        p2 = rt.store.get_active_pending()
+        check("[A5] 新 Pending 独立 ID（≠ 旧 ID）",
+              p2 is not None and p2.pending_id != p.pending_id, str(p2))
+        check("[A5] 新快照来自 fresh matches（1..2）",
+              [c.display_order for c in p2.candidates] == [1, 2]
+              and p2.candidates[0].name == "乙大排档（玄武店）", str(p2))
+        check("[A5] hint 刷新为新 Pending ID",
+              s.active_pending_id == p2.pending_id, "")
+        check("[A5] 消费记录回填 ambiguous",
+              store._latest_consumption()["revalidate_status"]
+              == "ambiguous", "")
+        check("[A5] 无重复消费（重验证全程零 consume）",
+              consume_calls["n"] == 1, str(consume_calls))
+        check("[A5] 重验证影子记录新旧 ID 关联（E2）",
+              any(x["action"] == "revalidate_new_pending_created"
+                  and x["pending_id"] == p.pending_id
+                  for x in orc._revalidator.shadow_log),
+              str(orc._revalidator.shadow_log[-2:]))
+    finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_a6_a7_unverified_rejected() -> None:
+    """A6：unverified → 保守回复（绝不 rejected 话术）、Handler 0 次
+    （F1：原 Pending 保持 consumed）；A7：rejected → 规定话术保留
+    原始表达。"""
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        # ---- A6 unverified ----
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[_unver_rc("海贝皇大排档（南京店）")])])
+        orc, s, store, p = _preset_orc("s-a6", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        calls = _count_answers(s)
+        r = orc.handle(s, "第1个")
+        check("[A6] 保守回复（暂查不到 + 引导）",
+              orc.last_ctx.route == "pending_consume"
+              and "暂时查不到" in str(r), str(r))
+        check("[A6] 绝不出现 rejected 话术",
+              "没有找到" not in str(r), str(r))
+        check("[A6/F1] Handler 调用 0 次",
+              calls["n"] == 0
+              and orc.last_ctx.route != "pending_consume_execute",
+              str(calls))
+        check("[A6/F1] 原 Pending 保持 consumed",
+              store.get_pending_by_id(p.pending_id).status == "consumed",
+              "")
+        check("[A6] 回填 unverified + probe 如实（E1·unverified 行）",
+              store._latest_consumption()["revalidate_status"]
+              == "unverified"
+              and store._latest_consumption()["revalidate_probe_status"]
+              == "not_requested", str(store._latest_consumption()))
+        # ---- A7 rejected ----
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[_rej_rc("海贝皇大排档（南京店）")])])
+        orc2, s2, store2, p2 = _preset_orc("s-a7", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        calls2 = _count_answers(s2)
+        r2 = orc2.handle(s2, "第1个")
+        check("[A7] 规定话术 + 保留原始表达",
+              orc2.last_ctx.route == "pending_consume"
+              and "规定数据源与检索范围内没有找到" in str(r2)
+              and "海贝皇大排档（南京店）" in str(r2), str(r2))
+        check("[A7/F1] Handler 调用 0 次 + 原 Pending consumed",
+              calls2["n"] == 0
+              and store2.get_pending_by_id(p2.pending_id).status
+              == "consumed", str(calls2))
+        check("[A7] 回填 rejected（E1·rejected 行）",
+              store2._latest_consumption()["revalidate_status"]
+              == "rejected", "")
+    finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_d1_d2_d3_robustness() -> None:
+    """D1 重验证抛异常 → B3 兜底确认短路（消费不撤销）；D2 回填失败
+    → 回复与状态不变、shadow 归因 + 警告（F4：无重复 Handler）；
+    D3 重验证期间 store 异常 → 保守路径。"""
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        # ---- D1：重验证 resolve 抛异常 ----
+        def boom(candidates, context=None, **kw):
+            raise RuntimeError("注入：重验证 resolve 故障")
+        _rv_mod._resolve_entities = boom
+        orc, s, store, p = _preset_orc("s-d1", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        calls = _count_answers(s)
+        r = orc.handle(s, "第1个")
+        check("[D1] B3 兜底确认短路（消费事实不被撤销）",
+              r is not None and "已确认您的选择" in str(r)
+              and store.get_pending_by_id(p.pending_id).status
+              == "consumed", str(r))
+        check("[D1] 回填未发生（三列 NULL，契约 6）",
+              store._latest_consumption()["revalidate_status"] is None, "")
+        check("[D1] 警告已记录", any("revalidate" in w
+              for w in orc._pending_warnings), str(orc._pending_warnings))
+        # ---- D2：回填失败（rowcount=0 同源）→ 分支不变 + 无重复 Handler
+        orc2, s2, store2, p2 = _preset_orc("s-d2", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        store2.record_revalidation = lambda *a, **kw: False
+        calls2 = _count_answers(s2)
+        r2 = orc2.handle(s2, "第1个")
+        check("[D2] 回填失败 → 分支结果不变（仍受控流转）",
+              orc2.last_ctx.route == "pending_consume_execute"
+              and r2 is not None, str(r2))
+        check("[D2] 回填失败警告 + shadow 归因（E2）",
+              any("回填失败" in w for w in orc2._pending_warnings)
+              and any(x["action"] == "revalidate_backfill_failed"
+                      for x in orc2._revalidator.shadow_log),
+              str(orc2._pending_warnings))
+        check("[D2/F4] 无重复 Handler（恰 1 次）",
+              calls2["n"] == 1, str(calls2))
+        check("[D2/F4] 无重复消费（同一 pending 恰一次）",
+              store2._latest_consumption()["pending_id"] == p2.pending_id,
+              "")
+        # ---- D3：重验证期间 store 异常（pending 定位失败）----
+        # 注意：interceptor locate 与 revalidator 归属校验共用
+        # get_pending_by_id——仅第二次（重验证）调用注入故障
+        orc3, s3, store3, p3 = _preset_orc("s-d3")
+        orig_get = store3.get_pending_by_id
+        get_calls = {"n": 0}
+
+        def boom_get_second(pending_id):
+            get_calls["n"] += 1
+            if get_calls["n"] >= 2:
+                raise RuntimeError("注入：store 定位故障")
+            return orig_get(pending_id)
+        store3.get_pending_by_id = boom_get_second
+        r3 = orc3.handle(s3, "第1个")
+        check("[D3] store 异常 → B3 保守路径（确认短路）",
+              r3 is not None and "已确认您的选择" in str(r3), str(r3))
+        check("[D3] gate evaluate 正常（首次 locate 未受影响）",
+              get_calls["n"] >= 2, str(get_calls))
+        store3.get_pending_by_id = orig_get
+        check("[D3] lease 已归还",
+              orc3._pending_manager.runtime("s-d3").active_ops == 0, "")
+    finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_f2_f3_negative() -> None:
+    """F2：ambiguous 重建失败（规则 8 撞车）→ 不执行 Handler、不复活
+    旧 Pending、不伪造成功；F3：confirmed 但 Handler 前置未接住 →
+    服从原规则回退确认话术，不因消歧绕过。"""
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        # ---- F2：重建失败（create 拒绝）----
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _amb_rc("乙大排档（玄武店）", "南京",
+                        "乙大排档（浦东店）", "上海")])])
+        orc, s, store, p = _preset_orc("s-f2", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        orig_create = store.create_pending
+
+        def rule8_create(*a, **kw):
+            raise ValueError("已存在 active pending（规则 8 拒绝）")
+        store.create_pending = rule8_create
+        calls = _count_answers(s)
+        r = orc.handle(s, "第1个")
+        check("[F2] 保守重试话术（不伪造成功）",
+              "稍后重试" in str(r), str(r))
+        check("[F2] 不执行 Handler", calls["n"] == 0, str(calls))
+        check("[F2] 不复活旧 Pending（保持 consumed + 回填 ambiguous）",
+              store._latest_consumption()["pending_id"] == p.pending_id
+              and store._latest_consumption()["revalidate_status"]
+              == "ambiguous", str(store._latest_consumption()))
+        # ---- F3：confirmed 但 Handler 前置未接住 ----
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        orc2, s2, store2, p2 = _preset_orc("s-f3", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        orig_answer = s2._answer
+        s2._answer = lambda kind, ut: None   # Handler 前置未接住
+        try:
+            r2 = orc2.handle(s2, "第1个")
+        finally:
+            s2._answer = orig_answer
+        check("[F3] Handler 未接住 → 回退确认话术（服从原规则不绕过）",
+              orc2.last_ctx.route == "pending_consume_execute"
+              and "已确认：海贝皇大排档（南京店）" in str(r2), str(r2))
+        check("[F3] 决策已构造（confirmed 归因在案）",
+              orc2.last_ctx.pending_decision is not None, "")
+    finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_channel0_zero_revalidation() -> None:
+    """channel=0 逐位：重验证侧零触发——revalidator/producer/decider
+    零构造、重验证 resolve 零调用、回填零调用；普通路由行为不变。"""
+    for env in (None, "0"):
+        set_env(channel=env)
+        old_orch_resolve = _orch_mod._resolve_entities
+        old_rv_resolve = _rv_mod._resolve_entities
+        try:
+            stub = _StubResolver([ResolveResult(resolved=[
+                _amb_rc("海贝皇大排档（南京店）", "南京",
+                        "海贝皇大排档（上海店）", "上海")])])
+            _orch_mod._resolve_entities = stub
+            _rv_mod._resolve_entities = _StubResolver([ResolveResult(
+                resolved=[_conf_rc_fresh("x", "南京", "e-x")])])
+            orc = Orchestrator()
+            s = _produce_session(orc, "s-off-b")
+            # 预置一个 open pending（若通道误开，选择话术会触发消费链）
+            rt = orc._pending_runtime("s-off-b")
+            p = rt.store.create_pending("哪家海贝皇大排档好", "poi_query",
+                                        "query", SNAP)
+            s.active_pending_id = p.pending_id
+            orc._pending_manager.release(rt)
+            r = orc.handle(s, "第1个")
+            check(f"[C0 env={env}] 选择话术走原路由（非 pending 通道）",
+                  orc.last_ctx.route not in ("pending_consume",
+                                             "pending_consume_execute",
+                                             "pending_produce"),
+                  str(orc.last_ctx.route))
+            check(f"[C0 env={env}] 重验证 resolve 零调用",
+                  _rv_mod._resolve_entities.calls == 0, "")
+            check(f"[C0 env={env}] revalidator/producer/decider 零构造",
+                  orc._revalidator is None and orc._producer is None
+                  and orc._decider is None, "")
+            check(f"[C0 env={env}] 回填零发生（记录不存在或三列 NULL）",
+                  rt.store._latest_consumption() is None
+                  or rt.store._latest_consumption()["revalidate_status"]
+                  is None, "")
+        finally:
+            _orch_mod._resolve_entities = old_orch_resolve
+            _rv_mod._resolve_entities = old_rv_resolve
+    set_env()
+
 # ================================================== main
 
 
@@ -1952,9 +2415,16 @@ def main() -> int:
                test_p25a_channel0_zero_side_effect,
                test_p25a_non_clarify_not_produced,
                test_p25a_decision_chain_failure,
-               test_p25a_compensation_boundary_integration):
+               test_p25a_compensation_boundary_integration,
+               test_p25b_a3_confirmed_controlled_flow,
+               test_p25b_a4_plan_confirmed_no_plan_write,
+               test_p25b_a5_ambiguous_new_pending,
+               test_p25b_a6_a7_unverified_rejected,
+               test_p25b_d1_d2_d3_robustness,
+               test_p25b_f2_f3_negative,
+               test_p25b_channel0_zero_revalidation):
         fn()
-    print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a): {_PASS} pass / {_FAIL} fail")
+    print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
 
 
