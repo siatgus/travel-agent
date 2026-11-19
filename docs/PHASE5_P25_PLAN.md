@@ -636,6 +636,152 @@ P2.4b 九类 verdict 接线与四项异常边界。
 独立提交 + 独立回归 + 独立代码验收；P2.5b 申请待 P2.5a 验收
 通过后提交。
 
+### 11.R3 开工申请修订（复审 2026-11-19 CONDITIONAL PASS 两阻断项落实，形成 r3）
+
+> 复审裁定：范围划分/D1 方案甲/HC-4/展示先行/创建失败处理/模块
+> 职责边界/分阶段验收**认可**；两个阻断项（cancel 失败孤儿隔离、
+> P2.5a 运行边界）+ 三个细节须补入申请形成 r3，按修订条款做开工
+> 前复审。本节纯设计修订，不改业务代码。
+>
+> **与现状的差异如实申报**：当前归档（83de409）按 §11 原文实施，
+> **不含** 11.R3.1 的 L1 二线终结与负向隔离测试——两项为 r3 新增
+> 批准条件，批准后以独立整改申请实施（producer 模块内，冻结清单
+> 零触碰）。
+
+#### 11.R3.1 阻断项 1：cancel 失败后孤儿 Pending 的可验证隔离
+
+**问题重述（裁定场景）**：create 成功 → 绑定失败 → cancel 失败 →
+服务端保留 open 孤儿 → 下一轮有效选择表达可能消费用户从未见过的
+快照——重新引入 §10.2 要消除的状态不一致。保守拦截只解决当前轮。
+
+**代码事实基础（r3 取证）**：
+
+1. 消费定位门 `_resolve_pending_id` 第①步 `store.get_active_pending()`
+   为**权威定位**（orchestrator.py:103-110，「hint 非权威，store
+   为准」）——孤儿 open Pending **无需 hint 即可直达消费路径**，
+   裁定关注成立；
+2. 既有时间终态：`DEFAULT_TTL_SECONDS = 300`（pending.py:57），
+   `get_active_pending` 显式过滤过期 open（规则 5 注释）——TTL
+   到期后权威定位①永久不可达；
+3. sqlite cancel/expire 同走 `_terminal_transition`
+   （pending_store_sqlite.py:537-542），但为**两笔独立事务**
+   （各自 connect + BEGIN IMMEDIATE）——瞬时单笔故障下第二次
+   调用有效；
+4. 现行补偿（83de409）：bind/return 失败 → `cancel_pending` →
+   失败（异常或 ok=False）→ 保守拦截 + PendingProduceError +
+   shadow orphan——**无二线终结**，裁定指出的缺口属实。
+
+**r3 隔离设计（不加新状态；全部利用既有接口与既有状态语义）**：
+
+- **L1 二线终结（新增补偿步骤，producer 模块内）**：cancel 失败
+  分支增加「立即调用 `expire_pending(pending_id)`（契约④既有
+  接口）」。两笔独立事务覆盖瞬时故障；expire 成功 → pending
+  终态 → `get_active_pending` 返回 None → 权威定位①不可达
+  （**可验证**：隔离效果由消费定位门直接判 None 证明，非日志
+  推断）；shadow 记 `orphan_terminal_retry`；
+- **L2 时间终态（既有，声明为最终防线）**：TTL 300s 到期后孤儿
+  永久退出可消费集——无论补偿结果如何，不一致状态有界；
+- **L3 消费侧 fail-closed（既有 P2.4b 冻结边界）**：持续性 store
+  故障场景下，下一轮 evaluate/act 落入同一故障域 → P2.4b 异常
+  边界②「无法判定时保守拦截（不伪造成功、不交回原链路）」→
+  消费不可达；
+- **L4 单槽阻塞效应（既有，如实申报）**：孤儿占用 `_active`
+  槽位期间，规则 8 拒绝一切新 Pending 创建（不覆盖不轮换）——
+  孤儿不会被静默轮换出权威定位，爆炸半径有界（≤TTL）。
+
+**残余窗口如实声明（裁定第 1-3 点要求的明示）**：L1+L2+L3 组合
+后仍剩窄切片——「cancel 与 expire 两笔事务均失败，而 5 分钟内
+后续消费读写正常」。对该切片的**完全封闭**需要新增 store 状态或
+新存储接口（超出 P2.5a 冻结范围，须单独评审授权）。r3 立场：在
+该切片被单独评审关闭之前，组合防线声明为「隔离尽力而为 + 明示
+残余窗口」；且 11.R3.2 的开关冻结使该窗口在生产不可达——**两个
+阻断项互为成立条件**。若评审不接受该组合，则明确结论为：当前
+补偿方案不足以保证安全，不得启用生产开关（与 11.R3.2 一致）。
+
+**负向测试（新增，r3 交付判定）**：
+
+- 变体一（双终结故障桩）：cancel 抛异常 + expire 抛异常 → 本轮
+  保守拦截；下一轮注入旧候选有效选择表达（「第1个」）→ 断言
+  Handler 不执行、旧 Pending status 仍 open 未被消费、回复为
+  保守拦截形态；
+- 变体二（单终结故障桩）：cancel 失败 + expire 成功 → 下一轮
+  同样选择表达 → 断言权威定位①判 None（get_active_pending 为
+  空）、旧 Pending 不被消费、不走 pending 消费通道；
+- 变体三（持久故障对照）：store 持续故障 → 下一轮 evaluate/
+  act 触发 P2.4b fail-closed 保守拦截（证明 L3 生效）。
+
+#### 11.R3.2 阻断项 2：P2.5a 与 P2.5b 的运行安全边界（冻结条款）
+
+- P2.5a 可独立开发、测试、提交和验收（范围划分不变，裁定已认可）；
+- **P2.5a 验收通过 ≠ 允许生产启用**；
+- **P2.5b 最终验收之前，所有生产环境 `TRAVEL_PENDING_CHANNEL`
+  必须保持 0**（orchestrator.py:91 默认值 "0" 为冻结项，交付
+  diff 须证明无任何默认值/读取逻辑改动）；
+- **禁止以测试配置、临时环境变量、灰度配置绕过**本约束将未完成
+  重验证闭环的消费链路暴露给真实用户；
+- 与 11.R3.1 的关系：开关冻结同时使孤儿隔离残余窗口与「未完成
+  重验证的消费链路」在生产均不可达。
+
+#### 11.R3.3 细节 1：cancel 接口精确签名与失败语义
+
+- 签名：`cancel_pending(pending_id: str) -> _ConsumeOutcome`
+  （pending.py:436 契约②；pending_store_sqlite.py:537 同签名，
+  双实现逐位语义）；expire 同构（契约④，pending.py:452 /
+  sqlite:542）；
+- 调用条件：仅当 `create_pending` 成功返回 PendingDisambiguation
+  且步骤 3（绑定/返回）失败时；入参 = 刚创建实例的 pending_id
+  （同会话、status==open）；
+- 失败语义：可预期失败以 `ok=False + reason` 返回（pending 不
+  存在 / pending_id 不匹配 / status 非 open）；存储层异常以异常
+  形态传播（sqlite `_terminal_transition` 连接层无吞异常设计）
+  ——producer 侧对 cancel 调用整体 `try/except`（83de409 已实现
+  ：异常与 ok=False 同进入保守拦截分支），r3 冻结该承接语义不变。
+
+#### 11.R3.4 细节 2：「绑定/返回环节失败」的精确集合
+
+**触发补偿**（已实现 + r3 冻结）：
+
+- (a) `reply_builder` 抛出任何异常（shadow `produce_bind_failed`
+  携带 pending_id）；
+- (b) `reply_builder` 返回 None（P2.5a-R2 裁定：与抛异常同视为
+  绑定失败，防止 None 交回遗留 open 孤儿）。
+
+**不触发补偿（超出可观测边界，如实声明不谎称可补偿）**：
+
+- `ProduceOutcome` 正常返回之后的**呈现层失败**（响应发送失败、
+  网络断连、客户端中断等）——producer 无感知通道，不纳入补偿
+  矩阵。该情形下 Pending 保持 open 但用户未见——不一致窗口由
+  L2 TTL（300s 后权威定位永久不可达）兜底，如实列为残余风险，
+  不宣称闭环。
+
+#### 11.R3.5 细节 3：channel=0 回归逐位对比项（C1/C2 补强）
+
+channel=0 完全旁路回归在既有「回复内容 + 管理/存储零构造」之上，
+r3 冻结以下逐位对比项（memory 与 sqlite 双 store 分别执行）：
+
+1. decision 返回值逐位：类型、action、intent、entity、reason
+   全文逐字（channel=0 时 decide 必须全影子口径）；
+2. producer 调用次数 = 0：`build_candidates`/`produce` 调用计数
+   桩证明零调用；
+3. store 构造次数 = 0：Runtime Manager 零装配
+   （`_pending_manager is None`）；
+4. 回复内容逐位相等（与基线输出口径）；
+5. shadow：pending 相关记录零新增（`produce_*`/`pending_*` 前缀
+   均不出现）。
+
+#### 11.R3.6 r3 交付判定增量汇总
+
+| 增量 | 内容 | 落点 |
+|---|---|---|
+| 补偿矩阵第三行增强 | L1 二线 expire 终结 + shadow `orphan_terminal_retry` | producer（批准后独立整改申请） |
+| 负向隔离测试 | 11.R3.1 三变体 | test_pending_producer / test_pending_channel |
+| 运行边界冻结条款 | 11.R3.2 四条 | 本节（验收判据引用） |
+| channel=0 逐位对比 | 11.R3.5 五项 | test_pending_channel C1/C2 |
+
+**r3 申请结论**：按本节修订条款请求开工前复审；复审通过后按
+增量清单实施（producer 模块内变更 + 测试，冻结清单零触碰），
+实施仍走独立 commit + 独立验收。
+
 ---
 
 ## 12. P2.5a 实施记录（按 00880ed 批准范围交付，2026-11-19）
