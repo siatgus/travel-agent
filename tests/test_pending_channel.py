@@ -8,6 +8,9 @@
 不改 Handler；P2.4b 的 act/verdict 分发绝不执行（观察模式）。
 """
 
+import copy
+import inspect
+import json
 import os
 import sys
 import threading
@@ -3036,6 +3039,637 @@ def test_p25b_channel0_zero_revalidation() -> None:
             _rv_mod._resolve_entities = old_rv_resolve
     set_env()
 
+# ================================================== 9. P2.6 增量 1+3：DecisionEngine 影子触达
+
+# 验收项与 PHASE5_P25_PLAN §25.5 一一对应：
+# #1 S1 开关关闭冻结 / #2 S2 每轮恰好一次 + J-A / #3 S3 记录一致 + J-B /
+# #4 S6 第 1 层（触点直接调用零写入 + DecisionResult 不变性）/
+# #5 S6 第 2 层（真实 handle 基线对照）/ #6 S4a 四路异常隔离 /
+# #7 输入边界（字段缺失，不承担隔离证明）/ #8 S5 零网络 + 零重解析 + 对象身份 /
+# #9 附加检查二（CHANNEL=1 不重复决策）/ #10 S7 开关冻结。
+
+from travel_agent.decision import (DecisionEngine, DecisionResult,
+                                   SHADOW_OBSERVATION_KEYS, SHADOW_RECORD_KEYS)
+
+
+def _p26_env(shadow=None, channel=None, takeover=None) -> None:
+    """P2.6 三开关显式设置（None = 移除，绝不隐式继承外部环境）。"""
+    for key, val in (("TRAVEL_DECISION_SHADOW", shadow),
+                     ("TRAVEL_PENDING_CHANNEL", channel),
+                     ("TRAVEL_DECISION_TAKEOVER", takeover)):
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
+class _CountingEngine(DecisionEngine):
+    """decide() 计数 + 入参/返回值捕获装具（S2/S3/S5/附加检查二）。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.decide_calls = 0
+        self.decide_args = []
+        self.decide_rets = []
+
+    def decide(self, parse_result, resolved, context=None, **kw):
+        self.decide_calls += 1
+        self.decide_args.append((parse_result, list(resolved or []),
+                                 dict(context or {}), dict(kw)))
+        out = super().decide(parse_result, resolved, context, **kw)
+        self.decide_rets.append(out)
+        return out
+
+
+class _AppendBoom(list):
+    """append 恒抛异常的 list 子类（记录容器 / 警告载体损坏装具）。"""
+
+    def append(self, item):
+        raise RuntimeError("append boom")
+
+
+class _FailIfCalled:
+    """调用即计数并抛错——用于「编排层不得二次解析」的反证装具。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *a, **kw):
+        self.calls += 1
+        raise AssertionError("orchestrator 不得再调 _resolve_entities")
+
+
+def _boom_sink(rec):
+    raise RuntimeError("sink boom")
+
+
+def test_p26_shadow_switch_off_frozen() -> None:
+    """S1：TRAVEL_DECISION_SHADOW 非 "1" 时为零行为——不建 engine、
+    不建记录容器、不额外解析；四组取值（未设 / "0" / "false" / ""）
+    的回复与 route 逐字一致。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    try:
+        baseline = None
+        for env in (None, "0", "false", ""):
+            _p26_env(shadow=env, channel=None, takeover=None)
+            stub = _StubResolver([ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-off")])])
+            _er_mod.resolve = stub
+            orc = Orchestrator()
+            s = Session(use_llm=False)
+            r = orc.handle(s, "南京海贝皇大排档哪家好")
+            tag = f"[S1 env={env!r}]"
+            check(f"{tag} 开关判定 False",
+                  orc._decision_shadow_enabled() is False, "")
+            check(f"{tag} 决策引擎未构造", orc._decider is None,
+                  str(orc._decider))
+            check(f"{tag} 观察记录容器未创建",
+                  orc._decision_shadow_log is None,
+                  str(orc._decision_shadow_log))
+            check(f"{tag} resolve 仅 parser 一次",
+                  stub.calls == 1, str(stub.calls))
+            check(f"{tag} route 非 pending_*",
+                  str(orc.last_ctx.route or "").startswith("pending") is False,
+                  str(orc.last_ctx.route))
+            check(f"{tag} producer 未构造", orc._producer is None, "")
+            check(f"{tag} 正常出回复", r is not None and bool(str(r)),
+                  str(r)[:80])
+            if baseline is None:
+                baseline = (str(r), orc.last_ctx.route)
+            else:
+                check(f"{tag} 回复与基线逐字一致",
+                      str(r) == baseline[0], f"{str(r)[:60]}")
+                check(f"{tag} route 与基线一致",
+                      orc.last_ctx.route == baseline[1], "")
+    finally:
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_switch_on_single_call() -> None:
+    """S2：开关开 + channel 关 → 三类问句各一轮，每轮恰好一次
+    decide()、恰好一条观察记录；记录覆盖 11 键；J-A 断言（decide()
+    对外返回 None，而记录 city_source/confidence 有真实非空值——
+    证明字段取自 _build() 的内部 result，不是对外返回值）。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        stub = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-on",
+                           confidence=0.92)])])
+        _er_mod.resolve = stub
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        eng = _CountingEngine()
+        orc._decider = eng
+        for i, ut in enumerate(("南京海贝皇大排档哪家好",      # poi
+                                "明天南京天气怎么样",          # weather
+                                "帮我排个南京3天行程"),        # plan
+                               start=1):
+            orc.handle(s, ut)
+            check(f"[S2 #{i}] 每轮恰好一次 decide()（累计 {i}）",
+                  eng.decide_calls == i, str(eng.decide_calls))
+            check(f"[S2 #{i}] 观察记录每轮 +1（累计 {i}）",
+                  len(orc._decision_shadow_log or []) == i,
+                  str(len(orc._decision_shadow_log or [])))
+            check(f"[S2 #{i}] engine.shadow_log 每轮 +1（累计 {i}）",
+                  len(eng.shadow_log) == i, str(len(eng.shadow_log)))
+        rec0, rec2 = orc._decision_shadow_log[0], orc._decision_shadow_log[2]
+        check("[S2] 记录键集合恰为 11 键契约",
+              len(rec0) == 11 and set(rec0) == set(SHADOW_RECORD_KEYS)
+              and set(SHADOW_OBSERVATION_KEYS) <= set(rec0), str(sorted(rec0)))
+        # ---- J-A：外部返回 None 与内部真实决策值并存 ----
+        check("[S2·J-A] 第 1 轮 decide() 对外返回 None（TAKEOVER=0）",
+              eng.decide_rets[0] is None, str(eng.decide_rets[0]))
+        check("[S2·J-A] 记录 city_source 非空真值（== query_city）",
+              rec0["city_source"] == "query_city", str(rec0["city_source"]))
+        check("[S2·J-A] 记录 confidence 非空真值（== 0.92）",
+              rec0["confidence"] == 0.92, str(rec0["confidence"]))
+        check("[S2·J-A] 记录 action 非空真值（== execute）",
+              rec0["action"] == "execute", str(rec0["action"]))
+        check("[S2] 规划轮 city_source 走 destination（口径一致）",
+              rec2["city_source"] == "destination", str(rec2["city_source"]))
+    finally:
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_record_matches_independent_decide() -> None:
+    """S3：同一 parse / 同一 resolved / 同一 rctx 下另建独立
+    DecisionEngine 调一次 decide()，11 字段逐字段相等；副本与源记录
+    字段相等但**身份不同**；J-B（记录字段与 _shadow() 实际收到的
+    result 逐一对应，且 takeover_on is False）。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    old_shadow = DecisionEngine._shadow
+    _p26_env(shadow="1", channel=None, takeover=None)
+    cap = {}
+
+    def wrap(self, result, intent, resolved, takeover_on, batch_on):
+        cap["result"] = result
+        cap["takeover_on"] = takeover_on
+        return old_shadow(self, result, intent, resolved, takeover_on,
+                          batch_on)
+
+    try:
+        _er_mod.resolve = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-s3",
+                           confidence=0.88)])])
+        DecisionEngine._shadow = wrap
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        eng = _CountingEngine()
+        orc._decider = eng
+        orc.handle(s, "南京海贝皇大排档哪家好")
+        parse, objs, rctx, kw = eng.decide_args[0]
+        ind = DecisionEngine()
+        ind.decide(parse, list(objs), rctx, **kw)
+        mine, src = orc._decision_shadow_log[0], ind.shadow_log[-1]
+        for key in SHADOW_RECORD_KEYS:
+            check(f"[S3] 字段 {key} 与独立决策逐字段相等",
+                  mine[key] == src[key], f"{mine[key]!r} != {src[key]!r}")
+        check("[S3] 副本非引用（身份不同）",
+              mine is not src and mine is not orc._decider.shadow_log[-1], "")
+        check("[S3] 副本键集合 == 源记录键集合 == 11 键",
+              set(mine) == set(src) == set(SHADOW_RECORD_KEYS), "")
+        # ---- J-B：调用链断言 ----
+        res = cap.get("result")
+        check("[S3·J-B] _shadow() 捕获到非 None 的 result", res is not None,
+              str(res))
+        check("[S3·J-B] _shadow() 收到 takeover_on is False",
+              cap.get("takeover_on") is False, str(cap.get("takeover_on")))
+        check("[S3·J-B] 记录 action / city_source / confidence / "
+              "entity_city 与 result 逐一相等",
+              mine["action"] == res.action
+              and mine["city_source"] == res.city_source
+              and mine["confidence"] == res.confidence
+              and mine["entity_city"] == (res.entity or {}).get("city"),
+              str(mine))
+    finally:
+        DecisionEngine._shadow = old_shadow
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_touchpoint_direct_zero_write() -> None:
+    """S6 第 1 层：**直接调用** `_decision_shadow(session, ctx)`（不经
+    handle）——session 状态与解析对象前后快照相等，DecisionResult
+    进入真实 _shadow 前后的 to_dict() 完全相等（记录装配未改业务
+    对象）；记录恰 11 键、无 utterance/history 键、不含问句唯一标记。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    old_shadow = DecisionEngine._shadow
+    _p26_env(shadow="1", channel=None, takeover=None)
+    cap = {}
+
+    def wrap(self, result, intent, resolved, takeover_on, batch_on):
+        cap["before"] = copy.deepcopy(result.to_dict()) if result else None
+        cap["result"] = result
+        out = old_shadow(self, result, intent, resolved, takeover_on, batch_on)
+        cap["after"] = copy.deepcopy(result.to_dict()) if result else None
+        # 反向污染装具：向**源记录**追加原文片段与额外键——若触点改成
+        # `dict(rec)` 整条复制，下面两条断言立即失败；只有白名单投影
+        # 才能把额外键挡在副本之外（评审 2026-11-20 实施约束）
+        self.shadow_log[-1]["utterance_echo"] = "ZQXTOKEN-leak"
+        return out
+
+    try:
+        _er_mod.resolve = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-s6")])])
+        DecisionEngine._shadow = wrap
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        ut = "南京海贝皇大排档哪家好 ZQXTOKEN"
+        ctx = make_ctx(ut)
+        s.query_city = ctx.parse.query_city
+        pr = ctx.parse
+        before = {
+            "slots": copy.deepcopy(s.slots),
+            "query_city": s.query_city,
+            "plan_made": s.plan_made,
+            "last_plan": copy.deepcopy(s.last_plan),
+            "active_pending_id": s.active_pending_id,
+            "objs": [o.as_dict() for o in pr.shadow_resolved_objs],
+        }
+        orc._decision_shadow(s, ctx)          # 直接调用触点，不经 handle
+        after = {
+            "slots": copy.deepcopy(s.slots),
+            "query_city": s.query_city,
+            "plan_made": s.plan_made,
+            "last_plan": copy.deepcopy(s.last_plan),
+            "active_pending_id": s.active_pending_id,
+            "objs": [o.as_dict() for o in pr.shadow_resolved_objs],
+        }
+        check("[S6-1] session 五字段 + 解析对象快照前后相等",
+              before == after, f"{before} != {after}")
+        check("[S6-1] ctx.route 未变、pending_decision 仍为 None",
+              ctx.route is None and ctx.pending_decision is None, "")
+        check("[S6-1] DecisionResult to_dict() 进入/退出 _shadow 完全相等",
+              cap.get("before") is not None and cap["before"] == cap["after"],
+              f"{cap.get('before')} != {cap.get('after')}")
+        rec = orc._decision_shadow_log[0]
+        check("[S6-1] 记录恰 11 键（无多余键）",
+              len(rec) == 11 and set(rec) == set(SHADOW_RECORD_KEYS),
+              str(sorted(rec)))
+        check("[S6-1] 污染装具有效性：源记录确实带额外键 utterance_echo",
+              "utterance_echo" in orc._decider.shadow_log[-1],
+              str(sorted(orc._decider.shadow_log[-1])))
+        check("[S6-1] 白名单投影未复制源记录的额外键（非 dict(rec) 整条复制）",
+              "utterance_echo" not in rec, str(sorted(rec)))
+        check("[S6-1] 记录不含 utterance/history 类键",
+              all(k not in rec for k in ("utterance", "history", "text",
+                                         "query", "raw")), str(sorted(rec)))
+        blob = json.dumps(rec, ensure_ascii=False, default=str)
+        check("[S6-1] 不落原文：问句唯一标记 ZQXTOKEN 未出现在记录中",
+              "ZQXTOKEN" not in blob, blob[:160])
+        check("[S6-1] 触点返回值恒为 None",
+              orc._decision_shadow(s, ctx) is None, "")
+    finally:
+        DecisionEngine._shadow = old_shadow
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_handle_baseline_equivalence() -> None:
+    """S6 第 2 层：同输入分别以 SHADOW=0 / SHADOW=1 跑真实 `handle()`
+    ——Reply 文本逐字相等、route 相等、producer/manager 均未构造；
+    唯一差异是观察记录容器（关=None / 开=1 条 11 键）。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    try:
+        _er_mod.resolve = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-base")])])
+        snap = {}
+        for tag, env in (("off", None), ("on", "1")):
+            _p26_env(shadow=env, channel=None, takeover=None)
+            orc = Orchestrator()
+            s = Session(use_llm=False)
+            r = orc.handle(s, "你好")
+            snap[tag] = {"reply": str(r), "route": orc.last_ctx.route,
+                         "producer": orc._producer,
+                         "manager": orc._pending_manager,
+                         "log": orc._decision_shadow_log}
+            if tag == "on":
+                check("[S6-2] 开启侧记录恰 1 条且 11 键",
+                      len(orc._decision_shadow_log or []) == 1
+                      and set(orc._decision_shadow_log[0])
+                      == set(SHADOW_RECORD_KEYS),
+                      str(orc._decision_shadow_log))
+            else:
+                check("[S6-2] 关闭侧无记录容器（None）",
+                      orc._decision_shadow_log is None, "")
+        check("[S6-2] 两次 Reply 文本逐字相等",
+              snap["off"]["reply"] == snap["on"]["reply"],
+              f"{snap['off']['reply'][:60]} != {snap['on']['reply'][:60]}")
+        check("[S6-2] route 相等",
+              snap["off"]["route"] == snap["on"]["route"],
+              f"{snap['off']['route']} != {snap['on']['route']}")
+        check("[S6-2] producer / manager 两侧均未构造",
+              snap["off"]["producer"] is None and snap["on"]["producer"] is None
+              and snap["off"]["manager"] is None
+              and snap["on"]["manager"] is None, "")
+        check("[S6-2] 唯一差异确为观察记录（关 None / 开 1 条）",
+              snap["off"]["log"] is None and len(snap["on"]["log"]) == 1, "")
+    finally:
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_exception_isolation() -> None:
+    """S4a：四路真异常注入，四路都必须返回正常 Reply 且 route 正常。
+    ① `_build` 抛异常 → 无记录 + 警告；② 记录容器 append 抛异常 →
+    decide() 已执行但复制失败被吞；③ shadow_sink 抛异常 → 记录仍生成
+    （_shadow 先 append 再调 sink）；④ `_build` 抛异常且警告载体本身
+    也抛异常 → 警告记录失败不得外抛。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    old_build = DecisionEngine._build
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        _er_mod.resolve = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-ex")])])
+
+        # ---- ① _build 抛异常 ----
+        def boom_build(self, *a, **kw):
+            raise RuntimeError("build boom")
+        DecisionEngine._build = boom_build
+        orc1 = Orchestrator()
+        r1 = orc1.handle(Session(use_llm=False), "南京海贝皇大排档哪家好")
+        check("[S4a-①] 正常返回 Reply", r1 is not None and bool(str(r1)),
+              str(r1)[:60])
+        check("[S4a-①] 触达失败 → 无观察记录",
+              orc1._decision_shadow_log is None, "")
+        check("[S4a-①] engine.shadow_log 长度不变（0）",
+              orc1._decider is not None and orc1._decider.shadow_log == [],
+              str(orc1._decider.shadow_log if orc1._decider else None))
+        check("[S4a-①] 异常已记入警告（前缀 decision shadow:）",
+              any(w.startswith("decision shadow:")
+                  for w in orc1._pending_warnings),
+              str(orc1._pending_warnings))
+
+        # ---- ② 记录容器 append 抛异常（decide() 已成功）----
+        DecisionEngine._build = old_build
+        orc2 = Orchestrator()
+        orc2._decision_shadow_log = _AppendBoom()
+        r2 = orc2.handle(Session(use_llm=False), "南京海贝皇大排档哪家好")
+        check("[S4a-②] 正常返回 Reply", r2 is not None and bool(str(r2)),
+              str(r2)[:60])
+        check("[S4a-②] decide() 已执行（engine.shadow_log == 1）",
+              orc2._decider is not None
+              and len(orc2._decider.shadow_log) == 1,
+              str(orc2._decider.shadow_log if orc2._decider else None))
+        check("[S4a-②] 复制失败被吞并记入警告",
+              any(w.startswith("decision shadow:")
+                  for w in orc2._pending_warnings),
+              str(orc2._pending_warnings))
+
+        # ---- ③ shadow_sink 抛异常（记录仍生成）----
+        orc3 = Orchestrator()
+        orc3._decider = DecisionEngine(shadow_sink=_boom_sink)
+        r3 = orc3.handle(Session(use_llm=False), "南京海贝皇大排档哪家好")
+        check("[S4a-③] 正常返回 Reply", r3 is not None and bool(str(r3)),
+              str(r3)[:60])
+        check("[S4a-③] 记录仍生成（sink 异常前的记录）",
+              len(orc3._decision_shadow_log or []) == 1
+              and len(orc3._decider.shadow_log) == 1,
+              str(orc3._decision_shadow_log))
+        check("[S4a-③] sink 异常不产生警告（_shadow 内部静默）",
+              orc3._pending_warnings == [], str(orc3._pending_warnings))
+
+        # ---- ④ _build 抛异常 + 警告载体自身 append 失败 ----
+        DecisionEngine._build = boom_build
+        orc4 = Orchestrator()
+        orc4._pending_warnings = _AppendBoom()
+        r4 = orc4.handle(Session(use_llm=False), "南京海贝皇大排档哪家好")
+        check("[S4a-④] 警告追加失败也不外抛，正常返回 Reply",
+              r4 is not None and bool(str(r4)), str(r4)[:60])
+        check("[S4a-④] route 正常（未被影子异常改写）",
+              orc4.last_ctx is not None and orc4.last_ctx.route is not None,
+              str(orc4.last_ctx.route if orc4.last_ctx else None))
+    finally:
+        DecisionEngine._build = old_build
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_input_boundary_missing_field() -> None:
+    """输入异常边界（与 S4a 隔离证明严格分开）：① 解析对象缺
+    `shadow_resolved_objs` → 以空列表决策（candidates_count == 0、
+    未形成结论），不崩；② `ctx.parse is None` → 触点直接 return，
+    零记录、零 engine 构造。**本函数不承担异常隔离的证明**。"""
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        _er_mod.resolve = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-bd")])])
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        ctx = make_ctx("南京海贝皇大排档哪家好")
+        s.query_city = ctx.parse.query_city
+        del ctx.parse.shadow_resolved_objs        # 属性缺失
+        orc._decision_shadow(s, ctx)
+        rec = (orc._decision_shadow_log or [None])[0]
+        check("[边界①] 缺失字段 → 以空列表决策（candidates_count == 0）",
+              rec is not None and rec["candidates_count"] == 0, str(rec))
+        check("[边界①] 空候选 → 未形成结论（action None / reason 保留）",
+              rec is not None and rec["action"] is None
+              and rec["reason"] == "未形成结论", str(rec))
+        check("[边界①] 不崩且无警告", orc._pending_warnings == [],
+              str(orc._pending_warnings))
+        # ---- ② parse is None ----
+        orc2 = Orchestrator()
+        ctx2 = make_ctx("你好")
+        ctx2.parse = None
+        orc2._decision_shadow(s, ctx2)
+        check("[边界②] parse is None → 零记录", orc2._decision_shadow_log
+              is None, "")
+        check("[边界②] parse is None → 不构造 engine（零开销）",
+              orc2._decider is None, "")
+    finally:
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_zero_network_and_no_reparse() -> None:
+    """S5 + 附加检查一：dispatch 调用数为 0（影子决策未触发外部检索）；
+    `entity_resolver.resolve` 恰 1 次（仅 parser）、编排层二次解析装具
+    零调用；`confidence=0.777` 数值指纹 + **元素级 id() 身份断言**
+    （decide() 入参列表元素、parse.shadow_resolved_objs 元素、桩返回
+    对象为同一批）——证明对象来自本轮 parser 产物，不是数值碰巧相同。"""
+    import travel_agent.agent as _agent_mod
+    import travel_agent.entity_resolver as _er_mod
+    old_resolve = _er_mod.resolve
+    old_dispatch = _agent_mod.dispatch
+    old_orch_resolve = _orch_mod._resolve_entities
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        fp = _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-fp",
+                            confidence=0.777)
+        stub = _StubResolver([ResolveResult(resolved=[fp])])
+        _er_mod.resolve = stub
+        guard = _FailIfCalled()
+        _orch_mod._resolve_entities = guard
+        disp = []
+
+        def cap_dispatch(name, args):
+            disp.append(name)
+            return old_dispatch(name, args)
+        _agent_mod.dispatch = cap_dispatch
+        orc = Orchestrator()
+        eng = _CountingEngine()
+        orc._decider = eng
+        s = Session(use_llm=False)
+        r = orc.handle(s, "你好")             # 业务路径本身零检索
+        check("[S5] 正常出回复", r is not None and bool(str(r)), "")
+        check("[S5] dispatch 调用数 == 0（无外部检索）", disp == [], str(disp))
+        check("[S5] entity_resolver.resolve 恰 1 次（仅 parser）",
+              stub.calls == 1, str(stub.calls))
+        check("[S5] 编排层二次解析零调用（调用即抛错装具未被触发）",
+              guard.calls == 0, str(guard.calls))
+        check("[S5] 每轮恰好一次 decide()", eng.decide_calls == 1,
+              str(eng.decide_calls))
+        rec = (orc._decision_shadow_log or [None])[0]
+        check("[S5] 数值指纹：confidence == 0.777",
+              rec is not None and rec["confidence"] == 0.777, str(rec))
+        objs = orc.last_ctx.parse.shadow_resolved_objs
+        check("[S5] candidates_count == len(parse.shadow_resolved_objs) == 1",
+              rec is not None and rec["candidates_count"] == len(objs) == 1,
+              f"{rec and rec['candidates_count']} / {len(objs)}")
+        check("[S5] statuses 与指纹对象一致", rec is not None
+              and rec["statuses"] == ["confirmed"], str(rec and rec["statuses"]))
+        # ---- 元素级身份断言（数值相同不足以证明同源）----
+        passed = eng.decide_args[0][1]
+        check("[身份] decide() 入参元素 is 桩返回对象",
+              len(passed) == 1 and id(passed[0]) == id(fp), str(passed))
+        check("[身份] parse.shadow_resolved_objs 元素 is 同一对象",
+              len(objs) == 1 and id(objs[0]) == id(fp), str(objs))
+        check("[身份] 三者 id() 完全一致（非数值巧合）",
+              id(passed[0]) == id(objs[0]) == id(fp),
+              f"{id(passed[0])} {id(objs[0])} {id(fp)}")
+    finally:
+        _agent_mod.dispatch = old_dispatch
+        _orch_mod._resolve_entities = old_orch_resolve
+        _er_mod.resolve = old_resolve
+        _p26_env()
+
+
+def test_p26_shadow_channel1_no_double_decide() -> None:
+    """附加检查二：CHANNEL=1 时影子触点不触达，绝不产生第二次
+    decide()。两轮对照：
+    - 生产轮（ambiguous → 创建 Pending）：decide() 恰 1 次，全部来自
+      `_pending_produce` 钩子，影子零记录；
+    - 消费轮（选择 → 重验证）：decide() 0 次（重验证直接构造
+      DecisionResult，不走 decide()），影子零记录，route/回复与既有
+      P2.5b 基线一致。"""
+    _p26_env(shadow="1", channel="1", takeover=None)
+    old_orch_resolve = _orch_mod._resolve_entities
+    old_rv_resolve = _rv_mod._resolve_entities
+    try:
+        # ---- 生产轮 ----
+        _orch_mod._resolve_entities = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        orc = Orchestrator()
+        eng = _CountingEngine()
+        orc._decider = eng
+        s = _produce_session(orc, "s-p26-a")
+        r1 = orc.handle(s, "海贝皇大排档哪家好")
+        check("[C1 生产轮] route=pending_produce（钩子照常工作）",
+              orc.last_ctx.route == "pending_produce", str(orc.last_ctx.route))
+        check("[C1 生产轮] 回复含候选展示", "海贝皇大排档（南京店）" in str(r1),
+              str(r1)[:80])
+        check("[C1 生产轮] decide() 恰 1 次（仅 pending 钩子，影子未叠加）",
+              eng.decide_calls == 1, str(eng.decide_calls))
+        check("[C1 生产轮] 影子零记录", orc._decision_shadow_log is None,
+              str(orc._decision_shadow_log))
+        check("[C1 生产轮] 开关判定 False（channel=1 时影子不触达）",
+              orc._decision_shadow_enabled() is False, "")
+
+        # ---- 消费轮 ----
+        _orch_mod._resolve_entities = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-c1")])])
+        _rv_mod._resolve_entities = _StubResolver([ResolveResult(resolved=[
+            _conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-c1-rv")])])
+        orc2, s2, store2, p2 = _preset_orc(
+            "s-p26-b", lambda: datetime.now())
+        eng2 = _CountingEngine()
+        orc2._decider = eng2
+        r2 = orc2.handle(s2, "第1个")
+        check("[C1 消费轮] route=pending_consume_execute（既有基线）",
+              orc2.last_ctx.route == "pending_consume_execute",
+              str(orc2.last_ctx.route))
+        check("[C1 消费轮] decide() 0 次（重验证不调 decide，影子未叠加）",
+              eng2.decide_calls == 0, str(eng2.decide_calls))
+        check("[C1 消费轮] 影子零记录", orc2._decision_shadow_log is None,
+              str(orc2._decision_shadow_log))
+        check("[C1 消费轮] 回复呈现 fresh 实体（未被影子影响）",
+              "海贝皇大排档（南京店）" in str(r2), str(r2)[:80])
+    finally:
+        _orch_mod._resolve_entities = old_orch_resolve
+        _rv_mod._resolve_entities = old_rv_resolve
+        _p26_env()
+
+
+def test_p26_switch_freeze() -> None:
+    """S7：三个既有开关语义不变、新开关默认关闭；`TRAVEL_DECISION_SHADOW`
+    在生产源码中只有一处读取点（`_decision_shadow_enabled`）；
+    `SHADOW_OBSERVATION_KEYS` 是字段契约常量，不被 `_build` / `decide` /
+    `DecisionResult` 读取。"""
+    # ---- ① 既有 CHANNEL 开关三态不变 ----
+    for env, want in ((None, False), ("0", False), ("1", True)):
+        _p26_env(shadow=None, channel=env, takeover=None)
+        check(f"[S7] _channel_enabled() env={env!r} → {want}",
+              Orchestrator._channel_enabled() is want, "")
+    # ---- ② TAKEOVER 未设 → decide() 返回 None（既有语义）----
+    _p26_env(shadow=None, channel=None, takeover=None)
+    pr = make_ctx("南京海贝皇大排档哪家好").parse
+    out = DecisionEngine().decide(
+        pr, [_conf_rc_fresh("海贝皇大排档（南京店）", "南京", "e-fz")],
+        {"slots": {}}, intent="poi_query")
+    check("[S7] TRAVEL_DECISION_TAKEOVER 未设 → decide() 返回 None",
+          out is None, str(out))
+    # ---- ③ 新开关默认关闭 ----
+    check("[S7] 新开关未设时默认关闭",
+          Orchestrator._decision_shadow_enabled() is False, "")
+    # ---- ④ 生产源码中开关读取点唯一（只数带引号的字面量读取，
+    #         注释/docstring 中的名称提及不计）----
+    hits = []
+    root = os.path.join(os.path.dirname(__file__), "..", "src", "travel_agent")
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, fn)
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+            n = src.count('"TRAVEL_DECISION_SHADOW"')
+            if n:
+                hits.append((os.path.relpath(path, root), n))
+    check("[S7] TRAVEL_DECISION_SHADOW 生产读取点唯一（orchestrator 1 处）",
+          len(hits) == 1 and hits[0][0].endswith("orchestrator.py")
+          and hits[0][1] == 1, str(hits))
+    # ---- ⑤ SHADOW_OBSERVATION_KEYS 不是决策输入 ----
+    check("[S7] SHADOW_OBSERVATION_KEYS 恰 4 个观察字段",
+          SHADOW_OBSERVATION_KEYS == ("city_source", "entity_city",
+                                      "confidence", "candidates_count"),
+          str(SHADOW_OBSERVATION_KEYS))
+    check("[S7] SHADOW_RECORD_KEYS == 既有 7 键 + 4 观察字段（11 键）",
+          len(SHADOW_RECORD_KEYS) == 11
+          and tuple(SHADOW_RECORD_KEYS[7:]) == SHADOW_OBSERVATION_KEYS,
+          str(SHADOW_RECORD_KEYS))
+    for fn in (DecisionEngine._build, DecisionEngine.decide,
+               DecisionEngine._shadow):
+        check(f"[S7] {fn.__name__} 无 SHADOW_OBSERVATION_KEYS 读取点",
+              "SHADOW_OBSERVATION_KEYS" not in inspect.getsource(fn), "")
+    check("[S7] DecisionResult 无 SHADOW_OBSERVATION_KEYS 读取点",
+          "SHADOW_OBSERVATION_KEYS"
+          not in inspect.getsource(DecisionResult), "")
+    _p26_env()
+
+
 # ================================================== main
 
 
@@ -3087,9 +3721,20 @@ def main() -> int:
                test_p25b_mechanism_e_fresh_entity_enforcement,
                test_p25b_mechanism_e_failure_conservative,
                test_p25b_other_city_template_text_detection,
-               test_p25b_channel0_zero_revalidation):
+               test_p25b_channel0_zero_revalidation,
+               # ---- P2.6 增量 1+3：DecisionEngine 影子触达（10 个）----
+               test_p26_shadow_switch_off_frozen,
+               test_p26_shadow_switch_on_single_call,
+               test_p26_shadow_record_matches_independent_decide,
+               test_p26_shadow_touchpoint_direct_zero_write,
+               test_p26_shadow_handle_baseline_equivalence,
+               test_p26_shadow_exception_isolation,
+               test_p26_shadow_input_boundary_missing_field,
+               test_p26_shadow_zero_network_and_no_reparse,
+               test_p26_shadow_channel1_no_double_decide,
+               test_p26_switch_freeze):
         fn()
-    print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b): {_PASS} pass / {_FAIL} fail")
+    print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b+P2.6): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0
 
 

@@ -70,6 +70,21 @@ _HC4_ROLES = ("negated", "remove")
 
 _PLAN_PREFIX = "plan"
 
+# ---- P2.6 增量 3（评审 2026-11-20 批准）：影子记录字段契约 ----
+
+# 新增的四个**观察字段**。纯记录用途，供测试与文档核对字段口径；
+# **不是决策输入**——不得被 _build() / decide() / DecisionResult 读取，
+# 也不得据此改变任何判定分支（tests/test_pending_channel.py 有断言锁定）。
+SHADOW_OBSERVATION_KEYS = ("city_source", "entity_city",
+                           "confidence", "candidates_count")
+
+# 影子记录的**完整键集合**（11 键 = 既有 7 键 + 上述 4 观察字段）。
+# Orchestrator 侧按本元组做**白名单投影**复制记录副本（不是整条
+# dict(...) 复制）——生产侧写入的键即此集合，不多不少。
+SHADOW_RECORD_KEYS = ("intent", "takeover", "batch_enabled", "action",
+                      "reason", "entity_text", "statuses",
+                      ) + SHADOW_OBSERVATION_KEYS
+
 
 @dataclass
 class DecisionResult:
@@ -174,6 +189,7 @@ class DecisionEngine:
 
     def _shadow(self, result, intent, resolved, takeover_on,
                 batch_on) -> None:
+        entity = (result.entity if result else None) or {}
         rec = {
             "intent": intent,
             "takeover": takeover_on,
@@ -183,6 +199,14 @@ class DecisionEngine:
             "entity_text": (result.entity or {}).get("name")
             if result else None,
             "statuses": [getattr(r, "status", "") for r in (resolved or [])],
+            # ---- P2.6 增量 3（纯记录，不参与决策）----
+            # 取值对象是 _build() 的返回值 result（见 PHASE5_P25_PLAN
+            # §25.4.2 调用链），与本方法所属 decide() 的对外返回值无关：
+            # TAKEOVER=0 时 decide() 返回 None，此处仍有本轮真实决策值。
+            "city_source": result.city_source if result else None,
+            "entity_city": entity.get("city"),
+            "confidence": result.confidence if result else None,
+            "candidates_count": len(resolved or []),
         }
         self.shadow_log.append(rec)
         if self.shadow_sink is not None:

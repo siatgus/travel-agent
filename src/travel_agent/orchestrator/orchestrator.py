@@ -21,7 +21,7 @@ import os
 from .. import llm
 from ..candidate_extractor import extract as _extract_candidates
 from ..decision import (ACTION_CLARIFY, ACTION_EXECUTE, DEFAULT_BATCHES,
-                        DecisionEngine)
+                        SHADOW_RECORD_KEYS, DecisionEngine)
 from ..dialogue import Reply
 from ..entity_resolver import resolve as _resolve_entities
 from ..parser import parse_utterance
@@ -82,6 +82,10 @@ class Orchestrator:
         self._decider: DecisionEngine | None = None
         # P2.5b：重验证装配（同上，channel=0 永不构造，零开销旁路）
         self._revalidator: PendingRevalidator | None = None
+        # P2.6：决策影子观察记录（延迟构造——开关关闭时恒为 None，
+        # 零容器、零记录）。纯内存：不落盘、不落原文、无跨进程语义
+        # （生命周期见 PHASE5_P25_PLAN §25.4.4）
+        self._decision_shadow_log: list[dict] | None = None
 
     # -------------------------------------------------- P2.4a pending gate
 
@@ -89,6 +93,20 @@ class Orchestrator:
     def _channel_enabled() -> bool:
         """TRAVEL_PENDING_CHANNEL 开关（默认 0 = 完全旁路）。"""
         return os.environ.get("TRAVEL_PENDING_CHANNEL", "0").strip() == "1"
+
+    @staticmethod
+    def _decision_shadow_enabled() -> bool:
+        """TRAVEL_DECISION_SHADOW 开关（默认 0 = 完全旁路）。
+
+        P2.6 增量 1（评审 2026-11-20 裁定 r1）：独立开关，不复用
+        CHANNEL/TAKEOVER 组合，也不改变 pending 通道的任何既有判定。
+        运行约束（裁定同条）：仅 pending 通道关闭时启用影子触达——
+        避免同一轮出现两次 decide() 计算（pending 钩子已在本轮决策
+        一次），这是「不重复执行」而非复用开关语义。
+        """
+        if os.environ.get("TRAVEL_DECISION_SHADOW", "0").strip() != "1":
+            return False
+        return os.environ.get("TRAVEL_PENDING_CHANNEL", "0").strip() != "1"
 
     def _pending_runtime(self, sid: str):
         """延迟装配 Runtime Manager（首个 channel=1 请求时构造）。"""
@@ -531,10 +549,72 @@ class Orchestrator:
         return self._producer
 
     def _ensure_decider(self) -> DecisionEngine:
-        """延迟构造决策引擎（同上；channel=0 永不构造）。"""
+        """延迟构造决策引擎（同上；两个开关均关时永不构造）。"""
         if self._decider is None:
             self._decider = DecisionEngine()
         return self._decider
+
+    # ---------------------------------------- P2.6 增量 1 影子触达
+
+    def _decision_shadow(self, session, ctx) -> None:
+        """P2.6 增量 1：DecisionEngine 影子触达（纯观察，恒返回 None）。
+
+        位置：`handle()` 内统一解析之后、pending 消费通道之前（§25.2）。
+        每轮恰好一次，任何 route 都经过；开关关闭时零开销返回。
+
+        六条调用契约（PHASE5_P25_PLAN §25.2，逐条对应实现）：
+        1. 恒返回 None——调用方不接收返回值，decide() 的结果（无论
+           None 还是 DecisionResult）**不参与任何分流判定**，本方法
+           在结构上不是分流点；
+        2. 每轮恰好一次 decide()（含候选为空的轮次）；
+        3. 输入 resolved 只能是本轮 parser 产出的
+           `ctx.parse.shadow_resolved_objs`——**不再调**
+           _extract_candidates / _resolve_entities（甲方案红线：零
+           重复解析）；
+        4. 记录来自 decide() 写入 engine.shadow_log 的那一条，按
+           SHADOW_RECORD_KEYS **白名单投影**复制（不是整条 dict 复制，
+           也不是引用）；调用前后比较长度，长度未增（决策内部异常）
+           则**不复制**，杜绝复制到上一轮的陈旧记录；
+        5. 异常隔离覆盖整个触达过程：构造 engine、读解析对象、组装
+           rctx、调用 decide()、长度比较、容器延迟创建、记录投影与
+           append 全在同一个 try 内，任何异常都不外抛；
+        6. except 内的警告追加再包一层 try/except——警告载体损坏时
+           二次抛出会破坏正常 Reply，这是最不可接受的失败形态。
+
+        「不落原文」的实现约束：本方法签名不含问句；记录装配只读
+        SHADOW_RECORD_KEYS（11 键）白名单，不访问 ctx.utterance /
+        ctx.history / session.history；全程不做任何序列化。
+        """
+        if not self._decision_shadow_enabled():
+            return
+        try:
+            parse = getattr(ctx, "parse", None)
+            if parse is None:              # 防御：解析缺失 → 不决策
+                return
+            objs = getattr(parse, "shadow_resolved_objs", None) or []
+            # rctx 与 P2.5a 生产钩子（_pending_produce 内）逐字同构，
+            # 口径一致性优先（含 last_city 取 query_city 的既有口径）
+            rctx = {"slots": getattr(session, "slots", {}) or {},
+                    "trip_dest": (getattr(parse, "destination", "") or ""),
+                    "last_city": (getattr(session, "query_city", "") or "")}
+            engine = self._ensure_decider()
+            before = len(engine.shadow_log)
+            engine.decide(parse, list(objs), rctx,
+                          intent=getattr(parse, "intent", "") or None)
+            if len(engine.shadow_log) > before:
+                if self._decision_shadow_log is None:
+                    self._decision_shadow_log = []
+                rec = engine.shadow_log[-1]
+                # 白名单投影（评审 2026-11-20 实施约束）：只取契约
+                # 声明的 11 键，绝不整条复制、绝不序列化原文
+                self._decision_shadow_log.append(
+                    {k: rec.get(k) for k in SHADOW_RECORD_KEYS})
+        except Exception as exc:
+            try:                           # 契约 6：警告追加失败也不外抛
+                self._pending_warnings.append(
+                    f"decision shadow: {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
 
     def _pending_produce(self, session, utterance: str, ctx) -> Reply | None:
         """P2.5a 生产钩子（步骤 1.8）：ambiguous → 创建 Pending → 展示。
@@ -630,6 +710,11 @@ class Orchestrator:
         ctx.parse = parse_utterance(utterance, context=session,
                                     today=session.today)
         session.query_city = ctx.parse.query_city
+
+        # ---- 1.6 P2.6 影子触达：本轮解析结果 → DecisionEngine 纯观察 ----
+        # 单点单次：新开关开且 pending 通道关时每轮恰好一次 decide()。
+        # 返回值不使用（契约 1）：本调用在结构上不是分流点。
+        self._decision_shadow(session, ctx)
 
         # ---- 1.75 pending 消费通道（P2.4a 单点接入，唯一拦截点）----
         # 落点冻结：统一解析之后、周边咨询 gate 之前——保证「第一个」

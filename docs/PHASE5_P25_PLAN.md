@@ -2844,6 +2844,12 @@ format-on-save 类的自动重排行为；**未做根因确认**（未逐一定�
 +# 不得被 _build() / decide() / DecisionResult 读取或参与任何判定分支。
 +SHADOW_OBSERVATION_KEYS = ("city_source", "entity_city",
 +                           "confidence", "candidates_count")
++
++# 影子记录的**完整键集合**（11 键 = 既有 7 键 + 上述 4 观察字段）；
++# Orchestrator 侧按本元组做**白名单投影**（r3：评审最终实施约束）。
++SHADOW_RECORD_KEYS = ("intent", "takeover", "batch_enabled", "action",
++                      "reason", "entity_text", "statuses",
++                      ) + SHADOW_OBSERVATION_KEYS
 ```
 
 **② `DecisionEngine._shadow()`（锚点：`"statuses": [...]` 键之后）**
@@ -2876,7 +2882,7 @@ format-on-save 类的自动重排行为；**未做根因确认**（未逐一定�
 record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾，既有
 `shadow_log[0]["action"]` / `["takeover"]` 等断言不受影响）。
 
-#### 25.3.3 `src/travel_agent/orchestrator/orchestrator.py`（5 处）
+#### 25.3.3 `src/travel_agent/orchestrator/orchestrator.py`（6 处；第 6 项 import 为 r3 新增）
 
 **① `__init__`（锚点：`self._revalidator: PendingRevalidator | None = None` 之后）**
 
@@ -2946,8 +2952,10 @@ record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾�
 +            if len(engine.shadow_log) > before:
 +                if self._decision_shadow_log is None:
 +                    self._decision_shadow_log = []
++                rec = engine.shadow_log[-1]
++                # 白名单投影（r3：评审最终实施约束）——只取 11 键契约
 +                self._decision_shadow_log.append(
-+                    dict(engine.shadow_log[-1]))
++                    {k: rec.get(k) for k in SHADOW_RECORD_KEYS})
 +        except Exception as exc:
 +            try:                           # 契约 6：警告追加失败也不外抛
 +                self._pending_warnings.append(
@@ -2970,6 +2978,10 @@ record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾�
 ```
 
 **⑤ `_ensure_decider` docstring** 一行修订（见 ③ 中 diff）。
+
+**⑥ import（r3 新增）**：模块头 `from ..decision import (...)` 的导入
+元组增加 `SHADOW_RECORD_KEYS`（投影所需）；仅插入一项，不重排既有
+顺序。这是 r3 相对 r2 多出的唯一落点。
 
 ### 25.4 记录契约
 
@@ -3097,7 +3109,7 @@ record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾�
 | 6 | `test_p26_shadow_exception_isolation` | **S4a**（修订点三：真正的异常隔离） | 四路注入：①打桩 `DecisionEngine._build` 抛异常；②预置 `orc._decision_shadow_log = _AppendBoom()`（append 抛异常）；③预置带抛异常 `shadow_sink` 的 engine；④同时预置 `_AppendBoom` 警告载体 + 令 `_build` 抛异常 | ①四路均返回正常 `Reply`、route 正常；②第①路：无记录、`engine.shadow_log` 长度不变、`_pending_warnings` 含 `decision shadow:`；③第②路：`decide()` 已执行（`engine.shadow_log` +1）但复制失败被吞；④第③路：记录**仍生成**（`_shadow` 先 append 再调 sink），`shadow_log` 含 sink 异常前的记录；⑤第④路：**警告追加自身失败也不外抛**，`handle` 仍正常返回 |
 | 7 | `test_p26_shadow_input_boundary_missing_field` | **输入异常边界**（修订点三：与异常隔离区分） | ①`del ctx.parse.shadow_resolved_objs`；②`ctx.parse = None` | ①属性缺失 → 以空列表决策（`candidates_count == 0`）、正常出回复；②`parse is None` → 触点直接 return、零记录、不崩。**声明**：本函数验证「字段缺失的防御性处理」，不承担异常隔离的证明 |
 | 8 | `test_p26_shadow_zero_network_and_no_reparse` | **S5** + 附加检查一 | 打桩 `agent.dispatch` 计数；打桩 `entity_resolver.resolve` 返回**指纹对象列表**（`confidence=0.777`、固定 status 组合）；打桩 `_orch_mod._resolve_entities` 为「调用即置 FAIL」；wrap `DecisionEngine.decide` 捕获入参 | ①`dispatch` 计数 == 0；②`entity_resolver.resolve` 计数 == 1（parser 唯一一次）；③`_orch_mod._resolve_entities` 调用 0 次；④数值指纹：记录 `confidence == 0.777`、`candidates_count == len(parse.shadow_resolved_objs)`、`statuses` 与指纹一致；⑤**身份断言（评审要求补强）**：`decide()` 入参列表的元素 `is` 桩返回的同一批对象（逐元素 `id()` 相等），且 `parse.shadow_resolved_objs` 元素亦为同一批——证明对象来自本轮 parser 产物，而非数值碰巧相同 |
-| 9 | `test_p26_shadow_channel1_no_double_decide` | 附加检查二 | `SHADOW=1 ∧ CHANNEL=1`，预置 Pending 跑消费轮；预置 `_CountingEngine` | ①`_decision_shadow_log is None`（触点未触达）；②`decide` 计数 == 1（仅 pending 钩子）；③消费轮 route / 回复与既有 P2.5b 基线一致 |
+| 9 | `test_p26_shadow_channel1_no_double_decide` | 附加检查二 | `SHADOW=1 ∧ CHANNEL=1`，预置 Pending 跑消费轮；预置 `_CountingEngine` | ①`_decision_shadow_log is None`（触点未触达）；②生产轮 `decide` 计数 == 1（仅 pending 钩子）、**消费轮 == 0**（重验证直接构造 DecisionResult，不经 `decide()`——r3 按实测修正，见 §25.11.2-②）；③两轮 route / 回复与既有 P2.5b 基线一致 |
 | 10 | `test_p26_switch_freeze` | **S7** | 三开关独立设置 | ①`_channel_enabled()` 在未设/`"0"`/`"1"` 三态行为不变；②`TRAVEL_DECISION_TAKEOVER` 未设时 `decide()` 返回 `None`（既有语义）；③新开关默认 False；④全仓开关读取点仅出现在 §25.3 声明的两处；⑤`SHADOW_OBSERVATION_KEYS` 无任何 `_build`/`decide` 读取点（grep 断言） |
 
 **S8（范围与回归）不作为测试函数**：由证据交付承担（§25.7），评审已确认
@@ -3147,7 +3159,7 @@ record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾�
 
 1. `git show --format=fuller --stat` 全文（本轮实施 commit）；
 2. 三个生产文件完整 diff（`git diff <base>..<head> -- src/`），逐条对应
-   §25.3 的 9 处改动（parser 2 + decision 2 + orchestrator 5）；
+   §25.3 的 10 处改动（parser 2 + decision 2 + orchestrator 6，含 import）；
 3. 冻结清单逐项 `git diff --stat`（沿用 §22.7.5 四类计数口径）：
    9 独立文件（`decision.py` 本轮定向解冻、其余 8 项零 diff）+
    `handlers/` 目录级 + 目录内 9 个 `.py` 核查；
@@ -3214,3 +3226,122 @@ record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾�
 **r2 声明**：本轮仍只授权 P2.6 增量 1+3；不授权 JSONL、报告脚本、
 持久化、生产数据采集、P3、灰度或接管；三个既有开关保持关闭；文件
 清单未扩大。
+
+### 25.11 实施记录（r3，2026-11-20 最终授权后单 commit）
+
+评审 2026-11-20 的最终裁定为「CONDITIONAL PASS → 实施授权」，授权要求
+代码 / 测试 / 文档同一个独立 commit，提交后停止、不自动进入下一阶段。
+本节记录实际落点、与 r2 计划的偏差（三处，逐条申报）与验证结果。
+
+#### 25.11.1 交付物与改动统计
+
+| 文件 | 性质 | 改动 |
+|---|---|---|
+| `src/travel_agent/parser.py` | 生产 | 2 处（字段声明 + 一行赋值），+9 行 |
+| `src/travel_agent/decision.py` | 生产（定向解冻） | 2 处（两个契约常量 + `_shadow` 4 键），+24 行 |
+| `src/travel_agent/orchestrator/orchestrator.py` | 生产 | 6 处（import / `__init__` / 开关 / 触点 / handle 调用 / docstring），+89 行、−2 行 |
+| `tests/test_pending_channel.py` | 测试 | 新增 10 个函数 + 5 个辅助装具 + 4 项 import |
+| `docs/PHASE5_P25_PLAN.md` | 文档 | 本节 + §25.3/§25.5/§25.7 三处按实施修正 |
+
+`entity_resolver.py` 与 §22.7.5 冻结清单其余 8 项、`handlers/` 目录
+全部零 diff；未新增任何文件。
+
+#### 25.11.2 与 r2 计划的偏差（三处，如实申报）
+
+**① 白名单投影（评审最终授权第 3 条，r3 落实）**
+
+r2 草案 §25.3.3-③ 写的是 `dict(engine.shadow_log[-1])`（整条复制）。
+评审在最终授权中明确指出：不能整条复制后再声称「只读取 11 个键」，
+必须显式投影。实施改为：
+
+```
+rec = engine.shadow_log[-1]
+self._decision_shadow_log.append({k: rec.get(k) for k in SHADOW_RECORD_KEYS})
+```
+
+为此在 `decision.py` 增加第二个契约常量 `SHADOW_RECORD_KEYS`（11 键 =
+既有 7 键 + 4 观察字段，由 `SHADOW_OBSERVATION_KEYS` 拼接而成），并在
+orchestrator 模块头新增一项 import——**这是 orchestrator 改动由 5 处
+变为 6 处的唯一原因**，功能范围未扩大。`SHADOW_OBSERVATION_KEYS` 仍只
+表示 4 个观察字段（`S7` 有断言锁定其内容与 11 键的派生关系）。
+
+**② §25.5 #9 的断言按实测修正（r2 该行为事实错误）**
+
+r2 表中第 9 项写「消费轮 `decide` 计数 == 1（仅 pending 钩子）」。
+实测：**消费轮 `decide()` 调用为 0 次**——`PendingRevalidator` 在
+`pending_revalidator.py:356` 直接构造 `DecisionResult`，不经
+`DecisionEngine.decide()`；`decide()` 只出现在 P2.5a 生产钩子
+（`_pending_produce`）里，而消费轮在步骤 1.75 就已短路，走不到 1.8。
+
+因此测试改为**两轮对照**，两条断言都用实测值：
+
+| 轮次 | 实际 route | `decide()` 计数 | 影子记录 | 证明 |
+|---|---|---|---|---|
+| 生产轮（ambiguous → 创建 Pending） | `pending_produce` | **1**（仅钩子） | `None` | 影子未叠加第二次决策 |
+| 消费轮（选择 → 重验证 confirmed） | `pending_consume_execute` | **0** | `None` | 重验证不经 `decide()`，影子亦未新增 |
+
+附加检查二的结论（CHANNEL=1 时不产生第二次 `decide()`）不因该修正而
+减弱——生产轮从「应为 1」变成一个可证伪的等式（若去掉去重条件立即
+变 2，见 §25.11.5 的 M3）。
+
+**③ 新增一条 r2 表外的断言（加强，非扩围）**
+
+S6 第 1 层（`test_p26_shadow_touchpoint_direct_zero_write`）增加了
+**反向污染装具**：包装 `DecisionEngine._shadow`，在真实记录写完之后
+向**源记录**追加 `utterance_echo = "ZQXTOKEN-leak"`，再断言
+`_decision_shadow_log` 的副本仍恰 11 键、不含该键、序列化后不含该
+标记。这是唯一能把「白名单投影」与「整条复制」区分开的断言——
+若实现退回 `dict(rec)`，它连同「11 键」断言一起失败（M1）。装具同时
+自证有效性（断言源记录确实带上了该额外键），避免空转。
+
+#### 25.11.3 十处落点（实际行号，`git diff` 逐条对应）
+
+| # | 文件:行 | 内容 |
+|---|---|---|
+| 1 | `parser.py:107-113` | `ParseResult.shadow_resolved_objs`（`repr=False, compare=False`） |
+| 2 | `parser.py:313` | `res.shadow_resolved_objs = list(_rr.resolved)`（与 `shadow_resolved` 同一批对象） |
+| 3 | `decision.py:73-86` | `SHADOW_OBSERVATION_KEYS`（4 键）+ `SHADOW_RECORD_KEYS`（11 键） |
+| 4 | `decision.py:192` | `entity = (result.entity if result else None) or {}` |
+| 5 | `decision.py:202-209` | `_shadow` 记录追加 4 观察键 |
+| 6 | `orchestrator.py:23-24` | import 增加 `SHADOW_RECORD_KEYS` |
+| 7 | `orchestrator.py:85-88` | `_decision_shadow_log` 延迟容器 |
+| 8 | `orchestrator.py:97-110` | `_decision_shadow_enabled()`（AND 两条件） |
+| 9 | `orchestrator.py:552` / `559-617` | `_ensure_decider` docstring 修订 / `_decision_shadow()` 触点 |
+| 10 | `orchestrator.py:714-718` | `handle()` 步骤 1.6 调用（解析之后、1.75 之前） |
+
+#### 25.11.4 测试矩阵落地与运行结果
+
+10 个函数全部落在 `tests/test_pending_channel.py`（3106–3670 行；`main()` 定义在 3676、调用列表 3677 起），
+并已加入 `main()` 调用列表；函数名、构造、断言与 §25.5 表一致，
+仅第 9 项按 §25.11.2-② 修正。
+
+| 指标 | 实施前 | 实施后 |
+|---|---|---|
+| channel 套件断言 | 357 pass / 0 fail | **486 pass / 0 fail**（+129） |
+| 退出码 | 0 | **0** |
+| 17 套件 | 全绿 | **全绿（17/17 exit=0）** |
+
+17 套件逐一断言数：pending 60、producer 72、revalidator 78、sqlite 95、
+channel 486、interceptor 150、decision / orchestrator / routing / reply /
+resolver / corpus_v4 / parser / extractor 全部 exit=0，dialogue 244、
+server 52、conversations 21。原始输出见 §25.7 第 5 项。
+
+#### 25.11.5 变异检验（证明新测试非空转）
+
+对生产代码做三处临时变异（每次跑完立即还原，还原后复跑 486/0）：
+
+| 变异 | 预期被捕获 | 实测 |
+|---|---|---|
+| M1 投影改回 `dict(rec)` 整条复制 | 11 键 / 投影 / 不落原文 | **3 条 FAIL**（含 `[S6-1] 白名单投影未复制源记录的额外键`、`不落原文`） |
+| M2 去掉 `TRAVEL_PENDING_CHANNEL != "1"` 去重条件 | 附加检查二 | **5 条 FAIL**（生产轮 `decide` 变 2、影子出现记录） |
+| M3 `decide()` 把 `None` 传给 `_shadow`（模拟「从对外返回值取字段」） | S2·J-A / S3·J-B | **7 条 FAIL**（J-A 四字段全 None；既有 `[A1]`/`[C2]` 也失败，说明既有套件本就锁住该调用链） |
+
+#### 25.11.6 边界与状态
+
+- 三个开关：`TRAVEL_DECISION_SHADOW` 未设置（默认 0）、
+  `TRAVEL_PENDING_CHANNEL=0`、`TRAVEL_DECISION_TAKEOVER` 未设置；
+  测试内显式设置并在 `finally` 中清除，不跨测试泄漏。
+- 本轮为**机制可验证实现**，不是生产观察数据采集：无 JSONL、无
+  `TRAVEL_SHADOW_LOG`、无文件写入、无脱敏机制、无容量上限（无上限
+  已登记为生产启用门槛，见 §25.4.4）。
+- 未进入 P3、未做灰度/接管、未触碰 §23.5 五项遗留、未追溯整改 F6。

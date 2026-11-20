@@ -104,6 +104,13 @@ class ParseResult:
     # 影子运行（Phase 4）：EntityResolver 的实体验证四档分流结果，同样
     # 只记录不驱动业务。dict 见 entity_resolver.ResolvedCandidate。
     shadow_resolved: list[dict] = field(default_factory=list)
+    # 影子运行（P2.6 增量 3，评审 2026-11-20 批准甲方案）：与上一字段
+    # **同一批** ResolvedCandidate 对象原样保留，供 DecisionEngine 影子
+    # 触达直接消费——绝不二次 extract/resolve。仅影子消费，绝不进入任何
+    # 业务分支。repr/compare 均排除：不改变 ParseResult 的日志输出与
+    # 相等语义（既有测试比较逻辑零扰动）。
+    shadow_resolved_objs: list = field(default_factory=list,
+                                       repr=False, compare=False)
 
     # -------------------------------------------------- 兼容层
     def to_legacy_delta(self) -> dict:
@@ -302,6 +309,8 @@ def parse_utterance(text: str, context=None, today: date | None = None,
             from .entity_resolver import resolve as _resolve_entities
             _rr = _resolve_entities(_shadow.poi_candidates, ctx)
             res.shadow_resolved = [r.as_dict() for r in _rr.resolved]
+            # P2.6：同一批对象保留（甲方案）——零重复解析、零重复验证
+            res.shadow_resolved_objs = list(_rr.resolved)
             res.shadow_notes.extend(_rr.notes)
         except Exception as e:
             res.notes.append(f"影子实体验证异常：{type(e).__name__}: {e}")
