@@ -3,7 +3,7 @@
 运行：python tests/test_shadow_offline.py
 
 覆盖评审 2026-11-20 CONDITIONAL PASS 的 T1–T7、T9（含复审 R1 的 T4c/T7b、
-复审 R2 的 T4d/T4e/T7c/T7d）：
+复审 R2 的 T4d/T4e/T7c/T7d、复审 R3 的 T4f/T4g/T7e）：
   T1 src/ 零改动（工作区相对 HEAD）
   T2 生产链路零引用（src/ 不 import 两个脚本）
   T3 可复现（两次采集字节级一致）
@@ -12,12 +12,15 @@
   T4c 闸门安装不完整必须 fail-closed（退出码 7、不进 collect、不写 JSONL）
   T4d 闸门事务式安装（中途失败回滚已替换入口，不留半装状态）
   T4e 清理失败不阻断恢复（uninstall 抛出仍恢复 dispatch/环境变量，并 [WARN] 上报）
+  T4f 第三入口事务回滚（connect 抛 RuntimeError 时前两入口同样回滚、同进程再调不污染）
+  T4g pin_env 事务化（中途失败就地回滚；回滚失败写进消息；main 映射退出码 6）
   T5 不落原文（utterance 与 entity_text 唯一标记都不进 JSONL）
   T6 fail-loud（缺键/多余键/容器类型错；路径守卫；拒绝覆盖；不留半成品）
   T7 统计守恒（分布之和 == 总数；case 对账）
   T7b 报告负向（重复 case_id 必须失败、缺失 case 必须失败）
   T7c 报告 schema 独立（本地 12 字段白名单，不跟随采集侧漂移）
   T7d 恒真校验已删除（checks 中不再有 each_record_single_category）
+  T7e 零记录必须拒绝（空文件/纯空白行 → 退出码 4，不渲染报告）
   T9 开关冻结（进程内 main() 前后环境变量逐项恢复）
 
 T8（17 套件回归）由验收证据承担，本文件不重复执行。
@@ -445,6 +448,207 @@ def test_t4e_cleanup_layers(tmpdir: Path) -> None:
           f"stdout={stdout_text[:80]!r}")
 
 
+# ---------------------------------------------------------------- T4f 第三入口事务回滚
+
+_ORIG_CONNECT = _Sentinel("connect")
+
+
+class _RejectConnectRuntimeMeta(type):
+    """模拟「第 3 个入口赋值抛出非 C 槽位错误」：RuntimeError 而非 TypeError。"""
+
+    def __setattr__(cls, name, value):
+        if name == "connect":
+            raise RuntimeError("injected: connect 赋值失败（RuntimeError）")
+        super().__setattr__(name, value)
+
+
+class _FakeSocketRT(metaclass=_RejectConnectRuntimeMeta):
+    connect = _ORIG_CONNECT
+
+
+class _RejectConnectRuntimeModule:
+    """替身 socket 模块：前两个入口可写，第 3 个入口抛 RuntimeError。"""
+
+    create_connection = _ORIG_CREATE
+    getaddrinfo = _ORIG_GAI
+    socket = _FakeSocketRT
+
+
+def test_t4f_third_entry_transactional(tmpdir: Path) -> None:
+    """第 3 个入口以非 C 槽位异常失败时，前两个入口也必须回滚。
+
+    R2 版本只把前两个入口放进事务 try，`connect` 单独 `except
+    (AttributeError, TypeError)`；一旦抛出 RuntimeError 就既不回滚也不置
+    active，两个已替换的入口永久留在进程里。T4d 只覆盖第 2 个入口，测不到这个洞。
+    """
+    real_socket = sc.socket
+
+    # 单元层（捕获 BaseException：变异后裸 RuntimeError 逃逸也要落成一条 FAIL，
+    # 不能让套件在断言前中止 —— 中止会掩盖「到底哪条约束没被守住」）
+    g = sc.NetworkGuard()
+    fake = _RejectConnectRuntimeModule()
+    caught: BaseException | None = None
+    sc.socket = fake
+    try:
+        try:
+            g.install()
+        except BaseException as exc:        # noqa: BLE001
+            caught = exc
+    finally:
+        sc.socket = real_socket
+    check("[T4f] 第 3 个入口抛 RuntimeError → 抛 GuardIncomplete",
+          isinstance(caught, sc.GuardIncomplete),
+          f"{type(caught).__name__}: {caught}")
+    check("[T4f] 回滚后 active 为 False（无半装状态）", g.active is False,
+          f"active={g.active}")
+    check("[T4f] create_connection 已还原为同一对象",
+          fake.create_connection is _ORIG_CREATE, repr(fake.create_connection))
+    check("[T4f] getaddrinfo 已还原为同一对象",
+          fake.getaddrinfo is _ORIG_GAI, repr(fake.getaddrinfo))
+    check("[T4f] 回滚完成后备份已清空", g._orig == {}, str(g._orig))
+    check("[T4f] 未误标为 C 槽位降级（partial 保持 False）",
+          g.partial is False, f"partial={g.partial}")
+
+    # 端到端层
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import travel_agent.agent as agent_mod      # noqa: PLC0415
+    import travel_agent.tools as tools_mod      # noqa: PLC0415
+    before_agent = agent_mod.dispatch
+    before_tools = tools_mod.dispatch
+
+    fake2 = _RejectConnectRuntimeModule()
+    out = tmpdir / "third.jsonl"
+    err_path = tmpdir / "third.err.txt"
+    called: list[int] = []
+    orig_collect = sc.collect
+    sc.socket = fake2
+    sc.collect = lambda *a, **k: (called.append(1), ([], {}))[1]
+    try:
+        with open(err_path, "w", encoding="utf-8") as fe:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(fe):
+                try:
+                    code = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+                    code2 = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+                except BaseException as exc:   # noqa: BLE001 - 异常逃逸本身就是失败
+                    code = code2 = f"EXC:{type(exc).__name__}"
+    finally:
+        sc.socket = real_socket
+        sc.collect = orig_collect
+    err = err_path.read_text(encoding="utf-8")
+    check("[T4f] main() 返回 7（fail-closed）", code == 7, str(code))
+    check("[T4f] main() 未进入 collect()", not called, str(called))
+    check("[T4f] 不产生 JSONL", not out.exists())
+    check("[T4f] 替身模块两个入口均还原（同一对象）",
+          fake2.create_connection is _ORIG_CREATE
+          and fake2.getaddrinfo is _ORIG_GAI)
+    check("[T4f] 报错含回滚说明", "安装失败" in err and "回滚" in err,
+          err.strip()[:240])
+    check("[T4f] 同进程再次调用 main() 同样返回 7（无残留污染）",
+          code2 == 7 and len(called) == 0, f"code2={code2} called={called}")
+    check("[T4f] 两处 dispatch 恢复为原对象（未泄漏包装）",
+          agent_mod.dispatch is before_agent and tools_mod.dispatch is before_tools)
+
+
+# ---------------------------------------------------------------- T4g pin_env 事务化
+
+def _diff_env(before: dict[str, str], keys) -> dict[str, tuple[str, str]]:
+    return {k: (before[k], os.environ.get(k, "<unset>"))
+            for k in keys if before[k] != os.environ.get(k, "<unset>")}
+
+
+def test_t4g_pin_env_transactional(tmpdir: Path) -> None:
+    """pin_env() 中途失败必须就地回滚；回滚失败必须显式上报。
+
+    R2 版本的缺口：循环里直接写环境变量，中途抛出时调用方的 saved 仍未赋值，
+    外层 `if saved:` 不成立 → 已改写的键永久留在进程里，且无人知道。
+    """
+    env_type = type(os.environ)
+    orig_setitem = env_type.__setitem__
+    keys = sorted(set(sc.ENV_PINS) | {"TRAVEL_RESOLVER_ONLINE"})
+    before = {k: os.environ.get(k, "<unset>") for k in keys}
+
+    # 场景 1：第 2 个键写入失败，回滚可完成
+    def fail_second(self, key, value):
+        if key == "TRAVEL_AUTOFETCH":
+            raise RuntimeError("injected pin failure")
+        return orig_setitem(self, key, value)
+
+    raised: BaseException | None = None
+    env_type.__setitem__ = fail_second
+    try:
+        try:
+            sc.pin_env()
+        except sc.EnvPinError as exc:
+            raised = exc
+    finally:
+        env_type.__setitem__ = orig_setitem
+    check("[T4g] pin_env 中途失败抛 EnvPinError（非裸异常）",
+          isinstance(raised, sc.EnvPinError), repr(raised))
+    check("[T4g] 已写入的键被就地回滚（环境逐项恢复）",
+          _diff_env(before, keys) == {}, str(_diff_env(before, keys)))
+    check("[T4g] 消息声明回滚结果",
+          raised is not None and "已回滚 1/1" in str(raised), str(raised))
+    check("[T4g] EnvPinError 属 CollectError（main 映射为退出码 6）",
+          issubclass(sc.EnvPinError, sc.CollectError))
+
+    # 场景 2：回滚本身也失败 → 必须写进消息，不能静默
+    os.environ["USE_REAL_DATA"] = "1"          # 让回滚需要真正写回旧值
+
+    def fail_second_and_rollback(self, key, value):
+        if key == "TRAVEL_AUTOFETCH" or (key == "USE_REAL_DATA" and value != "0"):
+            raise RuntimeError(f"injected {key}")
+        return orig_setitem(self, key, value)
+
+    raised2: BaseException | None = None
+    env_type.__setitem__ = fail_second_and_rollback
+    try:
+        try:
+            sc.pin_env()
+        except sc.EnvPinError as exc:
+            raised2 = exc
+    finally:
+        env_type.__setitem__ = orig_setitem
+    leaked = os.environ.get("USE_REAL_DATA")
+    try:
+        check("[T4g] 回滚失败被写进消息（不静默）",
+              raised2 is not None and "回滚未完成" in str(raised2)
+              and "USE_REAL_DATA" in str(raised2), str(raised2))
+        check("[T4g] 回滚失败时该键确实停在写入值（如实在消息中承认）",
+              leaked == "0", repr(leaked))
+    finally:
+        env_type.__setitem__ = orig_setitem
+        if before["USE_REAL_DATA"] == "<unset>":
+            os.environ.pop("USE_REAL_DATA", None)
+        else:
+            os.environ["USE_REAL_DATA"] = before["USE_REAL_DATA"]
+
+    # 端到端：main() 必须非 0、不写产物、环境复原、不留临时目录
+    out = tmpdir / "pin.jsonl"
+    err_path = tmpdir / "pin.err.txt"
+    tmp_before = set(Path(tempfile.gettempdir()).glob("p26obs-*"))
+    env_type.__setitem__ = fail_second
+    try:
+        with open(err_path, "w", encoding="utf-8") as fe:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(fe):
+                code = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+    finally:
+        env_type.__setitem__ = orig_setitem
+    err = err_path.read_text(encoding="utf-8")
+    tmp_new = set(Path(tempfile.gettempdir()).glob("p26obs-*")) - tmp_before
+    check("[T4g] main() 返回 6（固定开关失败判失败）", code == 6, str(code))
+    check("[T4g] 不产生 JSONL", not out.exists())
+    check("[T4g] 环境变量在 main() 返回后已复原",
+          _diff_env(before, keys) == {}, str(_diff_env(before, keys)))
+    check("[T4g] stderr 点名固定开关失败", "固定开关失败" in err,
+          err.strip()[:240])
+    check("[T4g] 临时目录未被遗留", not tmp_new,
+          str([p.name for p in tmp_new]))
+
+
 # ---------------------------------------------------------------- T5
 def test_t5_no_raw_text(tmpdir: Path) -> None:
     token = "ZQXOBSTOKEN"
@@ -719,6 +923,61 @@ def test_t7d_no_tautological_check(tmpdir: Path) -> None:
           f"{len(rep['checks'])} 条：{rep['checks']}")
 
 
+# ---------------------------------------------------------------- T7e 零记录必须拒绝
+
+def test_t7e_empty_jsonl_rejected(tmpdir: Path) -> None:
+    """0 行有效记录的 JSONL 必须判失败，不能 vacuous 通过。
+
+    R2 及之前：空文件 → total=0，6 条守恒校验在「0 == 0」上全部 OK、exit 0，
+    读者会把「没有任何观察数据」误读成「报告正常」。
+    """
+    empty = tmpdir / "empty.jsonl"
+    empty.write_bytes(b"")
+    blanks = tmpdir / "blanks.jsonl"
+    blanks.write_bytes(b"\n   \n\n")
+
+    def run_cli(path: Path, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [PY, str(SCRIPTS / "shadow_report.py"), "--jsonl", str(path), *extra],
+            cwd=str(REPO), capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
+
+    r1 = run_cli(empty)
+    r2 = run_cli(blanks)
+    r3 = run_cli(empty, "--corpus", str(CORPUS))
+
+    check("[T7e] 空文件 → 退出码 4（契约错误）", r1.returncode == 4,
+          f"{r1.returncode} / {r1.stderr.strip()[:160]}")
+    check("[T7e] 空文件 → stderr 点名零记录",
+          "不含任何记录" in r1.stderr, r1.stderr.strip()[:200])
+    check("[T7e] 空文件 → 不渲染报告（stdout 为空）",
+          r1.stdout.strip() == "", r1.stdout[:160])
+    check("[T7e] 只有空白行同样判失败", r2.returncode == 4, str(r2.returncode))
+    check("[T7e] 空文件 + --corpus 仍为 4（先于校验判定）",
+          r3.returncode == 4, str(r3.returncode))
+
+    lib_raised = False
+    try:
+        sr.load_jsonl(empty)
+    except sr.ContractError:
+        lib_raised = True
+    check("[T7e] 库调用路径同样拒绝（load_jsonl 抛 ContractError）", lib_raised)
+
+    # 对照：一条合法记录必须照常 exit 0，证明判据没有扩大到正常输入
+    row = {
+        "case_id": "X01", "category": "poi", "intent": "poi_query",
+        "takeover": False, "batch_enabled": False, "action": "clarify",
+        "reason": "control", "statuses": ["ok"], "city_source": "explicit",
+        "entity_city": "北京", "confidence": 0.5, "candidates_count": 1,
+    }
+    one = tmpdir / "one.jsonl"
+    one.write_text(json.dumps(row, ensure_ascii=False) + "\n",
+                   encoding="utf-8", newline="\n")
+    r4 = run_cli(one)          # 不给语料：X01 不在语料内，给了会被 case 对账拦下
+    check("[T7e] 对照：单条记录仍 exit 0（判据未误伤正常输入）",
+          r4.returncode == 0, f"{r4.returncode} / {r4.stderr.strip()[:160]}")
+
+
 # ---------------------------------------------------------------- T9
 
 def test_t9_env_restored(tmpdir: Path) -> None:
@@ -758,12 +1017,15 @@ def main() -> int:
         test_t4c_guard_partial_fail_closed(tmpdir)
         test_t4d_install_transactional(tmpdir)
         test_t4e_cleanup_layers(tmpdir)
+        test_t4f_third_entry_transactional(tmpdir)
+        test_t4g_pin_env_transactional(tmpdir)
         test_t5_no_raw_text(tmpdir)
         test_t6_fail_loud(tmpdir)
         test_t7_conservation(tmpdir)
         test_t7b_report_negative(tmpdir)
         test_t7c_report_schema_independent(tmpdir)
         test_t7d_no_tautological_check(tmpdir)
+        test_t7e_empty_jsonl_rejected(tmpdir)
         test_t9_env_restored(tmpdir)
     finally:
         import shutil

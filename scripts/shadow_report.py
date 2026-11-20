@@ -28,6 +28,9 @@
   校验也会判失败（退出码 5）。
 - **缺失 case**：给出 `--corpus` 时，`no_missing_cases` 校验失败 → 退出码 5。
   即「零记录」是**失败**，而不是仅作提示；报告仍会打印缺失清单供定位。
+- **零记录输入**（复审 R3）：`load_jsonl` 在 0 行有效记录时直接抛
+  `ContractError`（退出码 4），不进入统计与渲染。此前空文件会让 6 条守恒校验
+  在「0 == 0」上全部通过并 exit 0，属 vacuous 通过，已废止。
 
 外部 schema 独立性（复审 R2，评审 2026-11-20）
 ---------------------------------------------
@@ -100,6 +103,13 @@ def load_jsonl(path: Path) -> list[dict]:
                     f"第 {lineno} 行 case_id 重复：{cid}（首次出现在第 {seen[cid]} 行）")
             seen[cid] = lineno
             rows.append(row)
+    if not rows:
+        # 复审 R3（评审 2026-11-20）：零记录必须判失败。
+        # 否则「0 条记录 + 各分布全 0」会让 6 条守恒校验全部 vacuous 通过、
+        # 退出码 0，读者会误以为拿到了有效观察数据。采集侧本就拒绝写出空产物，
+        # 因此空 JSONL 只可能来自手工喂入或产物被替换/截断，属契约错误。
+        raise ContractError(
+            f"JSONL 不含任何记录（{path}）：0 行有效记录不构成可分析的产物")
     return rows
 
 

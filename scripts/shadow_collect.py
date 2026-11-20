@@ -28,6 +28,7 @@
 0 成功 / 1 参数或输出路径不允许（SystemExit 字符串）/ 2 argparse 用法错误
 3 语料错误 / 4 记录契约不符 / 5 出现网络尝试（离线性不成立）
 6 采集内部失败 / 7 网络闸门安装不完整（fail-closed，未开始采集）
+  （6 亦覆盖 pin_env() 固定开关中途失败：该函数已就地回滚，失败原因随消息上报）
 
 退出码与产物的关系（精确表述，不得简化成「非 0 就一定没有文件」）
   3 / 4 / 5 / 7 一律发生在 write_jsonl() 之前 → 不产生 JSONL、不留临时文件。
@@ -130,6 +131,14 @@ class GuardIncomplete(Exception):
     """网络闸门未能完整安装（退出码 7，fail-closed 中止）。"""
 
 
+class EnvPinError(CollectError):
+    """固定环境变量时中途失败（退出码 6）。
+
+    `pin_env()` 已把该项失败**就地回滚**；回滚本身失败的名字会写进消息，
+    不静默丢弃（复审 R3，评审 2026-11-20）。
+    """
+
+
 # ---------------------------------------------------------------- 网络闸门
 
 class NetworkGuard:
@@ -196,7 +205,23 @@ class NetworkGuard:
         return failed
 
     def install(self) -> None:
-        """事务式安装；任一步失败即回滚已完成部分，抛 ``GuardIncomplete``。"""
+        """事务式安装；**三个入口在同一个事务里**，任一步失败即回滚已完成部分。
+
+        复审 R3（评审 2026-11-20）指出的缺口：R2 版本只把前两个入口放进 try，
+        第三个入口 ``connect`` 单独用 ``except (AttributeError, TypeError)`` 处理，
+        于是「赋值抛 RuntimeError」时既不回滚、也不置 active，前两个入口就此留在
+        进程里。现在统一处理：
+
+        - 三个入口都按顺序装入同一个 try；
+        - ``connect`` 的 AttributeError / TypeError 仍视为 C 槽位不可写
+          （``partial=True``），但**同样先回滚**已替换入口，再 fail-closed；
+        - 其他任何异常（含 RuntimeError）一律回滚后抛 ``GuardIncomplete``；
+        - 成功返回时三个入口全部替换，``active=True``。
+
+        不变式：``install()`` 要么三入口全部生效，要么 socket 模块保持原样并抛
+        ``GuardIncomplete``（唯一例外是回滚自身失败——此时 ``active`` 保持 True，
+        由 ``main()`` 外层 finally 重试并把失败上报）。
+        """
         self._orig["create_connection"] = socket.create_connection
         self._orig["getaddrinfo"] = socket.getaddrinfo
         self._orig["connect"] = socket.socket.connect
@@ -214,26 +239,33 @@ class NetworkGuard:
             raise NetworkAttempted(f"socket.connect denied: {address!r}")
 
         done: list[str] = []
+        c_slot: str | None = None
         try:
             self._set("create_connection", deny_create)
             done.append("create_connection")
             self._set("getaddrinfo", deny_gai)
             done.append("getaddrinfo")
+            try:
+                self._set("connect", deny_connect)
+            except (AttributeError, TypeError) as exc:
+                # C 槽位不可写：先记下降级事实，再回滚前两个入口（不能带着半装退出）
+                self.partial = True
+                c_slot = f"C 槽位不可写（{type(exc).__name__}: {exc}）"
+                raise
+            done.append("connect")
         except BaseException as exc:
-            # 事务回滚：把已经替换的入口还原，再按 fail-closed 中止
+            # 事务回滚：把已经替换的入口按逆序还原
             failed = self._restore(tuple(reversed(done)))
+            if not failed:
+                # 全部还原成功 → 备份已无意义（含从未生效的 connect 备份）
+                self._orig.clear()
             # 回滚未完成 → 保持 active，交给 main() 外层 finally 再试一次
             self.active = bool(failed)
+            reason = c_slot or f"{type(exc).__name__}: {exc}"
+            prefix = "网络闸门安装不完整" if c_slot else "网络闸门安装失败"
             raise GuardIncomplete(
-                f"网络闸门安装失败（{type(exc).__name__}: {exc}），"
-                f"已回滚 {done or '无'}；回滚未完成：{failed or '无'}") from exc
-
-        try:
-            self._set("connect", deny_connect)
-        except (AttributeError, TypeError):
-            # C 槽位不可写：记录降级事实，由调用方 fail-closed 处理（退出码 7）
-            self.partial = True
-            self._orig.pop("connect", None)
+                f"{prefix}（{reason}），已回滚 {done or '无'}；"
+                f"回滚未完成：{failed or '无'}；未开始采集") from exc
         self.active = True
 
     def uninstall(self) -> list[str]:
@@ -256,22 +288,68 @@ def snapshot_env(keys) -> dict[str, str]:
 
 def pin_env(extra: dict[str, str] | None = None,
             shadow_mode: str = "on") -> dict[str, str]:
-    """保存并固定环境变量；返回保存的原值（含 <unset> 标记）。"""
+    """保存并固定环境变量；返回保存的原值（含 <unset> 标记）。
+
+    事务式：任一项写入抛出即按**已写入项**逆序回滚，再抛 ``EnvPinError``。
+    复审 R3（评审 2026-11-20）指出的缺口是 R2 版本在循环里直接写，
+    中途抛出时调用方的 ``saved`` 仍未赋值，外层 ``finally`` 的 ``if saved:``
+    不成立 → 已改写的键永久留在进程里。现在回滚在 ``pin_env`` 内部完成，
+    不依赖调用方是否拿到返回值。
+
+    **回滚失败必须显式记录**：失败的名字与原因写进异常消息（``回滚未完成``），
+    由 ``main()`` 打到 stderr 并以退出码 6 结束，不静默忽略。
+    """
     pins = dict(ENV_PINS)
     if shadow_mode == "off":
         # 仅用于「影子是否增加 dispatch」的对照运行：关掉影子触点，
         # 其余环境（离线、mock 工具、pending 关闭）逐项保持不变。
         pins["TRAVEL_DECISION_SHADOW"] = "0"
-    saved = {}
-    for k, v in pins.items():
-        saved[k] = os.environ.get(k, _SENTINEL)
-        os.environ[k] = v
-    # 防止外层环境把影子在线探测打开（会真联网）
-    saved["TRAVEL_RESOLVER_ONLINE"] = os.environ.pop("TRAVEL_RESOLVER_ONLINE", _SENTINEL)
-    for k, v in (extra or {}).items():
-        saved.setdefault(k, os.environ.get(k, _SENTINEL))
-        os.environ[k] = v
+
+    saved: dict[str, str] = {}
+    applied: list[str] = []                     # 已实际改写的键（按写入顺序）
+    try:
+        for k, v in pins.items():
+            saved[k] = os.environ.get(k, _SENTINEL)
+            os.environ[k] = v
+            applied.append(k)
+        # 防止外层环境把影子在线探测打开（会真联网）
+        saved["TRAVEL_RESOLVER_ONLINE"] = os.environ.pop("TRAVEL_RESOLVER_ONLINE",
+                                                         _SENTINEL)
+        applied.append("TRAVEL_RESOLVER_ONLINE")
+        for k, v in (extra or {}).items():
+            saved.setdefault(k, os.environ.get(k, _SENTINEL))
+            os.environ[k] = v
+            applied.append(k)
+    except BaseException as exc:
+        restored, failed = _rollback_env(applied, saved)
+        raise EnvPinError(
+            f"固定开关失败（{type(exc).__name__}: {exc}）；"
+            f"已回滚 {restored}/{len(applied)} 项；"
+            f"回滚未完成：{failed or '无'}") from exc
     return saved
+
+
+def _rollback_env(applied: list[str], saved: dict[str, str]) -> tuple[int, list[str]]:
+    """按已写入项逆序还原；返回**实际还原成功数**与**回滚失败**的键。
+
+    不抛出：回滚失败由调用方写进异常消息上报，不能静默忽略。
+    成功数按真实写入结果计数，不用「总数 - 失败数」倒推——否则回滚被短路时
+    消息仍会声称「已全部还原」。
+    """
+    restored = 0
+    failed: list[str] = []
+    for k in reversed(applied):
+        value = saved.get(k, _SENTINEL)
+        try:
+            if value == _SENTINEL:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+        except BaseException as exc:            # 记录后继续还原其余键
+            failed.append(f"{k}（{type(exc).__name__}: {exc}）")
+        else:
+            restored += 1
+    return restored, failed
 
 
 def restore_env(saved: dict[str, str]) -> None:

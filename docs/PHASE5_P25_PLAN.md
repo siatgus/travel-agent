@@ -3926,3 +3926,135 @@ R1 版 `from shadow_collect import EXPORT_KEYS` 让两侧共享**同一个对象
 5. `ALLOWED_CATEGORIES` 仍与采集侧共享（见 §28.2）。
 6. `pin_env()` 中途异常时可能无法完整恢复；`sys.path` 插入后不还原（CLI 单次运行影响有限）。
 7. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。
+
+---
+
+## 29. P2.6 st.2 复审 R3 修复记录（2026-11-20，第三入口事务回滚 + 零记录拒绝 + pin_env 事务化）
+
+评审结论：**§26 Path A 暂缓最终 PASS**；R1 两个阻塞项已解除、R2 三项修复基本符合，
+但新发现「第三个入口安装失败没有事务回滚」。本轮只做评审授权的三个小范围动作，
+仍限原五个文件；未改 `src/`、未动 `08_ACCEPTANCE.md` 与既有证据包、未引入
+`TRAVEL_SHADOW_LOG`、未处理 R-01、未进入 P3 / 生产接管。
+
+### 29.1 阻塞项：第三入口安装失败没有事务回滚（已修）
+
+**缺口**（R2 版 `install()`）：前两个入口放在事务 `try` 内，第三个入口 `connect`
+单独一段 `try/except (AttributeError, TypeError)`。若替身模块在
+`socket.socket.connect = deny_connect` 时抛 `RuntimeError`：
+
+1. 前两个入口已替换；
+2. 异常不进入事务回滚；
+3. `active` 尚未置 True；
+4. 外层 `if guard.active` 不成立；
+5. 两个已替换入口永久留在进程里。
+
+T4d 只覆盖第 2 个入口，测不到这个洞。
+
+**修法**（`scripts/shadow_collect.py`）：
+
+| 位置 | 改动 |
+|---|---|
+| `:207-269` | `install()` 重写：三个入口按顺序装入**同一个** `try`；`done` 只记录**已成功替换**的入口 |
+| `:248-255` | `connect` 的 `AttributeError / TypeError` 仍视为 C 槽位不可写（`partial=True`），但先记 `c_slot` 再 `raise`，由统一出口回滚 |
+| `:256-269` | 统一出口：`_restore(reversed(done))` → 回滚未完成则 `active=True` 交给外层重试；否则清空备份；前缀按 `c_slot` 区分「安装不完整」/「安装失败」 |
+| `:259-262` | 回滚成功时 `_orig.clear()`（含从未生效的 `connect` 备份），避免残留陈旧备份被误用 |
+| `:134` | 新增 `EnvPinError(CollectError)`（见 29.3） |
+
+**不变式**：`install()` 要么三入口全部生效并 `active=True`，要么 socket 模块保持原样
+并抛 `GuardIncomplete`；唯一例外是**回滚自身失败**——此时 `active` 保持 True，
+由 `main()` 外层 finally 重试并把 `[WARN]` 上报。
+
+**测试** `tests/test_shadow_offline.py:477` `test_t4f_third_entry_transactional`（**13 条**）：
+
+- 单元层：抛 `GuardIncomplete`；`active is False`；`create_connection` / `getaddrinfo`
+  还原为**同一对象**；`_orig` 已清空；`partial` 仍为 False（未误标成 C 槽位降级）。
+- 端到端：`main()` 返回 7；未进 `collect()`；不产生 JSONL；两入口均还原；
+  报错含「安装失败 + 回滚」；**同进程再调一次 `main()` 仍返回 7 且 collect 仍为 0 次**；
+  两处 `dispatch` 恢复为原对象（包装未泄漏）。
+
+**非空转证明**：R3-M1（把第三个入口重新排除在事务之外，回到 R2 形态）→ 套件在
+T4d 处以裸 `RuntimeError: injected: getaddrinfo 赋值失败` **中止**（异常逃逸即检出，
+但没有逐条断言）；R3-M1b（非 C 槽位失败时跳过回滚）→ **4 FAIL**
+（T4d 1 条 + T4f 3 条，全部是「入口未还原成同一对象」）。
+
+### 29.2 报告拒绝零记录输入（已修）
+
+**缺口**：空 JSONL → `total=0`，6 条守恒校验在 `0 == 0` 上全部 OK、退出码 0，
+读者会把「没有任何观察数据」误读成「报告正常」。上一轮已在 §28.5 申报，
+本轮按评审裁定修复。
+
+**修法**（`scripts/shadow_report.py:106-112`）：`load_jsonl()` 在 0 行有效记录时抛
+`ContractError` → 退出码 **4**，在统计与渲染之前中止。理由写在注释里：采集侧本就
+拒绝写出空产物，空 JSONL 只可能来自手工喂入或产物被替换/截断，属契约错误。
+docstring 已补该条（`:31-33`）。
+
+**测试** `tests/test_shadow_offline.py:928` `test_t7e_empty_jsonl_rejected`（**7 条**）：
+空文件 → 4 且 stderr 点名「不含任何记录」且 stdout 为空；纯空白行 → 4；
+空文件 + `--corpus` → 仍是 4（先于守恒校验）；库调用路径 `load_jsonl` 同样抛
+`ContractError`；**对照：一条合法记录仍 exit 0**，证明判据没有误伤正常输入。
+
+**非空转证明**：R3-M3（`if not rows:` → `if False:`）→ **6 FAIL**。
+
+### 29.3 `pin_env()` 事务化（已修）
+
+**缺口**：R2 版在循环里直接写 `os.environ`。中途抛出时 `saved` 尚未赋值，
+调用方 `main()` 的 `saved` 仍为 `{}`，`finally` 的 `if saved:` 不成立 →
+已改写的键永久留在进程里，且异常裸奔出 `main()`（CLI 是 traceback + 退出码 1，
+没有约定退出码）。上一轮只做静态推断，本轮先实测确认（见 `P26R2Edge/02_*`）。
+
+**修法**（`scripts/shadow_collect.py:289-329`、`:332-352`）：
+
+- `applied` 记录**已实际改写**的键（含 `TRAVEL_RESOLVER_ONLINE` 的 pop 与 `extra` 项）；
+- 任一步抛出 → `_rollback_env(applied, saved)` 按逆序还原 → 抛 `EnvPinError`；
+- `_rollback_env` 返回 **实际还原成功数** 与 **失败键清单**，不用「总数 − 失败数」倒推
+  —— 否则回滚被短路时消息仍会声称「已全部还原」；
+- 失败写进异常消息（`已回滚 N/M 项；回滚未完成：[...]`），`EnvPinError` 继承
+  `CollectError` → `main()` 映射为退出码 **6**，消息打到 stderr，不静默。
+
+**测试** `tests/test_shadow_offline.py:562` `test_t4g_pin_env_transactional`（**11 条**）：
+
+- 场景 1（第 2 个键写入失败、回滚可完成）：抛 `EnvPinError`；环境逐项复原；
+  消息含「已回滚 1/1」；`EnvPinError` 是 `CollectError` 子类。
+- 场景 2（回滚本身也失败）：消息含「回滚未完成」且点名 `USE_REAL_DATA`；
+  该键确实停在写入值（如实在消息中承认，而不是假装成功）。
+- 端到端：`main()` 返回 6；不产生 JSONL；返回后环境逐项复原；stderr 点名
+  「固定开关失败」；**临时目录未遗留**。
+
+**非空转证明**：R3-M2（`_rollback_env` 短路 `return 0, []`）→ **4 FAIL**
+（就地回滚、消息计数 0/1、回滚失败上报、main 后环境复原）。
+
+### 29.4 运行结果
+
+| 项 | 结果 |
+|---|---|
+| 离线套件 | **116 pass / 0 fail，exit=0**（85 + T4f 13 + T4g 11 + T7e 7） |
+| 完整回归 | 17 套件 + 离线套件共 **18 个全 exit=0**（在最终字节上一次性跑完） |
+| 定向变异 | M1 / M1b / M2 / M3 / M4 全部被捕获，逐字节还原（sha256 前后相同），还原后复跑 116/0 |
+
+变异明细（`../P26R3Obs/04_mutation_proof.txt`）：
+
+| 变异 | 实测 |
+|---|---|
+| R3-M1 第三入口重新排除在事务外 | 套件以裸 `RuntimeError` 中止（检出，无逐条断言） |
+| R3-M1b 非 C 槽位失败时跳过回滚 | **4 FAIL**（T4d 1 + T4f 3） |
+| R3-M2 `_rollback_env` 短路 | **4 FAIL**（全部在 T4g） |
+| R3-M3 删除零记录拒绝 | **6 FAIL**（全部在 T7e） |
+| R3-M4 去掉回滚后备份清理 | **1 FAIL**（T4f 备份清空） |
+
+### 29.5 本轮未做 / 已知边界
+
+未做：`src/` 任何改动、生产 JSONL、`TRAVEL_SHADOW_LOG`、R-01 容量策略、P3 / TAKEOVER / 灰度。
+
+仍遗留（均未修，待裁定）：
+
+1. `NetworkGuard._restore()` 与 `_rollback_env()` 捕获 `BaseException`，会把
+   `KeyboardInterrupt` / `SystemExit` 当普通恢复失败处理。评审建议后续考虑改
+   `Exception`；本轮未授权，保持原样并在此申报。
+2. 临时目录 `p26obs-*` 实际未被清理（`rmtree(..., ignore_errors=True)` 在 KB 连接
+   未关时吞掉 Windows 文件锁错误，故 `cleanup_failures` 永不记录）。已单独取证
+   （`../P26R2Edge/03_*`），本轮未修：属新授权范围。
+3. `write_jsonl` 拒覆盖的 TOCTOU 窗口；未对父目录 `fsync`（不宣称并发安全 / 断电持久化）。
+4. `reason` 渲染截断 40 字符（显示层）。
+5. `ALLOWED_CATEGORIES` 仍与采集侧共享（语料词表同一语义，评审本轮明确不要求拆分）。
+6. `sys.path` 插入后不还原（CLI 单次执行边界）。
+7. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。
