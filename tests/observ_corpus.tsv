@@ -1,0 +1,34 @@
+﻿# P2.6 batch 5.0 stage-2 · 人工构造观察语料（observ_corpus）
+#
+# 声明（评审 2026-11-20 强制标注，报告与文档须同步重述）：
+#   本文件是人工构造的观察语料，不是生产流量样本，不是权威分类基准，
+#   不构成真实用户行为分布证据。
+#   category 是语料作者指定的观察分类；intent 是实际决策记录中的细分意图，
+#   两者不是同一概念，报告分别展示，互不推导。
+#
+# 格式：4 列 TSV（case_id / category / utterance / context-JSON），
+#       '#' 开头的行为注释，采集与报告脚本均跳过。
+# category 允许值：weather / poi / transport / plan / plan_qa / smalltalk / other
+# case_id 在文件内唯一。
+case_id	category	utterance	context
+W01	weather	明天大理天气怎么样	{}
+W02	weather	后天丽江会下雨吗	{"slots":{"destination":"丽江"}}
+W03	weather	上海这周末冷不冷	{}
+P01	poi	成都宽窄巷子值得去吗	{"slots":{"destination":"成都"}}
+P02	poi	上海外滩附近有什么好吃的	{"slots":{"destination":"上海"}}
+P03	poi	大理崇圣寺三塔文化旅游区值得去吗	{"slots":{"destination":"大理"}}
+T01	transport	大理洱海生态廊道怎么去	{"slots":{"destination":"大理"}}
+T02	transport	从大理到丽江怎么走	{"slots":{"destination":"丽江"}}
+T03	transport	上海到杭州高铁多久	{}
+PL01	plan	帮我排个含大理古城的3天行程	{}
+PL02	plan	把洱海生态廊道加进行程	{"slots":{"destination":"大理"}}
+PL03	plan	成都玩3天，一定要去宽窄巷子	{}
+Q01	plan_qa	总结一下这个行程	{"plan_made":true,"slots":{"destination":"大理"}}
+Q02	plan_qa	这个行程合理吗	{"plan_made":true,"slots":{"destination":"成都"}}
+Q03	plan_qa	点评一下行程	{"plan_made":true,"slots":{"destination":"丽江"}}
+S01	smalltalk	你好	{}
+S02	smalltalk	你是谁	{}
+S03	smalltalk	谢谢	{}
+O01	other	随便说点什么	{}
+O02	other	今天心情不错	{}
+O03	other	12345	{}

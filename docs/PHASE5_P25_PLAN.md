@@ -3511,3 +3511,197 @@ Handler 分支，两者未在同轮对齐记录。因此本轮报告**只能给�
 
 本申请**零生产代码、零测试代码**；不批准则 P2.6 维持「机制已验收、观察未闭环」
 状态，本轮无任何实施。
+
+### 26.9 实施记录（r2，2026-11-20 评审 CONDITIONAL PASS 后单 commit 交付）
+
+> 本节是 §26 申请的实施结果记录。评审 2026-11-20 的裁定为
+> **CONDITIONAL PASS → 路径 A 实施授权**，并附三项开工前必收紧
+> （导出字段、离线性证明、报告分组信息）与 A1 补充约束。
+> **本记录不构成 P2.6 整体关闭，也不代表生产启用。**
+
+#### 26.9.1 交付物（5 个文件，全部新增或仅文档追加）
+
+| 文件 | 性质 | 内容 |
+|---|---|---|
+| `scripts/shadow_collect.py` | 新增离线脚本 | 采集：固定环境 → 逐 case 独立 Session/Orchestrator → 读影子记录 → 白名单投影 → 原子写 JSONL |
+| `scripts/shadow_report.py` | 新增离线脚本 | 报告：只读 JSONL → 总体分布 + 按 category 分组 + 守恒校验 + case 对账 |
+| `tests/observ_corpus.tsv` | 新增数据 | 21 例人工构造观察语料（7 粗分类 × 3 例），首部为声明注释 |
+| `tests/test_shadow_offline.py` | 新增测试 | 47 条断言，覆盖 T1/T2/T3/T4/T4b/T5/T6/T7/T9 |
+| `docs/PHASE5_P25_PLAN.md` | 文档 | 本节（§26.9） |
+
+`src/` 零 diff；`08_ACCEPTANCE.md` 及证据包未触碰；四份既有语料未改动。
+
+#### 26.9.2 三处收紧要求的落实
+
+**① 导出字段：内部 11 键 / 外部 12 字段，两层契约分离**
+
+| 层次 | 键 | 校验位置 |
+|---|---|---|
+| 内部记录 | 11 键（`intent/takeover/batch_enabled/action/reason/entity_text/statuses/city_source/entity_city/confidence/candidates_count`） | `validate_record()`：集合必须**恰好相等**，不匹配即报出缺失键与多余键并非 0 退出 |
+| 外部 JSONL | 12 字段（`case_id` + `category` + 除 `entity_text` 外的 10 个观察字段） | `project_record()`：按 `EXPORT_KEYS` 显式取键，函数末尾再断言 `"entity_text" not in out` |
+
+- 两层契约在脚本内**硬编码**，不 import 生产的 `SHADOW_RECORD_KEYS` /
+  `SHADOW_OBSERVATION_KEYS`——按评审要求，防止「生产常量与生产记录一起
+  改变时，脚本与测试同步接受意外 schema 变化」。
+- 不使用 `dict(rec)`，不使用 `{k: rec.get(k) for k in 生产的键元组}`。
+- T5 用**两级证据**证明不落原文：端到端（语料 utterance 含 `ZQXOBSTOKEN`，
+  JSONL 全文不含）+ 单元（构造 `entity_text = "ZQXOBSTOKEN-ENT"` 的内部
+  记录，投影后既无该键也无该值）。
+
+**② 离线性：四层证据，不依赖单一计数**
+
+评审指出「`agent.dispatch == 0` 只能证明没走该入口」。实施后改为四层：
+
+| 层 | 措施 | 证据 |
+|---|---|---|
+| L1 实现层 | 固定 `USE_REAL_DATA=0` → `travel_agent.tools` 导入 `mock_tools`（该模块零 `urllib`/`http` 引用） | 摘要 `tools_module` 以 `mock_tools` 结尾 |
+| L2 依赖层 | 固定 `TRAVEL_AUTOFETCH=0`（该常量在 import 期求值，故必须在 import 前设置） | 摘要 `autofetch_enabled: false`，采集前断言 |
+| L3 运行层 | `NetworkGuard` 拦截 `socket.create_connection` / `socket.getaddrinfo` / `socket.socket.connect`，任一次尝试即计数并抛出 | 摘要 `network_attempts: 0`；**另有 T4b 主动验证闸门确实能拦住三类入口** |
+| L4 对照层 | 同一语料在 `shadow=on` 与 `shadow=off` 各跑一次，比较 `dispatch` 调用数与调用名序列 | 两者均为 11 次、全部为 `search_poi`、序列逐项相同 → **影子触点贡献 0 次 dispatch** |
+
+采集期间的 `_pending_warnings` 一并收集；KB 被复制到临时目录
+（`TRAVEL_KB_DB` / `TRAVEL_APP_DB` 指向临时目录），避免 SQLite 的
+WAL/SHM 写进仓库 `data/`。
+
+**③ 报告分组信息：category 由语料继承，不由 intent 反推**
+
+- 采集时每个 case 的 `category` 写进该 case 的每条记录（JSONL 第 2 字段）。
+- 报告同时输出 `by_category`（语料分类）与 `by_intent`（决策记录细分），
+  **分别统计、互不推导**。
+- 交叉表 `cross_category_action` 的每行之和必须等于该 category 的记录数
+  （`cross_table_conserved` 校验）。
+- 给出 `--corpus` 时做 case 对账：`missing_cases` 即「零记录」的 case
+  清单，与「采集失败」（脚本非 0 退出、无 JSONL）在语义上明确区分；
+  报告头部直接打印该清单，不把零记录伪装成正常。
+
+#### 26.9.3 与 §26 申请的偏差（四项，逐条申报）
+
+**偏差 1（重要）：T4 的 `dispatch == 0` 判据不成立，已改为对照法**
+
+§26.6 原文写「T4 零网络：采集全程 `agent.dispatch` 计数为 0」。实测**必然
+非 0**：采集要跑真实 `handle()`，业务本身会用 `dispatch` 查 KB——本次 21 例
+共 11 次 `search_poi`，全部来自 P01/P02/P03/PL03 四个有具名实体的 case。
+
+该判据本身有误（它把「影子零网络」与「业务零工具调用」混为一谈）。改为
+上述四层证据，其中 L4 对照能给出**可证伪的等式**：去掉影子后计数不变，
+说明影子本身不产生任何 dispatch。若把判据强改为 0，只能靠绕过 `handle()`
+实现，那就不再是真实链路观察。
+
+**偏差 2：新增 `--shadow-mode {on,off}` 参数**
+
+仅用于 L4 对照。`off` 模式不产生数据文件，且若仍产生记录会直接报错
+（说明影子开关未生效）。这是 §26.3 未列的必要扩展，功能未超出「离线
+观察工具」范围。
+
+**偏差 3：KB 复制到临时目录**
+
+§26.3 未提及。不复制会让 `kb.py` 的 `sqlite3.connect(path)` 在仓库 `data/`
+下产生 `-wal`/`-shm`，与「产物在仓库外、不污染仓库」的精神冲突。复制为
+172 KB，成本可忽略。
+
+**偏差 4：语料用 UTF-8 with BOM**
+
+与既有四份语料保持一致（它们表头均带 BOM）。脚本统一用 `utf-8-sig`
+读取，因此带不带 BOM 都能解析。
+
+#### 26.9.4 测试矩阵落地与运行结果
+
+| 判据 | 断言数 | 关键断言 |
+|---|---|---|
+| T1 `src/` 零 diff | 2 | `git status --porcelain -- src/` 空、`git diff --stat HEAD -- src/` 空 |
+| T2 生产零引用 | 2 | `src/**/*.py` 无 `shadow_collect`/`shadow_report`；`server.py` 无相关 import |
+| T3 可复现 | 4 | 两次采集 `exit=0`、JSONL 字节级相等、`sha256` 相等、记录数 == 语料 case 数 |
+| T4 离线性 | 10 | 网络尝试 0 / `USE_REAL_DATA=0` / mock 工具 / autofetch 关闭 / 闸门非降级 / 对照 `dispatch` 计数与名称序列相同 |
+| T4b 闸门有效性 | 7 | 主动 `create_connection`、`getaddrinfo`、`socket.connect` 三类均被拦截并计数；卸载后恢复 |
+| T5 不落原文 | 5 | utterance 标记不进 JSONL；`entity_text` 标记不随投影泄漏；导出恰 12 字段 |
+| T6 fail-loud | 8 | 缺键/多余键/类型错均抛 `ContractError` 且报出具体键；`--out` 在仓库内非 0 退出且不留产物与临时文件；已有文件默认拒绝覆盖且原内容不变 |
+| T7 统计守恒 | 6 | 全部 `checks` 通过；分布之和 == 总数；每条记录唯一归类；缺一条时能定位到具体 `case_id` 且总数相应减少 |
+| T9 开关冻结 | 3 | 进程内 `main()` 前后 8 个环境变量逐项恢复 |
+
+运行结果：`python tests/test_shadow_offline.py` → **47 pass / 0 fail，exit=0**。
+
+#### 26.9.5 变异检验（证明测试非空转）
+
+| 变异 | 预期 | 实测 |
+|---|---|---|
+| M1 导出白名单混入 `entity_text` | 投影层拒绝 | **7 FAIL**，`ContractError: W01：导出记录不得包含 entity_text`（采集直接非 0 退出，无产物） |
+| M2 `USE_REAL_DATA` 固定为 `"1"` | 离线断言拒绝 | **10 FAIL**，`采集失败：工具层不是 mock 实现：travel_agent.real_tools` |
+| M3 去掉 `--out` 路径守卫 | 仓库内写入被放行 | **2 FAIL**：`--out 在仓库内 → 非 0 退出` 得到 0；`路径守卫失败不留产物` 失败 |
+| M4 只去掉工具层 mock 断言 | 无影响（冗余双保险） | **0 FAIL**——如实记录：真正隔离靠 `USE_REAL_DATA=0` + 闸门，该断言是第二道锁 |
+| M5 同时放开 `USE_REAL_DATA` 与 mock 断言 | 离线断言捕获 | **2 FAIL**：`USE_REAL_DATA=0` 实得 1；`工具层为 mock_tools` 实得 `real_tools` |
+
+四次变异后文件逐字节还原（`sha256` 前后相同），还原后复跑 47/0。
+
+M4 无影响这一点如实保留：它说明「冗余断言被删不会让测试失明」，也说明
+不能靠断言数量推断隔离强度。
+
+#### 26.9.6 首次观察结果（本轮唯一的实质数据）
+
+21 例全部产生记录（零记录 case：无）。
+
+| 维度 | 分布 |
+|---|---|
+| `action` | `<none>` 14（66.7%）／`clarify` 4（19.0%）／`conservative` 3（14.3%）／**`execute` 0** |
+| `city_source` | `<none>` 14／`query_city` 4／`destination` 3 |
+| `statuses` 组合 | `<empty>` 14／`ambiguous` 4／`unverified` 2／`unverified+unverified` 1 |
+| `candidates_count` | 0 → 14；1 → 6；2 → 1 |
+| `reason` | 未形成结论 14／同名分店（HC-3）4／证据不足保持未验证 3 |
+
+按 category 分组：`weather` 3 全 `<none>`；`poi` 3 全 `clarify`；
+`transport` 2 `<none>` + 1 `conservative`；`plan` 2 `conservative` + 1 `clarify`；
+`plan_qa`／`smalltalk`／`other` 各 3 全 `<none>`。
+
+三条可在后续阶段引用的观察：
+
+1. **无具名实体的轮次一律不形成结论**（14/21）。这印证 §24.1-F1：
+   `DecisionEngine` 只处理「具名实体」路径，天气、闲聊、行程问答、泛化
+   咨询都不进入决策。
+2. **`execute` 为 0**。四个有实体候选的 case 全部落在 `ambiguous`
+   （同名分店）或 `unverified`（`probe=not_requested`），因此决策层
+   没有形成任何可执行结论。**这意味着 P3 接管在当前语料与 KB 状态下
+   缺乏执行侧数据支撑**——是准入判断的重要负面信号，不能当作「影子
+   工作正常」的乐观证据。
+3. **`category` 与 `intent` 确实不同**：O02「今天心情不错」、O03「12345」
+   的 `category` 为 `other`，但决策记录的 `intent` 为 `poi_query`。若用
+   `intent` 反推语料分类，会把这两条错误归入 poi。这实证了评审要求
+   「两者不能混为一谈」的必要性。
+
+适用范围声明（强制）：以上分布来自**人工构造的 21 例观察语料**，
+不是生产流量样本，不是权威分类基准，不构成真实用户行为分布证据。
+语料中带具名实体的 4 例全部命中「同名分店/未验证」，这与 KB 当前只有
+229 个 POI、且多数无 `probe` 结果强相关，不能外推。
+
+#### 26.9.7 边界与状态
+
+- `src/` 零 diff（T1 两条断言 + 验收证据的提交前后 diff 双重证明）。
+- 未新增生产 JSONL、未引入 `TRAVEL_SHADOW_LOG`、未加 Web API、
+  未改 R-01 容量策略、未进入 P3 / TAKEOVER / 灰度。
+- 三开关：采集脚本在**进程内** pin 并在 `finally` 恢复；脚本退出后
+  进程环境不残留（T9）。脚本运行前仓库与环境三开关均为 unset。
+- 采集产物写在仓库外，不入库；保留期 30 天，人工清理，不实现自动清理
+  （评审裁定④）。
+- 本轮仍**不构成 P2.6 整体关闭**：观察工具已可复现，但「观察数据是否
+  支持 P3 准入」的结论尚未成立（见 26.9.6 第 2 条）。
+
+#### 26.9.8 使用说明
+
+```
+# 1) 采集（输出路径必须在仓库与 TRAVEL_DATA_DIR 之外）
+python scripts/shadow_collect.py \
+    --corpus tests/observ_corpus.tsv \
+    --out ../P26Obs_20261120/run.jsonl
+
+# 2) 对照运行（只验证「影子是否增加 dispatch」，不产出数据）
+python scripts/shadow_collect.py \
+    --corpus tests/observ_corpus.tsv --out /tmp/x.jsonl --shadow-mode off
+
+# 3) 报告（--corpus 可选；给出时做 case 对账并列出零记录 case）
+python scripts/shadow_report.py \
+    --jsonl ../P26Obs_20261120/run.jsonl --corpus tests/observ_corpus.tsv
+```
+
+退出码：`0` 成功／`2` 参数或路径不允许／`3` 语料错误／`4` 记录契约不符／
+`5` 出现网络尝试／`6` 采集内部失败。任何非 0 退出都**不产出** JSONL。
+
+新增语料需保持 4 列（`case_id`/`category`/`utterance`/`context`），
+`category` 限于七个允许值，`case_id` 文件内唯一；`#` 开头为注释行。
