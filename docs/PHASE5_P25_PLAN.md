@@ -4079,12 +4079,12 @@ PASS。本轮只动三个授权文件（`scripts/shadow_collect.py`、`tests/tes
 | 模块级单例 `_DB` / `_DB_PATH` | `src/travel_agent/kb.py:26-28` |
 | `get_kb()` 返回该单例（首次打开并 seed） | `kb.py:58-70` |
 | `KnowledgeBase.conn = sqlite3.connect(..., check_same_thread=False)`，进程内长期存活 | `kb.py:73-75` |
-| **没有任何 close 接口**：模块 `dir()` 中 close/shutdown 名称集合为空 | 实测见 `../P26R4Probe/01_kb_holder_raw.txt` |
+| **没有任何 close 接口**：模块 `dir()` 中 close/shutdown 名称集合为空 | 实测见 `../P26R4Obs/02_probe_a_current.txt`、`../P26R4Obs/03_probe_b_release_mechanism.txt` |
 | `configure()` 只做 `_DB = None`（丢引用，不关闭） | `kb.py:38-42` |
 | 业务侧引用全部经 `get_kb()`：agent 3 处、real_tools 4 处、dialogue 2 处、autofetch 5 处、entity_resolver、candidate_extractor、services.adapters.repositories | 全仓 grep |
 | `auth._conn()` / `conversations._conn()` / `moderation._conn()` 指向 **app.db**，按调用新建；`pending_store_sqlite` 每个方法 `con.close()` | 与 kb.db 无关 |
 
-**实测因果链**（`../P26R4Probe/01_kb_holder_raw.txt`，同一进程内）
+**实测因果链**（修复前基线 `8222c53` 工作树上当次会话输出）
 
 ```
 main() rc = 0，产物 5503 字节
@@ -4095,6 +4095,20 @@ kb._DB.conn = <sqlite3.Connection object ...>
 rmtree（连接仍开着）  -> FAILED PermissionError: [WinError 32] ... 'kb.db'
 kb._DB.conn.close() 后 -> rmtree OK | 目录仍存在: False
 ```
+
+**证据出处更正（R4-R1 修订）**：上一段曾标注来源为
+`../P26R4Probe/01_kb_holder_raw.txt`，**该文件不存在**——上面这 6 行是当次会话
+在旧基线工作树上执行 `P26R4Probe/probe_a_kb_holder.py` 时的屏幕输出，未单独落盘。
+可复核的等效证据已落盘两份：
+
+- `../P26R4Obs/03_probe_b_release_mechanism.txt`：同一进程内先打开真实单例连接 →
+  `rmtree` 抛 `WinError 32`（`...\kb.db`）→ `release_kb_handles(snap)` → 再次
+  `rmtree` 成功、目录不存在。这是**同一条因果链的可复核版本**；
+- `../P26R4Obs/02_probe_a_current.txt`：修复后 `main()` 返回 0、`新增残留目录: []`、
+  `kb._DB = None`（正向结果）。
+
+即：修复前的现象行以本节代码块为准（未落盘，不可独立复核）；修复后的结果以
+`02`/`03` 为准（已落盘、可复核）。
 
 持有者因此被确定为 `kb._DB.conn` 这**一个**连接；不是「可能某个模块」，也不是
 「SQLite 一般都会锁文件」这类泛化推断。
@@ -4182,7 +4196,8 @@ dispatch 计数（父进程包裹失效）、mock 工具选择与闸门安装位
 | 完整回归 | 17 套件 + 离线套件共 **18 个全 exit=0**（在最终字节上一次性跑完） |
 | 定向变异 | R4-M1 / M2 / M3 全部被捕获，逐字节还原（sha256 前后相同），还原后复跑 134/0 |
 
-变异明细（`../P26R4Obs/04_mutation_proof.txt`，原文含 [FAIL] 行）：
+变异明细（`../P26R4Obs/05_mutation_proof.txt`，原文含 [FAIL] 行；R4-R1 修订前误写为
+`04_mutation_proof.txt`——`04` 是定向用例原始输出，变异文件因编号顺延为 `05`）：
 
 | 变异 | 实测 |
 |---|---|
@@ -4229,3 +4244,33 @@ dispatch 计数（父进程包裹失效）、mock 工具选择与闸门安装位
    测试运行波动，实测约 1100 余个；本轮只保证「不再新增」，未做存量清理）。
    清理存量属独立动作，需单独授权后再做。
 9. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。
+
+
+---
+
+### 30.9 R4-R1 修订记录（doc-only，2026-11-20，证据引用修正）
+
+评审裁定：R4 核心修复与 C1–C8 通过静态复核；剩余问题全部属**证据引用**，
+**不重跑测试、不改代码**。本节只记录修订本身。
+
+**修订范围**：`docs/PHASE5_P25_PLAN.md`（本节 + 30.1 / 30.5 引用）、
+`../P26R4Obs/01_commit_full.diff.txt`、`../P26R4Obs/08_git_state.txt`、
+`../P26R4Obs/09_sha256.txt`、新增 `../P26R4Obs/10_revision_note.md`。
+**未触碰**：`src/`、`scripts/`、`tests/`、`shadow_report.py`、`08_ACCEPTANCE.md`，
+以及任何原始测试输出文件（`02`/`03`/`04`/`05`/`06`/`07` 与 `logs/`）。
+
+| 偏差 | 处置 |
+|---|---|
+| 30.1 探针来源写成不存在的 `../P26R4Probe/01_kb_holder_raw.txt` | 改为真实存在的 `../P26R4Obs/02_probe_a_current.txt`、`03_probe_b_release_mechanism.txt`；并明确「修复前那 6 行是当次会话输出、未落盘，不可独立复核」 |
+| 30.5 变异证据写成不存在的 `../P26R4Obs/04_mutation_proof.txt` | 改为 `05_mutation_proof.txt`，并注明 `04` 是定向用例输出、编号已顺延 |
+| `../P26R4Obs/04_targeted_raw.txt` 头部写 `HEAD = c0218c1` | **不改原文件**（禁止改写原始测试输出）。改为在 `01`/`08` 头部与 `10_revision_note.md` 说明：`c0218c1` 是 amend 前的哈希，`git diff --stat c0218c1 d075aae` 只改 docs 三行，`scripts/`、`tests/` 字节相同，故定向结果对所交付代码有效 |
+
+**代码冻结基线与修订提交的关系**：`scripts/`、`tests/` 的字节基线是
+`d075aae6815d8400557fef7a75ebf70ccceab599`（R4 代码提交）。本次修订只改文档，
+产生的新提交仅在其后追加；`git diff d075aae HEAD -- scripts/ tests/ src/` 为空
+即证明「测试字节与最终代码一致」。故 `d075aae` 仍是**代码**意义上的最终提交，
+HEAD 是**文档**意义上的最终状态——两者不可混称为同一个哈希。
+
+**哈希纪律**：因本次修改了 `01`（diff 内容随文档变化）、`08`（HEAD 与状态重取）、
+`09`（清单本身），三者与 `10` 一并重算；`09_sha256.txt` 自校验必须全 OK，旧清单
+作废，不做「改文件但沿用旧哈希」。
