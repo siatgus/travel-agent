@@ -2551,3 +2551,126 @@ P2.5b 全链：`1fce3f3`（首次实施，FAIL）→ `3c1af27`（R1 修复）→
 
 **当前状态**：P2.5b 已关闭；P2.6 / P3 未授权未启动；生产开关
 0/0/0 冻结不变。后续阶段保持暂停，等待新的明确授权。
+
+---
+
+## 24. P2.6 影子观察独立开工申请（2026-11-20，doc-only 零生产代码）
+
+> 依据：§23 关闭后「后续阶段保持暂停，等待新的明确授权」；P2.6 属
+> `PHASE5_P2_PLAN.md` 定版实施顺序的最后一步（「影子观察：记录决策
+> 依据，不自动灰度开启」），亦是 `PHASE5_DESIGN.md` §9.2 批次 5.0
+> 「DecisionEngine 全量影子运行（shadow_decision 纯记录，纯 KB-only）」。
+> 本申请**不进入 P3**，不请求任何接管，不开启任何生产开关。
+
+### 24.1 现状核查（申请依据的代码事实）
+
+| 事实 | 位置 | 含义 |
+|---|---|---|
+| F1 `DecisionEngine.decide()` 仅在 channel 门控钩子内被调用 | `orchestrator.py:579`（`_pending_produce` 内），钩子入口 `if not self._channel_enabled(): return None`（`:556`） | **`TRAVEL_PENDING_CHANNEL=0` 时 decider 根本不构造**（`_ensure_decider` `:533` 注释「channel=0 永不构造」）→ 正常流量**零决策影子** |
+| F2 决策影子记录已是「纯记录」形态 | `decision.py:175-192` `_shadow()`：写 `shadow_log` + 可选 `shadow_sink(rec)`，`sink` 异常静默兜底 | 记录能力已具备，缺的是**调用触达**与**落地通道** |
+| F3 候选提取 + 实体验证影子已**无条件**运行 | `parser.py:290-308`：每次 parse 都跑 `_extract_candidates` + `_resolve_entities` 并写入 `ctx.parse.shadow_candidates / shadow_resolved / shadow_notes`，异常仅记 note | ①②层影子已存在，**无需新建** |
+| F4 ①②层影子产物**零下游消费点** | 全仓 grep：`shadow_candidates` / `shadow_resolved` / `shadow_notes` 仅在 `parser.py` 内写入，无任何读取方 | 记录被丢弃——P2.6 的「观察」目前**没有任何可读产物** |
+| F5 `ResolvedCandidate` **无 `from_dict`** | `entity_resolver.py:107-149` 仅 `as_dict()` | `shadow_resolved` 是 dict 列表，而 `decide()` 需要对象（`_build` 用 `getattr(r, "status")`）→ **无法直接复用**，见 §24.3 待裁定 2 |
+| F6 既有钩子内部**重复** extract+resolve | `orchestrator.py:571-579`：`_extract_candidates(utterance, …)` + `_resolve_entities(...)` 各调一次，未复用 `ctx.parse.shadow_*` | 与设计 §9.4「必须复用现有 Resolver 调用链（shadow_resolved），不得为接入 DecisionEngine 而重复解析或验证」存在偏离；该偏离系 P2.5a 既有实现（channel 门控内），**如实申报**，本申请不追溯修改 |
+
+**结论（缺口定义）**：P2.6 的缺口不是「影子记录能力」，而是
+**①决策层没有任何触达路径（F1）、②三层影子产物没有任何落地出口（F4）**。
+
+### 24.2 交付物定义（仅机制，不含数据）
+
+P2.6 交付 = 「影子通道机制 + 默认关闭的开关 + 测试 + 离线报告工具」。
+**不含观察数据**：采集需另获授权开启开关（见 §24.6）。本轮交付后
+即使验收通过，生产行为仍与当前逐位一致。
+
+四项增量（获批即锁定为唯一授权范围）：
+
+| 增量 | 内容 | 性质 |
+|---|---|---|
+| 1 | 影子触点：`handle` 解析完成、pending 钩子之前新增一处调用——开关=1 时以**本轮已算出的**候选/验证产物驱动 `decide()`，仅记录，返回值**直接丢弃**（不挂 ctx、不进任何分支、不返回 Reply） | **唯一生产改动**（orchestrator 一处） |
+| 2 | 落地通道：`shadow_sink` 装配 + 记录聚合；默认仅内存，可选 JSONL 追加（路径由环境变量给出、未设则不落盘）；sink 异常零传播 | 生产改动（同触点内 + 可选 sink 装配） |
+| 3 | 测试：开关冻结组 / 触达组 / 异常隔离组 / 零行为差逐位组 / 零网络组 | 测试文件 |
+| 4 | `scripts/shadow_report.py` 离线报告（读 JSONL → action/reason/city_source 分布 + 三分类所需字段），**不接入生产链路** | 新脚本（非生产模块） |
+
+### 24.3 需请裁定事项（四项，申请不预设立场）
+
+**待裁定 1：开关命名与默认值。**
+建议新增 `TRAVEL_DECISION_SHADOW`，默认 `"0"`（与现有三个开关
+同风格、默认关闭）。若您倾向复用现有开关组合（如
+`CHANNEL=0 ∧ TAKEOVER=0` 即视为影子态），则不新增开关，但会使
+「影子观察」与「pending 通道」耦合，且 channel=1 时无法单独关闭
+影子——两种形态请择一裁定。
+
+**待裁定 2：影子决策的 `resolved` 来源（F5 的直接后果）。**
+四个可选方案：
+
+| 方案 | 做法 | 代价 | 风险 |
+|---|---|---|---|
+| 甲（推荐） | `parser.py` 影子段**额外保留对象**（新增 `shadow_resolved_objs` 字段，与现有 dict 字段并存） | parser 改 2-3 行，行为零变化 | 需授权触碰 `parser.py`（不在历次冻结清单内，但属生产模块） |
+| 乙 | 为 `ResolvedCandidate` 加 `from_dict()`，由 dict 还原对象 | 改 `entity_resolver.py`（P2.5 冻结清单内模块） | 还原的字段完整性/`probe_results` 语义需逐一证明 |
+| 丙 | 影子触点内重跑 `extract` + `resolve`（与 F6 既有钩子一致） | 零新模块改动 | **违反设计 §9.4「不得重复解析或验证」**；每轮多一次 KB 解析，纯 KB-only 但属重复计算 |
+| 丁 | P2.6 只落地 ①②层影子产物（`shadow_candidates` + `shadow_resolved` + 意图/城市），**不调用 `decide()`** | 改动最小、零重复 | 决策层影子仍为零 → 不满足批次 5.0「DecisionEngine 全量影子运行」，P3 准入缺乏决策侧数据 |
+
+我的建议是**甲**（零重复计算 + 不碰冻结模块 + 行为零变化），但方案
+选择涉及「是否允许新增 parser 字段」与「是否允许触碰 resolver」，属
+授权边界判断，请裁定。
+
+**待裁定 3：落地通道形态。**
+建议：默认纯内存（进程内 `shadow_log` 可读、测试可断言），JSONL 仅在
+环境变量 `TRAVEL_SHADOW_LOG`（路径）存在时追加，写入失败静默；单条
+记录即 `rec` dict（含改写后的判据字段，见待裁定 4）。需确认两点：
+① 是否允许生产环境出现文件写入（默认不写，但开关+路径同时给出才写）；
+② 记录中**是否允许落用户问句原文**（涉及隐私与体积——建议默认只落
+`intent`/`action`/`reason`/`entity_text`/`city_source`/`statuses` 等
+结构化字段，**不落原文**，需要原文时另行开启）。
+
+**待裁定 4：观察字段集是否够用于 §9.3 准入门槛。**
+`decision.py:_shadow` 现有字段：`intent / takeover / batch_enabled /
+action / reason / entity_text / statuses`。建议追加
+`city_source`、`entity_city`、`confidence`、`candidates_count`
+（均来自本轮已有对象，零额外计算），以便 P3 准入做「新旧差异三分类」。
+是否允许扩字段请裁定（扩字段属 `decision.py` 改动，需授权）。
+
+### 24.4 明确禁止的超范围改动（本申请边界）
+
+| 模块 | 授权 |
+|---|---|
+| `orchestrator.py` | 仅允许新增一处影子触点（解析后、pending 钩子前）+ sink 装配 |
+| `parser.py` | 仅当待裁定 2 选「甲」时允许新增一个影子对象字段；其余不动 |
+| `entity_resolver.py` | 仅当选「乙」时允许新增 `from_dict`；否则零触碰 |
+| `decision.py` | 仅当待裁定 4 批准扩字段时允许追加记录字段；**决策逻辑零改动** |
+| `pending_interceptor.py` / `pending_runtime.py` / `pending.py` / 双 store / `pending_revalidator.py` / `pending_producer.py` / `dialogue.py` / 全部 Handler | **零触碰** |
+| P3 接管 / 批次白名单 / 灰度 | 不在本申请 |
+| S3 other_city 缺口 / `isinstance` 契约硬化 / RV-05 / 密闭性排查 | 不在本申请，沿用 §23.5 遗留登记 |
+
+### 24.5 验收标准（提交时按此提供证据）
+
+| 判据 | 必须提供的证据 |
+|---|---|
+| S1 零行为差 | 开关 0 vs 1 同语料逐位对比：Reply 九类字段全等；`handle` 返回值全等；`ctx` 无新增可见字段 |
+| S2 触达正确 | 开关=1 时每轮**恰一条**记录，且 `intent`/`action`/`reason` 与独立调用 `decide()` 的结果逐字段相等 |
+| S3 异常隔离 | sink 抛异常 / 影子链抛异常 → 用户回复与开关=0 逐位相等；异常仅记警告 |
+| S4 零网络 | 影子触点前后 `agent.dispatch` 调用计数为 0（纯 KB-only，不发在线请求） |
+| S5 零副作用 | 不写 pending、不写 slots、不产生 DecisionResult 消费、不构造 producer |
+| S6 开关冻结 | 三既有开关 0/0/0；新开关默认 0；`decision.py` 决策逻辑零 diff（除批准的记录字段） |
+| S7 冻结边界 | 完整 diff + 冻结清单逐项 `git diff --stat`（沿用 §22.7.5 四类计数口径） |
+| S8 回归 | 17 套件完整原始输出 + 退出码；channel 套件 357/0 不回退 |
+
+### 24.6 采集与阶段边界（不在本次授权内）
+
+- 本轮**不开启** `TRAVEL_DECISION_SHADOW`；交付后生产行为与当前逐位一致。
+- 实际采集（开关=1 跑语料或影子观察期）**需单独授权**，并明确：
+  环境（建议先离线语料、后非生产环境）、时长、记录落盘路径与
+  隐私口径、观察期结束后的数据处置。
+- P3（查询类接管）**未授权**；批次 5.1 及之后全部不在本申请。
+- 生产部署仍须独立部署审查；P2.6 通过不构成启用依据。
+
+### 24.7 请求裁定
+
+1. P2.6 影子观察是否批准开工（四项增量）？
+2. 待裁定 1（开关命名/默认值）、2（`resolved` 来源方案甲/乙/丙/丁）、
+   3（落地通道与是否落原文）、4（记录字段扩展）请逐项裁定。
+3. 若批准，是否要求先只做增量 1+3（机制与测试、不落盘），把落盘与
+   报告工具（增量 2 的 JSONL 部分 + 增量 4）留到采集授权时再做？
+   这样可把「生产写入路径」推迟到真正需要观察时评估。
+
+本申请零生产代码；不批准则 P2.6 维持未启动，本轮无任何实施。
