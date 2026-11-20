@@ -2334,20 +2334,29 @@ handle 步骤 5（QA 类）
 ```
 
 机制 E 的直调点即上链最后两级业务方法本身，实参 `(ecity, ename)`
-取代 `(city, spot_mention 产出)`。逐环节等价性对照：
+取代 `(city, spot_mention 产出)`。逐环节**必要前置保留对照**（评审
+2026-11-20 第二次复核：**不得称为全链行为等价**；本表只证明「必要
+业务前置行为与最终委托点被保留」，三处非等价项在下表明确标注）：
 
 | 原链环节 | 位置 | 机制 E 处理 | 判定 |
 |---|---|---|---|
-| 城市四源判定 | `_base.py:6-15` | `ecity` = fresh `entity.city` | 实体来源替换（RV-07 修复本意），判定优先级不再参与 |
-| 空城 → 泛推荐 | `poi_handler.py:78-79` | `ecity` 缺失 → confirm（不泛答） | **更保守**，不弱化 |
-| `last_city = city` | `poi_handler.py:80` | `orchestrator.py:486` 同位置（业务方法调用前） | 等价 |
+| 城市四源判定 | `_base.py:6-15` | `ecity` = fresh `entity.city` | **非等价**：实体来源替换（RV-07 修复本意），四源优先级不再参与 |
+| 空城 → 泛推荐 | `poi_handler.py:78-79` | `ecity` 缺失 → confirm（不泛答） | **非等价、更保守**：泛答分支变为不可达 |
+| `last_city = city` | `poi_handler.py:80` | `orchestrator.py:486` 同位置（业务方法调用前） | 时机与语义保留 |
 | `refine_intent` 细分排序 | `poi_handler.py:81-86` | 绕过 | **已获批偏差**（§18.4/§21 申报，非新增绕过） |
 | `spot_mention` 实体解析 | `dialogue.py:495` | 绕过 | 有意消除（I1 实体钉死） |
-| 周边语义分支 | `dialogue.py:497-499` | `any(k in orig_ut ...)` 同关键词集 | 语义等价 |
-| `_nearby_qa` 无坐标委托 | `dialogue.py:1352-1354` | 保留（委托 `_spot_qa`） | 等价 |
-| GuardPipeline | handle 步骤 6（方案修改守卫） | QA 类步骤 5 已返回，从不执行 | 无绕过对象 |
-| 权限 / moderation | 全仓 QA 链无此层 | 五条件② 可信内部流为消费轮权限闸 | 无绕过对象 |
-| 异常边界 | `orchestrator.py:485-501` | 两业务方法异常 → confirm + 警告 | 等价 |
+| 周边语义分支 | `dialogue.py:497-499` | `any(k in orig_ut ...)` 同关键词集 | 字面范围一致（仅语义检测，不参与实体解析） |
+| `_nearby_qa` 无坐标委托 | `dialogue.py:1352-1354` | 保留（委托 `_spot_qa`） | 保留 |
+| GuardPipeline | handle 步骤 6（方案修改守卫） | QA 类步骤 5 已返回，从不执行 | 无绕过对象（原链也不执行） |
+| 权限 / moderation | 全仓 QA 链无此层 | 五条件② 可信内部流为消费轮权限闸 | 无绕过对象（原链也无此层） |
+| 异常边界 | `poi_handler.py` 未捕获；`orchestrator.py:485-501` | 两业务方法异常 → confirm + 警告 | **非等价、更保守**：原链异常继续上抛，机制 E 就地转确认 |
+
+**「等价」的准确边界（评审裁定照录）**：本节的结论仅限于「机制 E
+保留了 QA 路径的必要业务前置行为（`last_city` 设置、周边语义分支、
+无坐标委托）与同一最终委托点（`_spot_qa`/`_nearby_qa`）」。下列三项
+**不构成等价**，不得被表述为 Handler 链整体行为等价：① 城市来源由
+四源判定改为 fresh `ecity`；② `refine_intent` 被绕过（已获批偏差）；
+③ 异常处理策略较原链更保守（就地 confirm，而非继续上抛）。
 
 **refine_intent 绕过为何不削弱安全**：该函数的作用是为「意图未定
 的自由问句」选首选细分路（general/route/attraction/food/...）。
@@ -2398,3 +2407,69 @@ return 点穷举（AST 遍历，共 14 个，全部为字符串表达式）：
 进入 Reply 的用法同源）。按评审「契约严格保证则不必为形式增加生产
 改动」的口径，本轮不动生产代码；若后续要求把该依赖改为防御式
 （例如把 I3 段移入 try），属触点 2 内的独立小改动，须另行申请。
+
+#### 22.7.8 第三次补证：B 项测试函数 / C 项 `unknown_spot_reply` 契约 / 提交状态
+
+评审 2026-11-20 第三次复核要求三项材料（B 项完整函数、C 项严格返回
+值契约、`git status --short`）。本节为记录；原文见
+P25bR4_evidence.txt（函数与源码全文）与 P25bR4_b_trace.txt（实测）。
+
+**B 项：`test_p25b_mechanism_e_fresh_entity_enforcement` 全文**
+（`tests/test_pending_channel.py:2662-2791`，130 行）。`dispatch_calls`
+生命周期逐点：
+
+| 行号 | 语句 | 作用 |
+|---|---|---|
+| 2696 | `dispatch_calls = []` | 初始化（轮 1 之前） |
+| 2711 | `r1 = orc.handle(s, "帮我查一下海贝皇大排档")` | 轮 1 创建 Pending |
+| 2714 | `check("[E·前置] 轮1 创建 pending", p1 is not None, ...)` | 轮 1 完成确认 |
+| **2719** | **`dispatch_calls.clear()`** | **轮 1 完成之后、轮 2 之前清空** |
+| 2720 | `r2 = orc.handle(s, "第1个")` | 消费轮 |
+| 2730-2734 | `any(c.get("keyword") == fresh ... for c in dispatch_calls)` | 消费轮断言（只可能看到清空后的记录） |
+| 2756 | `dispatch_calls.clear()` | 阶段二（注入式反证）前清空 |
+| 2764-2775 | 同相位 `any` + 全量 `all("迪士尼" not in keyword)` | 反证阶段断言 |
+| 2779 | `dispatch_calls.clear()` | 反证对照（普通路由）前清空 |
+
+实测（P25bR4_b_trace.txt，同一装具复现）：轮 1 捕获 **0** 条；清空后
+消费轮捕获 **恰 1 条** `{"city": "南京", "keyword": "海贝皇大排档
+（南京店）", "limit": 3}`；阶段二消费轮同样恰 1 条且与 fresh 一致；
+两轮 `route=pending_consume_execute`、`last_city=南京`。因每轮捕获数
+为 1，`any()` 在本装具下退化为「唯一调用的判定」，不存在累计记录
+使断言意外通过的空间；`clear()` 在本 fixture 中属防御性保险（轮 1
+未产生 `search_poi`），保留以隔离未来装具/行为变化。
+
+**C 项：`llm.unknown_spot_reply` 的严格返回值契约**（`llm.py:1142-1168`）。
+四个 return 点：`L1152 return None`（`client is None`）、
+`L1164 return None`（`LLMError`）、`L1167 return None`（空文本 /
+含数字 / 含「免费」）、`L1168 return text`。`text` 来源链：
+
+```
+text = _clean_reply(client.chat(sys_p, ...))      llm.py:1162
+_clean_reply(text: str, limit) -> str             llm.py:988-995
+    s = (text or "").strip(); ... return s[:limit].rstrip() if len(s) > limit else s
+```
+
+`_clean_reply` 只有 **1 个 return 点**且表达式恒为 `str`（对 `s` 切片
+/去空白）；若入参非 `str`（无 `.strip()`），它**抛 `AttributeError`
+而非返回非串**。上游 `Client.chat` 的 return 点
+（`llm.py:165 data["choices"][0]["message"].get("content") or ""`、
+`llm.py:259`/`:373 return text` 透传）恒为 `str`。故：
+
+1. **正常路径**：`unknown_spot_reply` 的全部 truthy 返回值必为 `str`
+   → `_spot_qa:996 return smart` 不可能是非字符串；
+2. **异常路径（上游违约返回非 `str`）**：`_clean_reply` 抛
+   `AttributeError`，该异常在 `_spot_qa` 外层**未被吞**，继续上抛至
+   触点 2 的 `try`（`orchestrator.py:495-498`）→ 转 `confirm()` +
+   警告。即：违约**不可能**到达 `ename not in text`（`orchestrator.py:515`）。
+
+结论：L996 的唯一非类型保证点已由「`_clean_reply` 单返回点恒 `str`
++ 上游 chat 恒 `str` + 违约路径必抛异常且被触点 2 捕获」三者闭合，
+不再依赖 `if smart:` 的真值推断。如要求运行时强校验（`isinstance`
+断言），属触点 2 内生产改动，须另行申请。
+
+**提交状态**：`git status --short` 原始输出共 38 行，**全部为 `??`
+（未跟踪的历史验收工件：diff/日志/证据包）**，无 ` M` / `A` / `D`
+跟踪文件改动 → 已跟踪树干净。HEAD =
+`6fdcb0ebcc1095d8c0074ca4fb101fd562fe29d6`（main）。上述工件依验收
+惯例不入库，如需纳入版本管理或清理，请另行指示（属仓库整洁性操作，
+不在本阶段授权范围）。
