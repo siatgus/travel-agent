@@ -14,6 +14,9 @@
   T4e 清理失败不阻断恢复（uninstall 抛出仍恢复 dispatch/环境变量，并 [WARN] 上报）
   T4f 第三入口事务回滚（connect 抛 RuntimeError 时前两入口同样回滚、同进程再调不污染）
   T4g pin_env 事务化（中途失败就地回滚；回滚失败写进消息；main 映射退出码 6）
+  T4h 临时目录清理（关闭 kb 单例连接后真实删除；同进程二次运行不残留）
+  T4i 真实占用下删除失败被检出（不用 ignore_errors，证明失败不静默）
+  T4j 清理失败可见（删除失败 → [WARN]、退出码 6、产物成功与整体失败分开表述）
   T5 不落原文（utterance 与 entity_text 唯一标记都不进 JSONL）
   T6 fail-loud（缺键/多余键/容器类型错；路径守卫；拒绝覆盖；不留半成品）
   T7 统计守恒（分布之和 == 总数；case 对账）
@@ -649,6 +652,147 @@ def test_t4g_pin_env_transactional(tmpdir: Path) -> None:
           str([p.name for p in tmp_new]))
 
 
+# ---------------------------------------------------------------- T4h 临时目录清理
+
+def _kb_singleton():
+    """取 travel_agent.kb 的模块级单例（main() 已把 src 插进 sys.path）。"""
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import travel_agent.kb as kb_mod      # noqa: PLC0415
+    return getattr(kb_mod, "_DB", None)
+
+
+def _run_main_quiet(argv: list[str], tmpdir: Path,
+                    tag: str) -> tuple[int, str, str]:
+    """调用 sc.main() 并回收输出。
+
+    stdout 重定向到**真实文件**而不是 StringIO：`agent.py` 首次导入会执行
+    `sys.stdout.reconfigure(encoding="utf-8")`，StringIO 没有该方法（会
+    AttributeError）。这是装具边界，不是被测脚本的行为。
+    """
+    out_log = tmpdir / f"{tag}.stdout.txt"
+    err_log = tmpdir / f"{tag}.stderr.txt"
+    with open(out_log, "w", encoding="utf-8") as fo, \
+            open(err_log, "w", encoding="utf-8") as fe:
+        with contextlib.redirect_stdout(fo), contextlib.redirect_stderr(fe):
+            code = sc.main(argv)
+    return (code, out_log.read_text(encoding="utf-8"),
+            err_log.read_text(encoding="utf-8"))
+
+
+def test_t4h_tmpdir_cleanup(tmpdir: Path) -> None:
+    """正常采集后临时目录必须真的消失（复审 R4 C1/C2）。
+
+    R3 及之前：kb 单例连接一直占着 kb.db，Windows 上 rmtree 抛 WinError 32，
+    又被 ignore_errors=True 吞掉 → 目录残留、退出码仍是 0（P26R2Edge/03）。
+    修法：清理阶段先关闭该连接并还原单例，再不用 ignore_errors 删除目录。
+    """
+    tmp_root = Path(tempfile.gettempdir())
+    before = set(tmp_root.glob("p26obs-*"))
+    out = tmpdir / "t4h_cleanup.jsonl"
+
+    code, _so, err = _run_main_quiet(
+        ["--corpus", str(CORPUS), "--out", str(out)], tmpdir, "t4h")
+    new = set(tmp_root.glob("p26obs-*")) - before
+
+    check("[T4h] 采集成功（退出码 0）", code == 0, f"{code} / {err[:200]}")
+    check("[T4h] 产物已生成", out.is_file())
+    check("[T4h] 采集后无新增 p26obs-* 目录（真的删掉了，不是吞异常）",
+          not new, str([p.name for p in new]))
+    check("[T4h] 知识库单例已还原为 None（连接生命周期闭合）",
+          _kb_singleton() is None, repr(_kb_singleton()))
+    check("[T4h] 无清理告警（成功路径不得带 [WARN]）",
+          "[WARN]" not in err, err.strip()[:200])
+
+    # 同进程再跑一次：不得复用上一次已关闭的连接，也不得再留目录
+    out2 = tmpdir / "t4h_cleanup2.jsonl"
+    code2, _so2, _err2 = _run_main_quiet(
+        ["--corpus", str(CORPUS), "--out", str(out2)], tmpdir, "t4h_2")
+    new2 = set(tmp_root.glob("p26obs-*")) - before
+    check("[T4h] 同进程第二次运行同样成功且不再留目录",
+          code2 == 0 and out2.is_file() and not new2,
+          f"code2={code2} out2={out2.exists()} 残留={[p.name for p in new2]}")
+
+
+def test_t4i_tmpdir_removal_detects_failure(tmpdir: Path) -> None:
+    """真实文件占用下删除必须报告失败（C3，证明没有 ignore_errors）。
+
+    这里不用注入：Windows 上只要目录里的文件还有句柄打开，rmtree 就会抛
+    WinError 32。`ignore_errors=True` 会把它吞掉并返回 None（目录仍在），
+    正是 R3 之前「退出码 0 但目录残留」的成因。
+    """
+    d = tmpdir / "locked_dir"
+    d.mkdir()
+    lock = d / "kb.db"
+    lock.write_bytes(b"locked")
+    fh = open(lock, "rb")                 # 持有句柄 → 删除必然失败
+    try:
+        failures = sc.remove_tmpdir(d)
+        still_there = d.exists()
+    finally:
+        fh.close()
+
+    check("[T4i] 真实占用下删除失败被检出（返回非空清单）",
+          bool(failures), str(failures))
+    check("[T4i] 失败信息点名目录、异常与残留文件",
+          bool(failures) and str(d) in failures[0] and "残留" in failures[0]
+          and "kb.db" in failures[0], str(failures)[:300])
+    check("[T4i] 失败时不假装删除（目录确实还在）", still_there,
+          f"exists={still_there}")
+
+    after = sc.remove_tmpdir(d)
+    check("[T4i] 释放句柄后可正常删除且不再报失败",
+          after == [] and not d.exists(), f"{after} / exists={d.exists()}")
+
+
+def test_t4j_tmpdir_cleanup_failure(tmpdir: Path) -> None:
+    """删除失败必须被检测、上报、影响退出码，且不阻断环境恢复（C3–C7）。"""
+    keys = sorted(set(sc.ENV_PINS) | {"TRAVEL_RESOLVER_ONLINE",
+                                      "TRAVEL_KB_DB", "TRAVEL_APP_DB"})
+    before = {k: os.environ.get(k, "<unset>") for k in keys}
+    tmp_root = Path(tempfile.gettempdir())
+    dirs_before = set(tmp_root.glob("p26obs-*"))
+    out = tmpdir / "fail.jsonl"
+
+    orig_rmtree = sc.shutil.rmtree
+
+    def boom(path, *a, **k):
+        raise PermissionError(f"injected: 目录被占用 {path}")
+
+    sc.shutil.rmtree = boom
+    try:
+        code, so, err = _run_main_quiet(
+            ["--corpus", str(CORPUS), "--out", str(out)], tmpdir, "t4j")
+    finally:
+        sc.shutil.rmtree = orig_rmtree
+    new = set(tmp_root.glob("p26obs-*")) - dirs_before
+
+    check("[T4j] 删除失败 → 退出码 6（不得声称成功）", code == 6, str(code))
+    check("[T4j] 失败进入 [WARN] 且点名临时目录（不再被 ignore_errors 吞掉）",
+          "[WARN] 清理未完成" in err and "临时目录未能删除" in err,
+          err.strip()[:300])
+    check("[T4j] 摘要不输出（stdout 为空）", so.strip() == "", so[:120])
+    check("[T4j] 产物已写出（C7 的前提）", out.is_file())
+    check("[T4j] 明示「产物已写出但整体判失败」",
+          "采集产物已写出" in err and "整体判为失败" in err, err.strip()[:300])
+    check("[T4j] 清理失败不阻断环境变量恢复（C5）",
+          _diff_env(before, keys) == {}, str(_diff_env(before, keys)))
+    check("[T4j] 目录确实残留（注入只影响删除，不假装已删）",
+          bool(new), str([p.name for p in new]))
+
+    # 失败路径上连接也必须已释放：复原 rmtree 后本进程应能删掉残留
+    removed = []
+    for d in sorted(new):
+        try:
+            orig_rmtree(d)
+            removed.append(d.name)
+        except OSError:
+            pass
+    check("[T4j] 清理失败后连接仍已释放（复原后本进程可删掉残留）",
+          len(removed) == len(new), f"{removed} / {[p.name for p in new]}")
+
+
 # ---------------------------------------------------------------- T5
 def test_t5_no_raw_text(tmpdir: Path) -> None:
     token = "ZQXOBSTOKEN"
@@ -1019,6 +1163,9 @@ def main() -> int:
         test_t4e_cleanup_layers(tmpdir)
         test_t4f_third_entry_transactional(tmpdir)
         test_t4g_pin_env_transactional(tmpdir)
+        test_t4h_tmpdir_cleanup(tmpdir)
+        test_t4i_tmpdir_removal_detects_failure(tmpdir)
+        test_t4j_tmpdir_cleanup_failure(tmpdir)
         test_t5_no_raw_text(tmpdir)
         test_t6_fail_loud(tmpdir)
         test_t7_conservation(tmpdir)

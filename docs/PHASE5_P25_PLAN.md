@@ -4058,3 +4058,174 @@ docstring 已补该条（`:31-33`）。
 5. `ALLOWED_CATEGORIES` 仍与采集侧共享（语料词表同一语义，评审本轮明确不要求拆分）。
 6. `sys.path` 插入后不还原（CLI 单次执行边界）。
 7. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。
+
+
+---
+
+## 30. P2.6 st.2 复审 R4 修复记录（2026-11-20，临时目录清理闭环）
+
+评审裁定：R3 三个代码修复点保留、R3 证据包封存；但 `p26obs-*` 临时目录「实际从未
+删除」+ `ignore_errors=True` 使失败检测失效，属**阻塞缺陷**，§26 Path A 暂缓最终
+PASS。本轮只动三个授权文件（`scripts/shadow_collect.py`、`tests/test_shadow_offline.py`、
+本文件）；未改 `src/`、未动 `shadow_report.py`、未动 `08_ACCEPTANCE.md` 与既有证据包、
+未引入 `TRAVEL_SHADOW_LOG`、未处理 R-01、未进入 P3 / takeover / 灰度 / 生产开关。
+
+### 30.1 C1：先查清 kb.db 的连接生命周期，再动手
+
+**探查结论（源码 + 实测，不是猜测）**
+
+| 事实 | 位置 |
+|---|---|
+| 模块级单例 `_DB` / `_DB_PATH` | `src/travel_agent/kb.py:26-28` |
+| `get_kb()` 返回该单例（首次打开并 seed） | `kb.py:58-70` |
+| `KnowledgeBase.conn = sqlite3.connect(..., check_same_thread=False)`，进程内长期存活 | `kb.py:73-75` |
+| **没有任何 close 接口**：模块 `dir()` 中 close/shutdown 名称集合为空 | 实测见 `../P26R4Probe/01_kb_holder_raw.txt` |
+| `configure()` 只做 `_DB = None`（丢引用，不关闭） | `kb.py:38-42` |
+| 业务侧引用全部经 `get_kb()`：agent 3 处、real_tools 4 处、dialogue 2 处、autofetch 5 处、entity_resolver、candidate_extractor、services.adapters.repositories | 全仓 grep |
+| `auth._conn()` / `conversations._conn()` / `moderation._conn()` 指向 **app.db**，按调用新建；`pending_store_sqlite` 每个方法 `con.close()` | 与 kb.db 无关 |
+
+**实测因果链**（`../P26R4Probe/01_kb_holder_raw.txt`，同一进程内）
+
+```
+main() rc = 0，产物 5503 字节
+新增残留目录: ['p26obs-10zkjqbv']  内容: [('kb.db', 176128)]
+kb._DB = <travel_agent.kb.KnowledgeBase object ...>
+kb._DB.conn = <sqlite3.Connection object ...>
+模块是否有正式 close 接口: []
+rmtree（连接仍开着）  -> FAILED PermissionError: [WinError 32] ... 'kb.db'
+kb._DB.conn.close() 后 -> rmtree OK | 目录仍存在: False
+```
+
+持有者因此被确定为 `kb._DB.conn` 这**一个**连接；不是「可能某个模块」，也不是
+「SQLite 一般都会锁文件」这类泛化推断。
+
+**备选方案为何不选**：把实际采集放进子进程虽可借进程退出释放句柄，但会改变
+dispatch 计数（父进程包裹失效）、mock 工具选择与闸门安装位置，直接动摇 T4 的
+语义；评审也要求「不能只为清理目录就破坏既有测试语义」。故本轮采用**进程内关闭
+真实持有者**，子进程方案列为遗留备选（§30.5）。
+
+**修法**（`scripts/shadow_collect.py`）
+
+| 位置 | 改动 |
+|---|---|
+| `:367` | `_KB_MODULE = "travel_agent.kb"` |
+| `:370` | `snapshot_kb_state()`：采集前记录 `_DB` / `_DB_PATH`（必须早于任何 `get_kb()`） |
+| `:384` | `release_kb_handles(snap)`：关闭**本次运行**打开的连接 → 还原单例 → 返回失败清单（不抛） |
+| `:705` | `main()` 在导入 travel_agent 后立即快照 |
+| `:842` | 外层 finally 第二层：`release_kb_handles(kb_snap)`，失败进 `cleanup_failures` |
+
+清理顺序：guard 重试 → **关 kb 连接** → 恢复环境变量 → 删除临时目录。
+关连接必须在删目录之前（否则 Windows 上必然失败），环境变量恢复独立于前两层
+（C5：任何一层失败都不阻断后面的层）。
+
+**依赖边界（已申报）**：本函数读写模块私有 `_DB` / `_DB_PATH`。这不是猜测某个
+函数名——持有者已由源码与实测双重确认；但它是**私有状态的静态契约依赖**，上游
+一旦提供正式 `kb.close()` 应改为调用它（§30.5 遗留 1，需另案申请 src 改动）。
+
+**行为变化（需知悉）**：R3 及之前，同一进程内多次 `main()` 会复用第一次打开的
+连接（指向上一轮的临时副本）；现在每轮结束后单例归零，下一轮按当时的
+`TRAVEL_KB_DB` 重新打开自己的副本。这是更正确的语义，T4h 的第二段专门覆盖它。
+
+### 30.2 C2：正常采集后目录确实不存在
+
+`tests/test_shadow_offline.py:684` `test_t4h_tmpdir_cleanup`（**6 条**）：
+
+- 采集成功（退出码 0）、产物存在；
+- 采集后**无新增** `p26obs-*` 目录（全局 glob 差集）；
+- 结束后 `travel_agent.kb._DB is None`（连接生命周期闭合，不只是目录消失）；
+- 成功路径不带任何 `[WARN]`；
+- **同进程第二次运行**同样成功且不再留目录（覆盖 30.1 的行为变化）。
+
+### 30.3 C3–C6：删除失败必须可见、上报、影响退出码、不阻断环境恢复
+
+**修法**：抽出 `remove_tmpdir()`（`:434`），**不使用** `ignore_errors=True`：
+删除失败返回原因清单（含目标路径、异常类型与消息、残留文件名），由 `main()`
+（`:856`）并入 `cleanup_failures`。
+
+**C3 正向证据不靠注入**：`tests/test_shadow_offline.py:718`
+`test_t4i_tmpdir_removal_detects_failure`（**4 条**）——在本进程内 `open()` 住目录里的
+`kb.db`（Windows 上仅此即可阻止删除），然后：
+
+- `remove_tmpdir()` 返回**非空**失败清单；
+- 清单点名目录、异常与残留文件 `kb.db`；
+- 目录确实还在（不假装删除）；
+- 关闭句柄后再删成功且清单为空。
+
+这组断言正是 `ignore_errors=True` 的反证：变异 M2 把 `ignore_errors=True` 加回去，
+这两条立即变红（见 30.5 变异表）。
+
+**C4–C6 端到端**：`tests/test_shadow_offline.py:749` `test_t4j_tmpdir_cleanup_failure`
+（**8 条**，注入 `rmtree` 抛 `PermissionError`）：
+
+- 退出码 **6**（C6），不声称成功；
+- stderr 出现 `[WARN] 清理未完成` 且点名「临时目录未能删除」（C4）；
+- stdout 为空（摘要不输出）；
+- 产物已写出（C7 前提）；
+- 明确区分「产物已写出」与「整体判为失败」（C7）；
+- 环境变量逐项恢复（C5：清理失败不阻断恢复）；
+- 注入期间目录确实残留（不是假删除）；
+- 失败路径上连接也已释放——复原 `rmtree` 后本进程能删掉残留。
+
+### 30.4 C7：产物成功 ≠ 运行成功
+
+`main()` 返回前（`:862-871`）：`rc == 0` 但 `cleanup_failures` 非空时，若 `out_path`
+存在，额外打一条 `[WARN] 采集产物已写出（<路径>），但本次运行清理未完成，整体判为
+失败（退出码 6）`，返回值仍是 6。docstring 的「退出码与产物的关系」已同步写明该
+表述（`:33-40`）。
+
+### 30.5 运行结果与变异
+
+| 项 | 结果 |
+|---|---|
+| T4h / T4i / T4j 定向 | **18 pass / 0 fail**（6 + 4 + 8） |
+| 离线套件 | **134 pass / 0 fail，exit=0**（116 + 18） |
+| 完整回归 | 17 套件 + 离线套件共 **18 个全 exit=0**（在最终字节上一次性跑完） |
+| 定向变异 | R4-M1 / M2 / M3 全部被捕获，逐字节还原（sha256 前后相同），还原后复跑 134/0 |
+
+变异明细（`../P26R4Obs/04_mutation_proof.txt`，原文含 [FAIL] 行）：
+
+| 变异 | 实测 |
+|---|---|
+| R4-M1 跳过 `release_kb_handles`（回到 R3 形态） | **5 FAIL**（T4h：rc 6、目录残留、单例未还原、出现 [WARN]、二次运行仍残留）；失败信息即真实 `WinError 32` |
+| R4-M2 `remove_tmpdir` 恢复 `ignore_errors=True` | **2 FAIL**（T4i：真实占用下返回空清单、信息不回显） |
+| R4-M3 删除「产物已写出但整体失败」告警 | **1 FAIL**（T4j） |
+
+**测试装具边界（非产品缺陷）**：`agent.py` 在模块级执行
+`sys.stdout.reconfigure(encoding="utf-8")`，若首次导入发生在
+`redirect_stdout(StringIO)` 之内会抛 `AttributeError`。因此新增用例把 stdout
+重定向到**真实文件**（`_run_main_quiet`，`:666`），而不是改产品代码。
+
+### 30.6 旧证据行号对应（不回改旧证据）
+
+| 证据 | 记录的基线 | 记录的行号 | R3 对应 | R4 对应 |
+|---|---|---|---|---|
+| `../P26R2Edge/03_tmpdir_leak_raw.txt` | `5410283` | `673-678` | `751-756` | 已重构为 `remove_tmpdir()`（`:434`），调用点 `:856` |
+
+旧证据描述的是当时字节的真实行号，事后修改会破坏证据真实性，故保持原样，仅在此
+给出映射。
+
+### 30.7 C8：未改变的部分（自查）
+
+- 采集数据格式：`EXPORT_KEYS` 12 字段、JSONL 写出逻辑、sha256 计算均未改；
+- 网络闸门：`NetworkGuard` 三个入口与 fail-closed 语义未改；
+- 报告 schema：`shadow_report.py` **零 diff**；
+- 生产代码：`src/` **零 diff**（`git diff --stat HEAD -- src/` 为空；
+  `git diff --stat 331e6b1 HEAD -- src/` 同为空）；
+- 13 个未授权路径/开关：三开关仍 `<unset>`，无 `TRAVEL_SHADOW_LOG`。
+
+### 30.8 仍未做 / 遗留（均需另行授权）
+
+1. **私有状态依赖**：`release_kb_handles()` 读写 `_DB` / `_DB_PATH`。建议另案申请
+   src 侧正式接口（例如 `kb.close()`：关闭连接并置空单例），届时本函数退化为调用它。
+   本轮未获授权改 `src/`，故以私有依赖 + 测试证明的方式落地。
+2. **子进程备选方案**未实施：需重做 dispatch 计数与 mock 选择，动静大于本轮授权。
+3. `_restore()` / `_rollback_env()` / 各清理层仍捕 `BaseException`（评审本轮明确
+   不要求修改，保留为工程风险记录）。
+4. `write_jsonl` 拒覆盖的 TOCTOU 窗口；未对父目录 `fsync`。
+5. `reason` 渲染截断 40 字符（显示层）。
+6. `ALLOWED_CATEGORIES` 仍与采集侧共享（评审明确不要求拆分）。
+7. `sys.path` 插入后不还原（CLI 单次执行边界）。
+8. **历史残留未清**：修复前累积的 `p26obs-*` 目录仍在系统临时目录里（数量随
+   测试运行波动，实测约 1100 余个；本轮只保证「不再新增」，未做存量清理）。
+   清理存量属独立动作，需单独授权后再做。
+9. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。

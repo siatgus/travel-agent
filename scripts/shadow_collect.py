@@ -33,9 +33,11 @@
 退出码与产物的关系（精确表述，不得简化成「非 0 就一定没有文件」）
   3 / 4 / 5 / 7 一律发生在 write_jsonl() 之前 → 不产生 JSONL、不留临时文件。
   6 有两个来源：写出前（全部 case 无记录、对照运行仍产生记录等）→ 无产物；
-  写出后（闸门 / 环境变量 / 临时目录未能复原）→ JSONL 可能已存在，但摘要
-  不输出、退出码非 0，属「产物存在但运行未成功」，须人工判读。清理失败一律
-  以 [WARN] 清理未完成 打到 stderr，不静默吞掉。
+  写出后（闸门 / 环境变量 / 知识库句柄 / 临时目录未能复原）→ JSONL 可能已存在，
+  但摘要不输出、退出码非 0，属「产物存在但运行未成功」，须人工判读。清理失败
+  一律以 [WARN] 清理未完成 打到 stderr，不静默吞掉；产物已写出时额外用一条
+  [WARN] 明示「产物已写出、整体判失败」，避免把有产物误读成成功。
+  临时目录删除**不使用** ignore_errors=True（复审 R4）：删除失败必须可见。
 
 网络隔离的证明边界（不得外推）
 ----------------------------
@@ -360,6 +362,93 @@ def restore_env(saved: dict[str, str]) -> None:
             os.environ[k] = v
 
 
+# ---------------------------------------------------------------- 知识库句柄
+
+_KB_MODULE = "travel_agent.kb"
+
+
+def snapshot_kb_state() -> dict:
+    """在采集前记录 travel_agent.kb 单例的状态（供清理阶段精确还原）。
+
+    必须在任何 get_kb() 之前调用：采集期间打开的连接属于本次运行，清理时
+    要关闭；采集前就存在的对象不属于本次运行，只还原引用、不关闭。
+    """
+    mod = sys.modules.get(_KB_MODULE)
+    if mod is None:
+        return {"present": False, "db": None, "path": None}
+    return {"present": True,
+            "db": getattr(mod, "_DB", None),
+            "path": getattr(mod, "_DB_PATH", None)}
+
+
+def release_kb_handles(snap: dict) -> list[str]:
+    """关闭采集期间打开的知识库连接，并把单例还原到采集前状态。
+
+    为什么必须显式关闭（复审 R4，评审 2026-11-20 验收项 C1）
+    ------------------------------------------------------
+    ``travel_agent.kb`` 用**模块级单例** ``_DB`` 持有 ``KnowledgeBase.conn``
+    （``kb.py:26-28``、``:58-70``、``:75``），并且**没有任何 close 接口**
+    （模块 ``dir()`` 里没有 close/shutdown）。该连接在进程内一直存活，
+    Windows 上使 ``shutil.rmtree`` 抛 ``WinError 32``，临时目录因此删不掉，
+    而 ``ignore_errors=True`` 又把失败吞掉，于是退出码仍是 0。
+    实测：``../P26R4Probe/01_kb_holder_raw.txt``（关闭前 PermissionError，
+    ``conn.close()`` 后同一目录删除成功）。
+
+    依赖边界（已知、已申报）
+    ----------------------
+    本函数读写模块私有全局 ``_DB`` / ``_DB_PATH``，因为上游没有正式关闭接口。
+    这不是猜测某个函数名——持有者已用源码（单例 + ``self.conn``）与实测
+    （关闭后目录可删）双重确认。一旦上游提供 ``kb.close()``，应改为调用它
+    （见 §30.5 遗留 1 的申请路径）。
+
+    返回失败清单（不抛出）：失败必须由调用方记入 cleanup_failures 并上报，
+    不能静默。
+    """
+    failures: list[str] = []
+    mod = sys.modules.get(_KB_MODULE)
+    if mod is None:
+        return failures
+
+    db = getattr(mod, "_DB", None)
+    if db is not None and db is not snap.get("db"):
+        conn = getattr(db, "conn", None)
+        try:
+            if conn is not None:
+                conn.close()
+        except BaseException as exc:            # 记录后继续还原单例
+            failures.append(f"知识库连接关闭失败 {type(exc).__name__}: {exc}")
+
+    # 无论关闭成功与否都还原单例：否则下一次运行会拿到已关闭的连接
+    try:
+        if snap.get("present"):
+            mod._DB = snap.get("db")
+            mod._DB_PATH = snap.get("path")
+        else:
+            mod._DB = None
+            mod._DB_PATH = None
+    except BaseException as exc:
+        failures.append(f"知识库单例还原失败 {type(exc).__name__}: {exc}")
+    return failures
+
+
+def remove_tmpdir(tmpdir: Path) -> list[str]:
+    """删除临时目录；失败返回原因清单（不抛、也**不吞**）。
+
+    不使用 ``ignore_errors=True``（复审 R4 C3）：R3 及之前它把 Windows 上的
+    ``WinError 32``（文件仍被占用）吞掉，于是「目录还在、退出码 0」。现在删除
+    失败必须变成一条可见的失败记录，由 ``main()`` 汇总成 ``[WARN]`` 并判失败。
+    """
+    if not tmpdir.exists():
+        return []
+    try:
+        shutil.rmtree(tmpdir)
+    except OSError as exc:
+        leftover = sorted(p.name for p in tmpdir.iterdir()) if tmpdir.is_dir() else []
+        return [f"临时目录未能删除 {tmpdir}（{type(exc).__name__}: {exc}）；"
+                f"残留：{leftover or '空'}"]
+    return []
+
+
 def _is_within(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -579,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
     tmpdir: Path | None = None
     guard = NetworkGuard()
     saved: dict[str, str] = {}
+    # 采集前 kb 单例状态（复审 R4 C1）：清理时据此关闭本次打开的连接
+    kb_snap: dict = {"present": False, "db": None, "path": None}
     dispatch = {"calls": 0, "names": []}
     # 清理阶段收集的失败（评审 R2：不得静默吞掉恢复失败）
     cleanup_failures: list[str] = []
@@ -609,6 +700,9 @@ def main(argv: list[str] | None = None) -> int:
         import travel_agent.tools as tools              # noqa: E402
         from travel_agent.dialogue import Session       # noqa: E402
         from travel_agent.orchestrator.orchestrator import Orchestrator  # noqa: E402
+
+        # 知识库单例快照：必须早于任何 get_kb()；清理阶段据此只关闭本次连接
+        kb_snap = snapshot_kb_state()
 
         # 4) 采集前断言：开关实际值 + 离线实现
         expect = {
@@ -733,7 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FATAL] 采集失败：{exc}", file=sys.stderr)
         rc = 6
     finally:
-        # 三层独立清理：任一层异常都不跳过后面的恢复动作（评审 R2）
+        # 四层独立清理：任一层异常都不跳过后面的恢复动作（评审 R2 / R4）
         try:
             if guard.active:
                 failed = guard.uninstall()
@@ -742,24 +836,38 @@ def main(argv: list[str] | None = None) -> int:
         except BaseException as exc:
             cleanup_failures.append(
                 f"外层 guard.uninstall() 抛出 {type(exc).__name__}: {exc}")
+        # 复审 R4 C1：先关知识库连接，否则 Windows 上 kb.db 仍被占用，
+        # 后面的 rmtree 必然失败（且旧代码用 ignore_errors 把它吞掉）
+        try:
+            for item in release_kb_handles(kb_snap):
+                cleanup_failures.append(item)
+        except BaseException as exc:            # release_kb_handles 自身不抛，仍兜住
+            cleanup_failures.append(
+                f"知识库连接释放异常 {type(exc).__name__}: {exc}")
         try:
             if saved:
                 restore_env(saved)
         except BaseException as exc:
             cleanup_failures.append(
                 f"环境变量恢复失败 {type(exc).__name__}: {exc}")
+        # 复审 R4 C3：不得再用 ignore_errors=True——删除失败必须可见
         try:
-            if tmpdir is not None and tmpdir.exists():
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir is not None:
+                cleanup_failures.extend(remove_tmpdir(tmpdir))
         except BaseException as exc:
             cleanup_failures.append(
-                f"临时目录清理失败 {type(exc).__name__}: {exc}")
+                f"临时目录清理异常 {type(exc).__name__}: {exc}")
 
     # 清理结果在返回前统一处理：保留原始异常（rc），不静默吞掉恢复失败
     if cleanup_failures:
         for item in cleanup_failures:
             print(f"[WARN] 清理未完成：{item}", file=sys.stderr)
-        if rc == 0:                            # 采集本身成功但状态未复原 → 判失败
+        if rc == 0:
+            # 复审 R4 C7：产物已写出 ≠ 本次运行成功，必须分开表述
+            if out_path.is_file():
+                print(f"[WARN] 采集产物已写出（{out_path}），"
+                      f"但本次运行清理未完成，整体判为失败（退出码 6）",
+                      file=sys.stderr)
             return 6
         return rc
     if rc != 0:
