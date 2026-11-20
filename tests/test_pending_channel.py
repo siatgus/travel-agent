@@ -2070,7 +2070,10 @@ def test_p25a_orphan_terminal_integration() -> None:
 def test_p25a_channel0_clarify_decision_bitwise() -> None:
     """§11.R3.5 增补（r4 裁定）：decision 逐位对比覆盖 channel=0 时
     本轮真实 clarify 场景——decide 未接管分支 + D1 放行 hunk 的
-    零影子行为差（真实 parse + 真实 ambiguous resolve 输入）。"""
+    零影子行为差（真实 parse + 真实 ambiguous resolve 输入）。
+    （r5 验收补证：TRAVEL_DECISION_TAKEOVER 由本测试显式保存、
+    固定为 "0"、并在 finally 中恢复——测试条件独立、确定、可恢复，
+    不受执行环境影响。）"""
     from travel_agent.decision import DecisionEngine
     from travel_agent.parser import parse_utterance
 
@@ -2082,20 +2085,29 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
                         "海贝皇大排档（上海店）", "上海")]
     rctx = {"slots": {}, "trip_dest": "", "last_city": ""}
 
+    # 环境变量显式控制：两个开关均保存原值、按测试条件固定、finally 恢复
     old_chan = os.environ.get("TRAVEL_PENDING_CHANNEL")
+    old_takeover = os.environ.get("TRAVEL_DECISION_TAKEOVER")
     try:
         # 基线：P2.5a 引入前语义（CHANNEL 未设）→ decide None + 影子
         os.environ.pop("TRAVEL_PENDING_CHANNEL", None)
+        os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
+        assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
         eng_base = DecisionEngine()
         d_base = eng_base.decide(parse0, resolved, dict(rctx),
                                  intent=(parse0.intent or "") or None)
         # channel=0：D1 放行条件不满足 → 原行为逐位保持
         os.environ["TRAVEL_PENDING_CHANNEL"] = "0"
+        assert os.environ["TRAVEL_PENDING_CHANNEL"] == "0"
+        assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
         eng0 = DecisionEngine()
         d0 = eng0.decide(parse0, resolved, dict(rctx),
                          intent=(parse0.intent or "") or None)
         # channel=1 + TAKEOVER=0：D1 单点放行（影子仍零差）
         os.environ["TRAVEL_PENDING_CHANNEL"] = "1"
+        os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
+        assert os.environ["TRAVEL_PENDING_CHANNEL"] == "1"
+        assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
         eng1 = DecisionEngine()
         d1 = eng1.decide(parse0, resolved, dict(rctx),
                          intent=(parse0.intent or "") or None)
@@ -2120,6 +2132,9 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
               d1.pending is None, str(d1))
         # 放行结果确定性：同输入重放逐位一致
         os.environ["TRAVEL_PENDING_CHANNEL"] = "1"
+        os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
+        assert os.environ["TRAVEL_PENDING_CHANNEL"] == "1"
+        assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
         eng2 = DecisionEngine()
         d2 = eng2.decide(parse0, resolved, dict(rctx),
                          intent=(parse0.intent or "") or None)
@@ -2130,10 +2145,18 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
             os.environ.pop("TRAVEL_PENDING_CHANNEL", None)
         else:
             os.environ["TRAVEL_PENDING_CHANNEL"] = old_chan
+        if old_takeover is None:
+            os.environ.pop("TRAVEL_DECISION_TAKEOVER", None)
+        else:
+            os.environ["TRAVEL_DECISION_TAKEOVER"] = old_takeover
 
     # channel=0 全链路逐位：真实 ambiguous 问句输出与无 pending
     # 基础设施基线逐位一致（producer/decider/manager 零构造）
+    # （r5：该阶段同样显式固定 TAKEOVER=0，并用完恢复）
     set_env(channel="0")
+    os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
+    assert os.environ["TRAVEL_PENDING_CHANNEL"] == "0"
+    assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
     try:
         old = _orch_mod._resolve_entities
         _orch_mod._resolve_entities = _StubResolver([ResolveResult(
@@ -2156,6 +2179,10 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
             _orch_mod._resolve_entities = old
     finally:
         set_env()
+        if old_takeover is None:
+            os.environ.pop("TRAVEL_DECISION_TAKEOVER", None)
+        else:
+            os.environ["TRAVEL_DECISION_TAKEOVER"] = old_takeover
 
 
 # ============================================ 9. P2.5b：重验证侧集成（消费 → fresh 重验证 → 四分支/受控流转）
