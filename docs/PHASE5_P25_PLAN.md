@@ -1856,3 +1856,71 @@ shadow 通道同构。
   pending / pending_store_sqlite / revalidator / dialogue /
   orchestrator 全部为空；改动仅 3 文件（producer + 两测试）；
 - 开关 0/0/0；P2.5b 相关代码零触碰；P2.6/P3 未授权。
+
+---
+
+## 20. P2.5a 独立整改最终验收关闭记录（2026-11-20 评审裁定）
+
+### 20.1 裁定结果（评审原文归档）
+
+**正式裁定：P2.5a 独立整改验收通过。验收对象：947883d。本次验收
+仅覆盖 P2.5a，不向后延伸。**
+
+评审归档用语（照录）：
+
+> P2.5a 独立整改（commit 947883d）经设计边界、代码变更范围、补偿
+> 逻辑、R4 风险场景、channel=0 真实 clarify 逐位对比及回归证据
+> 审查，最终验收通过。P2.5a 阶段关闭。该结论不构成 P2.5b 验收
+> 通过或生产启用授权。生产环境 TRAVEL_PENDING_CHANNEL 继续保持
+> 关闭，后续阶段须另行申请。
+
+### 20.2 最终验收清单（评审逐项裁定，全部 PASS）
+
+L1 二线终结补偿 PASS / 双终结失败保守拦截 PASS / R4 故障恢复与
+持续故障场景 PASS / 孤儿 Pending 残余风险表述 PASS / channel=0
+真实 clarify 逐位对比 PASS / D1 channel=1 放行条件 PASS /
+TAKEOVER=0 测试隔离 PASS / 冻结模块改动范围 PASS（依据已提交
+diff 与证据记录）/ 17 套件单轮回归 PASS（依据已提交原始输出）/
+独立测试恢复逻辑 PASS。
+
+### 20.3 补证提交链（最终验收依据）
+
+| commit | 内容 |
+|---|---|
+| `947883d` | P2.5a 独立整改实施（§19，四增量） |
+| `ba211db` | 验收补证 r5：bitwise 测试显式固定 TRAVEL_DECISION_TAKEOVER（保存→五段固定 "0"+前置 assert→finally 恢复；单测 8/0 exit=0，双开关恢复 None） |
+| `26a8cfe` | 验收补证 r6：两项健壮性建议（第二阶段环境断言移入 try；d1 空值防护）+ 两处既有测试墙钟时间炸弹修复（§4.2 LRU 两处 evaluate 传 now=clock；gate B1 s3 装具改 _ClockBoundInterceptor，因 _pending_gate 冻结不传 now=）；channel 330/0 exit=0、全量 17 套件 exit=0 ×17 |
+
+时间炸弹根因备案：interceptor `_now_epoch(None)` 回退真实墙钟，
+与 fixed_clock store 混源，600 秒重选窗口判定跨过 fixed 时间戳后
+确定性失败——2026-11-19 的 330/0 系真实时间早于 fixed 时间戳、
+负 diff 意外通过。残余：其余约 18 处 evaluate 未传 now 调用点
+今日验证全绿，全量排查待独立授权。
+
+### 20.4 阶段状态与冻结边界（评审五项强调，照录归档）
+
+1. TRAVEL_PENDING_CHANNEL 在所有生产环境继续保持 0；
+2. 不得通过临时环境变量、灰度配置或部署脚本绕过冻结；
+3. P2.5a 通过**不代表**双终结失败后的孤儿 Pending 已获得即时
+   隔离保证（§11.R4 定性持续有效：L1–L4 为尽力补偿与故障约束）；
+4. 生产启用前，仍须独立核查部署配置、启动脚本、容器环境变量及
+   CI 注入（§11.R4.3 启用前独立验收门槛）；
+5. 不自动开始 P2.5b。
+
+| 项 | 状态 |
+|---|---|
+| P2.5a 独立整改（947883d + ba211db + 26a8cfe） | PASS，关闭 |
+| P2.5b 重验证闭环 | 未验收（维持 FAIL，待 RV-07 机制裁定） |
+| P2.6 / P3 | 未授权 |
+| TRAVEL_PENDING_CHANNEL | 0（不变） |
+| TRAVEL_PENDING_TAKEOVER / TRAVEL_DECISION_TAKEOVER | 0 / 0（不变） |
+
+### 20.5 待办移交
+
+- P2.5b：维持 FAIL，待 §18 机制 E（RV-07 fresh entity 强约束）
+  裁定后另行申请；不因本关闭自动启动；
+- RV-05 city_hints Resolver 适配点：另案申请，未实施；
+- 测试密闭性全量排查（约 18 处 evaluate 无 now= 调用点）：
+  test-only，待独立授权。
+
+---
