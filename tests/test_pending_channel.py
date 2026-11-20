@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -2250,15 +2251,17 @@ def _rej_rc(text):
         probe_reason="cross_source_empty")
 
 
-def _preset_orc(sid, clock=None, *, intent="poi_query", role="query"):
+def _preset_orc(sid, clock=None, *, intent="poi_query", role="query",
+                ut="哪家海贝皇大排档好"):
     if clock is None:
         clock = lambda: datetime(2026, 11, 19, 10, 0, 0)
-    """预置 store + runtime 注入 manager（B 段惯用法）。"""
+    """预置 store + runtime 注入 manager（B 段惯用法）；
+    ut 参数可注入自定义原始问句（机制 E 反证装具用）。"""
     orc = Orchestrator()
     s = Session(use_llm=False)
     s.pending_session_id = sid
     store = PendingStore(session_id=sid, now=clock)
-    p = store.create_pending("哪家海贝皇大排档好", intent, role, SNAP)
+    p = store.create_pending(ut, intent, role, SNAP)
     s.active_pending_id = p.pending_id
     mgr = PendingRuntimeManager(max_runtimes=8, now=clock)
     rt = PendingRuntime(sid, store, PendingInterceptor(store),
@@ -2269,14 +2272,16 @@ def _preset_orc(sid, clock=None, *, intent="poi_query", role="query"):
 
 
 def _count_answers(s):
-    """包装 session._answer 统计 Handler 入口调用次数（F1/A6 用）。"""
-    orig = s._answer
+    """包装 session._spot_qa 统计消费轮直调业务入口调用次数（F1/A6
+    用；机制 E 后消费轮执行入口 = _spot_qa/_nearby_qa 实体参数化
+    直调，session._answer 不再是消费轮执行路径——见 §21/§22）。"""
+    orig = s._spot_qa
     calls = {"n": 0}
 
-    def counting(kind, ut):
+    def counting(city, spot):
         calls["n"] += 1
-        return orig(kind, ut)
-    s._answer = counting
+        return orig(city, spot)
+    s._spot_qa = counting
     return calls
 
 
@@ -2327,7 +2332,15 @@ def test_p25b_a3_confirmed_controlled_flow() -> None:
         check("[A3] 轮1 创建 pending（intent=poi_query 入白名单）",
               p1 is not None and p1.original_intent == "poi_query",
               str(p1))
-        calls = _count_answers(s)
+        # 机制 E：受控直调桩——捕获实参（fresh entity 恒等断言）并
+        # 返回受控产出（避免真实 KB/autofetch 的网络不确定性）
+        spot_calls = []
+        orig_spot_qa = s._spot_qa
+
+        def cap_spot_qa(city, spot):
+            spot_calls.append((city, spot))
+            return f"已为您介绍「{spot}」（{city}）：门票与开放时间如上。"
+        s._spot_qa = cap_spot_qa
         r2 = orc.handle(s, "第1个")                        # 选择 c1
         check("[A3] route=pending_consume_execute（受控流转）",
               orc.last_ctx.route == "pending_consume_execute"
@@ -2349,8 +2362,11 @@ def test_p25b_a3_confirmed_controlled_flow() -> None:
               == "confirmed"
               and rt.store._latest_consumption()["revalidated_at"]
               is not None, str(rt.store._latest_consumption()))
-        check("[A3] 同一轮恰一次 Handler 入口调用（无重复执行）",
-              calls["n"] == 1, str(calls))
+        check("[A3] 同一轮恰一次直调且实参恒等 fresh entity"
+              "（机制 E：Entity_Decision == Entity_BusinessMethod）",
+              len(spot_calls) == 1
+              and spot_calls[0] == ("南京", "海贝皇大排档（南京店）"),
+              str(spot_calls))
         check("[A3] pending 已消费 + hint 已清空",
               rt.store.get_pending_by_id(p1.pending_id).status == "consumed"
               and s.active_pending_id is None, "")
@@ -2363,6 +2379,7 @@ def test_p25b_a3_confirmed_controlled_flow() -> None:
                   for x in orc._revalidator.shadow_log),
               str(orc._revalidator.shadow_log[-2:]))
     finally:
+        s._spot_qa = orig_spot_qa
         _orch_mod._resolve_entities = old_orch_resolve
         _rv_mod._resolve_entities = old_rv_resolve
         set_env()
@@ -2541,7 +2558,15 @@ def test_p25b_d1_d2_d3_robustness() -> None:
                 _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
                                "e-nj-fresh")])])
         store2.record_revalidation = lambda *a, **kw: False
-        calls2 = _count_answers(s2)
+        # 机制 E：受控直调桩（避免真实 KB/autofetch 网络不确定性）+
+        # fresh 实参捕获
+        d2_calls = []
+        orig_spot2 = s2._spot_qa
+
+        def cap_spot2(city, spot):
+            d2_calls.append((city, spot))
+            return f"已为您介绍「{spot}」（{city}）：门票与开放时间如上。"
+        s2._spot_qa = cap_spot2
         r2 = orc2.handle(s2, "第1个")
         check("[D2] 回填失败 → 分支结果不变（仍受控流转）",
               orc2.last_ctx.route == "pending_consume_execute"
@@ -2551,8 +2576,11 @@ def test_p25b_d1_d2_d3_robustness() -> None:
               and any(x["action"] == "revalidate_backfill_failed"
                       for x in orc2._revalidator.shadow_log),
               str(orc2._pending_warnings))
-        check("[D2/F4] 无重复 Handler（恰 1 次）",
-              calls2["n"] == 1, str(calls2))
+        check("[D2/F4] 无重复直调（恰 1 次）且实参恒等 fresh entity"
+              "（机制 E）",
+              len(d2_calls) == 1
+              and d2_calls[0] == ("南京", "海贝皇大排档（南京店）"),
+              str(d2_calls))
         check("[D2/F4] 无重复消费（同一 pending 恰一次）",
               store2._latest_consumption()["pending_id"] == p2.pending_id,
               "")
@@ -2615,18 +2643,255 @@ def test_p25b_f2_f3_negative() -> None:
                 _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
                                "e-nj-fresh")])])
         orc2, s2, store2, p2 = _preset_orc("s-f3", lambda: datetime(2026, 11, 19, 10, 0, 0))
-        orig_answer = s2._answer
-        s2._answer = lambda kind, ut: None   # Handler 前置未接住
+        orig_answer = s2._spot_qa
+        s2._spot_qa = lambda city, spot: None   # 业务方法前置未接住
         try:
             r2 = orc2.handle(s2, "第1个")
         finally:
-            s2._answer = orig_answer
-        check("[F3] Handler 未接住 → 回退确认话术（服从原规则不绕过）",
+            s2._spot_qa = orig_answer
+        check("[F3] 业务方法未接住 → 回退确认话术（服从原规则不绕过）",
               orc2.last_ctx.route == "pending_consume_execute"
               and "已确认：海贝皇大排档（南京店）" in str(r2), str(r2))
         check("[F3] 决策已构造（confirmed 归因在案）",
               orc2.last_ctx.pending_decision is not None, "")
     finally:
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_mechanism_e_fresh_entity_enforcement() -> None:
+    """机制 E（§18.4/§21，评审 2026-11-20 批准开工）：J1/J2/J3
+    构造性证明 + 注入式反证（§21.2 增量 2 双路测试）。
+
+    构造性证明（J1 三段等式）：Entity_Decision == Entity_Business
+    Method == Entity_FinalLookup——捕获 _spot_qa 实参与 agent.
+    dispatch 最终检索实参（keyword/city），三段恒等 fresh entity；
+    last_city == fresh_city；shadow execute_begin/done 双记录含
+    reason 归因；DecisionResult.reason 保留 pending_id/candidate_id。
+
+    注入式反证（I2 构造不可达 + J2）：误导性原始问句（含其他景点
+    名「上海迪士尼门票多少钱」）作为 Pending 原始问句注入——对照
+    普通路由对同一问句真实重解析出「迪士尼」（分歧机制真实存在、
+    反证有证明力），而 confirmed 消费路径最终检索实参仍为 fresh
+    entity、误导实体从未进入任何检索——偏移状态在直调路径按构造
+    不可发生，差异被限定在触点 2 内。"""
+    import travel_agent.agent as _agent_mod
+    set_env(channel="1", store_kind="memory")
+    old_orch_resolve = _orch_mod._resolve_entities
+    old_rv_resolve = _rv_mod._resolve_entities
+    old_dispatch = _agent_mod.dispatch
+    try:
+        _orch_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _amb_rc("海贝皇大排档（南京店）", "南京",
+                        "海贝皇大排档（上海店）", "上海")])])
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        dispatch_calls = []
+
+        def cap_dispatch(name, args):
+            if name == "search_poi":
+                dispatch_calls.append(dict(args or {}))
+                return {"ok": True, "items": [{
+                    "name": "海贝皇大排档（南京店）", "city": "南京",
+                    "category": "attraction", "area": "玄武区",
+                    "duration_min": 90, "cost": 0,
+                    "open_hours": "全天", "geo": (32.06, 118.79)}],
+                    "total": 1}
+            return old_dispatch(name, args)
+        _agent_mod.dispatch = cap_dispatch
+        orc = Orchestrator()
+        s = _produce_session(orc, "s-me1")
+        r1 = orc.handle(s, "帮我查一下海贝皇大排档")
+        rt = orc._pending_manager.runtime("s-me1")
+        p1 = rt.store.get_active_pending()
+        check("[E·前置] 轮1 创建 pending", p1 is not None, str(p1))
+        # ---- 构造性证明（J1/J3）----
+        r2 = orc.handle(s, "第1个")
+        d = orc.last_ctx.pending_decision
+        check("[E·构造] route=pending_consume_execute（机制 E 受控流转）",
+              orc.last_ctx.route == "pending_consume_execute"
+              and d is not None, str(orc.last_ctx.route))
+        check("[E·构造] Entity_Decision = fresh confirmed 实体",
+              d is not None and d.entity.get("name")
+              == "海贝皇大排档（南京店）"
+              and d.entity.get("city") == "南京"
+              and d.entity.get("status") == "confirmed", str(d))
+        check("[E·构造] Entity_FinalLookup：最终检索实参恒等 fresh"
+              " entity（keyword/city 逐项相等）",
+              any(c.get("keyword") == "海贝皇大排档（南京店）"
+                  and c.get("city") == "南京" for c in dispatch_calls),
+              str(dispatch_calls))
+        check("[E·构造] last_city = fresh_city（语义同 POIHandler:80）",
+              s.last_city == "南京", str(s.last_city))
+        check("[E·构造] 回复呈现 fresh 实体产出（非确认话术）",
+              "海贝皇大排档（南京店）" in str(r2)
+              and "已确认：" not in str(r2), str(r2)[:120])
+        check("[E·构造] J3 归因：reason 含 pending_id/candidate_id/"
+              "revalidate 前缀",
+              d is not None and p1.pending_id in d.reason
+              and p1.candidates[0].candidate_id in d.reason
+              and "pending_revalidate:" in d.reason, d.reason if d else "")
+        shadow_acts = [x.get("action") for x in rt.interceptor.shadow_log]
+        check("[E·构造] shadow execute_begin/done 恰各一条（J3 双通道）",
+              shadow_acts.count("execute_begin") == 1
+              and shadow_acts.count("execute_done") == 1, str(shadow_acts))
+        check("[E·构造] shadow begin 记录携带归因 reason（含 "
+              "pending_revalidate）",
+              any(x.get("action") == "execute_begin"
+                  and "pending_revalidate" in str(x.get("detail", ""))
+                  for x in rt.interceptor.shadow_log),
+              str(rt.interceptor.shadow_log[-3:]))
+        # ---- 注入式反证（I2/J2）：误导性原始问句 ----
+        dispatch_calls.clear()
+        orc2, s2, store2, p2 = _preset_orc(
+            "s-me2", lambda: datetime(2026, 11, 19, 10, 0, 0),
+            ut="上海迪士尼门票多少钱")
+        r3 = orc2.handle(s2, "第1个")
+        check("[E·反证] 注入条件成立：原问句含误导实体名（迪士尼）",
+              "迪士尼" in str(orc2.last_ctx.pending_decision_utterance
+                              or ""), str(orc2.last_ctx))
+        check("[E·反证] 消费路径最终检索实参仍为 fresh entity",
+              any(c.get("keyword") == "海贝皇大排档（南京店）"
+                  and c.get("city") == "南京" for c in dispatch_calls),
+              str(dispatch_calls))
+        check("[E·反证] 误导实体从未进入任何检索（I2 构造不可达）",
+              dispatch_calls
+              and all("迪士尼" not in str(c.get("keyword") or "")
+                      for c in dispatch_calls), str(dispatch_calls))
+        check("[E·反证] 偏移实体内容未呈现给用户（J2）",
+              "迪士尼" not in str(r3), str(r3)[:120])
+        # ---- 反证对照：普通路由真实重解析（分歧机制存在）----
+        dispatch_calls.clear()
+        s3 = Session(use_llm=False)          # 无 pending 身份 → 原链路
+        orc3 = Orchestrator()
+        orc3.handle(s3, "上海迪士尼门票多少钱")
+        check("[E·反证对照] 同一问句在普通路由下真实重解析出「迪士尼」"
+              "（分歧机制真实存在，反证有证明力）",
+              any("迪士尼" in str(c.get("keyword") or "")
+                  for c in dispatch_calls), str(dispatch_calls))
+    finally:
+        _agent_mod.dispatch = old_dispatch
+        _orch_mod._resolve_entities = old_orch_resolve
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
+def test_p25b_mechanism_e_failure_conservative() -> None:
+    """机制 E I3 失败保守组（评审约束 4/C，§21.2 增量 2）：KB 无有效
+    检索结果 → 保守话术不编造；other_city 冲突 → 冻结模板确定性
+    信号回退确认话术（偏移归属绝不呈现，J2）；_spot_qa/_nearby_qa
+    异常 → 既有异常边界回退；空文本 → F3 回退；五条件任一不满足
+    → confirm 语义不变（直调不改变任何回退行为）。"""
+    import travel_agent.agent as _agent_mod
+    import travel_agent.autofetch as _autofetch_mod
+    from travel_agent.decision import (ACTION_CLARIFY, DecisionResult)
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    old_ensure_spot = _autofetch_mod.ensure_spot
+    old_dispatch = _agent_mod.dispatch
+    try:
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh("海贝皇大排档（南京店）", "南京",
+                               "e-nj-fresh")])])
+        _agent_mod.dispatch = lambda name, args: (
+            {"ok": True, "items": [], "total": 0}
+            if name == "search_poi" else old_dispatch(name, args))
+        # ---- a) KB 无有效结果 → 保守话术（不编造、非确认话术）----
+        _autofetch_mod.ensure_spot = lambda *a, **kw: {"status": "not_found"}
+        orc, s, store, p = _preset_orc(
+            "s-me-f1", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        r1 = orc.handle(s, "第1个")
+        check("[I3-a] KB 无结果 → 保守话术（含 fresh 实体、绝不编造）",
+              "暂时查不到" in str(r1)
+              and "海贝皇大排档（南京店）" in str(r1)
+              and "已确认：" not in str(r1), str(r1)[:120])
+        # ---- b) other_city 冲突 → 确定性信号回退确认话术（J2）----
+        _autofetch_mod.ensure_spot = lambda *a, **kw: {
+            "status": "other_city", "city": "上海",
+            "poi": {"name": "海贝皇大排档（南京店）", "city": "上海",
+                    "category": "attraction"}}
+        orc2, s2, store2, p2 = _preset_orc(
+            "s-me-f2", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        r2 = orc2.handle(s2, "第1个")
+        check("[I3-b] other_city 冲突 → 验收位回退确认话术",
+              "已确认：海贝皇大排档（南京店）" in str(r2)
+              and orc2.last_ctx.route == "pending_consume_execute",
+              str(r2))
+        check("[I3-b] 偏移归属绝不呈现（J2：「位于上海」「不在南京」"
+              "零出现）",
+              "位于上海" not in str(r2) and "不在南京" not in str(r2),
+              str(r2))
+        check("[I3-b] 验收位回退警告已记录",
+              any("验收位回退" in w for w in orc2._pending_warnings),
+              str(orc2._pending_warnings))
+        # ---- c) _spot_qa 异常 → 既有异常边界回退 ----
+        orc3, s3, store3, p3 = _preset_orc(
+            "s-me-f3", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        orig_sq = s3._spot_qa
+
+        def boom_sq(city, spot):
+            raise RuntimeError("注入：业务方法异常")
+        s3._spot_qa = boom_sq
+        try:
+            r3 = orc3.handle(s3, "第1个")
+        finally:
+            s3._spot_qa = orig_sq
+        check("[I3-c] _spot_qa 异常 → 异常边界回退确认话术 + 警告",
+              "已确认：" in str(r3)
+              and orc3.last_ctx.route == "pending_consume_execute"
+              and any("注入失败" in w for w in orc3._pending_warnings),
+              str(r3))
+        # ---- d) _nearby_qa 异常（原问句含周边语义）→ 同一异常边界 ----
+        orc4, s4, store4, p4 = _preset_orc(
+            "s-me-f4", lambda: datetime(2026, 11, 19, 10, 0, 0),
+            ut="海贝皇大排档周边怎么样")
+        orig_nq = s4._nearby_qa
+
+        def boom_nq(city, spot):
+            raise RuntimeError("注入：周边业务方法异常")
+        s4._nearby_qa = boom_nq
+        try:
+            r4 = orc4.handle(s4, "第1个")
+        finally:
+            s4._nearby_qa = orig_nq
+        check("[I3-d] _nearby_qa 异常 → 同一异常边界回退确认话术",
+              "已确认：" in str(r4)
+              and any("注入失败" in w for w in orc4._pending_warnings),
+              str(r4))
+        # ---- e) 空文本 → F3 回退（语义不变）----
+        orc5, s5, store5, p5 = _preset_orc(
+            "s-me-f5", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        orig_sq5 = s5._spot_qa
+        s5._spot_qa = lambda city, spot: ""
+        try:
+            r5 = orc5.handle(s5, "第1个")
+        finally:
+            s5._spot_qa = orig_sq5
+        check("[I3-e] 空文本 → F3 回退确认话术（直调零改变）",
+              "已确认：海贝皇大排档（南京店）" in str(r5)
+              and orc5.last_ctx.route == "pending_consume_execute",
+              str(r5))
+        # ---- f) 五条件③不满足（action=clarify）→ confirm 不变 ----
+        orc6, s6, store6, p6 = _preset_orc(
+            "s-me-f6", lambda: datetime(2026, 11, 19, 10, 0, 0))
+        ctx6 = SimpleNamespace(
+            pending_decision=DecisionResult(
+                action=ACTION_CLARIFY, intent="poi_query",
+                entity={"name": "海贝皇大排档（南京店）", "city": "南京"}),
+            pending_decision_source="pending_consume",
+            pending_decision_utterance="第1个")
+        rep = orc6._allow_handler_consume(s6, "第1个", ctx6)
+        check("[I3-f] 五条件③不满足 → confirm 回退（直调不改五条件"
+              "语义）",
+              rep is not None and "已确认：海贝皇大排档（南京店）"
+              in str(rep), str(rep))
+    finally:
+        _autofetch_mod.ensure_spot = old_ensure_spot
+        _agent_mod.dispatch = old_dispatch
         _rv_mod._resolve_entities = old_rv_resolve
         set_env()
 
@@ -2721,6 +2986,8 @@ def main() -> int:
                test_p25b_a6_a7_unverified_rejected,
                test_p25b_d1_d2_d3_robustness,
                test_p25b_f2_f3_negative,
+               test_p25b_mechanism_e_fresh_entity_enforcement,
+               test_p25b_mechanism_e_failure_conservative,
                test_p25b_channel0_zero_revalidation):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b): {_PASS} pass / {_FAIL} fail")

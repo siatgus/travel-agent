@@ -401,8 +401,22 @@ class Orchestrator:
     def _allow_handler_consume(self, session, utterance: str, ctx) \
             -> Reply | None:
         """P2.5b 触点 2：AllowHandler 五条件受控消费点（§10.1 D2
-        方案甲首次落地——§9.4「分支入口先看接入点 A 是否给出
-        DecisionResult」结构的建立；Handler 零改动）。
+        方案甲——§9.4「分支入口先看接入点 A 是否给出 DecisionResult」
+        结构；Handler 类与接口零改动）。
+
+        机制 E（§18.4/§21，评审 2026-11-20 批准）：五条件全过后
+        **实体参数化直调**——不再经 session._answer 从原始问句
+        重解析实体（RV-07 裁定读法乙：fresh DecisionResult/entity
+        必须实际约束最终执行实体），改为直调 Handler 链最终委托的
+        同一业务方法 session._spot_qa / session._nearby_qa，把
+        fresh entity 作为函数实参传入（I1 实体钉死：实体进入执行
+        的唯一通道是实参，直调路径不存在任何从问句重解析实体的
+        步骤，I2 分歧按构造不可达）。语义调整已获批：§9.4/§10.1
+        「经既有入口 session._answer」字面 → 「在保留既有业务安全
+        前置条件的前提下，直调该链最终委托的同一业务方法并显式
+        传入 fresh entity」——**批准绕过的是问句重解析，不是业务
+        安全链路**：五条件 AND / confirm 回退 / 异常边界 / F3 空文本
+        语义 / 原链前置等价映射全部保留（等价性证明见实施记录 §22）。
 
         ctx.pending_decision 为 None（非 pending 消费轮）→ 返回
         None，主流程逐位不变。五条件 AND（缺一不可）：
@@ -411,11 +425,10 @@ class Orchestrator:
         IntentInQueryWhitelist（decision.DEFAULT_BATCHES，规划类
         永不）∧ RevalidationConfirmed。
 
-        全过 → 经**既有业务分支入口** session._answer（与 handle
-        步骤 5 同一入口、同一 Handler 链）执行 Handler——
-        GuardPipeline / 权限 / Handler 前置条件零绕过；任一条件不
-        满足或注入失败 → 冻结确认话术交回，绝不裸调 Handler、绝不
-        退回普通路由（防选择话术被普通意图解析重复执行）。"""
+        任一条件不满足、前置缺失或执行失败 → 冻结确认话术交回，
+        绝不裸调业务方法、绝不退回普通路由（防选择话术被普通意图
+        解析重复执行）。I3 验收位为保守兜底（fresh_name 未见于回复
+        / other_city 确定性冲突信号 → 回退），不是新的实体判断器。"""
         decision = getattr(ctx, "pending_decision", None)
         if decision is None:
             return None                        # 非消费通道轮 → 逐位不变
@@ -424,7 +437,7 @@ class Orchestrator:
         ecity = entity.get("city")
         confirm = lambda: self._consume_confirm_reply(session, ename, ecity)
 
-        # ---- 五条件 AND（§10.1 定版）----
+        # ---- 五条件 AND（§10.1 定版，逐位冻结不变）----
         allowed = (
             self._channel_enabled()                       # ① 开关
             and getattr(ctx, "pending_decision_source", None)
@@ -441,24 +454,72 @@ class Orchestrator:
             getattr(decision, "intent", "") or "")
         orig_ut = str(getattr(ctx, "pending_decision_utterance", "")
                       or "").strip()
-        if kind is None or not orig_ut:
-            # 注入前置缺失 → 回退确认话术，绝不裸调 Handler
+        if kind is None or not orig_ut or not ecity:
+            # 注入前置缺失 → 回退确认话术，绝不裸调 Handler。
+            # 新增 ecity 条件 = 原链 POIHandler.handle「resolve_city
+            # 为空 → 泛推荐兜底」前置的等价映射——消费轮语义下更
+            # 保守：绝不泛答（§22 等价性证明表）
             self._pending_warnings.append(
-                "pending consume execute: 注入前置缺失（kind/utterance）")
+                "pending consume execute: 注入前置缺失（kind/utterance/city）")
             return confirm()
+
+        # 机制 E 直调（评审批准的唯一生产语义变更，触点 2 块内）：
+        # orig_ut 仅作周边语义检测（与 dialogue.py:497 同一关键词集
+        # 的等价判定），绝不参与实体解析（I1）。
+        reason = str(getattr(decision, "reason", "") or "")
+        sid2 = str(getattr(session, "pending_session_id", "") or "")
+
+        def _shadow_exec(action: str, detail: str) -> None:
+            # 与既有 shadow 通道同构（_shadow_gate；冻结约束 ③：
+            # 观察记录绝不影响主链路，一切记录异常吞掉）
+            try:
+                rt2 = (self._pending_manager.runtime(sid2)
+                       if (self._pending_manager is not None and sid2)
+                       else None)
+                if rt2 is not None:
+                    self._shadow_gate(rt2, "allow_execute", action,
+                                      detail=detail, pending_id=None)
+            except Exception:
+                pass
+
         try:
-            # 既有业务分支入口（与 handle 步骤 5 同一入口同一链）；
-            # DecisionResult 经 ctx 载体随轮可溯（§9.4 结构）
-            text = session._answer(kind, orig_ut)
+            session.last_city = ecity   # 语义同 POIHandler.handle:80
+            _shadow_exec("execute_begin",
+                         f"entity={ename!r}@{ecity!r} reason={reason}")
+            # 既有业务方法直调（= handle 步骤 5 Handler 链最终委托的
+            # 同一业务方法，dialogue.py:498-499；GuardPipeline 为步骤
+            # 6 方案修改守卫，QA 链正常路径本就不经过，五条件④已锁定
+            # 规划类永不进入——无守卫被绕过，§22 等价性证明表）
+            if any(k in orig_ut for k in ("周边", "附近", "周围", "附件")):
+                text = session._nearby_qa(ecity, ename)
+            else:
+                text = session._spot_qa(ecity, ename)
         except Exception as exc:
             self._pending_warnings.append(
                 f"pending consume execute 注入失败 "
                 f"{type(exc).__name__}: {exc}")
             return confirm()                  # 注入失败 → 回退确认话术
         if not text:
-            # Handler 前置条件未接住（返回 None）→ 服从原规则（F3：
+            # 业务方法前置未接住（返回 None/空）→ 服从原规则（F3：
             # 不因消歧绕过权限/前置），回退确认话术
             return confirm()
+        # I3 验收位（保守兜底而非唯一约束——实体已由实参钉死，本位
+        # 只处理数据缺失/归属冲突类失败）：
+        # ① fresh_name 未出现于回复：辅助验收位（评审约束 4：名称
+        #   可能出现在错误归属的回答中，不单独证明实体正确）；
+        # ② other_city 确定性信号：dialogue.py _spot_qa 冻结话术模板
+        #   两处均含「不在{ecity}」固定结构（「位于{true_city}，不在
+        #   {city}。」/「不在{city}一带」）——精确子串匹配，非宽泛
+        #   正则、非回复文本猜测；误报方向 = 保守 confirm（安全侧），
+        #   模板漂移由 other_city 注入测试锁定暴露（可复现）。
+        if ename not in text or f"不在{ecity}" in text:
+            self._pending_warnings.append(
+                "pending consume execute: 验收位回退"
+                "（fresh 实体未见于回复 / other_city 冲突信号）→ 确认话术")
+            return confirm()
+        _shadow_exec("execute_done",
+                     f"entity={ename!r}@{ecity!r} reason={reason} "
+                     f"reply={text[:80]!r}")
         return answer_reply(session, text)
 
     # -------------------------------------------------- P2.5a 生产钩子

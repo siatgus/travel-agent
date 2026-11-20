@@ -2056,3 +2056,141 @@ return answer_reply(session, text)
 2. 本节增量清单是否批准开工？
 3. 若机制 E 否决：是否转机制 C 另案，或维持 P2.5b FAIL 状态
    等待其他机制提案？（三项择一裁定即可，本申请不预设立场。）
+
+---
+
+## 22. P2.5b 整改实施记录（机制 E，按 §21 批准范围交付，2026-11-20）
+
+> 评审裁定（2026-11-20）：机制 E 批准为设计基础（含 §18.5.1 语义
+> 调整）；§21.2 增量 1～4 批准独立开工，附五项实施约束；机制 C
+> 不启用。本节按批准范围交付，**完成后暂停待独立代码验收**。
+> 核心原则照录：**批准绕过 _answer 的问句重新解析，不等于批准
+> 绕过原有业务安全链路。**
+
+### 22.1 授权范围落实
+
+- 改动仅 2 文件：`orchestrator.py`（触点 2 内部，+91/-33 行中的
+  生产部分）+ `tests/test_pending_channel.py`（接缝升级 + 新增
+  双路测试）；
+- 冻结清单零触碰（git diff 复核）：pending_interceptor /
+  pending_runtime / entity_resolver / pending.py / 双 store /
+  pending_revalidator / pending_producer / dialogue.py / 全部
+  Handler 类与接口 / decision.py **零 diff**；
+- 开关 0/0/0 贯穿；P2.6/P3 未授权；RV-05 适配点与密闭性排查
+  不在本次范围（未实施）。
+
+### 22.2 增量 1：触点 2 内部行为变更（唯一生产改动）
+
+`_allow_handler_consume` 五条件全过分支：
+
+```python
+# 旧（RV-07 缺陷实证：实参是原始问句，实体由链内重解析）
+text = session._answer(kind, orig_ut)
+
+# 新（机制 E：fresh entity 经函数实参成为唯一执行实体）
+session.last_city = ecity            # 语义同 POIHandler.handle:80
+shadow execute_begin（entity + reason 归因）
+if orig_ut 含 {周边,附近,周围,附件}:     # dialogue.py:497 同一
+    text = session._nearby_qa(ecity, ename)   # 关键词集等价判定
+else:
+    text = session._spot_qa(ecity, ename)
+shadow execute_done（entity + reason + reply 摘要）
+# I3 验收位：ename not in text 或 "不在{ecity}" in text → confirm
+```
+
+逐位保留：五条件 AND 原文 / confirm() 回退 / `decision is None →
+None` 透传 / except → confirm（警告文案不变）/ F3 空文本回退 /
+`kind is None or not orig_ut` 前置（仅扩展 `or not ecity`，警告
+文案同步为 kind/utterance/city——见等价性表）。周边检测用
+`any(k in orig_ut for k in (...))` 与 dialogue.py:497 正则
+`周边|附近|周围|附件` 字面等价（纯字面量 alternation，零新增
+import，diff 严格限于触点 2 块）。
+
+### 22.3 业务方法等价性证明表（评审约束 1——本次批准核心条件）
+
+| 检查对象 | 证明 |
+|---|---|
+| `_spot_qa` 是原链同一业务方法 | 原链：POIHandler → AttractionHandler（`_method="_attraction_answer"`，poi_handler.py）→ `_attraction_answer` → dialogue.py:499 `return self._spot_qa(city, spot)`——直调即该最终委托点，实参形态 (city, spot) 相同，fresh 值取代 resolve_city/spot_mention 产出 |
+| `_nearby_qa` 是原链同一业务方法 | 原链：dialogue.py:497-498 周边分支 `return self._nearby_qa(city, spot)`——直调即该最终委托点，周边判定复用同一关键词集 |
+| 权限检查 | QA 执行链**不存在独立权限层**（全仓核查：moderation/auth 不在 QA 路径任何环节）；消费轮权限闸 = 五条件②可信内部流（`pending_decision_source == "pending_consume"`，绝不由用户输入/LLM 伪造）——直调前后同一 |
+| GuardPipeline | 位于 handle **步骤 6**（方案修改守卫，guard.py），仅规划类触达；QA 类正常路径在步骤 5 已返回、从不执行 Guard——直调未绕过任何实际会执行的检查；规划类经五条件④（DEFAULT_BATCHES 白名单）永久排除在消费执行之外（A4 测试锁定） |
+| 参数校验 | ename 非空 = 五条件⑤后置 `bool(entity.get("name"))`（既有）；**新增 ecity 缺失前置 → confirm** = 原链 POIHandler.handle「resolve_city 为空 → 泛推荐兜底」的等价映射，消费轮语义下更保守（绝不泛答） |
+| Handler 前置条件 | F3 语义保留：业务方法返回 None/空 → confirm（测试 I3-e）；异常 → confirm（测试 I3-c/d）；原链细分兜底链（refine_intent 顺序）按获批偏差绕过（§18.4 申报：消费轮问句本为关于候选实体的单一问句，点名 QA 为主语义，周边变体保留） |
+
+**last_city 语义验证（约束 3）**：设置时机与 POIHandler.handle:80
+一致（链执行前设置，异常路径不回滚——原链同语义）；本轮查询
+使用 fresh city（检索实参断言锁定）；值 = fresh confirmed 实体
+归属城市——对比原链 resolve_city 在消费轮的实际输出（问句无城市
+时落 slots.destination/旧 last_city，本轮 A3/D2 旧实现实证为
+空城泛推荐），机制 E 以 fresh 为准正是 RV-07 修复本意，不存在
+「错误继承」新增路径；附近与普通 POI 共用同一 ecity 实参。
+
+**I3 约束 4 落实**：fresh_name-in-reply 仅为辅助验收位；other_city
+信号 = dialogue.py `_spot_qa` **冻结话术模板的确定性结构**
+（两处均含「不在{ecity}」固定子串：「位于{true_city}，不在{city}。」
+/「不在{city}一带」）——精确子串匹配，非宽泛正则、非回复文本
+猜测；误报方向 = 保守 confirm（安全侧）；模板漂移由 other_city
+注入测试（I3-b）锁定暴露（可复现）。
+
+**如实申报**：shadow 复用既有 `_shadow_gate` 通道（stage="gate"，
+verdict="allow_execute"，action=execute_begin/done），pending_id
+字段为 None、归因经 detail=reason（含 pending_id/candidate_id
+全文）承载——与既有通道同构，未新增 shadow 基础设施。
+
+### 22.4 增量 2/3：测试设计与既有测试升级（零断言放宽）
+
+**新增双路测试**（§21.2，channel 330→352）：
+
+1. `test_p25b_mechanism_e_fresh_entity_enforcement`：
+   - 构造性证明：捕获 `agent.dispatch` 最终检索实参——
+     Entity_Decision == Entity_BusinessMethod（_spot_qa 实参）==
+     Entity_FinalLookup（dispatch keyword/city）三段恒等 fresh
+     entity；last_city==fresh_city；回复含 fresh 实体且非确认
+     话术；shadow begin/done 恰各一条且 begin 携带归因 reason；
+     reason 含 pending_id/candidate_id/pending_revalidate 前缀；
+   - 注入式反证：误导性原始问句「上海迪士尼门票多少钱」注入
+     Pending——消费路径最终检索实参仍为 fresh entity、误导实体
+     零进入检索、偏移内容零呈现（I2/J2）；**反证对照**：同一
+     问句经普通路由真实重解析出「迪士尼」（spot_mention 实证），
+     分歧机制真实存在、反证有证明力，差异被限定于触点 2。
+2. `test_p25b_mechanism_e_failure_conservative`（I3 组）：
+   a) KB 无结果 → 保守话术（含 fresh 实体、不编造、非确认话术）；
+   b) other_city 注入 → 验收位回退确认话术 + 「位于上海」「不在
+   南京」零呈现（J2）+ 警告记录；c) `_spot_qa` 异常 → 异常边界
+   回退 + 警告；d) `_nearby_qa` 异常（原问句含周边语义）→ 同一
+   边界；e) 空文本 → F3 回退；f) 五条件③不满足（action=clarify
+   直调注入）→ confirm 语义不变。
+
+**既有测试接缝升级明细**（增量 3）：
+
+| 测试 | 变更 | 断言强度 |
+|---|---|---|
+| A3 | `_count_answers` 计数 → 受控直调桩 + 实参捕获；「恰一次入口调用」→「恰一次直调且实参恒等 fresh entity」 | **收紧**（新增实参恒等断言） |
+| D2 | 同 A3（受控桩 + 恒等断言） | **收紧** |
+| A4/A6/A7/D1/D3/F2 | `_count_answers` 装具重定位（包装 `_spot_qa`，零调用断言不变） | 等价 |
+| F3 | 桩接缝 `s2._answer→None` → `s2._spot_qa→None` | 等价 |
+| `_preset_orc` | 增 `ut` 可选参数（默认原文不变，反证装具用） | 向后兼容 |
+
+**如实申报（接缝事实变化）**：旧实现在消费轮的实际执行内容为
+POIHandler「resolve_city 空城 → `intent.poi_answer("")` 泛推荐」
+——即 J1 缺陷的行为实证；机制 E 后为实体化执行，故 A3/D2 以
+受控桩替换真实 KB 链（避免 mock KB 无南京数据触发 autofetch 的
+网络不确定性），最终检索实参的真实性由专项测试 1 的 dispatch
+捕获链证明。
+
+### 22.5 验证结果
+
+- 专项：channel **352**/0（330→352，exit=0 原始输出见
+  P25bR1_evidence_logs.txt）；
+- 全量回归 **17 套件全绿 exit=0**：pending 60 / producer 72 /
+  revalidator 78 / sqlite 95 / channel 352 / interceptor 150 /
+  decision / orchestrator 33 / routing 49 / reply 28 / resolver /
+  corpus v4 / parser 62 / extractor 36 / dialogue 244 / server 52 /
+  conversations 21；
+- 冻结模块零 diff（git 复核见 §22.1）；开关 0/0/0。
+
+### 22.6 状态
+
+commit：待提交（基线 1e9e77e）。**交付后暂停，等待独立代码
+验收**；P2.6/P3 未授权；生产启用禁止（启用前部署配置审计为
+独立门槛）。
