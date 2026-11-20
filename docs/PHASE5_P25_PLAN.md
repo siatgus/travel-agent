@@ -2268,6 +2268,16 @@ S2/S3/S4，S1 由既有 I3-b 锁定；S3 断言显式记录「当前不回退」
 #### 22.7.5 整改项 5：原始证据补齐
 
 新增 P25bR2_raw_evidence.txt：逐套件实际执行命令、完整原始 stdout
-与退出码；`git show --format=fuller --stat` 全文；冻结清单 11 个
-文件逐项 `git diff --stat` 原始输出。整改范围严格限于测试文件 +
-本文档，生产代码零 diff（9eba91f 即为唯一生产改动）。
+与退出码；`git show --format=fuller --stat` 全文（实施 commit 与整改
+commit 各一份）；冻结清单 **10 项（9 个文件 + `handlers/` 目录级
+覆盖）**的逐项 `git diff --stat` 原始输出；另含触点 2 范围证明
+（全部 hunk 的 old 行号落在 402–461，处于 `_allow_handler_consume`
+区间 [401, 527) 内，且 diff 中无任何 `class`/`def` 定义行增删——
+9 个 hunk 系 docstring 重写与函数体分段所致，不代表触及范围扩大）。
+整改范围严格限于测试文件 + 本文档：`git diff --stat 9eba91f 7e168f5
+-- src/` 为空。
+
+**一致性自查（如实申报）**：整改 commit 信息中「11-file frozen-list」
+与本节实际执行的 10 项（9 文件 + handlers 目录）不符，系表述笔误；
+以本节与 P25bR2_raw_evidence.txt 的逐项输出为准（未增删任何被核验
+对象，仅计数口径差异：目录级覆盖 handlers 下 9 个 Handler 文件）。
