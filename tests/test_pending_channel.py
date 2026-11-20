@@ -481,9 +481,12 @@ def test_lru_eviction_and_protection() -> None:
                   pb.pending_id).candidates]
               == [c.as_dict() for c in pb.candidates], "")
         # 到期后选择仍正确产出 expired_reply（runtime 未丢状态）
+        # （r6 密闭性修复：显式注入 now=clock——此前 evaluate 未传
+        # now 时 _now_epoch 回退真实墙钟，与 fixed_clock store 混源，
+        # expired/TTL 判定跨日不确定）
         v = PendingInterceptor(st_b).evaluate(
             "第一个", make_ctx("第一个").parse,
-            session_pending_id=pb.pending_id)
+            session_pending_id=pb.pending_id, now=clock)
         check("[测试 A] 到期后选择 → expired_reply",
               v.verdict == V_EXPIRED_REPLY, str(v.as_dict()))
         # 测试 B：重复选择仍识别原消费记录
@@ -493,7 +496,7 @@ def test_lru_eviction_and_protection() -> None:
             poi_candidates = []
             intent_coarse = ""
         v2 = PendingInterceptor(stores["d"]).evaluate(
-            "第一个", _PR(), session_pending_id=pd.pending_id)
+            "第一个", _PR(), session_pending_id=pd.pending_id, now=clock)
         check("[测试 B] 重复选择仍识别原消费记录 → duplicate_select",
               v2.verdict == V_DUPLICATE_SELECT, str(v2.as_dict()))
         advance(reselect_window_seconds() + 1)
@@ -994,6 +997,27 @@ def _gate_harness(clock, sid="s1", store=None, interceptor=None):
     return orc, s, store, rt, mgr
 
 
+class _ClockBoundInterceptor(PendingInterceptor):
+    """测试密闭性装具（r6）：evaluate 强制注入 fixed clock。
+
+    背景：PendingInterceptor._now_epoch(None) 回退真实墙钟
+    （time.time()），与 fixed_clock store 组合成混合时间源——
+    duplicate_select 的 600 秒重选窗口判定（now_e - consumed_at
+    > window）在执行日期跨过 fixed 时间戳后确定性失败（时间炸弹，
+    2026-11-19 330/0 系真实时间早于 fixed 时间戳、负 diff 意外
+    通过）。orchestrator._pending_gate 为冻结模块、调用 evaluate
+    不传 now=，gate 路径只能在测试侧绑定时钟。本类零业务语义
+    改变，仅使时间源单一化。"""
+
+    def __init__(self, store, clock, **kw) -> None:
+        super().__init__(store, **kw)
+        self._clock = clock
+
+    def evaluate(self, utterance, parse_result=None, **kw):
+        kw.setdefault("now", self._clock)
+        return super().evaluate(utterance, parse_result, **kw)
+
+
 class _FailConsumeStore(PendingStore):
     """act 如实失败（不抛异常）：consume_pending 返回 ok=False。"""
 
@@ -1287,7 +1311,13 @@ def test_b1_expired_restate_handback_duplicate_none() -> None:
         check("[B1/B6] hand_back → hint 保留",
               s2.active_pending_id == p2.pending_id, "")
         # duplicate_select：先消费，窗口内纯选择线索 → 短路告知已确认
-        orc3, s3, store3, rt3, _ = _gate_harness(clock, sid="s3")
+        # （r6 密闭性修复：gate 路径经冻结的 _pending_gate 调用
+        # evaluate 不传 now=，此处用 _ClockBoundInterceptor 注入
+        # fixed clock，消除与 store 时间戳的混合时间源）
+        store3 = PendingStore(session_id="s3", now=clock)
+        orc3, s3, store3, rt3, _ = _gate_harness(
+            clock, sid="s3", store=store3,
+            interceptor=_ClockBoundInterceptor(store3, clock))
         p3 = store3.create_pending("排海贝皇大排档", "plan_modify",
                                    "must_visit", SNAP)
         s3.active_pending_id = p3.pending_id
@@ -2127,9 +2157,11 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
               and "歧义" in d1.reason, str(d1))
         # D1 契约：clarify 结果本身不携带 pending（消歧载荷由
         # producer 从本轮 fresh matches 构建，D1 绝不从历史恢复）
+        # （r6 健壮性：d1 为 None 时不再直接访问属性，保证失败项
+        # 完整报告而不中断后续断言）
         check("[逐位] D1 放行结果 pending=None（载荷由生产侧从本轮 "
               "fresh matches 构建，绝不从历史/旧 Pending 恢复）",
-              d1.pending is None, str(d1))
+              d1 is not None and d1.pending is None, str(d1))
         # 放行结果确定性：同输入重放逐位一致
         os.environ["TRAVEL_PENDING_CHANNEL"] = "1"
         os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
@@ -2153,11 +2185,13 @@ def test_p25a_channel0_clarify_decision_bitwise() -> None:
     # channel=0 全链路逐位：真实 ambiguous 问句输出与无 pending
     # 基础设施基线逐位一致（producer/decider/manager 零构造）
     # （r5：该阶段同样显式固定 TAKEOVER=0，并用完恢复）
-    set_env(channel="0")
-    os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
-    assert os.environ["TRAVEL_PENDING_CHANNEL"] == "0"
-    assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
+    # （r6 健壮性：环境设置与断言全部移入 try——即使断言失败，
+    # finally 的恢复逻辑也保证执行）
     try:
+        set_env(channel="0")
+        os.environ["TRAVEL_DECISION_TAKEOVER"] = "0"
+        assert os.environ["TRAVEL_PENDING_CHANNEL"] == "0"
+        assert os.environ["TRAVEL_DECISION_TAKEOVER"] == "0"
         old = _orch_mod._resolve_entities
         _orch_mod._resolve_entities = _StubResolver([ResolveResult(
             resolved=[_amb_rc("海贝皇大排档（南京店）", "南京",
