@@ -2673,8 +2673,12 @@ def test_p25b_mechanism_e_fresh_entity_enforcement() -> None:
     名「上海迪士尼门票多少钱」）作为 Pending 原始问句注入——对照
     普通路由对同一问句真实重解析出「迪士尼」（分歧机制真实存在、
     反证有证明力），而 confirmed 消费路径最终检索实参仍为 fresh
-    entity、误导实体从未进入任何检索——偏移状态在直调路径按构造
-    不可发生，差异被限定在触点 2 内。"""
+    entity、误导实体未进入消费路径的 POI 检索 keyword（断言范围限定
+    为本次捕获的 search_poi 调用，不宣称覆盖全部检索通道）——偏移
+    状态在直调路径按构造不可发生，差异被限定在触点 2 内。
+
+    消费轮隔离（评审 2026-11-20 整改项 1）：轮1 创建 pending 完成后
+    清空 dispatch_calls，构造性证明的捕获只可能来自消费轮。"""
     import travel_agent.agent as _agent_mod
     set_env(channel="1", store_kind="memory")
     old_orch_resolve = _orch_mod._resolve_entities
@@ -2709,6 +2713,10 @@ def test_p25b_mechanism_e_fresh_entity_enforcement() -> None:
         p1 = rt.store.get_active_pending()
         check("[E·前置] 轮1 创建 pending", p1 is not None, str(p1))
         # ---- 构造性证明（J1/J3）----
+        # 隔离：轮1（创建 pending）期间可能已产生符合 fresh entity 的
+        # 检索记录，必须先清空，使下方断言只可能来自消费轮捕获
+        # （评审 2026-11-20 整改项 1）
+        dispatch_calls.clear()
         r2 = orc.handle(s, "第1个")
         d = orc.last_ctx.pending_decision
         check("[E·构造] route=pending_consume_execute（机制 E 受控流转）",
@@ -2757,7 +2765,11 @@ def test_p25b_mechanism_e_fresh_entity_enforcement() -> None:
               any(c.get("keyword") == "海贝皇大排档（南京店）"
                   and c.get("city") == "南京" for c in dispatch_calls),
               str(dispatch_calls))
-        check("[E·反证] 误导实体从未进入任何检索（I2 构造不可达）",
+        # 断言范围严格限定为「本次捕获的 search_poi 调用」——不宣称
+        # 覆盖全部检索通道（评审 2026-11-20 整改项 2：收窄至捕获范围
+        # 能够证明的结论）
+        check("[E·反证] 误导实体未进入消费路径的 POI 检索 keyword"
+              "（范围限定：本次捕获的 search_poi 调用）",
               dispatch_calls
               and all("迪士尼" not in str(c.get("keyword") or "")
                       for c in dispatch_calls), str(dispatch_calls))
@@ -2896,6 +2908,80 @@ def test_p25b_mechanism_e_failure_conservative() -> None:
         set_env()
 
 
+def test_p25b_other_city_signal_coverage() -> None:
+    """机制 E other_city 信号覆盖边界（评审 2026-11-20 整改项 3）。
+
+    消费路径只经 _spot_qa：_nearby_qa 在 KB 无坐标时委托 _spot_qa
+    （dialogue.py:1352-1354），_nearby_gate 的 other_city 分支
+    （dialogue.py:718-721）不在机制 E 直调路径内。故 other_city 返回
+    形态穷举为四类，本测试逐一锁定当前保证边界：
+
+      S1 res.poi 存在 → 「位于{true_city}，不在{city}」note
+         （dialogue.py:979-981）—— 含信号 ✓（既有 I3-b 已覆盖）
+      S2 无 poi + message = autofetch.py:858 跨城同名文本
+         （含「不在{city}」）—— 含信号 ✓
+      S3 无 poi + message = autofetch.py:937 重定向失败文本
+         （「离{city}很远，我没能核实到它在{city}」）—— **不含信号** ✗
+      S4 无 poi + message 缺失 → fallback「不在{city}一带」
+         （dialogue.py:982-983）—— 含信号 ✓
+
+    S3 是已申报的已知缺口：该分支不呈现偏移归属、不编造位置（J2
+    安全方向仍成立），但 I3 保守回退不触发——用户看到的是「离得很
+    远、没能核实」的原样答复而非确认话术。修复需在触点 2 内增加信号
+    来源（生产改动），按评审边界本轮不实施，待独立授权。本测试的
+    作用是锁定当前边界，防止日后被误读为「全部 other_city 分支已覆盖」。
+    """
+    import travel_agent.agent as _agent_mod
+    import travel_agent.autofetch as _autofetch_mod
+    set_env(channel="1", store_kind="memory")
+    old_rv_resolve = _rv_mod._resolve_entities
+    old_ensure_spot = _autofetch_mod.ensure_spot
+    old_dispatch = _agent_mod.dispatch
+    FRESH = "海贝皇大排档（南京店）"
+
+    def run(sid, ensure_ret):
+        _autofetch_mod.ensure_spot = lambda *a, **kw: ensure_ret
+        orc, s, _st, _p = _preset_orc(
+            sid, lambda: datetime(2026, 11, 19, 10, 0, 0))
+        return orc, s, (orc.handle(s, "第1个"))
+    try:
+        _rv_mod._resolve_entities = _StubResolver([
+            ResolveResult(resolved=[
+                _conf_rc_fresh(FRESH, "南京", "e-nj-fresh")])])
+        _agent_mod.dispatch = lambda name, args: (
+            {"ok": True, "items": [], "total": 0}
+            if name == "search_poi" else old_dispatch(name, args))
+        # ---- S2：autofetch.py:858 跨城同名 message（含信号）----
+        msg858 = (f"「{FRESH}」资料库里记在上海，不在南京；"
+                  f"如果你要的确实是南京的那个，告诉我我重新核实")
+        _o2, _s2, r2 = run("s-oc-s2", {"status": "other_city",
+                                       "source": "user", "message": msg858})
+        check("[OC·S2] message=跨城同名形态（含「不在{city}」）→ 回退确认"
+              "（偏移归属零呈现）",
+              "已确认：" in str(r2) and "记在上海" not in str(r2),
+              str(r2)[:120])
+        # ---- S3：autofetch.py:937 重定向失败 message（不含信号）----
+        msg937 = f"「{FRESH}」的位置离南京很远，我没能核实到它在南京"
+        _o3, _s3, r3 = run("s-oc-s3", {"status": "other_city",
+                                       "message": msg937})
+        check("[OC·S3·已知缺口] message=重定向失败形态（不含「不在{city}」）"
+              "→ 当前不回退（已申报：I3 保守回退不触发）",
+              "已确认：" not in str(r3), str(r3)[:160])
+        check("[OC·S3·安全方向] 该分支不呈现偏移归属、不编造位置（J2 保持）",
+              "上海" not in str(r3) and "迪士尼" not in str(r3),
+              str(r3)[:160])
+        # ---- S4：message 缺失 → dialogue 侧 fallback（含信号）----
+        _o4, _s4, r4 = run("s-oc-s4", {"status": "other_city"})
+        check("[OC·S4] message 缺失 → fallback「不在{city}一带」→ 回退确认",
+              "已确认：" in str(r4) and "一带" not in str(r4),
+              str(r4)[:120])
+    finally:
+        _autofetch_mod.ensure_spot = old_ensure_spot
+        _agent_mod.dispatch = old_dispatch
+        _rv_mod._resolve_entities = old_rv_resolve
+        set_env()
+
+
 def test_p25b_channel0_zero_revalidation() -> None:
     """channel=0 逐位：重验证侧零触发——revalidator/producer/decider
     零构造、重验证 resolve 零调用、回填零调用；普通路由行为不变。"""
@@ -2988,6 +3074,7 @@ def main() -> int:
                test_p25b_f2_f3_negative,
                test_p25b_mechanism_e_fresh_entity_enforcement,
                test_p25b_mechanism_e_failure_conservative,
+               test_p25b_other_city_signal_coverage,
                test_p25b_channel0_zero_revalidation):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b): {_PASS} pass / {_FAIL} fail")

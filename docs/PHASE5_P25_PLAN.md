@@ -2126,11 +2126,19 @@ import，diff 严格限于触点 2 块）。
 「错误继承」新增路径；附近与普通 POI 共用同一 ecity 实参。
 
 **I3 约束 4 落实**：fresh_name-in-reply 仅为辅助验收位；other_city
-信号 = dialogue.py `_spot_qa` **冻结话术模板的确定性结构**
-（两处均含「不在{ecity}」固定子串：「位于{true_city}，不在{city}。」
-/「不在{city}一带」）——精确子串匹配，非宽泛正则、非回复文本
-猜测；误报方向 = 保守 confirm（安全侧）；模板漂移由 other_city
-注入测试（I3-b）锁定暴露（可复现）。
+信号 = dialogue.py `_spot_qa` 冻结话术模板的确定性结构——精确子串
+匹配「不在{ecity}」，非宽泛正则、非回复文本猜测；误报方向 = 保守
+confirm（安全侧）。
+
+**保证范围限定（评审 2026-11-20 整改项 3 后修订）**：本检测**已
+覆盖当前冻结模板中明确包含「不在」的冲突话术**（S1 note 形态 /
+S2 跨城同名 message / S4 fallback，穷举表见 §22.7.2）；**其他模板
+形式不在本次检测保证范围内**——其中 S3（autofetch.py:937 重定向
+失败 message，不含「不在{city}」）为已申报已知缺口：该分支不呈现
+偏移归属、不编造位置（J2 安全方向仍成立），但 I3 保守回退不触发，
+修复需生产改动、按评审边界本轮不实施。S1 由 I3-b 注入测试锁定，
+S2/S3/S4 由 `test_p25b_other_city_signal_coverage` 锁定（S3 断言
+显式记录「当前不回退」的边界事实，不构成覆盖保证）。
 
 **如实申报**：shadow 复用既有 `_shadow_gate` 通道（stage="gate"，
 verdict="allow_execute"，action=execute_begin/done），pending_id
@@ -2148,9 +2156,13 @@ verdict="allow_execute"，action=execute_begin/done），pending_id
      entity；last_city==fresh_city；回复含 fresh 实体且非确认
      话术；shadow begin/done 恰各一条且 begin 携带归因 reason；
      reason 含 pending_id/candidate_id/pending_revalidate 前缀；
+     **轮 1（创建 pending）完成后清空捕获缓冲**，使恒等断言只
+     可能来自消费轮（评审整改项 1）；
    - 注入式反证：误导性原始问句「上海迪士尼门票多少钱」注入
-     Pending——消费路径最终检索实参仍为 fresh entity、误导实体
-     零进入检索、偏移内容零呈现（I2/J2）；**反证对照**：同一
+     Pending——消费路径最终检索实参仍为 fresh entity；断言
+     **误导实体未进入消费路径的 POI 检索 keyword**（范围限定为
+     本次捕获的 `search_poi` 调用，不宣称覆盖全部检索通道——
+     评审整改项 2）；偏移内容零呈现（I2/J2）；**反证对照**：同一
      问句经普通路由真实重解析出「迪士尼」（spot_mention 实证），
      分歧机制真实存在、反证有证明力，差异被限定于触点 2。
 2. `test_p25b_mechanism_e_failure_conservative`（I3 组）：
@@ -2160,6 +2172,9 @@ verdict="allow_execute"，action=execute_begin/done），pending_id
    回退 + 警告；d) `_nearby_qa` 异常（原问句含周边语义）→ 同一
    边界；e) 空文本 → F3 回退；f) 五条件③不满足（action=clarify
    直调注入）→ confirm 语义不变。
+3. `test_p25b_other_city_signal_coverage`（整改项 3 新增）：
+   other_city 四形态穷举与保证边界锁定，S3 已知缺口显式断言，
+   见 §22.7.2。
 
 **既有测试接缝升级明细**（增量 3）：
 
@@ -2180,17 +2195,79 @@ POIHandler「resolve_city 空城 → `intent.poi_answer("")` 泛推荐」
 
 ### 22.5 验证结果
 
-- 专项：channel **352**/0（330→352，exit=0 原始输出见
-  P25bR1_evidence_logs.txt）；
-- 全量回归 **17 套件全绿 exit=0**：pending 60 / producer 72 /
-  revalidator 78 / sqlite 95 / channel 352 / interceptor 150 /
-  decision / orchestrator 33 / routing 49 / reply 28 / resolver /
-  corpus v4 / parser 62 / extractor 36 / dialogue 244 / server 52 /
-  conversations 21；
-- 冻结模块零 diff（git 复核见 §22.1）；开关 0/0/0。
+- 专项：channel **356**/0（实施时 330→352；整改项 1/2 为断言
+  收紧、整改项 3 新增 4 项断言 → 356），exit=0；完整原始输出与
+  逐套件命令见 P25bR2_raw_evidence.txt / P25bR2_logs/；
+- 全量回归 **17 套件全绿 exit=0**（原始 stdout 逐套件留档，见
+  P25bR2_raw_evidence.txt「套件原始输出」段）；
+- 冻结模块零 diff（逐文件 `git diff --stat` 原始输出见
+  P25bR2_raw_evidence.txt「冻结清单逐项核验」段）；开关 0/0/0。
 
 ### 22.6 状态
 
-commit：待提交（基线 1e9e77e）。**交付后暂停，等待独立代码
-验收**；P2.6/P3 未授权；生产启用禁止（启用前部署配置审计为
-独立门槛）。
+实施 commit：**9eba91f**（基线 1e9e77e）；整改 commit 紧随其后
+（评审 2026-11-20 CONDITIONAL PASS 五项整改，见 §22.7）。**整改
+交付后暂停，等待独立代码验收**；P2.6/P3 未授权；生产启用禁止
+（启用前部署配置审计为独立门槛）。
+
+### 22.7 验收整改记录（评审 2026-11-20 CONDITIONAL PASS）
+
+裁定：机制 E 核心实现方向 / 五条件及回退语义 / fresh entity 实参
+约束 = 初步通过；构造性证明需补强、误导实体反证需收窄、other_city
+全路径覆盖待核实、回归与冻结证据待原始材料、交付文档一致性需修正。
+
+#### 22.7.1 整改项 1：消费轮检索捕获隔离
+
+轮 1（创建 pending）完成后、消费轮 `handle(s, "第1个")` 之前调用
+`dispatch_calls.clear()`。理由：轮 1 的建链过程可能已产生符合
+fresh entity 的检索记录，若不清空，`any(...)` 恒等断言可能由轮 1
+残留记录满足而使消费轮缺陷漏检。整改后该断言只可能由消费轮捕获
+满足。反证段与对照段原本已在各自轮前清空，保持不变。
+
+#### 22.7.2 整改项 2：反证断言收窄
+
+原断言「误导实体从未进入任何检索」改为「误导实体未进入消费路径的
+POI 检索 keyword（范围限定：本次捕获的 `search_poi` 调用）」。原因：
+捕获桩只拦截 `agent.dispatch("search_poi", ...)`，无法证明全部检索
+通道；收窄后断言与捕获范围严格对应，不宣称超出证据范围的结论。
+
+#### 22.7.3 整改项 3：other_city 全部返回形态核对（穷举表）
+
+机制 E 消费路径只经 `_spot_qa`：`_nearby_qa` 在 KB 无该点坐标时
+委托 `_spot_qa`（dialogue.py:1352-1354）；`_nearby_gate` 的 other_city
+分支（dialogue.py:718-721）不在直调路径内。
+
+| 形态 | 来源 | 返回文本 | 含「不在{city}」 | 验收位 |
+|---|---|---|---|---|
+| S1 | dialogue.py:976-981（`res.poi` 存在） | `「{name}」位于{true_city}，不在{city}。` + spot_answer | 是 | 回退（I3-b 覆盖） |
+| S2 | autofetch.py:858 跨城同名 → `res.message` 透传（dialogue.py:982-983） | `「{name}」资料库里记在{other}，不在{city}；…` | 是 | 回退（新增覆盖） |
+| S3 | autofetch.py:937 重定向失败 → `res.message` 透传 | `「{name}」的位置离{city}很远，我没能核实到它在{city}` | **否** | **不回退（已知缺口）** |
+| S4 | dialogue.py:982-983 fallback（message 缺失） | `「{spot}」不在{city}一带，我没法按{city}来介绍。` | 是 | 回退（新增覆盖） |
+
+注：autofetch.py:933（重定向成功）虽为 other_city，但其返回含 `poi`，
+在 `_spot_qa` 内被 S1 分支吸收，message 不参与输出，故不构成独立
+形态。
+
+**S3 已知缺口定性（如实申报）**：该分支不呈现偏移城市名、不呈现
+偏移实体、不编造位置——J2「偏移归属零呈现」仍成立；但 I3 保守
+回退不触发，用户会看到「离{city}很远、没能核实」的原样答复。
+修复需在触点 2 内增加信号来源（生产改动），按评审边界
+「不批准扩大生产改动范围」本轮不实施，待独立授权。
+
+**测试覆盖**：`test_p25b_other_city_signal_coverage`（4 断言）锁定
+S2/S3/S4，S1 由既有 I3-b 锁定；S3 断言显式记录「当前不回退」，
+作用为防止日后被误读为全覆盖，不构成覆盖保证。
+
+#### 22.7.4 整改项 4：交付文档一致性
+
+§22.6 原文「commit：待提交（基线 1e9e77e）」→ 修正为实施 commit
+**9eba91f**；§22.5 证据文件名由误写的 P25bR1_evidence_logs.txt 修正
+为 P25bME_evidence_logs.txt（该名曾用于上一轮补证），并更新为整改后
+的 P25bR2 系列工件。
+
+#### 22.7.5 整改项 5：原始证据补齐
+
+新增 P25bR2_raw_evidence.txt：逐套件实际执行命令、完整原始 stdout
+与退出码；`git show --format=fuller --stat` 全文；冻结清单 11 个
+文件逐项 `git diff --stat` 原始输出。整改范围严格限于测试文件 +
+本文档，生产代码零 diff（9eba91f 即为唯一生产改动）。
