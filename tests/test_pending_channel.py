@@ -2908,13 +2908,20 @@ def test_p25b_mechanism_e_failure_conservative() -> None:
         set_env()
 
 
-def test_p25b_other_city_signal_coverage() -> None:
-    """机制 E other_city 信号覆盖边界（评审 2026-11-20 整改项 3）。
+def test_p25b_other_city_template_text_detection() -> None:
+    """消费端对 other_city 冻结模板文本的检测测试（评审 2026-11-20
+    整改项 D1/D2 后改名与收窄表述）。
+
+    本测试**只验证消费端检测逻辑面对给定文本时的行为**，不验证生产
+    分支是否确实生成该文本——生产源头由静态核验证明（autofetch.py:858
+    跨城同名、:937 重定向失败，两处 message 均为 f-string 字面量构造，
+    原文见 P25bR3_chain_evidence.txt；若要证明源头模板不漂移，需另测
+    真实生成分支，不在本测试范围）。
 
     消费路径只经 _spot_qa：_nearby_qa 在 KB 无坐标时委托 _spot_qa
     （dialogue.py:1352-1354），_nearby_gate 的 other_city 分支
     （dialogue.py:718-721）不在机制 E 直调路径内。故 other_city 返回
-    形态穷举为四类，本测试逐一锁定当前保证边界：
+    形态穷举为四类：
 
       S1 res.poi 存在 → 「位于{true_city}，不在{city}」note
          （dialogue.py:979-981）—— 含信号 ✓（既有 I3-b 已覆盖）
@@ -2964,9 +2971,14 @@ def test_p25b_other_city_signal_coverage() -> None:
         msg937 = f"「{FRESH}」的位置离南京很远，我没能核实到它在南京"
         _o3, _s3, r3 = run("s-oc-s3", {"status": "other_city",
                                        "message": msg937})
+        check("[OC·S3·文本形态] 返回的确实是注入的重定向失败模板文本"
+              "（防空回复/异文本误过）",
+              "离南京很远" in str(r3) and "没能核实" in str(r3)
+              and FRESH in str(r3), str(r3)[:160])
         check("[OC·S3·已知缺口] message=重定向失败形态（不含「不在{city}」）"
               "→ 当前不回退（已申报：I3 保守回退不触发）",
-              "已确认：" not in str(r3), str(r3)[:160])
+              "已确认：" not in str(r3) and "没能核实" in str(r3),
+              str(r3)[:160])
         check("[OC·S3·安全方向] 该分支不呈现偏移归属、不编造位置（J2 保持）",
               "上海" not in str(r3) and "迪士尼" not in str(r3),
               str(r3)[:160])
@@ -3074,7 +3086,7 @@ def main() -> int:
                test_p25b_f2_f3_negative,
                test_p25b_mechanism_e_fresh_entity_enforcement,
                test_p25b_mechanism_e_failure_conservative,
-               test_p25b_other_city_signal_coverage,
+               test_p25b_other_city_template_text_detection,
                test_p25b_channel0_zero_revalidation):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b): {_PASS} pass / {_FAIL} fail")

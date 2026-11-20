@@ -2137,8 +2137,10 @@ S2 跨城同名 message / S4 fallback，穷举表见 §22.7.2）；**其他模�
 失败 message，不含「不在{city}」）为已申报已知缺口：该分支不呈现
 偏移归属、不编造位置（J2 安全方向仍成立），但 I3 保守回退不触发，
 修复需生产改动、按评审边界本轮不实施。S1 由 I3-b 注入测试锁定，
-S2/S3/S4 由 `test_p25b_other_city_signal_coverage` 锁定（S3 断言
-显式记录「当前不回退」的边界事实，不构成覆盖保证）。
+S2/S3/S4 由 `test_p25b_other_city_template_text_detection` 锁定
+（该测试只验证消费端面对给定文本的检测行为，不验证生产分支生成
+该文本；S3 双断言先确认文本形态再断言「当前不回退」，不构成覆盖
+保证）。
 
 **如实申报**：shadow 复用既有 `_shadow_gate` 通道（stage="gate"，
 verdict="allow_execute"，action=execute_begin/done），pending_id
@@ -2172,7 +2174,8 @@ verdict="allow_execute"，action=execute_begin/done），pending_id
    回退 + 警告；d) `_nearby_qa` 异常（原问句含周边语义）→ 同一
    边界；e) 空文本 → F3 回退；f) 五条件③不满足（action=clarify
    直调注入）→ confirm 语义不变。
-3. `test_p25b_other_city_signal_coverage`（整改项 3 新增）：
+3. `test_p25b_other_city_template_text_detection`（整改项 3 新增，
+   评审 D1 后改名以明确「消费端模板文本检测」语义）：
    other_city 四形态穷举与保证边界锁定，S3 已知缺口显式断言，
    见 §22.7.2。
 
@@ -2195,8 +2198,9 @@ POIHandler「resolve_city 空城 → `intent.poi_answer("")` 泛推荐」
 
 ### 22.5 验证结果
 
-- 专项：channel **356**/0（实施时 330→352；整改项 1/2 为断言
-  收紧、整改项 3 新增 4 项断言 → 356），exit=0；完整原始输出与
+- 专项：channel **357**/0（实施时 330→352；整改项 1/2 为断言收紧、
+  整改项 3 新增 5 项断言，其中 D2 阶段再补 1 项 S3 文本形态断言
+  → 357），exit=0；完整原始输出与
   逐套件命令见 P25bR2_raw_evidence.txt / P25bR2_logs/；
 - 全量回归 **17 套件全绿 exit=0**（原始 stdout 逐套件留档，见
   P25bR2_raw_evidence.txt「套件原始输出」段）；
@@ -2254,9 +2258,19 @@ POI 检索 keyword（范围限定：本次捕获的 `search_poi` 调用）」。
 修复需在触点 2 内增加信号来源（生产改动），按评审边界
 「不批准扩大生产改动范围」本轮不实施，待独立授权。
 
-**测试覆盖**：`test_p25b_other_city_signal_coverage`（4 断言）锁定
-S2/S3/S4，S1 由既有 I3-b 锁定；S3 断言显式记录「当前不回退」，
-作用为防止日后被误读为全覆盖，不构成覆盖保证。
+**测试覆盖（表述按评审 D1 收窄）**：`test_p25b_other_city_template_text_detection`
+（5 断言）是**消费端对冻结模板文本的检测测试**——它验证消费端检测
+逻辑面对给定文本时的行为，**不验证生产分支是否确实生成该文本**；
+生产源头由静态核验证明（autofetch.py:858 与 :937 的 message 均为
+f-string 字面量构造，原文见 P25bR3_chain_evidence.txt）。S1 由既有
+I3-b 锁定；S2/S3/S4 由本测试锁定，其中 S3 采取**双断言**：先确认
+返回文本确为注入的重定向失败模板（含「离{city}很远」「没能核实」
+与实体名，防空回复/异文本误过），再断言「当前不回退」——作用是
+防止日后被误读为全覆盖，不构成覆盖保证。
+
+**若验收标准要求「所有 other_city 结果均保守回退」**：则本轮仅修
+文档不足以满足，S3 必须做生产行为修复（触点 2 内增加信号来源或
+在 `_spot_qa` 侧统一冲突话术），须另行申请授权，本轮不实施。
 
 #### 22.7.4 整改项 4：交付文档一致性
 
@@ -2269,15 +2283,118 @@ S2/S3/S4，S1 由既有 I3-b 锁定；S3 断言显式记录「当前不回退」
 
 新增 P25bR2_raw_evidence.txt：逐套件实际执行命令、完整原始 stdout
 与退出码；`git show --format=fuller --stat` 全文（实施 commit 与整改
-commit 各一份）；冻结清单 **10 项（9 个文件 + `handlers/` 目录级
-覆盖）**的逐项 `git diff --stat` 原始输出；另含触点 2 范围证明
-（全部 hunk 的 old 行号落在 402–461，处于 `_allow_handler_consume`
-区间 [401, 527) 内，且 diff 中无任何 `class`/`def` 定义行增删——
-9 个 hunk 系 docstring 重写与函数体分段所致，不代表触及范围扩大）。
-整改范围严格限于测试文件 + 本文档：`git diff --stat 9eba91f 7e168f5
--- src/` 为空。
+commit 各一份）；冻结清单逐项 `git diff --stat` 原始输出；另含触点 2
+范围证明（全部 hunk 的 old 行号落在 402–461，处于
+`_allow_handler_consume` 区间 [401, 527) 内，且 diff 中无任何
+`class`/`def` 定义行增删——9 个 hunk 系 docstring 重写与函数体分段
+所致，不代表触及范围扩大）。整改范围严格限于测试文件 + 本文档：
+`git diff --stat 9eba91f 7e168f5 -- src/` 为空。
 
-**一致性自查（如实申报）**：整改 commit 信息中「11-file frozen-list」
-与本节实际执行的 10 项（9 文件 + handlers 目录）不符，系表述笔误；
-以本节与 P25bR2_raw_evidence.txt 的逐项输出为准（未增删任何被核验
-对象，仅计数口径差异：目录级覆盖 handlers 下 9 个 Handler 文件）。
+**冻结清单计数（评审 2026-11-20 要求精确区分，四个数字互不等同）**：
+
+| 口径 | 数量 | 明细 |
+|---|---|---|
+| 独立文件（逐文件命令） | **9** | pending_interceptor.py、pending_runtime.py、entity_resolver.py、pending.py、pending_store_sqlite.py、pending_revalidator.py、pending_producer.py、dialogue.py、decision.py |
+| 目录级检查（一条命令覆盖整目录） | **1** | `src/travel_agent/orchestrator/handlers` |
+| 该目录内实际包含的 .py 文件 | **9** | `__init__.py`、`_base.py`、general_handler.py、plan_handler.py、plan_qa_handler.py、poi_handler.py、smalltalk_handler.py、transport_handler.py、weather_handler.py |
+| 实际执行的 `git diff --stat` 命令 | **10** | 9 条逐文件 + 1 条目录级（未对目录内文件逐个执行命令） |
+
+**一致性自查（如实申报）**：整改 commit `7e168f5` 的信息中写作
+「11-file frozen-list」，与上表四项数字均不对应（9 独立文件 / 1 目录 /
+9 目录内文件 / 10 条命令），系表述笔误；`48c6438`（doc-only）已修
+正正文并复述笔误，但**该 commit 的提交信息本身不可回改**，故
+`git log --oneline 7e168f5` 仍显示 11-file——这是历史事实，不是未
+完成的整改。以下表与 P25bR2_raw_evidence.txt 的逐项输出为准，未
+增删任何被核验对象，差异仅来自计数口径混用（把 handlers 目录内
+9 个文件与 9 个独立文件相加得 18，与 11 亦不符）。
+
+#### 22.7.6 A 项补证：原 Handler 链五函数完整实现与调用关系
+
+评审 2026-11-20 复核第 3 项要求补交五个函数的完整实现及调用关系。
+以下为 QA 路径真实调用链（行号对应当前 HEAD；完整源码原文见
+P25bR3_chain_evidence.txt 第 1–5 节）：
+
+```
+handle 步骤 5（QA 类）
+└─ Session._answer(kind, utterance)                    dialogue.py:419-430
+   └─ QA_HANDLERS[kind].handle(session, utterance)      (kind 由决策层给出)
+      └─ POIHandler.handle(session, utterance)          poi_handler.py:75-86
+         ├─ city = resolve_city(session, utterance)     _base.py:6-15
+         │     = intent.city_in(utt) or slots.destination
+         │       or last_city or trip_dest
+         ├─ if not city → return intent.poi_answer("")  ← 空城泛推荐
+         ├─ session.last_city = city                    ← 副作用①
+         ├─ fine = intent.refine_intent(utterance, city) ← 细分排序
+         └─ for handler in CHAIN[start:]:               ← 逐路兜底
+              AttractionHandler.handle
+              └─ Session._attraction_answer(city, ut)   dialogue.py:490-535
+                 ├─ spot = intent.spot_mention(utt, city) ← 实体从问句解析
+                 ├─ 周边正则 → Session._nearby_qa(city, spot)  dialogue.py:1347-1374
+                 └─ 否则     → Session._spot_qa(city, spot)    dialogue.py:956-1000
+```
+
+机制 E 的直调点即上链最后两级业务方法本身，实参 `(ecity, ename)`
+取代 `(city, spot_mention 产出)`。逐环节等价性对照：
+
+| 原链环节 | 位置 | 机制 E 处理 | 判定 |
+|---|---|---|---|
+| 城市四源判定 | `_base.py:6-15` | `ecity` = fresh `entity.city` | 实体来源替换（RV-07 修复本意），判定优先级不再参与 |
+| 空城 → 泛推荐 | `poi_handler.py:78-79` | `ecity` 缺失 → confirm（不泛答） | **更保守**，不弱化 |
+| `last_city = city` | `poi_handler.py:80` | `orchestrator.py:486` 同位置（业务方法调用前） | 等价 |
+| `refine_intent` 细分排序 | `poi_handler.py:81-86` | 绕过 | **已获批偏差**（§18.4/§21 申报，非新增绕过） |
+| `spot_mention` 实体解析 | `dialogue.py:495` | 绕过 | 有意消除（I1 实体钉死） |
+| 周边语义分支 | `dialogue.py:497-499` | `any(k in orig_ut ...)` 同关键词集 | 语义等价 |
+| `_nearby_qa` 无坐标委托 | `dialogue.py:1352-1354` | 保留（委托 `_spot_qa`） | 等价 |
+| GuardPipeline | handle 步骤 6（方案修改守卫） | QA 类步骤 5 已返回，从不执行 | 无绕过对象 |
+| 权限 / moderation | 全仓 QA 链无此层 | 五条件② 可信内部流为消费轮权限闸 | 无绕过对象 |
+| 异常边界 | `orchestrator.py:485-501` | 两业务方法异常 → confirm + 警告 | 等价 |
+
+**refine_intent 绕过为何不削弱安全**：该函数的作用是为「意图未定
+的自由问句」选首选细分路（general/route/attraction/food/...）。
+消费轮的问句来自候选消歧，语义已被 DecisionResult 归一为「对某一
+具体实体的点名 QA」；机制 E 已确定走点名路（`_spot_qa`/`_nearby_qa`），
+若再跑 refine 反而可能被问句表层词（如「哪家」「多少钱」）导向品类
+或关键词路径，偏离 fresh entity 约束。故绕过是修复的必要组成，
+不是顺带扩大的绕过程度——原链在此处的三条前置（城市判定、空城
+兜底、last_city）已逐项映射，无其它前置被跳过。
+
+#### 22.7.7 C 项补证：`_spot_qa` / `_nearby_qa` 返回类型契约
+
+签名（AST 原文）：
+
+- `dialogue.py:956  def _spot_qa(self, city: str, spot: str) -> str`
+- `dialogue.py:1347 def _nearby_qa(self, city: str, spot: str) -> str`
+- 下游：`_filler_node_answer(...) -> str`（dialogue.py:939）、
+  `intent.spot_answer(...) -> str`（intent.py:1042）、
+  `intent.nearby_answer(...) -> str`（intent.py:1196）
+
+return 点穷举（AST 遍历，共 14 个，全部为字符串表达式）：
+
+| 函数 | return 点 | 表达式性质 |
+|---|---|---|
+| `_spot_qa` | L962 `_filler_node_answer(node)` | `-> str` |
+| | L980 / L1000 `intent.spot_answer(...)` | `-> str` |
+| | L985 / L997 f-string | 字面量 |
+| | L996 `return smart` | 位于 `if smart:` 内，`llm.unknown_spot_reply` 返回 falsy 时不可达 |
+| | **L982 `res.get("message") or f"…"`** | **唯一非类型系统保证点**：`message` 取自 autofetch 返回 dict，值类型无静态约束 |
+| `_nearby_qa` | L1354 `self._spot_qa(city, spot)` | `-> str` |
+| | L1372 f-string | 字面量 |
+| | L1374 `intent.nearby_answer(...)` | `-> str` |
+| `_filler_node_answer` | L943/948/951/954 f-string | 字面量 |
+
+**L982 的唯一非类型保证点已静态闭合**：autofetch 全部 `other_city`
+分支的 `message` 均为 f-string 构造（`autofetch.py:858`、`:933`、
+`:937`，原文见 P25bR3_chain_evidence.txt 第 6 节），其余 status 分支
+的 `message` 同为 f-string；不存在返回非字符串对象的路径。故运行时
+契约 = `str`（无 `None` 返回路径；`_nearby_qa` 亦不返回 `None`）。
+
+**非预期类型是否突破异常边界（如实申报）**：不会「被处理」——若
+未来有分支违反上述契约返回 truthy 非字符串，`orchestrator.py:515`
+的 `ename not in text` 可能抛 `TypeError`，且该行位于触点 2 的
+`try` 块**之外**（try 止于 L501），`handle:648` 调用点亦无包裹，
+异常会向上传播。这是**契约依赖**而非新增风险面：整改前
+`session._answer` 同样声明 `-> str | None` 并在同一位置依赖 str 语义
+（旧实现 `ename not in text` 不存在，但 `if not text` 与 `text`
+进入 Reply 的用法同源）。按评审「契约严格保证则不必为形式增加生产
+改动」的口径，本轮不动生产代码；若后续要求把该依赖改为防御式
+（例如把 I3 段移入 try），属触点 2 内的独立小改动，须另行申请。
