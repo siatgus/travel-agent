@@ -1924,3 +1924,135 @@ diff 与证据记录）/ 17 套件单轮回归 PASS（依据已提交原始输�
   test-only，待独立授权。
 
 ---
+
+## 21. P2.5b 整改独立开工申请（RV-07 机制 E 实施，2026-11-20）
+
+> P2.5a 已于 §20 关闭（评审 2026-11-20 正式裁定 PASS）。按 §20.4
+> 第 5 条「不自动开始 P2.5b」，本节为**独立开工申请**——纯设计
+> 文档，生产代码在本申请获批前零改动。开关 0/0/0。
+
+### 21.1 申请范围与背景
+
+P2.5b（1fce3f3 → 3c1af27 → 9b25f24 → 64ef36f）维持 FAIL。R1/R2
+两轮后 RV-01/02/03/04/06/08 已闭合，剩余**唯一实质阻断 = RV-07**：
+裁定读法乙——执行路径必须保证 Handler 使用 fresh
+DecisionResult/entity 实际约束最终执行实体，当前 `_answer` 链式
+实现（实体由问句重解析）不满足 A3/J1。
+
+§18 已提交机制 E 设计（实体参数化直调，I1/I2/I3 三不变量），
+**尚未获裁定**。本申请按 §18.5.3 预告的程序提交实施申请，请求
+评审**一轮复审完成两项裁定**：
+
+1. **机制 E 批准为触点 2 语义变更的设计基础**（§18.5.1，含
+   §18.4 申报偏差点：§9.4「走该 Handler 受控链路」与 §10.1 D2
+   方案甲「经既有入口 session._answer」的字面改为「直调该链最终
+   委托的同一业务方法」）；
+2. **本节增量清单开工批准**。
+
+若裁定否决机制 E、必须字面保留 QA_HANDLERS 链，则按 §18.5.2 转
+机制 C 备选（五访问面同拦）另行申请——本申请自动作废，不实施。
+
+### 21.2 实施增量清单（授权边界）
+
+**增量 1（唯一生产代码改动）：orchestrator.py 触点 2 内部行为
+变更**——`_allow_handler_consume` 五条件全过分支，现有：
+
+```python
+text = session._answer(kind, orig_ut)
+```
+
+改为机制 E 直调（伪码，按 §18.4 执行策略）：
+
+```python
+ename/ecity 来自 decision.entity（五条件⑤+非缺失已锁定来源）
+session.last_city = ecity（显式设置，语义同 POIHandler.handle:80）
+shadow: execute_begin（pending_id/candidate_id/entity）
+if re.search(r"周边|附近|周围", orig_ut):
+    text = session._nearby_qa(ecity, ename)      # 实体实参化入口
+else:
+    text = session._spot_qa(ecity, ename)        # 实体实参化入口
+shadow: execute_done（reply 摘要）
+# I3 验收位（兜底）：fresh_name 未出现于 text 或 other_city 歧义
+# 信号 → 丢弃执行结果、回退 confirm()；text 为空 → 回退 confirm()
+# （语义同现有 F3：不因消歧绕过前置）
+return answer_reply(session, text)
+```
+
+- 五条件 AND、confirm() 回退、异常边界（except → confirm）、
+  `pending_decision is None → None` 等既有结构**逐位保留**；
+- 周边检测沿用 dialogue.py:493 既有正则语义（`orig_ut` 仅作此
+  语义检测，绝不参与实体解析——I1）；
+- §10.5 配额不变：仍是触点 2 同一代码块内部，无新逻辑触点；
+- 除本块外 orchestrator 其余部分、全部 Handler 类与接口、
+  dialogue.py、decision/interceptor/runtime/resolver/pending/
+  双 store/revalidator/producer **零改动**（冻结清单照旧）。
+
+**增量 2（测试）**：构造性证明 + 注入式反证双路（§18.5.3 要求）：
+
+- **构造性证明（J1/J3）**：
+  - 捕获桩：monkeypatch `agent.dispatch`/`session._spot_qa`/
+    `session._nearby_qa`，断言检索 keyword/city 实参 ==
+    decision.entity 的 fresh name/city（实体唯一通道 = 实参）；
+  - `session.last_city == fresh_city`；
+  - DecisionResult.reason 归因前缀保留（pending_id/candidate_id）；
+  - shadow execute_begin/done 双条记录含 pending_id/candidate_id；
+  - confirmed 消费轮回复含 fresh entity 内容（A3 主断言延续）。
+- **注入式反证（I2 构造不可达）**：
+  - 向消费轮注入「会误导问句重解析」的输入变形（如问句含其他
+    景点名/别名，使原链 spot_mention 必然产出不同实体），断言
+    直调路径产出的检索实参仍为 fresh_name——证明不存在「从问句
+    重解析实体」步骤，偏移状态构造上不可发生；
+  - 反证对照：普通路由（非消费轮）同输入走原链重解析——证明
+    差异仅由机制 E 引入且被限定在触点 2 内。
+- **失败保守（I3）**：KB 查不到 fresh entity → 保守话术或验收位
+  回退确认话术；other_city 分支信号 → 回退确认，绝不呈现错误
+  归属；`_spot_qa` 抛异常 → 既有 except → confirm 路径不变。
+- **开关冻结**：channel=0 全链路逐位回归不破坏（零构造零旁路
+  语义不变）；五条件任一不满足 → confirm 路径逐位不变。
+
+**增量 3（受影响既有测试升级，零断言放宽）**：现有以
+`session._answer` 为桩接缝的测试改为对接缝 `_spot_qa`/
+`_nearby_qa`/`agent.dispatch` 断言（直调后 `_answer` 不再是消费
+轮执行入口）。实施时逐一清点并在实施记录中列全表，初步涉及：
+
+| 测试函数 | 影响 |
+|---|---|
+| test_p25b_a3_confirmed_controlled_flow | 主断言升级为直调契约（fresh 实参捕获 + 归因保留） |
+| test_p25b_a4_plan_confirmed_no_plan_write | 规划类 confirm 路径零触碰，预期仅接缝名称调整 |
+| test_p25b_a6_a7_unverified_rejected | unverified/rejected 不进执行，预期仅接缝名称调整 |
+| test_p25b_d1_d2_d3_robustness | 注入失败/前置缺失回退 confirm 路径保留，接缝调整 |
+| test_p25b_f2_f3_negative | F3「前置未接住」（s2._answer→None 桩）改桩 `_spot_qa` 空/异常 |
+| test_p25a_channel0_clarify_decision_bitwise | 仅 channel=0 路径，预期零改动（直调仅 channel=1 消费轮可达） |
+
+原则：断言只收紧不放宽；桩缺陷如实申报（沿用 §19 惯例）。
+
+**增量 4（文档）**：§22 实施记录（diff 清单、证据日志、冻结
+零触碰 diff 证明）。
+
+### 21.3 验收标准（对应 §18.1 判据）
+
+| 判据 | 验收测试 |
+|---|---|
+| J1 实际使用约束（构造保证） | 捕获桩断言检索/渲染实参恒等 fresh entity（增量 2 构造性证明组） |
+| J2 分歧不可达（按构造） | 注入式反证组：误导性问句输入下直调实参仍为 fresh；对照普通路由证明差异被触点 2 限定 |
+| J3 归因保留 | reason 前缀 + shadow begin/done 双通道断言 |
+| 既有契约不回退 | 五条件/confirm 回退/异常边界/空回复 F3 全部保留断言；channel=0 逐位；全量 17 套件 exit=0 |
+
+验收证据按惯例：完整 diff 原文 + 测试实跑原始输出 + 退出码；
+生产配置启用前核查门槛（§11.R4.3）继续有效，不在本阶段。
+
+### 21.4 冻结与边界声明
+
+- 开关 0/0/0 贯穿全程；生产启用禁止；
+- Handler 类与接口零改动（机制 D 否决理由持续有效）；
+- P2.6/P3 不在申请范围；RV-05 Resolver 适配点另案（不在本申请）；
+- 测试密闭性全量排查（约 18 处 evaluate 无 now=）不在本申请；
+- 本申请获批即锁定上述增量清单为唯一授权范围，任何超范围改动
+  须重新申请。
+
+### 21.5 裁定请求
+
+1. §18.4 机制 E（含申报偏差点）是否批准为设计基础？
+2. 本节增量清单是否批准开工？
+3. 若机制 E 否决：是否转机制 C 另案，或维持 P2.5b FAIL 状态
+   等待其他机制提案？（三项择一裁定即可，本申请不预设立场。）
