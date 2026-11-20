@@ -29,6 +29,14 @@
 - **缺失 case**：给出 `--corpus` 时，`no_missing_cases` 校验失败 → 退出码 5。
   即「零记录」是**失败**，而不是仅作提示；报告仍会打印缺失清单供定位。
 
+外部 schema 独立性（复审 R2，评审 2026-11-20）
+---------------------------------------------
+本脚本**独立维护** 12 字段白名单 `REPORT_EXPORT_KEYS`，不再 import 采集侧的
+`EXPORT_KEYS`。两侧内容目前一致，但**不是同一个对象**：采集侧增删字段时，报告
+会在 `load_jsonl` 处以契约错误（退出码 4）暴露出来，而不是「自动接受对方的
+schema 变化」——这正是独立校验的意义。`ALLOWED_CATEGORIES` 仍从采集侧导入，
+因为那是语料分类词表（同一份语义），如需独立亦请单独授权。
+
 用法
 ----
     python scripts/shadow_report.py --jsonl /path/run.jsonl [--corpus tests/observ_corpus.tsv]
@@ -44,7 +52,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from shadow_collect import (  # noqa: E402
-    ALLOWED_CATEGORIES, EXPORT_KEYS, ContractError, CorpusError, load_corpus,
+    ALLOWED_CATEGORIES, ContractError, CorpusError, load_corpus,
+)
+
+# 外部 12 字段白名单：**本脚本独立硬编码**（复审 R2）。
+# 刻意不 import 采集侧的 EXPORT_KEYS：若两侧共享同一对象，采集侧改字段时报告会
+# 静默跟随，独立校验就失去意义。两侧漂移必须在报告侧表现为契约错误。
+REPORT_EXPORT_KEYS = (
+    "case_id", "category", "intent", "takeover", "batch_enabled",
+    "action", "reason", "statuses", "city_source", "entity_city",
+    "confidence", "candidates_count",
 )
 
 NONE_LABEL = "<none>"
@@ -66,9 +83,9 @@ def load_jsonl(path: Path) -> list[dict]:
                 raise ContractError(f"第 {lineno} 行不是合法 JSON：{exc}") from exc
             if not isinstance(row, dict):
                 raise ContractError(f"第 {lineno} 行不是 JSON 对象")
-            if set(row) != set(EXPORT_KEYS):
-                missing = sorted(set(EXPORT_KEYS) - set(row))
-                extra = sorted(set(row) - set(EXPORT_KEYS))
+            if set(row) != set(REPORT_EXPORT_KEYS):
+                missing = sorted(set(REPORT_EXPORT_KEYS) - set(row))
+                extra = sorted(set(row) - set(REPORT_EXPORT_KEYS))
                 raise ContractError(
                     f"第 {lineno} 行字段不符；缺失={missing}；多余={extra}")
             if row.get("category") not in ALLOWED_CATEGORIES:
@@ -136,6 +153,8 @@ def build_report(records: list[dict],
         counts[r["case_id"]] = counts.get(r["case_id"], 0) + 1
     duplicates = sorted(cid for cid, n in counts.items() if n > 1)
 
+    # 曾有一条 `each_record_single_category == (len(records) == total)`，
+    # 两边是同一个表达式，恒真、不提供任何保证；复审 R2 已删除，不再作为验收证据。
     checks = {
         "total_equals_sum_by_category": sum(by_category.values()) == total,
         "total_equals_sum_by_action": sum(by_action.values()) == total,
@@ -143,7 +162,6 @@ def build_report(records: list[dict],
         "total_equals_sum_by_statuses": sum(by_statuses.values()) == total,
         "cross_table_conserved": all(
             sum(cross[c].values()) == by_category.get(c, 0) for c in cross),
-        "each_record_single_category": len(records) == total,
         "no_duplicate_cases": not duplicates,
     }
     if corpus_cases is not None:

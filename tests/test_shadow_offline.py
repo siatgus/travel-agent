@@ -2,17 +2,22 @@
 
 运行：python tests/test_shadow_offline.py
 
-覆盖评审 2026-11-20 CONDITIONAL PASS 的 T1–T7、T9（含复审 R1 新增的 T4c/T7b）：
+覆盖评审 2026-11-20 CONDITIONAL PASS 的 T1–T7、T9（含复审 R1 的 T4c/T7b、
+复审 R2 的 T4d/T4e/T7c/T7d）：
   T1 src/ 零改动（工作区相对 HEAD）
   T2 生产链路零引用（src/ 不 import 两个脚本）
   T3 可复现（两次采集字节级一致）
   T4 离线性（三个受监控 socket 入口 0 次尝试、mock 工具、autofetch 关闭、影子不增加 dispatch）
   T4b 闸门有效性（主动证明三类入口确实被拦，卸载后恢复）
   T4c 闸门安装不完整必须 fail-closed（退出码 7、不进 collect、不写 JSONL）
+  T4d 闸门事务式安装（中途失败回滚已替换入口，不留半装状态）
+  T4e 清理失败不阻断恢复（uninstall 抛出仍恢复 dispatch/环境变量，并 [WARN] 上报）
   T5 不落原文（utterance 与 entity_text 唯一标记都不进 JSONL）
   T6 fail-loud（缺键/多余键/容器类型错；路径守卫；拒绝覆盖；不留半成品）
   T7 统计守恒（分布之和 == 总数；case 对账）
   T7b 报告负向（重复 case_id 必须失败、缺失 case 必须失败）
+  T7c 报告 schema 独立（本地 12 字段白名单，不跟随采集侧漂移）
+  T7d 恒真校验已删除（checks 中不再有 each_record_single_category）
   T9 开关冻结（进程内 main() 前后环境变量逐项恢复）
 
 T8（17 套件回归）由验收证据承担，本文件不重复执行。
@@ -265,6 +270,181 @@ def test_t4c_guard_partial_fail_closed(tmpdir: Path) -> None:
           "安装不完整" in err, err.strip()[:200])
 
 
+# ---------------------------------------------------------------- T4d 事务式安装回滚
+
+class _Sentinel:
+    """可辨识的原始入口：用 `is` 比较即可证明「确实还原成了原来那个对象」。"""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __call__(self, *a, **k):           # pragma: no cover
+        raise AssertionError(f"原始入口 {self.name} 不应被调用")
+
+    def __repr__(self) -> str:
+        return f"<orig {self.name}>"
+
+
+_ORIG_CREATE = _Sentinel("create_connection")
+_ORIG_GAI = _Sentinel("getaddrinfo")
+
+
+class _PlainSocket:
+    connect = _Sentinel("connect")
+
+    def __init__(self):
+        raise AssertionError("不应创建真连接")   # pragma: no cover
+
+
+class _RejectGaiModule:
+    """替身 socket 模块：第一个入口可写、第二个入口赋值即失败。"""
+
+    create_connection = _ORIG_CREATE
+    getaddrinfo = _ORIG_GAI
+    socket = _PlainSocket
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_fail_on", "getaddrinfo")
+
+    def __setattr__(self, name, value):
+        if name == self._fail_on:
+            raise RuntimeError(f"injected: {name} 赋值失败")
+        object.__setattr__(self, name, value)
+
+
+def test_t4d_install_transactional(tmpdir: Path) -> None:
+    """install() 中途失败必须回滚已完成替换，不得留「半装」状态。
+
+    R1 版本的缺口：前两个入口的赋值不在 try 内，第二步抛出时 active 仍为 False，
+    main() 外层 `if guard.active` 不会还原 → 进程里留着已被替换的 create_connection。
+    """
+    real_socket = sc.socket
+    # 单元层：直接看 guard 内部状态
+    g = sc.NetworkGuard()
+    raised = False
+    sc.socket = _RejectGaiModule()
+    try:
+        try:
+            g.install()
+        except sc.GuardIncomplete:
+            raised = True
+    finally:
+        sc.socket = real_socket
+    check("[T4d] 安装第 2 步失败 → 抛 GuardIncomplete", raised)
+    check("[T4d] 回滚后 active 为 False（无半装状态）", g.active is False,
+          f"active={g.active}")
+    check("[T4d] 已替换的 create_connection 被还原（同一对象）",
+          g._orig.get("create_connection") is None, str(g._orig))
+
+    # 端到端层：main() 必须 fail-closed，且不进入 collect()
+    fake = _RejectGaiModule()
+    out = tmpdir / "rollback.jsonl"
+    err_path = tmpdir / "rollback.err.txt"
+    called: list[int] = []
+    orig_collect = sc.collect
+    sc.socket = fake
+    sc.collect = lambda *a, **k: (called.append(1), ([], {}))[1]
+    try:
+        with open(err_path, "w", encoding="utf-8") as fe:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(fe):
+                code = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+    finally:
+        sc.socket = real_socket
+        sc.collect = orig_collect
+    err = err_path.read_text(encoding="utf-8")
+    check("[T4d] main() 返回 7（安装失败 fail-closed）", code == 7, str(code))
+    check("[T4d] main() 未进入 collect()", not called, str(called))
+    check("[T4d] 不产生 JSONL", not out.exists())
+    check("[T4d] 替身模块的 create_connection 已还原（同一对象）",
+          fake.create_connection is _ORIG_CREATE, repr(fake.create_connection))
+    check("[T4d] 第二个入口始终未被替换", fake.getaddrinfo is _ORIG_GAI)
+    check("[T4d] 报错含回滚说明", "安装失败" in err and "回滚" in err,
+          err.strip()[:200])
+
+
+# ---------------------------------------------------------------- T4e 清理失败不阻断恢复
+
+def _flaky_guard_factory(made: list) -> type:
+    """返回一个「第一次 uninstall 抛异常、之后正常」的 NetworkGuard 子类工厂。"""
+
+    class _FlakyUninstallGuard(sc.NetworkGuard):
+        def __init__(self) -> None:
+            super().__init__()
+            self.uninstall_calls = 0
+
+        def uninstall(self):
+            self.uninstall_calls += 1
+            if self.uninstall_calls == 1:
+                raise RuntimeError("injected uninstall failure")
+            return super().uninstall()
+
+    def factory():
+        guard = _FlakyUninstallGuard()
+        made.append(guard)
+        return guard
+
+    return factory
+
+
+def test_t4e_cleanup_layers(tmpdir: Path) -> None:
+    """uninstall() 抛异常时，dispatch 与环境变量仍必须恢复，且失败要被记录。
+
+    R1 版本的缺口：`finally: guard.uninstall(); agent.dispatch = ...` 顺序执行，
+    uninstall 抛出就会跳过两个 dispatch 恢复；外层 finally 若再抛，环境变量与
+    临时目录也一并跳过，且错误被吞掉。
+    """
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import travel_agent.agent as agent_mod      # noqa: PLC0415
+    import travel_agent.tools as tools_mod      # noqa: PLC0415
+
+    before_agent = agent_mod.dispatch
+    before_tools = tools_mod.dispatch
+    keys = sorted(set(sc.ENV_PINS) | {"TRAVEL_RESOLVER_ONLINE", "TRAVEL_KB_DB",
+                                      "TRAVEL_APP_DB"})
+    before_env = {k: os.environ.get(k, "<unset>") for k in keys}
+
+    made: list = []
+    orig_guard = sc.NetworkGuard
+    out = tmpdir / "cleanup.jsonl"
+    err_path = tmpdir / "cleanup.err.txt"
+    cap = io.StringIO()
+    sc.NetworkGuard = _flaky_guard_factory(made)
+    try:
+        with open(err_path, "w", encoding="utf-8") as fe:
+            with contextlib.redirect_stdout(cap), \
+                    contextlib.redirect_stderr(fe):
+                code = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+    finally:
+        sc.NetworkGuard = orig_guard
+    err = err_path.read_text(encoding="utf-8")
+    stdout_text = cap.getvalue()
+    after_env = {k: os.environ.get(k, "<unset>") for k in keys}
+
+    check("[T4e] 清理失败 → 非 0 退出（不声称成功）", code == 6, str(code))
+    check("[T4e] 清理失败被记录为 [WARN] 而非静默",
+          "[WARN] 清理未完成" in err and "injected uninstall failure" in err,
+          err.strip()[:240])
+    check("[T4e] agent.dispatch 已恢复原对象（未因 uninstall 抛出而跳过）",
+          agent_mod.dispatch is before_agent, repr(agent_mod.dispatch))
+    check("[T4e] tools.dispatch 已恢复原对象",
+          tools_mod.dispatch is before_tools, repr(tools_mod.dispatch))
+    check("[T4e] 环境变量逐项恢复（外层 finally 未被打断）",
+          before_env == after_env,
+          str({k: (before_env[k], after_env[k])
+               for k in keys if before_env[k] != after_env[k]}))
+    check("[T4e] 外层 finally 重试过卸载（uninstall 被调用 2 次）",
+          bool(made) and made[0].uninstall_calls == 2,
+          str([g.uninstall_calls for g in made]))
+    check("[T4e] 重试后闸门确实卸载干净（active False）",
+          bool(made) and made[0].active is False)
+    check("[T4e] 采集本身成功过（产物存在），但摘要不输出",
+          out.exists() and '"ok": true' not in stdout_text,
+          f"stdout={stdout_text[:80]!r}")
+
+
 # ---------------------------------------------------------------- T5
 def test_t5_no_raw_text(tmpdir: Path) -> None:
     token = "ZQXOBSTOKEN"
@@ -444,6 +624,101 @@ def test_t7b_report_negative(tmpdir: Path) -> None:
           r2.stderr.strip()[:200])
 
 
+# ---------------------------------------------------------------- T7c 报告 schema 独立性
+
+def test_t7c_report_schema_independent(tmpdir: Path) -> None:
+    """报告必须维护自己的 12 字段白名单，不能跟随采集侧 schema 漂移。
+
+    R1 版本 `from shadow_collect import EXPORT_KEYS`：采集侧改字段时报告自动接受，
+    独立校验形同虚设（评审 R2 指出）。
+    """
+    expected = ("case_id", "category", "intent", "takeover", "batch_enabled",
+                "action", "reason", "statuses", "city_source", "entity_city",
+                "confidence", "candidates_count")
+    check("[T7c] 报告侧独立定义 12 字段白名单",
+          tuple(sr.REPORT_EXPORT_KEYS) == expected, str(sr.REPORT_EXPORT_KEYS))
+    check("[T7c] 报告模块不再持有 EXPORT_KEYS 名字",
+          not hasattr(sr, "EXPORT_KEYS"))
+    check("[T7c] 两侧白名单不是同一对象（内容可相同）",
+          sr.REPORT_EXPORT_KEYS is not sc.EXPORT_KEYS)
+
+    # 源级判定：赋值右值必须是字符串字面量元组，不能是 import / 调用 / 变量引用。
+    # 只看运行时对象相等不够——`X = __import__("shadow_collect").EXPORT_KEYS`
+    # 的对象同样「内容正确」，但那是共享，不是独立硬编码。
+    import ast                                  # noqa: PLC0415
+    tree = ast.parse((SCRIPTS / "shadow_report.py").read_text(encoding="utf-8"))
+    literal_assign = False
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "REPORT_EXPORT_KEYS"
+                for t in node.targets):
+            literal_assign = (
+                isinstance(node.value, ast.Tuple)
+                and bool(node.value.elts)
+                and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        for e in node.value.elts))
+    check("[T7c] REPORT_EXPORT_KEYS 由本模块字面量元组硬编码（AST 判定）",
+          literal_assign)
+
+    out = tmpdir / "schema.jsonl"
+    code, d, log = run_collect(CORPUS, out)
+    check("[T7c] 前置采集成功", code == 0 and out.exists(), log[:300])
+    if not out.exists():
+        return
+
+    # 行为证明：篡改采集侧白名单后，报告仍按自己的 12 字段判定（无活依赖）
+    orig_keys = sc.EXPORT_KEYS
+    sc.EXPORT_KEYS = tuple(orig_keys) + ("extra_field",)
+    try:
+        rows = sr.load_jsonl(out)
+        independent = len(rows) == 21
+        err_msg = ""
+    except Exception as exc:                   # noqa: BLE001
+        independent = False
+        err_msg = f"{type(exc).__name__}: {exc}"
+    finally:
+        sc.EXPORT_KEYS = orig_keys
+    check("[T7c] 采集侧白名单被篡改后，报告仍能读自己的 12 字段",
+          independent, err_msg)
+
+    # 反向证明：报告侧白名单确实在生效——缺一个字段必须报错
+    first = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    first.pop("confidence")
+    bad = tmpdir / "bad_schema.jsonl"
+    bad.write_text(json.dumps(first, ensure_ascii=False) + "\n", encoding="utf-8")
+    rejected = False
+    msg = ""
+    try:
+        sr.load_jsonl(bad)
+    except sc.ContractError as exc:
+        rejected = True
+        msg = str(exc)
+    check("[T7c] 少一个字段 → 报告抛 ContractError（用自己的白名单判定）",
+          rejected and "缺失" in msg and "confidence" in msg, msg[:200])
+
+
+# ---------------------------------------------------------------- T7d 恒真校验清理
+
+def test_t7d_no_tautological_check(tmpdir: Path) -> None:
+    """`each_record_single_category = (len(records) == total)` 恒真，已删除。
+
+    留着它会被当成一条「守恒校验通过」的证据，实际不提供任何保证。
+    """
+    out = tmpdir / "taut.jsonl"
+    code, d, log = run_collect(CORPUS, out)
+    check("[T7d] 前置采集成功", code == 0 and out.exists(), log[:300])
+    if not out.exists():
+        return
+    rep = sr.build_report(sr.load_jsonl(out),
+                          [c["case_id"] for c in sc.load_corpus(CORPUS)])
+    check("[T7d] checks 中不再有 each_record_single_category",
+          "each_record_single_category" not in rep["checks"],
+          str(sorted(rep["checks"])))
+    check("[T7d] 剩余 9 条校验均为实质校验且全部通过",
+          len(rep["checks"]) == 9 and all(rep["checks"].values()),
+          f"{len(rep['checks'])} 条：{rep['checks']}")
+
+
 # ---------------------------------------------------------------- T9
 
 def test_t9_env_restored(tmpdir: Path) -> None:
@@ -481,10 +756,14 @@ def main() -> int:
         test_t4_offline(tmpdir)
         test_t4b_network_guard_blocks()
         test_t4c_guard_partial_fail_closed(tmpdir)
+        test_t4d_install_transactional(tmpdir)
+        test_t4e_cleanup_layers(tmpdir)
         test_t5_no_raw_text(tmpdir)
         test_t6_fail_loud(tmpdir)
         test_t7_conservation(tmpdir)
         test_t7b_report_negative(tmpdir)
+        test_t7c_report_schema_independent(tmpdir)
+        test_t7d_no_tautological_check(tmpdir)
         test_t9_env_restored(tmpdir)
     finally:
         import shutil

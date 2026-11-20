@@ -29,6 +29,13 @@
 3 语料错误 / 4 记录契约不符 / 5 出现网络尝试（离线性不成立）
 6 采集内部失败 / 7 网络闸门安装不完整（fail-closed，未开始采集）
 
+退出码与产物的关系（精确表述，不得简化成「非 0 就一定没有文件」）
+  3 / 4 / 5 / 7 一律发生在 write_jsonl() 之前 → 不产生 JSONL、不留临时文件。
+  6 有两个来源：写出前（全部 case 无记录、对照运行仍产生记录等）→ 无产物；
+  写出后（闸门 / 环境变量 / 临时目录未能复原）→ JSONL 可能已存在，但摘要
+  不输出、退出码非 0，属「产物存在但运行未成功」，须人工判读。清理失败一律
+  以 [WARN] 清理未完成 打到 stderr，不静默吞掉。
+
 网络隔离的证明边界（不得外推）
 ----------------------------
 本脚本只监控三个 socket 入口：socket.create_connection、socket.getaddrinfo、
@@ -141,7 +148,17 @@ class NetworkGuard:
     安装完整性：socket.socket.connect 是 C 槽位，个别实现不可写。写失败时
     置 ``partial=True`` 并降级记录，但**安装不完整即视为离线前提不成立**，
     调用方必须 fail-closed（本脚本 main() 直接以退出码 7 中止，不开始采集）。
+
+    事务性（复审 R2，评审 2026-11-20）：
+      - ``install()`` 任一步失败都会**回滚已完成的替换**，再抛
+        :class:`GuardIncomplete`；不会留下「前两个入口已替换、active 仍为 False」
+        的半装状态。
+      - ``uninstall()`` 尽力还原并**返回还原失败的入口名**（不抛出），
+        使调用方能在同一 finally 里继续恢复 dispatch / 环境变量 / 临时目录。
+      - 只要还有未还原的入口，``active`` 就保持 True，外层 finally 可再试一次。
     """
+
+    _RESTORE_ORDER = ("connect", "getaddrinfo", "create_connection")
 
     def __init__(self) -> None:
         self.attempts: list[tuple[str, str]] = []
@@ -149,8 +166,37 @@ class NetworkGuard:
         self.active = False
         self.partial = False
 
+    # -------------------------------------------------- 内部：按名读写
+    def _set(self, name: str, value: object) -> None:
+        if name == "create_connection":
+            socket.create_connection = value
+        elif name == "getaddrinfo":
+            socket.getaddrinfo = value
+        elif name == "connect":
+            socket.socket.connect = value
+        else:                                  # pragma: no cover - 防御
+            raise AssertionError(f"未知入口：{name}")
+
+    def _restore(self, names) -> list[str]:
+        """尽力还原给定入口；返回**还原失败**的名字（不抛出）。
+
+        用 ``name not in self._orig`` 判断「是否曾替换过」，不能用取值为 None
+        判断 —— 原实现可能是 None（替身模块），跳过就会漏还原。
+        """
+        failed: list[str] = []
+        for name in names:
+            if name not in self._orig:
+                continue
+            try:
+                self._set(name, self._orig[name])
+            except BaseException as exc:       # 记录后继续还原其余入口
+                failed.append(f"{name}（{type(exc).__name__}: {exc}）")
+            else:
+                self._orig.pop(name, None)     # 还原成功才移除备份
+        return failed
+
     def install(self) -> None:
-        """安装闸门；成功率不保证，调用方必须检查 ``partial``。"""
+        """事务式安装；任一步失败即回滚已完成部分，抛 ``GuardIncomplete``。"""
         self._orig["create_connection"] = socket.create_connection
         self._orig["getaddrinfo"] = socket.getaddrinfo
         self._orig["connect"] = socket.socket.connect
@@ -167,24 +213,36 @@ class NetworkGuard:
             self.attempts.append(("socket.connect", repr(address)))
             raise NetworkAttempted(f"socket.connect denied: {address!r}")
 
-        socket.create_connection = deny_create
-        socket.getaddrinfo = deny_gai
+        done: list[str] = []
         try:
-            socket.socket.connect = deny_connect
+            self._set("create_connection", deny_create)
+            done.append("create_connection")
+            self._set("getaddrinfo", deny_gai)
+            done.append("getaddrinfo")
+        except BaseException as exc:
+            # 事务回滚：把已经替换的入口还原，再按 fail-closed 中止
+            failed = self._restore(tuple(reversed(done)))
+            # 回滚未完成 → 保持 active，交给 main() 外层 finally 再试一次
+            self.active = bool(failed)
+            raise GuardIncomplete(
+                f"网络闸门安装失败（{type(exc).__name__}: {exc}），"
+                f"已回滚 {done or '无'}；回滚未完成：{failed or '无'}") from exc
+
+        try:
+            self._set("connect", deny_connect)
         except (AttributeError, TypeError):
             # C 槽位不可写：记录降级事实，由调用方 fail-closed 处理（退出码 7）
             self.partial = True
             self._orig.pop("connect", None)
         self.active = True
 
-    def uninstall(self) -> None:
+    def uninstall(self) -> list[str]:
+        """尽力还原；返回还原失败的入口名（不抛出，便于调用方继续清理）。"""
         if not self.active:
-            return
-        socket.create_connection = self._orig["create_connection"]
-        socket.getaddrinfo = self._orig["getaddrinfo"]
-        if "connect" in self._orig:
-            socket.socket.connect = self._orig["connect"]
-        self.active = False
+            return []
+        failed = self._restore(self._RESTORE_ORDER)
+        self.active = bool(failed)              # 仍有残留 → 允许外层再试一次
+        return failed
 
 
 # ---------------------------------------------------------------- 环境与路径
@@ -444,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
     guard = NetworkGuard()
     saved: dict[str, str] = {}
     dispatch = {"calls": 0, "names": []}
+    # 清理阶段收集的失败（评审 R2：不得静默吞掉恢复失败）
+    cleanup_failures: list[str] = []
+    summary: dict | None = None
+    rc = 0
     try:
         corpus = load_corpus(corpus_path)
 
@@ -501,17 +563,30 @@ def main(argv: list[str] | None = None) -> int:
         tools.dispatch = wrap_dispatch(orig_tools_dispatch)
 
         # 6) 装网络闸门后再采集；安装不完整必须 fail-closed，绝不"带着降级继续跑"
-        guard.install()
+        #    注意：install() 必须在 try 之内——它自己也会抛（R2 事务式安装失败），
+        #    否则 dispatch 包装会留在进程里，污染同进程的下一次调用。
         try:
+            guard.install()
             if guard.partial:
                 raise GuardIncomplete(
                     "网络闸门安装不完整（socket.socket.connect 不可写），"
                     "已中止采集且未写出任何产物")
             exported, detail = collect(corpus, Session, Orchestrator)
         finally:
-            guard.uninstall()
-            agent_mod.dispatch = orig_agent_dispatch
-            tools.dispatch = orig_tools_dispatch
+            # 分层清理（评审 R2）：闸门还原失败不得阻断 dispatch 恢复；
+            # 两个 dispatch 各自独立 finally，任何一个失败都不跳过另一个。
+            try:
+                failed = guard.uninstall()
+                if failed:
+                    cleanup_failures.append(f"socket 入口未还原：{failed}")
+            except BaseException as exc:       # 不静默：记录后继续清理
+                cleanup_failures.append(
+                    f"guard.uninstall() 抛出 {type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    agent_mod.dispatch = orig_agent_dispatch
+                finally:
+                    tools.dispatch = orig_tools_dispatch
 
         if guard.attempts:
             raise NetworkAttempted(
@@ -563,31 +638,57 @@ def main(argv: list[str] | None = None) -> int:
             "env_during": snapshot_env(sorted(set(ENV_PINS) | {"TRAVEL_KB_DB",
                                                                "TRAVEL_APP_DB"})),
         }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return 0
-
+        # 摘要延后到清理全部完成后再输出：清理失败时不得声称成功
     except CorpusError as exc:
         print(f"[FATAL] 语料错误：{exc}", file=sys.stderr)
-        return 3
+        rc = 3
     except ContractError as exc:
         print(f"[FATAL] 记录契约不符：{exc}", file=sys.stderr)
-        return 4
+        rc = 4
     except NetworkAttempted as exc:
         print(f"[FATAL] 离线性不成立：{exc}", file=sys.stderr)
-        return 5
+        rc = 5
     except GuardIncomplete as exc:
         print(f"[FATAL] 离线前提不成立：{exc}", file=sys.stderr)
-        return 7
+        rc = 7
     except CollectError as exc:
         print(f"[FATAL] 采集失败：{exc}", file=sys.stderr)
-        return 6
+        rc = 6
     finally:
-        if guard.active:
-            guard.uninstall()
-        if saved:
-            restore_env(saved)
-        if tmpdir is not None and tmpdir.exists():
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        # 三层独立清理：任一层异常都不跳过后面的恢复动作（评审 R2）
+        try:
+            if guard.active:
+                failed = guard.uninstall()
+                if failed:
+                    cleanup_failures.append(f"外层重试仍未还原 socket 入口：{failed}")
+        except BaseException as exc:
+            cleanup_failures.append(
+                f"外层 guard.uninstall() 抛出 {type(exc).__name__}: {exc}")
+        try:
+            if saved:
+                restore_env(saved)
+        except BaseException as exc:
+            cleanup_failures.append(
+                f"环境变量恢复失败 {type(exc).__name__}: {exc}")
+        try:
+            if tmpdir is not None and tmpdir.exists():
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except BaseException as exc:
+            cleanup_failures.append(
+                f"临时目录清理失败 {type(exc).__name__}: {exc}")
+
+    # 清理结果在返回前统一处理：保留原始异常（rc），不静默吞掉恢复失败
+    if cleanup_failures:
+        for item in cleanup_failures:
+            print(f"[WARN] 清理未完成：{item}", file=sys.stderr)
+        if rc == 0:                            # 采集本身成功但状态未复原 → 判失败
+            return 6
+        return rc
+    if rc != 0:
+        return rc
+    assert summary is not None                 # rc == 0 意味着摘要已装配
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":

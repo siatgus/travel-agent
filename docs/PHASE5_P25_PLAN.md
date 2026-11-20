@@ -3811,3 +3811,118 @@ JSONL False / 临时文件 (无)`。
 - 未处理上一轮自报的次要项（`each_record_single_category` 恒真、空 JSONL
   退化为 vacuous 通过、`reason` 显示截断）：它们不在本次两个阻塞项内，
   保留待单独裁定。
+
+---
+
+## 28. P2.6 st.2 复审 R2 修复记录（2026-11-20，异常清理加固 + 报告 schema 独立 + 恒真校验清理）
+
+评审结论：**解除 R1 两个阻塞项**（闸门降级 fail-closed、报告重复/缺失 case），
+但新增三项待修，且 **§26 Path A 最终验收暂缓**（因上一轮交付的是测试日志而非源码）。
+
+本轮只做评审授权的三项，仍限原五个文件；未改 `src/`、未动 `08_ACCEPTANCE.md` 与
+既有证据包、未引入 `TRAVEL_SHADOW_LOG`、未处理 R-01、未进入 P3 / 生产接管。
+
+### 28.1 异常清理加固（`scripts/shadow_collect.py`）
+
+**问题 A：`install()` 不是事务式安装**（R1 版 :170-178）
+R1 先赋值前两个入口、再 `try` 第三个；若第一/第二步抛出，`active` 仍为 `False`，
+`main()` 外层 `if guard.active` 不会还原 → 留下「前两个已替换、无备份可查」的半装状态。
+
+修法：
+- 新增 `_set(name, value)`（:170-178）与 `_restore(names)`（:180-196），把「按名替换 / 按名还原」
+  收敛到一处。
+- `install()`（:198-237）用 `done` 记录**已成功替换**的入口，前两步整体置于 `try`；
+  任一步抛出 → `_restore(reversed(done))` 回滚 → 抛 `GuardIncomplete`（:222-230）。
+- 回滚结果决定 `active`：`self.active = bool(failed)`，回滚不完整时把重试机会交给外层
+  `finally`，而不是假装干净。
+- `_restore()` 用 `name not in self._orig` 判断「是否曾替换过」，**不能用取值是否为 None
+  判断**——替身模块的原始入口可能就是 None，按值判断会漏还原。
+
+**问题 B：`uninstall()` 失败会阻断后续恢复**（R1 版 :511-514、:649-655）
+R1 是顺序执行 `guard.uninstall(); agent.dispatch = ...; tools.dispatch = ...`，
+卸载抛出就跳过两个 dispatch；外层 `finally` 再抛则环境变量与临时目录也被跳过，且错误被吞。
+
+修法（三层，互不依赖）：
+1. **内层**（:575-589）：`try: guard.uninstall() ... finally: try: agent.dispatch = ... finally: tools.dispatch = ...`
+   —— 闸门还原失败不影响 dispatch，两个 dispatch 也各自独立。
+2. **外层**（:657-678）：闸门重试 / 环境变量恢复 / 临时目录清理各占一个 `try/except`，
+   任一层异常都不跳过后面的动作。
+3. **返回前统一处理**（:680-691）：所有失败以 `[WARN] 清理未完成：…` 打到 stderr；
+   `rc == 0` 但清理失败 → 返回 6；`rc != 0` 则保持原退出码（**保留原始异常**，不覆盖）。
+
+**附带修复（本轮新增测试抓到的真实缺陷）**
+`guard.install()` 原在 `try` **之外**（R1 版 :504 vs :505）。它自身抛出时（R2 事务式安装失败），
+`finally` 根本不执行，两处 `dispatch` 包装会留在进程里，**污染同进程的下一次调用**：
+实测表现为随后一次 `main()` 在「工具层不是 mock」处以退出码 6 失败。
+已把 `guard.install()` 移入同一个 `try`（:568-575）。
+
+**退出码语义精确化**（docstring :26-38）
+- `3 / 4 / 5 / 7` 一律发生在 `write_jsonl()` **之前** → 不产生 JSONL、不留临时文件。
+- `6` 有两个来源：写出前（全部 case 无记录、对照运行仍产生记录等）→ 无产物；
+  写出后（闸门 / 环境变量 / 临时目录未能复原）→ JSONL **可能已存在**，但摘要不输出、
+  退出码非 0，属「产物存在但运行未成功」。不得把 `6` 简化为「没有文件」。
+- 摘要改为**清理全部完成之后**才输出（:689-691），避免「清理失败却打印 ok: true」。
+
+### 28.2 报告 schema 独立（`scripts/shadow_report.py`）
+
+R1 版 `from shadow_collect import EXPORT_KEYS` 让两侧共享**同一个对象**：采集侧改字段，
+报告自动跟随，独立校验形同虚设。
+
+修法：
+- 新增本地字面量 `REPORT_EXPORT_KEYS`（:61-65，12 字段，与采集侧内容一致但**不是同一对象**）。
+- `load_jsonl()` 改用 `REPORT_EXPORT_KEYS` 判定字段集（:86-88）。
+- 漂移语义：采集侧增删字段 → 报告侧在 `load_jsonl` 以契约错误（退出码 4）暴露，
+  而不是静默接受。
+
+**已知不完全独立点（申报）**：`ALLOWED_CATEGORIES` 仍从采集侧导入。理由是它属于
+「语料分类词表」——两侧必须同一语义，独立维护反而会制造假漂移；如评审要求同样独立，
+需单独授权。
+
+### 28.3 恒真校验清理（`scripts/shadow_report.py`）
+
+删除 `each_record_single_category: len(records) == total`（R1 版 :146）：右值就是 `total`
+的定义式，恒真、不提供任何保证，却会被读成一条「守恒校验通过」的证据。
+`checks` 由 10 条降为 **9 条**（6 条基础 + `--corpus` 时 3 条），全部为实质校验。
+
+### 28.4 测试与运行结果
+
+| 项 | 结果 |
+|---|---|
+| 离线套件 | **85 pass / 0 fail，exit=0**（R1 的 58 + T4d 9 + T4e 8 + T7c 7 + T7d 3） |
+| 17 套件回归 | **全部 exit=0**（本轮按评审要求做一次完整回归） |
+| 定向负向证明 | R2-M1..M4 四项变异全部被捕获，逐字节还原（sha256 前后相等），还原后复跑 85/0 |
+
+新增用例要点：
+- **T4d（9 条）**：替身 socket 模块让第二个入口赋值抛错 → 断言抛 `GuardIncomplete`、
+  `active` 为 False、`create_connection` 已还原成**同一对象**、`main()` 返回 7、不进 `collect()`、
+  不产生 JSONL、报错含回滚说明、第二入口始终未被替换。
+- **T4e（8 条）**：`uninstall()` 首次必抛的替身闸门 → 断言非 0 退出、`[WARN] 清理未完成` 出现在
+  stderr、`agent.dispatch` / `tools.dispatch` 恢复成**原对象**、环境变量逐项恢复、
+  `uninstall` 被调用 2 次（内层 + 外层重试）、重试后 `active` 为 False、产物存在但摘要不输出。
+- **T7c（7 条）**：白名单内容、`not hasattr(sr, "EXPORT_KEYS")`、非同一对象、
+  **AST 判定赋值右值必须是字符串字面量元组**（仅比较运行时对象相等无法识别
+  `X = __import__("shadow_collect").EXPORT_KEYS` 这种伪独立）、篡改采集侧名字后报告仍可读、
+  少一个字段必须抛 `ContractError`。
+- **T7d（3 条）**：`checks` 中不再有该键、剩余恰 9 条且全部通过。
+
+定向变异（`20_R2_negative_proof.txt`）：
+
+| 变异 | 预期 | 实测 FAIL |
+|---|---|---|
+| R2-M1 事务回滚换成空操作 | T4d 失败 | **2**（单元 `_orig` 未清、替身入口仍是 `deny_create`） |
+| R2-M2 dispatch 恢复改为「依赖 uninstall 成功」 | T4e 失败 | **4**（T4e 两条身份断言 + T9 级联两条：包装泄漏导致下次调用 exit 6） |
+| R2-M3 报告白名单改为共享采集侧对象 | T7c 失败 | **2**（同一对象、AST 非字面量） |
+| R2-M4 加回恒真校验 | T7d 失败 | **2**（键仍在、条数变 10） |
+
+### 28.5 本轮未做 / 仍遗留
+
+未做：`src/` 任何改动、生产 JSONL、`TRAVEL_SHADOW_LOG`、R-01 容量策略、P3 / TAKEOVER / 灰度。
+
+仍遗留（均已申报，待单独裁定）：
+1. `write_jsonl` 的拒覆盖检查与 `os.replace` 之间是 TOCTOU 窗口，**不得**表述为并发安全。
+2. 未对父目录 `fsync`，不是完整断电持久化保证。
+3. 空 JSONL 喂报告 → 8 条校验 vacuous 通过、exit=0（采集侧有「拒绝写出空产物」兜底）。
+4. `reason` 在渲染时被截到 40 字符（仅显示层）。
+5. `ALLOWED_CATEGORIES` 仍与采集侧共享（见 §28.2）。
+6. `pin_env()` 中途异常时可能无法完整恢复；`sys.path` 插入后不还原（CLI 单次运行影响有限）。
+7. R-01：`_decision_shadow_log` 会话级内存容器无上限，**仍是生产启用前阻断项**。
