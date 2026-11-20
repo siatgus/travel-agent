@@ -25,8 +25,16 @@
 
 退出码
 ------
-0 成功 / 2 参数或路径不允许 / 3 语料错误 / 4 记录契约不符
-5 出现网络尝试（离线性不成立）/ 6 采集内部失败
+0 成功 / 1 参数或输出路径不允许（SystemExit 字符串）/ 2 argparse 用法错误
+3 语料错误 / 4 记录契约不符 / 5 出现网络尝试（离线性不成立）
+6 采集内部失败 / 7 网络闸门安装不完整（fail-closed，未开始采集）
+
+网络隔离的证明边界（不得外推）
+----------------------------
+本脚本只监控三个 socket 入口：socket.create_connection、socket.getaddrinfo、
+socket.socket.connect。`network_attempts == 0` 只能说明「本次采集期间，
+三个受监控入口未检测到网络尝试」，**不等价于对进程全部网络行为的绝对证明**
+（例如直接 UDP sendto、子进程、非 socket 的 I/O 均不在监控范围内）。
 
 用法
 ----
@@ -83,6 +91,17 @@ ENV_PINS = {
 _ASSERTED_ENV = ("TRAVEL_DECISION_SHADOW", "TRAVEL_PENDING_CHANNEL",
                  "TRAVEL_DECISION_TAKEOVER")
 
+# 被监控的网络入口（写入摘要，避免把「三个入口 0 次」读成「进程零网络」）
+MONITORED_ENTRY_POINTS = (
+    "socket.create_connection",
+    "socket.getaddrinfo",
+    "socket.socket.connect",
+)
+
+NETWORK_SCOPE_NOTE = (
+    "仅覆盖上述三个受监控 socket 入口；0 次尝试不等于对进程全部网络行为的绝对证明"
+)
+
 
 class CorpusError(Exception):
     """语料格式错误（退出码 3）。"""
@@ -100,15 +119,28 @@ class CollectError(Exception):
     """采集内部失败（退出码 6）。"""
 
 
+class GuardIncomplete(Exception):
+    """网络闸门未能完整安装（退出码 7，fail-closed 中止）。"""
+
+
 # ---------------------------------------------------------------- 网络闸门
 
 class NetworkGuard:
-    """运行时零网络证明：拦截 connect / create_connection / getaddrinfo。
+    """运行时网络尝试计数：监控 connect / create_connection / getaddrinfo。
 
     agent.dispatch == 0 只能证明没有走那个入口，不能证明整个进程没有
-    网络行为（评审 2026-11-20 明确）。本闸门把「任意 socket 连接尝试」
-    变成可计数、可失败的事件，从而把「未触发外部入口」升级为
-    「进程内零连接尝试」。
+    网络行为（评审 2026-11-20 明确）。本闸门把「三个受监控 socket 入口的
+    连接尝试」变成可计数、可失败的事件。
+
+    证明边界（评审 R1 要求收紧，不得外推）：
+      计数为 0 仅表示「本次采集期间，socket.create_connection /
+      socket.getaddrinfo / socket.socket.connect 未检测到尝试」；
+      不覆盖 UDP sendto、子进程、非 socket I/O，**不构成对进程全部网络
+      行为的绝对证明**。
+
+    安装完整性：socket.socket.connect 是 C 槽位，个别实现不可写。写失败时
+    置 ``partial=True`` 并降级记录，但**安装不完整即视为离线前提不成立**，
+    调用方必须 fail-closed（本脚本 main() 直接以退出码 7 中止，不开始采集）。
     """
 
     def __init__(self) -> None:
@@ -118,6 +150,7 @@ class NetworkGuard:
         self.partial = False
 
     def install(self) -> None:
+        """安装闸门；成功率不保证，调用方必须检查 ``partial``。"""
         self._orig["create_connection"] = socket.create_connection
         self._orig["getaddrinfo"] = socket.getaddrinfo
         self._orig["connect"] = socket.socket.connect
@@ -138,7 +171,8 @@ class NetworkGuard:
         socket.getaddrinfo = deny_gai
         try:
             socket.socket.connect = deny_connect
-        except (AttributeError, TypeError):      # C 槽位不可写 → 降级但不隐瞒
+        except (AttributeError, TypeError):
+            # C 槽位不可写：记录降级事实，由调用方 fail-closed 处理（退出码 7）
             self.partial = True
             self._orig.pop("connect", None)
         self.active = True
@@ -466,9 +500,13 @@ def main(argv: list[str] | None = None) -> int:
         agent_mod.dispatch = wrap_dispatch(orig_agent_dispatch)
         tools.dispatch = wrap_dispatch(orig_tools_dispatch)
 
-        # 6) 装网络闸门后再采集
+        # 6) 装网络闸门后再采集；安装不完整必须 fail-closed，绝不"带着降级继续跑"
         guard.install()
         try:
+            if guard.partial:
+                raise GuardIncomplete(
+                    "网络闸门安装不完整（socket.socket.connect 不可写），"
+                    "已中止采集且未写出任何产物")
             exported, detail = collect(corpus, Session, Orchestrator)
         finally:
             guard.uninstall()
@@ -515,6 +553,8 @@ def main(argv: list[str] | None = None) -> int:
                 "tools_module": tools_mod,
                 "autofetch_enabled": bool(autofetch.ENABLED),
                 "network_attempts": len(guard.attempts),
+                "monitored_entry_points": list(MONITORED_ENTRY_POINTS),
+                "network_attempts_scope": NETWORK_SCOPE_NOTE,
                 "guard_partial": guard.partial,
                 "dispatch_calls": dispatch["calls"],
                 "dispatch_names": dispatch["names"],
@@ -535,6 +575,9 @@ def main(argv: list[str] | None = None) -> int:
     except NetworkAttempted as exc:
         print(f"[FATAL] 离线性不成立：{exc}", file=sys.stderr)
         return 5
+    except GuardIncomplete as exc:
+        print(f"[FATAL] 离线前提不成立：{exc}", file=sys.stderr)
+        return 7
     except CollectError as exc:
         print(f"[FATAL] 采集失败：{exc}", file=sys.stderr)
         return 6

@@ -3480,7 +3480,7 @@ Handler 分支，两者未在同轮对齐记录。因此本轮报告**只能给�
 | T1 `src/` 零 diff | `git diff --stat <base>..<head> -- src/` 空输出（原文） |
 | T2 生产链路零引用 | 全仓 grep：`src/` 内无 `shadow_collect`/`shadow_report` 引用；`server.py` 无相关 import（原文） |
 | T3 可复现 | 同语料连续两次采集，JSONL 逐条相等（记录无时间戳，应完全相等）；提供两次输出的 `diff` 原文 |
-| T4 零网络 | 采集全程 `agent.dispatch` 计数 == 0（脚本自打印 + 测试断言） |
+| T4 零网络 | ~~采集全程 `agent.dispatch` 计数 == 0~~（该判据已被 §26.9.3 偏差 1 判定为不可达并修正；现行判据见 §26.9.2 ② 四层证据，复审 R1 后再收紧证明边界，见 §27.2） |
 | T5 不落原文 | 语料中植入唯一标记（如 `ZQX-OBS-TOKEN`），断言 JSONL 全文不含该标记（`grep -c` 为 0 原文） |
 | T6 fail-loud | 人为破坏记录结构（临时改 `SHADOW_RECORD_KEYS`），脚本必须非 0 退出并打印差异，**不得产出空报告** |
 | T7 统计守恒 | 报告各类分布之和 == 记录总数；每条记录归类唯一（同一记录不重复计入两档） |
@@ -3556,7 +3556,7 @@ Handler 分支，两者未在同轮对齐记录。因此本轮报告**只能给�
 |---|---|---|
 | L1 实现层 | 固定 `USE_REAL_DATA=0` → `travel_agent.tools` 导入 `mock_tools`（该模块零 `urllib`/`http` 引用） | 摘要 `tools_module` 以 `mock_tools` 结尾 |
 | L2 依赖层 | 固定 `TRAVEL_AUTOFETCH=0`（该常量在 import 期求值，故必须在 import 前设置） | 摘要 `autofetch_enabled: false`，采集前断言 |
-| L3 运行层 | `NetworkGuard` 拦截 `socket.create_connection` / `socket.getaddrinfo` / `socket.socket.connect`，任一次尝试即计数并抛出 | 摘要 `network_attempts: 0`；**另有 T4b 主动验证闸门确实能拦住三类入口** |
+| L3 运行层 | `NetworkGuard` 监控 **三个 socket 入口**（`socket.create_connection` / `socket.getaddrinfo` / `socket.socket.connect`），任一次尝试即计数并抛出；安装不完整（`partial=True`）时直接以退出码 7 中止（fail-closed，不开始采集、不写文件） | 摘要 `network_attempts: 0` + `monitored_entry_points` + `network_attempts_scope`；**另有 T4b 主动验证三类入口确实被拦、T4c 验证降级必中止**。注意：0 次仅指「三个受监控入口未检测到尝试」，**不构成对进程全部网络行为的绝对证明**（不含 UDP `sendto`、子进程、非 socket I/O） |
 | L4 对照层 | 同一语料在 `shadow=on` 与 `shadow=off` 各跑一次，比较 `dispatch` 调用数与调用名序列 | 两者均为 11 次、全部为 `search_poi`、序列逐项相同 → **影子触点贡献 0 次 dispatch** |
 
 采集期间的 `_pending_warnings` 一并收集；KB 被复制到临时目录
@@ -3632,6 +3632,10 @@ WAL/SHM 写进仓库 `data/`。
 
 四次变异后文件逐字节还原（`sha256` 前后相同），还原后复跑 47/0。
 
+> 注：本节数字对应 `742d83e`（47 条断言）。复审 R1 增补 T4c/T7b 后，同一批变异
+> 的 FAIL 数随断言总数变化（M2 由 10 变 13，其中 T4c 的 2 条属级联：该变异先
+> 触发工具层断言、第 6 号退出，根本到不了闸门检查）。现行数字见 §27.4。
+
 M4 无影响这一点如实保留：它说明「冗余断言被删不会让测试失明」，也说明
 不能靠断言数量推断隔离强度。
 
@@ -3700,8 +3704,110 @@ python scripts/shadow_report.py \
     --jsonl ../P26Obs_20261120/run.jsonl --corpus tests/observ_corpus.tsv
 ```
 
-退出码：`0` 成功／`2` 参数或路径不允许／`3` 语料错误／`4` 记录契约不符／
-`5` 出现网络尝试／`6` 采集内部失败。任何非 0 退出都**不产出** JSONL。
+退出码：`0` 成功／`1` 参数或输出路径不允许（`SystemExit` 字符串）／
+`2` argparse 用法错误／`3` 语料错误／`4` 记录契约不符／`5` 出现网络尝试／
+`6` 采集内部失败／`7` 网络闸门安装不完整（fail-closed）。任何非 0 退出都**不产出** JSONL。
 
 新增语料需保持 4 列（`case_id`/`category`/`utterance`/`context`），
 `category` 限于七个允许值，`case_id` 文件内唯一；`#` 开头为注释行。
+
+---
+
+## 27. P2.6 st.2 复审 R1 修复记录（2026-11-20，两个阻塞项 + 证明边界收紧）
+
+评审结论：**暂不通过**，保留两个阻塞项；不要求重跑 17 套件；范围仍限于
+`scripts/shadow_collect.py`、`scripts/shadow_report.py` 与离线套件，不触及
+`src/`、不进入 P3。
+
+### 27.1 阻塞项 1：闸门安装不完整仍继续采集（已修，fail-closed）
+
+**根因**：`NetworkGuard.install()` 允许 `socket.socket.connect` 写失败
+（C 槽位），失败时只置 `partial=True` 而不抛出；`main()` 仅把它写进摘要，
+于是「闸门降级」仍会继续跑 `collect()` 并可能正常写出 JSONL。这是
+fail-open，与离线采集的前提不符。
+
+**修法**（`scripts/shadow_collect.py`）：
+
+| 位置 | 改动 |
+|---|---|
+| `:122` | 新增 `GuardIncomplete` 异常（对应退出码 7） |
+| `:504-509` | `guard.install()` 之后、`collect()` 之前立即检查 `guard.partial`，为真即抛 `GuardIncomplete`；该检查与 `collect()` 处于**同一个 try**，因此 `finally` 一定执行 `uninstall()` 与两处 `dispatch` 还原 |
+| `:578-580` | 捕获后打印 `[FATAL] 离线前提不成立：…` 并返回 7 |
+| `:32-37`、`:128-146` | 明确「安装不完整即离线前提不成立，调用方必须 fail-closed」 |
+
+**失败路径的保证**：检查发生在 `collect()` 之前、`write_jsonl()` 之前，
+因此降级时必然满足三条：不进入 `collect()`、不产生 JSONL、不留临时文件；
+`finally` 仍恢复环境变量与 `dispatch` 包装。
+
+**测试**（`tests/test_shadow_offline.py:237` `test_t4c_guard_partial_fail_closed`，5 条断言）：
+用带 metaclass 的替身 socket 模块让 `connect` 赋值抛 `TypeError`，复现
+「C 槽位不可写」，断言 `main()` 返回 **7**、`collect()` 未被调用、无 JSONL、
+无临时文件、stderr 含「安装不完整」。
+
+**非空转证明**（`10_R1_negative_proof.txt` R1-M1）：删掉 `:506-509` 的检查后，
+T4c 立刻 **3 FAIL**（退出码 6、`collect()` 被调用 1 次、错误信息变为
+「全部 case 均未产生记录」），逐字节还原后复跑 58/0。
+独立探针 `probe_r1_partial.py` 的原始输出：`return code 7 / collect False /
+JSONL False / 临时文件 (无)`。
+
+### 27.2 阻塞项 2：报告未校验重复 case_id，且缺失 case 不判失败（已修）
+
+**重复 case_id**（`scripts/shadow_report.py`）：
+
+- `:80-84` `load_jsonl()` 记录每条 `case_id` 首次出现的行号，重复即抛
+  `ContractError`（退出码 4），消息含「第 N 行 case_id 重复：W01（首次出现在第 1 行）」。
+- `:147` `build_report()` 另设 `no_duplicate_cases` 校验（`:145-147`），
+  即使绕过 `load_jsonl`（例如直接传内存列表）也会判失败（退出码 5）——
+  这是纵深防御，不是重复。
+- `:199-204` 报告头显式打印「重复 case_id：无 / [错误] 清单」。
+
+**缺失 case**（原为「仅提示、退出 0」）：
+
+- `:151` 新增 `no_missing_cases` 校验；`--corpus` 下只要有 case 无记录即
+  校验失败 → 退出码 5。
+- `:206-212` 零记录清单措辞改为「采集脚本成功但未产出记录，本次判为失败」，
+  仍保留清单以便定位——「区分零记录与采集失败」的语义不变，但**不再把
+  零记录当正常结果**。
+
+**测试**（`tests/test_shadow_offline.py:396` `test_t7b_report_negative`，6 条断言）：
+重复一条 → CLI 退出 **4** 且报出 ID 与行号；内存列表重复 → `no_duplicate_cases`
+为 False；缺失一条（删 W01）→ CLI 退出 **5**，stdout 列出 W01、stderr 点名
+`no_missing_cases`。
+
+**非空转证明**：R1-M2（删 `load_jsonl` 重复检查）→ **2 FAIL**（实得 5，
+由 `no_duplicate_cases` 兜住；报文不含重复 ID 与行号）；R1-M3（删
+`no_missing_cases`）→ **2 FAIL**（实得 0）。两次均逐字节还原。
+
+### 27.3 证明边界收紧（三处文字 + 两个摘要字段，避免「零网络」过度表述）
+
+评审指出：只监控三个 socket 入口，不能推出「进程内零网络」。
+
+| 位置 | 收紧后的表述 |
+|---|---|
+| `shadow_collect.py:32-37` | 新增「网络隔离的证明边界（不得外推）」小节：0 次仅指三个受监控入口未检测到尝试，不含 UDP `sendto`、子进程、非 socket I/O |
+| `shadow_collect.py:128-146` | `NetworkGuard` docstring 去掉「升级为进程内零连接尝试」，改为「三个受监控入口的连接尝试可计数；不构成对进程全部网络行为的绝对证明」 |
+| 摘要 `offline` 块 `:556-557` | 新增 `monitored_entry_points`（三个入口名）与 `network_attempts_scope`（一句话边界声明），使机器可读产物自带限定 |
+| §26.9.2 L3 行 | 同步改写，并注明 T4c 覆盖降级路径 |
+
+`network_attempts` 字段名与语义保持不变（仍为三个入口的计数），只补限定，
+避免破坏既有证据的解读方式。
+
+### 27.4 运行结果
+
+- `python tests/test_shadow_offline.py` → **58 pass / 0 fail，exit=0**
+  （原 47 + T4c 5 + T7b 6）。
+- 17 套件本轮**未重跑**（评审明确「目前不需要」）；上一轮 `742d83e` 的
+  18 套件 exit=0 记录仍然有效，本轮仅改 `scripts/` 与离线套件，不涉及那些
+  套件覆盖的模块。
+- 证据包 `../P26Obs_20261120/` 已同步更新：`01_commit_full.diff.txt`
+  （本次修复的完整 diff）、`10_R1_negative_proof.txt`（定点变异）、
+  `11_R1_negative_cli.txt`（负向 CLI 原始输出）、`T1_T9_raw.txt`（含 T4c/T7b）。
+
+### 27.5 本轮未做
+
+- 未改 `src/`、未动 `handlers`/`pending`/`stores`/`revalidator`/`producer`/`dialogue`。
+- 未新增生产 JSONL、未引入 `TRAVEL_SHADOW_LOG`、未做 R-01 容量策略。
+- 未进入 P3 / TAKEOVER / 灰度；三开关仍为 0/unset。
+- 未处理上一轮自报的次要项（`each_record_single_category` 恒真、空 JSONL
+  退化为 vacuous 通过、`reason` 显示截断）：它们不在本次两个阻塞项内，
+  保留待单独裁定。

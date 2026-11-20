@@ -2,14 +2,17 @@
 
 运行：python tests/test_shadow_offline.py
 
-覆盖评审 2026-11-20 CONDITIONAL PASS 的 T1–T7、T9：
+覆盖评审 2026-11-20 CONDITIONAL PASS 的 T1–T7、T9（含复审 R1 新增的 T4c/T7b）：
   T1 src/ 零改动（工作区相对 HEAD）
   T2 生产链路零引用（src/ 不 import 两个脚本）
   T3 可复现（两次采集字节级一致）
-  T4 离线性（网络尝试 0、mock 工具、autofetch 关闭、影子不增加 dispatch）
+  T4 离线性（三个受监控 socket 入口 0 次尝试、mock 工具、autofetch 关闭、影子不增加 dispatch）
+  T4b 闸门有效性（主动证明三类入口确实被拦，卸载后恢复）
+  T4c 闸门安装不完整必须 fail-closed（退出码 7、不进 collect、不写 JSONL）
   T5 不落原文（utterance 与 entity_text 唯一标记都不进 JSONL）
   T6 fail-loud（缺键/多余键/容器类型错；路径守卫；拒绝覆盖；不留半成品）
   T7 统计守恒（分布之和 == 总数；case 对账）
+  T7b 报告负向（重复 case_id 必须失败、缺失 case 必须失败）
   T9 开关冻结（进程内 main() 前后环境变量逐项恢复）
 
 T8（17 套件回归）由验收证据承担，本文件不重复执行。
@@ -207,6 +210,61 @@ def test_t4b_network_guard_blocks() -> None:
           str(len(guard.attempts)))
 
 
+# ---------------------------------------------------------------- T4c 闸门降级 fail-closed
+
+class _RejectConnectMeta(type):
+    """模拟 C 槽位不可写：对 connect 的属性赋值抛 TypeError。"""
+
+    def __setattr__(cls, name, value):
+        if name == "connect":
+            raise TypeError("cannot set 'connect' attribute of immutable type")
+        super().__setattr__(name, value)
+
+
+class _FakeSocket(metaclass=_RejectConnectMeta):
+    def connect(self, address):          # 不应被调用
+        raise AssertionError("real socket.connect reached")
+
+
+class _FakeSocketModule:
+    """替身 socket 模块：只有 install() 需要的三个属性。"""
+
+    socket = _FakeSocket
+    create_connection = None
+    getaddrinfo = None
+
+
+def test_t4c_guard_partial_fail_closed(tmpdir: Path) -> None:
+    """闸门安装不完整（partial=True）时必须中止，且不产生任何产物。
+
+    没有这一条，「摘要里写 guard_partial: true 但照样产出 JSONL」不会被发现。
+    """
+    real_socket = sc.socket
+    out = tmpdir / "partial.jsonl"
+    captured_out = tmpdir / "partial.out.txt"
+    captured_err = tmpdir / "partial.err.txt"
+    called: list[int] = []
+    orig_collect = sc.collect
+    sc.socket = _FakeSocketModule()
+    sc.collect = lambda *a, **k: (called.append(1), ([], {}))[1]
+    try:
+        with open(captured_out, "w", encoding="utf-8") as fo, \
+                open(captured_err, "w", encoding="utf-8") as fe:
+            with contextlib.redirect_stdout(fo), contextlib.redirect_stderr(fe):
+                code = sc.main(["--corpus", str(CORPUS), "--out", str(out)])
+    finally:
+        sc.socket = real_socket
+        sc.collect = orig_collect
+    err = captured_err.read_text(encoding="utf-8")
+    check("[T4c] 闸门降级 → main() 返回 7（fail-closed）", code == 7, str(code))
+    check("[T4c] 闸门降级 → 未进入 collect()", not called, str(called))
+    check("[T4c] 闸门降级 → 不产生 JSONL", not out.exists())
+    check("[T4c] 闸门降级 → 不留临时文件",
+          not list(tmpdir.glob("partial.jsonl.tmp.*")))
+    check("[T4c] 错误信息指明闸门安装不完整",
+          "安装不完整" in err, err.strip()[:200])
+
+
 # ---------------------------------------------------------------- T5
 def test_t5_no_raw_text(tmpdir: Path) -> None:
     token = "ZQXOBSTOKEN"
@@ -334,6 +392,58 @@ def test_t7_conservation(tmpdir: Path) -> None:
           f"{rep2['total']}")
 
 
+# ---------------------------------------------------------------- T7b 报告负向
+def test_t7b_report_negative(tmpdir: Path) -> None:
+    """重复 case_id 与缺失 case 都必须让报告失败（非 0 退出）。
+
+    「重复一条」与「缺失一条」是两种真实故障：前者说明同一轮被写了两次，
+    后者说明某轮没有记录。二者都不能只打印提示而返回 0。
+    """
+    out = tmpdir / "neg.jsonl"
+    code, d, log = run_collect(CORPUS, out)
+    check("[T7b] 前置采集成功", code == 0 and out.exists(), log[:300])
+    if not out.exists():
+        return
+    lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+    cases = [c["case_id"] for c in sc.load_corpus(CORPUS)]
+
+    def run_report(path: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [PY, "scripts/shadow_report.py", "--jsonl", str(path),
+             "--corpus", "tests/observ_corpus.tsv"],
+            cwd=str(REPO), capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
+
+    # 1) 重复一条（把 W01 再写一次）
+    dup = tmpdir / "dup.jsonl"
+    dup.write_text("\n".join(lines + [lines[0]]) + "\n", encoding="utf-8")
+    r = run_report(dup)
+    check("[T7b] 重复 case_id → 报告退出码 4（契约错误）",
+          r.returncode == 4, f"{r.returncode} {r.stderr.strip()[:160]}")
+    check("[T7b] 重复 case_id 报出具体 ID 与行号",
+          "case_id 重复" in r.stderr and "W01" in r.stderr
+          and "首次出现在第 1 行" in r.stderr, r.stderr.strip()[:200])
+
+    # 2) 绕过 load_jsonl（直接传内存列表）也必须判失败
+    dup_records = [json.loads(l) for l in lines] + [json.loads(lines[0])]
+    rep = sr.build_report(dup_records, cases)
+    check("[T7b] 内存列表重复 → no_duplicate_cases 为 False",
+          rep["checks"]["no_duplicate_cases"] is False,
+          str(rep["duplicate_cases"]))
+
+    # 3) 缺失一条（删掉 W01）
+    miss = tmpdir / "miss.jsonl"
+    miss.write_text("\n".join(
+        l for l in lines if json.loads(l)["case_id"] != "W01") + "\n",
+        encoding="utf-8")
+    r2 = run_report(miss)
+    check("[T7b] 缺失 case → 报告退出码 5（守恒/对账未通过）",
+          r2.returncode == 5, f"{r2.returncode} {r2.stderr.strip()[:160]}")
+    check("[T7b] 缺失 case 在 stdout 列出，且 stderr 点名 no_missing_cases",
+          "W01" in r2.stdout and "no_missing_cases" in r2.stderr,
+          r2.stderr.strip()[:200])
+
+
 # ---------------------------------------------------------------- T9
 
 def test_t9_env_restored(tmpdir: Path) -> None:
@@ -370,9 +480,11 @@ def main() -> int:
         test_t3_reproducible(tmpdir)
         test_t4_offline(tmpdir)
         test_t4b_network_guard_blocks()
+        test_t4c_guard_partial_fail_closed(tmpdir)
         test_t5_no_raw_text(tmpdir)
         test_t6_fail_loud(tmpdir)
         test_t7_conservation(tmpdir)
+        test_t7b_report_negative(tmpdir)
         test_t9_env_restored(tmpdir)
     finally:
         import shutil

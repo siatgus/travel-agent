@@ -17,9 +17,17 @@
 1. 每条记录必须自带 category（采集时由语料继承），**不得用 intent 反推**
    语料分类。报告分别展示 category 与 intent 两个维度。
 2. 必须区分「零记录」与「采集失败」：
-   - 零记录 = 语料里的 case 在 JSONL 中没有对应行（真实采集结果）；
+   - 零记录 = 语料里的 case 在 JSONL 中没有对应行（采集脚本成功但该轮无记录）；
    - 采集失败 = 采集脚本非 0 退出、没有产出 JSONL（本轮报告不负责兜底）。
    给出 --corpus 时，报告会做 case 对账并列出缺失 case_id。
+
+失败判据（复审 R1 补充，评审 2026-11-20）
+----------------------------------------
+- **重复 case_id**：`load_jsonl` 直接抛 `ContractError`（退出码 4）；
+  即便绕过它（例如直接传内存列表），`build_report` 的 `no_duplicate_cases`
+  校验也会判失败（退出码 5）。
+- **缺失 case**：给出 `--corpus` 时，`no_missing_cases` 校验失败 → 退出码 5。
+  即「零记录」是**失败**，而不是仅作提示；报告仍会打印缺失清单供定位。
 
 用法
 ----
@@ -46,6 +54,7 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.is_file():
         raise ContractError(f"JSONL 不存在：{path}")
     rows: list[dict] = []
+    seen: dict[str, int] = {}
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
@@ -65,6 +74,14 @@ def load_jsonl(path: Path) -> list[dict]:
             if row.get("category") not in ALLOWED_CATEGORIES:
                 raise ContractError(
                     f"第 {lineno} 行 category 非法：{row.get('category')!r}")
+            cid = row.get("case_id")
+            if not isinstance(cid, str) or not cid:
+                raise ContractError(f"第 {lineno} 行 case_id 非法：{cid!r}")
+            if cid in seen:
+                # 重复 ID 会让每条 case 的「恰一条记录」契约失效，属数据契约错误
+                raise ContractError(
+                    f"第 {lineno} 行 case_id 重复：{cid}（首次出现在第 {seen[cid]} 行）")
+            seen[cid] = lineno
             rows.append(row)
     return rows
 
@@ -113,6 +130,12 @@ def build_report(records: list[dict],
         missing = [c for c in corpus_cases if c not in present]
         extra = sorted(present - set(corpus_cases))
 
+    # 重复 case_id：即使绕过 load_jsonl（例如直接传内存列表）也必须被判定为失败
+    counts: dict[str, int] = {}
+    for r in records:
+        counts[r["case_id"]] = counts.get(r["case_id"], 0) + 1
+    duplicates = sorted(cid for cid, n in counts.items() if n > 1)
+
     checks = {
         "total_equals_sum_by_category": sum(by_category.values()) == total,
         "total_equals_sum_by_action": sum(by_action.values()) == total,
@@ -121,9 +144,11 @@ def build_report(records: list[dict],
         "cross_table_conserved": all(
             sum(cross[c].values()) == by_category.get(c, 0) for c in cross),
         "each_record_single_category": len(records) == total,
+        "no_duplicate_cases": not duplicates,
     }
     if corpus_cases is not None:
         checks["no_extra_cases"] = not extra
+        checks["no_missing_cases"] = not missing
         checks["missing_plus_present_equals_corpus"] = (
             len(missing) + len(present) if not extra else False) == len(corpus_cases)
 
@@ -140,6 +165,7 @@ def build_report(records: list[dict],
         "corpus_cases": None if corpus_cases is None else len(corpus_cases),
         "missing_cases": missing,
         "extra_cases": extra,
+        "duplicate_cases": duplicates,
         "checks": checks,
     }
 
@@ -170,15 +196,22 @@ def render(rep: dict, jsonl_path: str, corpus_path: str | None) -> str:
     if corpus_path:
         out.append(f"语料：{corpus_path}")
     out.append(f"记录总数：{total}")
+    if rep["duplicate_cases"]:
+        out.append(f"[错误] case_id 重复（{len(rep['duplicate_cases'])} 个）："
+                   f"{', '.join(rep['duplicate_cases'])}"
+                   f" —— 违反「每个 case 恰一条记录」，本次判为失败")
+    else:
+        out.append("重复 case_id：无")
     if rep["corpus_cases"] is not None:
         out.append(f"语料 case 数：{rep['corpus_cases']}")
         if rep["missing_cases"]:
             out.append(f"零记录 case（{len(rep['missing_cases'])} 个，"
-                       f"属真实采集结果而非失败）：{', '.join(rep['missing_cases'])}")
+                       f"采集脚本成功但未产出记录，本次判为失败）："
+                       f"{', '.join(rep['missing_cases'])}")
         else:
             out.append("零记录 case：无")
         if rep["extra_cases"]:
-            out.append(f"[警告] JSONL 中出现了语料之外的 case：{rep['extra_cases']}")
+            out.append(f"[错误] JSONL 中出现了语料之外的 case：{rep['extra_cases']}")
     out.append("")
     out.append("【总体分布】")
     out.extend(_section("action", rep["by_action"], total))
