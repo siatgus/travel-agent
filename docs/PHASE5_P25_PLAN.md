@@ -2674,3 +2674,402 @@ action / reason / entity_text / statuses`。建议追加
    这样可把「生产写入路径」推迟到真正需要观察时评估。
 
 本申请零生产代码；不批准则 P2.6 维持未启动，本轮无任何实施。
+
+## 25. P2.6 增量 1+3 实施计划（评审 2026-11-20 裁定批准，待确认后实施，零生产代码）
+
+> **裁定落定（2026-11-20）**：批准 P2.6 批次 5.0 第一阶段
+> 「DecisionEngine 影子触达机制」，授权范围 = 增量 1（影子触点）+
+> 增量 3（测试组）。四项待裁定逐项落定：**r1 = 新增独立开关
+> `TRAVEL_DECISION_SHADOW` 默认 0（不复用组合）**；**r2 = 甲方案
+> （parser 影子段保留对象）**；**r3 = 仅内存记录（不落盘、不落
+> 原文）**；**r4 = 批准四项观察字段**。
+>
+> **明确不批准**：JSONL 持久化、`TRAVEL_SHADOW_LOG`、
+> `scripts/shadow_report.py`、生产观察数据采集、P3 接管/灰度/自动
+> 执行、§23.5 遗留整改、P2.5a 重复解析偏差（F6）追溯修改。
+>
+> 本轮为**计划交付**，零生产代码、零测试代码。经确认后按本节实施，
+> 实施完成再单独提交证据验收。行号坐标为当前 HEAD `e39ced5`；
+> 插入后同文件后续行号整体偏移，故改动一律以**锚点表达式**描述。
+
+### 25.0 前置工作区状态（如实申报）
+
+核查发现工作区存在一处**非本轮产生的格式污染**：
+`docs/PHASE5_P25_PLAN.md` 相对 HEAD 有 1417 插入 / 1372 删除的差异，
+经逐行 `rstrip` 对比确认为 **markdown 格式化工具重排**（表格列宽
+对齐 + 行尾双空格硬换行），**零语义改动**。若原样提交，会把 2789
+行格式噪音混入本轮证据链。
+
+处置（已执行，可逆）：原文件备份为
+`../P26Fmt_noise_backup.md`（仓库外，不进入工作区），随后
+`git checkout -- docs/PHASE5_P25_PLAN.md` 恢复 HEAD 基线。
+处置后 `git status --short` 的 tracked 修改为 **0 项**，untracked
+工件 **43 项**（全部为既有验收工件，本轮未新增）。本节 §25 的全部
+内容基于恢复后的基线书写。
+
+### 25.1 四项裁定 → 实施落点
+
+| 裁定 | 具体决定 | 实施落点（文档精确定位） |
+|---|---|---|
+| r1 开关 | 新增 `TRAVEL_DECISION_SHADOW`，未设置默认 `0`，仅显式 `"1"` 生效，不复用 CHANNEL/TAKEOVER | `orchestrator.py` 新增 `Orchestrator._decision_shadow_enabled()`（紧随 `_channel_enabled` 之后，:88-91 后） |
+| r1 运行约束 | 仅 `SHADOW=1 ∧ CHANNEL=0` 触发，pending 通道开启时**不额外调用** `decide()` | 同上方法内第二个 `return`；触点 `_decision_shadow()` 首行即此判定 |
+| r2 来源 | 甲方案：parser 现有影子段保留对象，与 dict 并存 | `parser.py` `ParseResult` 新增字段 + 影子段新增 1 行赋值（复用 `_rr.resolved`） |
+| r3 通道 | 仅内存：`shadow_log` / 内存 sink；不建文件、不加路径变量、不落原文 | `orchestrator.py` `_decision_shadow_log`（延迟构造）；触点签名**不含 utterance** |
+| r4 字段 | 增 `city_source` / `entity_city` / `confidence` / `candidates_count`，只读、不参与决策 | `decision.py` `_shadow()` 记录字典新增 4 键 + 常量 `SHADOW_OBSERVATION_KEYS` |
+
+### 25.2 触点定义（单点、单次、纯观察）
+
+**位置**：`handle()` 内，统一解析（`session.query_city = ctx.parse.query_city`）
+**之后**、pending 消费通道（`---- 1.75`）**之前**。锚点：
+
+```
+        session.query_city = ctx.parse.query_city
+        + <本轮新增 5 行：1.6 影子触达>
+        # ---- 1.75 pending 消费通道（P2.4a 单点接入，唯一拦截点）----
+```
+
+选此位置的理由（三条）：
+
+1. 解析结果（含 `shadow_resolved_objs`）刚产出，是全流程唯一的
+   「本轮解析已完成」时点；
+2. 位于全部业务分流之前，任何 route（qa / guard / plan / pending）
+   都恰好经过一次——满足「每轮恰好一次」；
+3. `CHANNEL=0` 时其后的 `_pending_gate` / `_allow_handler_consume` /
+   `_pending_produce` 三者均恒返回 `None`（逐位旁路），触点插入不改变
+   任何既有短路时序。
+
+**触发条件（AND，缺一不触发）**：
+
+| 条件 | 代码 | 不满足时行为 |
+|---|---|---|
+| `TRAVEL_DECISION_SHADOW == "1"` | `os.environ.get(..., "0").strip() != "1"` → False | 立即 return（不构造 engine、不建容器、零开销） |
+| `TRAVEL_PENDING_CHANNEL != "1"` | 同上第二判定 | 立即 return（pending 钩子独占本轮决策调用，避免重复计算） |
+
+**调用契约（五条，实施时逐条对应 docstring）**：
+
+1. 恒返回 `None`，**绝不短路**任何业务分支、**绝不写** `ctx` /
+   `session` / store（零副作用）；
+2. 每轮**恰好一次** `decide()`（含候选为空的轮次，见 §25.6-④）；
+3. 输入 `resolved` 只能是 `ctx.parse.shadow_resolved_objs`，**不得**
+   再调 `_extract_candidates` / `_resolve_entities`（甲方案红线）；
+4. 记录来源 = `decide()` 自身写入 `engine.shadow_log` 的那一条的
+   **浅拷贝**；调用前后比较长度，长度未增（决策内部异常）则**不复制**，
+   杜绝复制到上一轮的陈旧记录；
+5. 触点内一切异常（含 `decide()` 抛出、记录装配失败）→ 追加一条
+   `_pending_warnings` 文本后 `pass`，**永不外抛**。
+
+**签名设计的合规意义**：`_decision_shadow(self, session, ctx)` **不接收
+用户问句**——「不落原文」不是靠自觉，而是从函数签名层面物理上不可能
+把原文写进记录。
+
+### 25.3 生产文件改动清单（三个文件，diff 草案）
+
+#### 25.3.1 `src/travel_agent/parser.py`（2 处）
+
+**① `ParseResult` 字段区（锚点：`shadow_resolved: list[dict] = field(default_factory=list)` 之后）**
+
+```diff
+     # 影子运行（Phase 4）：EntityResolver 的实体验证四档分流结果，同样
+     # 只记录不驱动业务。dict 见 entity_resolver.ResolvedCandidate。
+     shadow_resolved: list[dict] = field(default_factory=list)
++    # 影子运行（P2.6 增量 3，评审 2026-11-20 批准甲方案）：与上一字段
++    # **同一批** ResolvedCandidate 对象原样保留，供 DecisionEngine 影子
++    # 触达直接消费——绝不二次 extract/resolve。仅影子消费，绝不进入任何
++    # 业务分支。repr/compare 均排除：不改变 ParseResult 的日志输出与
++    # 相等语义（既有测试比较逻辑零扰动）。
++    shadow_resolved_objs: list = field(default_factory=list,
++                                       repr=False, compare=False)
+```
+
+**② 影子解析段（锚点：`res.shadow_resolved = [r.as_dict() for r in _rr.resolved]` 之后）**
+
+```diff
+             from .entity_resolver import resolve as _resolve_entities
+             _rr = _resolve_entities(_shadow.poi_candidates, ctx)
+             res.shadow_resolved = [r.as_dict() for r in _rr.resolved]
++            # P2.6：同一批对象保留（甲方案）——零重复解析、零重复验证
++            res.shadow_resolved_objs = list(_rr.resolved)
+             res.shadow_notes.extend(_rr.notes)
+```
+
+**边界**：不改 `_extract_candidates` 调用、不改 `_resolve_entities` 的
+参数与次数、不改任何 dict 结构、不改 Resolver 返回语义、不新增 import。
+
+#### 25.3.2 `src/travel_agent/decision.py`（2 处）
+
+**① 模块常量（锚点：`_PLAN_PREFIX = "plan"` 之后）**
+
+```diff
+ _PLAN_PREFIX = "plan"
++
++# P2.6 增量 3（评审 2026-11-20 批准）：影子观察字段——只记录，不参与
++# 决策；未知值保留 None，绝不推断补齐（口径见设计文档 §25.4）。
++SHADOW_OBSERVATION_KEYS = ("city_source", "entity_city",
++                           "confidence", "candidates_count")
+```
+
+**② `DecisionEngine._shadow()`（锚点：`"statuses": [...]` 键之后）**
+
+```diff
+     def _shadow(self, result, intent, resolved, takeover_on,
+                 batch_on) -> None:
++        entity = (result.entity if result else None) or {}
+         rec = {
+             "intent": intent,
+             "takeover": takeover_on,
+             "batch_enabled": batch_on,
+             "action": result.action if result else None,
+             "reason": result.reason if result else "未形成结论",
+             "entity_text": (result.entity or {}).get("name")
+             if result else None,
+             "statuses": [getattr(r, "status", "") for r in (resolved or [])],
++            # ---- P2.6 增量 3（纯记录，不参与决策）----
++            "city_source": result.city_source if result else None,
++            "entity_city": entity.get("city"),
++            "confidence": result.confidence if result else None,
++            "candidates_count": len(resolved or []),
+         }
+```
+
+**边界**：`DecisionResult` 的字段、`__post_init__` 校验、`to_dict()`、
+`decide()` 的三态返回**全不改**；不动 `_build` 及任何 HC 子步；
+record 只做键扩展（既有 7 键逐字不变，新增 4 键追加在末尾，既有
+`shadow_log[0]["action"]` / `["takeover"]` 等断言不受影响）。
+
+#### 25.3.3 `src/travel_agent/orchestrator/orchestrator.py`（5 处）
+
+**① `__init__`（锚点：`self._revalidator: PendingRevalidator | None = None` 之后）**
+
+```diff
+         # P2.5b：重验证装配（同上，channel=0 永不构造，零开销旁路）
+         self._revalidator: PendingRevalidator | None = None
++        # P2.6：决策影子观察记录（延迟构造——开关关闭时恒为 None，
++        # 零容器、零记录）。纯内存：不落盘、不落原文、无跨进程语义
++        # （生命周期见 §25.4.3）
++        self._decision_shadow_log: list[dict] | None = None
+```
+
+**② 开关（锚点：`_channel_enabled` 之后）**
+
+```diff
+     @staticmethod
+     def _channel_enabled() -> bool:
+         """TRAVEL_PENDING_CHANNEL 开关（默认 0 = 完全旁路）。"""
+         return os.environ.get("TRAVEL_PENDING_CHANNEL", "0").strip() == "1"
++
++    @staticmethod
++    def _decision_shadow_enabled() -> bool:
++        """TRAVEL_DECISION_SHADOW 开关（默认 0 = 完全旁路）。
++
++        P2.6 增量 1（评审 2026-11-20 裁定 r1）：独立开关，不复用
++        CHANNEL/TAKEOVER 组合，也不改变 pending 通道的任何既有判定。
++        运行约束（裁定同条）：仅 pending 通道关闭时启用影子触达——
++        避免同一轮出现两次 decide() 计算（pending 钩子已在本轮决策
++        一次），这是「不重复执行」而非复用开关语义。
++        """
++        if os.environ.get("TRAVEL_DECISION_SHADOW", "0").strip() != "1":
++            return False
++        return os.environ.get("TRAVEL_PENDING_CHANNEL", "0").strip() != "1"
+```
+
+**③ 触点方法（锚点：`_ensure_decider` 之后、`_pending_produce` 之前）**
+
+```diff
+     def _ensure_decider(self) -> DecisionEngine:
+-        """延迟构造决策引擎（同上；channel=0 永不构造）。"""
++        """延迟构造决策引擎（同上；两个开关均关时永不构造）。"""
+         if self._decider is None:
+             self._decider = DecisionEngine()
+         return self._decider
++
++    def _decision_shadow(self, session, ctx) -> None:
++        """P2.6 增量 1：DecisionEngine 影子触达（纯观察，恒无短路）。
++
++        ...（docstring 全文见 §25.2 调用契约五条）...
++        """
++        if not self._decision_shadow_enabled():
++            return
++        try:
++            parse = getattr(ctx, "parse", None)
++            if parse is None:              # 防御：解析缺失 → 不决策
++                return
++            objs = getattr(parse, "shadow_resolved_objs", None) or []
++            # rctx 与 P2.5a 生产钩子（_pending_produce 内）逐字同构，
++            # 口径一致性优先（含 last_city 取 query_city 的既有口径）
++            rctx = {"slots": getattr(session, "slots", {}) or {},
++                    "trip_dest": (getattr(parse, "destination", "") or ""),
++                    "last_city": (getattr(session, "query_city", "") or "")}
++            engine = self._ensure_decider()
++            before = len(engine.shadow_log)
++            engine.decide(parse, list(objs), rctx,
++                          intent=getattr(parse, "intent", "") or None)
++            if len(engine.shadow_log) > before:
++                if self._decision_shadow_log is None:
++                    self._decision_shadow_log = []
++                self._decision_shadow_log.append(
++                    dict(engine.shadow_log[-1]))
++        except Exception as exc:
++            self._pending_warnings.append(
++                f"decision shadow: {type(exc).__name__}: {exc}")
+```
+
+**④ `handle()` 插入调用（锚点见 §25.2）**
+
+```diff
+         session.query_city = ctx.parse.query_city
++
++        # ---- 1.6 P2.6 影子触达：本轮解析结果 → DecisionEngine 纯观察 ----
++        # 单点单次：开关开且 pending 通道关时每轮恰好一次 decide()，
++        # 恒返回 None、不短路、不写 ctx/session/store（§25.2 契约）
++        self._decision_shadow(session, ctx)
+ 
+         # ---- 1.75 pending 消费通道（P2.4a 单点接入，唯一拦截点）----
+```
+
+**⑤ `_ensure_decider` docstring** 一行修订（见 ③ 中 diff）。
+
+### 25.4 记录契约
+
+#### 25.4.1 字段表（11 键；前 7 键为 P1 起既有，逐字不变）
+
+| # | 字段 | 来源 | 未知值语义 | 是否参与决策 |
+|---|---|---|---|---|
+| 1 | `intent` | `parse.intent` / 入参 | `""` | 否（记录） |
+| 2 | `takeover` | 决策内 `takeover_on` | — | 否（记录真实门控值） |
+| 3 | `batch_enabled` | `intent in batches` | — | 否 |
+| 4 | `action` | `DecisionResult.action` | `None`（未形成结论） | 否（记录） |
+| 5 | `reason` | `DecisionResult.reason` | `"未形成结论"` | 否 |
+| 6 | `entity_text` | `DecisionResult.entity["name"]` | `None` | 否 |
+| 7 | `statuses` | 逐候选 `rc.status` | `[]` | 否 |
+| 8 | `city_source` | `DecisionResult.city_source` | `None` | **否（本轮新增）** |
+| 9 | `entity_city` | `DecisionResult.entity["city"]` | `None` | **否（新增）** |
+| 10 | `confidence` | `DecisionResult.confidence` | `None` | **否（新增）** |
+| 11 | `candidates_count` | `len(resolved)`（含 skipped） | `0` | **否（新增）** |
+
+**字段口径必须注意的两点（实施即如此，文档先行登记）**：
+
+- `city_source` / `confidence` 来自 `_build()` 的产物而非 `decide()`
+  的返回值——因此 `TAKEOVER=0`、`CHANNEL=0` 下 `decide()` 返回 `None`
+  时，记录里仍是**本轮真实决策值**，不是 `None`。这正是「能观察到
+  未接管时的决策」的机制前提。
+- `entity_city` 只在 `action == "execute"` 时有值：`clarify` /
+  `conservative` / `reject_reply` / `category_path` / `deferred` 的
+  `DecisionResult` 按冻结契约**不携带 entity**（`_build` 内 `entity=None`），
+  故一律 `None`。**不做推断补齐**（不从 `matches[0].city` 反查），
+  这是裁定「未知值必须保留 None」的直接后果；需要该值时应在采集
+  授权阶段另行设计，不在本轮。
+
+#### 25.4.2 每轮记录条数
+
+`decide()` 自身恒追加 1 条到 `engine.shadow_log`（P1 起既有行为），
+触点再复制 1 条到 `_decision_shadow_log`。因此：
+
+- 本轮新增的**可验收对象** = `Orchestrator._decision_shadow_log`
+  （每轮至多 1 条，§25.5 全部断言以此为准）；
+- `engine.shadow_log` 中的那条是 `decide()` 的既有纯记录，**不是
+  本轮新增**，两者字段值相等、对象不同（浅拷贝）。
+
+#### 25.4.3 可访问范围与生命周期（评审要求必须写明）
+
+| 维度 | 事实 |
+|---|---|
+| 归属 | `Orchestrator` 实例属性；该实例由 `Session._orchestrator` 惰性持有（`dialogue.py:889`，**会话级单例**） |
+| 累积范围 | 同一 `Session` 对象的全部轮次（跨该会话的多请求累积），**不同 Session 之间互不可见** |
+| 可见性 | 仅进程内可读（`orc._decision_shadow_log`）；本轮无任何生产读取方、无 API、无管理端导出 |
+| 生命周期 | 随 `Session`/进程结束即丢失；**无持久化、无跨进程、无跨会话共享**——不得描述为「跨请求持久观察数据」 |
+| 容量 | **无上限**（随会话轮次线性增长） |
+| 裁剪/轮转 | 本轮**不实现**（属未授权的采集系统范畴，登记为生产启用前必须另行设计的门槛） |
+
+### 25.5 测试矩阵（增量 3；8 个函数，全部落在 `tests/test_pending_channel.py`）
+
+运行方式不变：`python tests/test_pending_channel.py`，`exit=0` 且
+`fail=0`。新增函数插在 `test_p25b_channel0_zero_revalidation` 之后、
+`main()` 之前，并加入 `main()` 的调用列表。
+
+| 测试函数 | 覆盖 | 构造 | 关键断言 |
+|---|---|---|---|
+| `test_p26_shadow_switch_off_frozen` | **S1** + S7 部分 | env 四组：未设 / `"0"` / `"false"` / `""`；桩 `entity_resolver.resolve` 计数 | ①`_decision_shadow_enabled()` False；②`_decider is None`；③`_decision_shadow_log is None`；④`resolve` 计数 == 1（仅 parser）；⑤回复与 route 与基线一致（非 `pending_*`）；⑥`_producer is None` |
+| `test_p26_shadow_switch_on_single_call` | **S2** | `SHADOW=1`、CHANNEL 未设；预置 `_CountingEngine(DecisionEngine)` 到 `orc._decider` | ①三类问句（poi / weather / plan）各一轮 → 每轮 decide 计数 +1、记录 +1；②两轮后 `len == 2` 且 `engine.shadow_log` 增量同为 1/轮；③记录含全部 11 键（`SHADOW_OBSERVATION_KEYS` 全覆盖） |
+| `test_p26_shadow_record_matches_independent_decide` | **S3** | 同一 `parse` / 同一 `objs` / 同一 `rctx`，另建独立 `DecisionEngine()` 调一次 `decide()` | ①触点记录 11 字段与独立记录**逐字段 `==`**；②`_decision_shadow_log[0] is not engine.shadow_log[-1]`（副本非引用） |
+| `test_p26_shadow_exception_isolated` | **S4** | 三路注入：①打桩 `DecisionEngine._build` 抛异常；②`shadow_sink` 抛异常；③`ctx.parse` 删除 `shadow_resolved_objs` 属性 | ①`handle` 正常返回 Reply、route 正常、无记录、`_pending_warnings` 含 `decision shadow:`；②sink 异常下记录仍生成、业务不受影响；③属性缺失 → 以空列表决策、仍出回复不崩 |
+| `test_p26_shadow_zero_network_and_no_reparse` | **S5** + 附加检查一 | 打桩 `agent.dispatch` 计数；打桩 `entity_resolver.resolve` 计数并返回**指纹对象**（`confidence=0.777`、status 组合固定）；打桩 `_orch_mod._resolve_entities` 为「调用即置 FAIL 标记」 | ①`dispatch` 计数 == 0；②`entity_resolver.resolve` 计数 == 1（parser 唯一一次）；③`_orch_mod._resolve_entities` 调用 0 次；④记录 `confidence == 0.777`、`candidates_count == len(parse.shadow_resolved_objs)`、`statuses` 与指纹一致 → 证明对象来自本轮 parser 产物而非第二次解析 |
+| `test_p26_shadow_zero_side_effect` | **S6** + 附加检查三 | 真实 `handle` 一轮（`SHADOW=1`、`CHANNEL=0`） | ①`_pending_manager is None`、`_producer is None`（零 store/零 producer）；②`session.slots` / `plan_made` / `last_plan` 深拷贝前后相等；③`ctx.pending_decision is None`、`ctx.route` 不变；④本轮 `resolved` 对象 `as_dict()` 快照前后逐字段相等（记录未反向污染业务对象）；⑤`DecisionResult` 快照（`to_dict()`）与记录中对应字段一致 |
+| `test_p26_shadow_channel1_no_double_decide` | 附加检查二 | `SHADOW=1 ∧ CHANNEL=1`，预置 Pending 跑消费轮 | ①`_decision_shadow_log is None`（触点未触达）；②`engine.decide` 计数 == 1（仅 pending 钩子）；③消费轮 route / 回复与既有 P2.5b 基线一致 |
+| `test_p26_switch_freeze` | **S7** | 三开关独立设置 | ①`_channel_enabled()` 在未设/`"0"`/`"1"` 三态行为不变；②`TRAVEL_DECISION_TAKEOVER` 未设时 `decide()` 返回 `None`（既有语义）；③新开关默认 False；④全仓开关读取点仅出现在 §25.3 声明的两处 |
+
+**S8（范围与回归）不作为测试函数**：由证据交付承担（§25.7）。
+
+### 25.6 申报事项（实施前须评审知悉的八项）
+
+1. **解冻申报**：`decision.py` 在 §22.7.5 冻结清单（9 独立文件）之内。
+   本轮依据裁定 r4「允许触碰 decision.py，但仅限影子记录字段和记录
+   构造」而**定向解冻**，改动范围严格限于 `_shadow()` 记录字典 4 键 +
+   一个常量；`entity_resolver.py`（同属该清单）仍**零触碰**——这正是
+   选甲方案的理由。其余 7 个独立文件 + `handlers/` 目录继续零 diff。
+2. **注释语义变化**：`_ensure_decider` docstring 由「channel=0 永不构造」
+   改为「两个开关均关时永不构造」。**行为未变**（仍为延迟构造），
+   但原注释在新开关下不再成立，故必须同步修订——这是唯一一处非新增
+   的代码行改动，如实申报。
+3. **双记录**：§25.4.2 说明的 2 条/轮结构，验收对象为
+   `_decision_shadow_log`。
+4. **空候选轮也决策**：`objs` 为空时仍调用一次 `decide()`（返回
+   `None`，记录 `action=None`、`reason="未形成结论"`、`candidates_count=0`），
+   以满足「每轮恰好一次」。**已知观察盲点**：此时无法区分「本轮确实
+   无候选」与「parser 影子段抛异常被兜底」——两者都表现为空列表。
+   该盲点登记为已知局限，本轮不引入新字段区分（r4 只批准 4 字段）。
+5. **rctx 口径**：触点 `rctx` 与 `_pending_produce` 内构造**逐字同构**，
+   包括 `last_city` 取 `session.query_city`（该值刚在上一行被写成本轮
+   `parse.query_city`，严格说不是「上一轮城市」）。这是**沿用既有口径**
+   而非修正——本轮不引入第二种上下文构造方式，偏差登记为既有实现
+   事实（与 F6 同类，须独立授权才能整改）。
+6. **记录无上限**：见 §25.4.3。生产开关保持 0，本轮无实际增长风险；
+   启用前必须另行设计容量/轮转。
+7. **P2.5a 重复解析偏差（F6）不修**：影子触点走 parser 对象，pending
+   钩子仍走自身 `extract + resolve`。两条路径并存但**互不引用**，
+   `CHANNEL=1` 时触点不触达，故不会叠加为第三次解析。
+8. **格式污染处置**：见 §25.0（已备份恢复，可逆）。
+
+### 25.7 S8 验收证据清单（实施交付时提供）
+
+1. `git show --format=fuller --stat` 全文（本轮实施 commit）；
+2. 三个生产文件完整 diff（`git diff <base>..<head> -- src/`），
+   并逐条对应 §25.3 的 9 处改动（parser 2 + decision 2 + orchestrator 5）；
+3. 冻结清单逐项 `git diff --stat`（沿用 §22.7.5 四类计数口径）：
+   9 独立文件（`decision.py` 本轮定向解冻、其余 8 项零 diff）+
+   `handlers/` 目录级 + 目录内 9 个 `.py` 核查；
+4. `python tests/test_pending_channel.py` 完整原始输出 + 退出码
+   （预计 357 + 新增断言数），并声明新增函数数；
+5. 17 套件逐一原始输出 + 退出码（清单见 §17.4：pending / producer /
+   revalidator / sqlite / channel / interceptor / decision / orchestrator /
+   routing / reply / resolver / corpus v4 / parser / extractor / dialogue /
+   server / conversations）；
+6. 三开关运行时状态：`TRAVEL_DECISION_SHADOW` 未设置（默认 0）、
+   `TRAVEL_PENDING_CHANNEL=0`、`TRAVEL_DECISION_TAKEOVER` 未设置；
+7. `git status --short` 原始输出（tracked 修改应为 0）。
+
+### 25.8 明确不做（本轮）
+
+- 不写任何文件（无 JSONL、无 `TRAVEL_SHADOW_LOG`、无目录创建）；
+- 不做 `scripts/shadow_report.py`、不做离线报告与统计分析；
+- 不落用户问句原文（签名层面已排除）；
+- 不改 `decision.py` 的 `DecisionResult` 语义、`decide()` 三态、任何
+  HC 子步与批次白名单；
+- 不改 `parser.py` 的候选提取 / 实体解析 / 排序 / 置信度规则，
+  不改 `shadow_resolved` 的 dict 结构；
+- 不碰 `entity_resolver.py` 及 §22.7.5 冻结清单其余 8 项；
+- 不重构 `_pending_produce`、不修 F6、不触碰 §23.5 五项遗留；
+- 不开启任何生产开关、不进入 P3、不做灰度或接管。
+
+### 25.9 请求确认
+
+请确认以下三点后即按本节实施（单 commit，测试与文档同批）：
+
+1. §25.2 的**触点位置与触发条件**（解析之后、pending 通道之前；
+   `SHADOW=1 ∧ CHANNEL=0`）；
+2. §25.3 的**9 处代码改动**（parser 2 / decision 2 / orchestrator 5，
+   含第 2 项申报的 docstring 修订）与 §25.4 的**字段口径**
+   （尤其 `entity_city` 在非 execute 轮恒为 `None`、不做推断补齐）；
+3. §25.5 的**8 个测试函数与断言矩阵**是否覆盖 S1–S8 与三项附加检查；
+   若需增删断言，请在确认时指出，避免实施后返工。
+
+本节零代码；未获确认前不进入实施。
