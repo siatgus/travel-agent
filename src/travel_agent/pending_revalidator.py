@@ -42,6 +42,10 @@ from .entity_resolver import (STATUS_AMBIGUOUS, STATUS_CONFIRMED,
 from .entity_resolver import resolve as _resolve_entities
 from .pending import REVALIDATE_STATUSES
 from .pending_producer import PendingProducer
+# R-01（I-2）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
+from .retention import (LIM_DETAIL, LIM_ID, SHADOW_CAPACITY,
+                        RetentionInvariantError, append_bounded,
+                        coerce_text, new_stats)
 
 # HC-4 角色红线（§3.1 同源）：negated / remove 永不进入 execute
 # DecisionResult 构造（producer 已在快照层排除，此处纵深防御）。
@@ -109,6 +113,9 @@ class PendingRevalidator:
         self._shadow_sink = shadow_sink          # 可选回调：record(dict)
         self._producer = producer                # None 时延迟构造
         self.shadow_log: list[dict] = []         # 重验证影子（纯记录）
+        # ---- R-01（I-2）：S5 容量治理状态 ----
+        self.shadow_dead = False                 # 容器不可判定后不再写入
+        self.shadow_stats = None                 # 首次成功追加后才就位
 
     # -------------------------------------------------- 影子记录
 
@@ -117,17 +124,37 @@ class PendingRevalidator:
                 candidate_id: str | None = None,
                 revalidate_status: str | None = None) -> None:
         """重验证影子记录（§14.4 预申报字段清单；B5 精神：记录自身
-        一切异常被吞掉，绝不影响主链路与四分支流转）。"""
+        一切异常被吞掉，绝不影响主链路与四分支流转）。
+
+        R-01（I-2）：有界追加 + 失效标记。顺序为 ``append_bounded`` 成功
+        → 提交 stats → 调用 sink（评审 2026-11-23 修订 2）。
+        """
+        rec = None
+        append_succeeded = False
         try:
+            if self.shadow_dead:
+                return
             rec = {"stage": "revalidator", "action": action,
-                   "detail": detail, "pending_id": pending_id,
-                   "candidate_id": candidate_id,
+                   "detail": coerce_text(detail, LIM_DETAIL),
+                   "pending_id": coerce_text(pending_id, LIM_ID),
+                   "candidate_id": coerce_text(candidate_id, LIM_ID),
                    "revalidate_status": revalidate_status}
-            self.shadow_log.append(rec)
-            if self._shadow_sink is not None:
-                self._shadow_sink(rec)
+            stats = self.shadow_stats
+            if stats is None:
+                stats = new_stats(self.shadow_log, SHADOW_CAPACITY)
+            append_bounded(self.shadow_log, rec, stats)
+            if self.shadow_stats is None:
+                self.shadow_stats = stats        # 先于 sink 提交
+            append_succeeded = True
+        except RetentionInvariantError:
+            self.shadow_dead = True              # 先置失效，再吞掉
         except Exception:
             pass
+        if append_succeeded and self._shadow_sink is not None:
+            try:
+                self._shadow_sink(rec)
+            except Exception:
+                pass
 
     def _producer_of(self) -> PendingProducer:
         if self._producer is None:

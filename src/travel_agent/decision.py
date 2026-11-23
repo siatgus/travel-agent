@@ -40,6 +40,11 @@ from .entity_resolver import (
     REASON_CROSS_SOURCE_EMPTY,
     AMBIG_REASON_TYPE,
 )
+# R-01（I-2 + I-3）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
+from .retention import (LIM_ENTITY, LIM_ENTITY_CITY, LIM_REASON,
+                        SHADOW_CAPACITY, STATUSES_MAX_ITEMS, STATUS_ITEM_MAX,
+                        RetentionInvariantError, append_bounded,
+                        clip_str_list, coerce_text, new_stats)
 
 # ---- 六档 action（v3.2.1 §2.3 冻结枚举） ----
 ACTION_EXECUTE = "execute"              # 已确认，进入原业务
@@ -141,6 +146,13 @@ class DecisionEngine:
         self.batches = tuple(batches) if batches else DEFAULT_BATCHES
         self.shadow_sink = shadow_sink        # 可选回调：record(dict)
         self.shadow_log: list[dict] = []      # 影子决策记录（纯记录）
+        # ---- R-01（I-2）：S2 容量治理状态（惰性，不在此构造 stats）----
+        # shadow_dead：跨轮失效标记——append_bounded 抛
+        # RetentionInvariantError 后置 True，此后不再追加（容器不可判定时
+        # 禁止继续写入）；shadow_stats：首次**成功**追加后才就位
+        # （I-3 检测点读它的 total_appended 判断本轮是否产生了新记录）。
+        self.shadow_dead = False
+        self.shadow_stats = None
 
     # -------------------------------------------------- 主入口
 
@@ -189,26 +201,50 @@ class DecisionEngine:
 
     def _shadow(self, result, intent, resolved, takeover_on,
                 batch_on) -> None:
+        """写一条影子决策记录（R-01：有界 + 失效标记）。
+
+        写入顺序（评审 2026-11-23 修订 2）：``append_bounded`` 成功 →
+        提交 stats → 调用 sink。sink 失败不回滚记录、不丢计数。
+        只捕获 ``RetentionInvariantError``（置 dead 后返回）；``_build``
+        之后的任何其他异常仍按原行为外抛，业务边界不变。
+        """
+        if self.shadow_dead:
+            return                                # 跨轮失效：不再写该容器
         entity = (result.entity if result else None) or {}
         rec = {
             "intent": intent,
             "takeover": takeover_on,
             "batch_enabled": batch_on,
             "action": result.action if result else None,
-            "reason": result.reason if result else "未形成结论",
-            "entity_text": (result.entity or {}).get("name")
-            if result else None,
-            "statuses": [getattr(r, "status", "") for r in (resolved or [])],
+            "reason": coerce_text(result.reason if result else "未形成结论",
+                                  LIM_REASON),
+            "entity_text": coerce_text(
+                (result.entity or {}).get("name") if result else None,
+                LIM_ENTITY),
+            "statuses": clip_str_list(
+                [getattr(r, "status", "") for r in (resolved or [])],
+                STATUSES_MAX_ITEMS, STATUS_ITEM_MAX),
             # ---- P2.6 增量 3（纯记录，不参与决策）----
             # 取值对象是 _build() 的返回值 result（见 PHASE5_P25_PLAN
             # §25.4.2 调用链），与本方法所属 decide() 的对外返回值无关：
             # TAKEOVER=0 时 decide() 返回 None，此处仍有本轮真实决策值。
             "city_source": result.city_source if result else None,
-            "entity_city": entity.get("city"),
+            "entity_city": coerce_text(entity.get("city"), LIM_ENTITY_CITY),
             "confidence": result.confidence if result else None,
             "candidates_count": len(resolved or []),
         }
-        self.shadow_log.append(rec)
+        stats = self.shadow_stats
+        if stats is None:
+            # 惰性构造：current_size 取容器真实 len（不假设 0）
+            stats = new_stats(self.shadow_log, SHADOW_CAPACITY)
+        try:
+            append_bounded(self.shadow_log, rec, stats)
+        except RetentionInvariantError:
+            # 容器不可判定：先置失效，本轮不写、不重试、不修补
+            self.shadow_dead = True
+            return
+        if self.shadow_stats is None:
+            self.shadow_stats = stats              # 成功后才提交（先于 sink）
         if self.shadow_sink is not None:
             try:
                 self.shadow_sink(rec)

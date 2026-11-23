@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from .decision import ACTION_CLARIFY, DecisionResult  # noqa: F401  (契约引用)
 from .dialogue import Reply   # P2.5a-R2：保守回复第二层自建用（只读不修改）
 from .entity_resolver import STATUS_AMBIGUOUS
+# R-01（I-2）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
+from .retention import (LIM_DETAIL, LIM_ID, SHADOW_CAPACITY,
+                        RetentionInvariantError, append_bounded,
+                        coerce_text, new_stats)
 
 # HC-4 角色红线（§3.1）：与 decision._HC4_ROLES 同值。decision 的
 # 私有常量不便 import，双处同值由 P1 HC-4 负向测试 + 本模块 P1 测试
@@ -76,21 +80,45 @@ class PendingProducer:
         self._id_gen = id_gen or (lambda: uuid.uuid4().hex[:12])
         self._shadow_sink = shadow_sink          # 可选回调：record(dict)
         self.shadow_log: list[dict] = []         # 生产侧影子记录（纯记录）
+        # ---- R-01（I-2）：S4 容量治理状态 ----
+        self.shadow_dead = False                 # 容器不可判定后不再写入
+        self.shadow_stats = None                 # 首次成功追加后才就位
 
     # -------------------------------------------------- 影子记录
 
     def _shadow(self, action: str, detail: str = "",
                 pending_id: str | None = None) -> None:
         """生产侧影子记录（B5 精神：记录自身一切异常被吞掉，绝不
-        影响主链路、绝不改变补偿矩阵分支）。"""
+        影响主链路、绝不改变补偿矩阵分支）。
+
+        R-01（I-2）：有界追加 + 失效标记。顺序为 ``append_bounded`` 成功
+        → 提交 stats → 调用 sink（评审 2026-11-23 修订 2）；sink 是否
+        调用由独立 ``append_succeeded`` 决定。
+        """
+        rec = None
+        append_succeeded = False
         try:
+            if self.shadow_dead:
+                return
             rec = {"stage": "producer", "action": action,
-                   "detail": detail, "pending_id": pending_id}
-            self.shadow_log.append(rec)
-            if self._shadow_sink is not None:
-                self._shadow_sink(rec)
+                   "detail": coerce_text(detail, LIM_DETAIL),
+                   "pending_id": coerce_text(pending_id, LIM_ID)}
+            stats = self.shadow_stats
+            if stats is None:
+                stats = new_stats(self.shadow_log, SHADOW_CAPACITY)
+            append_bounded(self.shadow_log, rec, stats)
+            if self.shadow_stats is None:
+                self.shadow_stats = stats        # 先于 sink 提交
+            append_succeeded = True
+        except RetentionInvariantError:
+            self.shadow_dead = True              # 先置失效，再吞掉
         except Exception:
             pass
+        if append_succeeded and self._shadow_sink is not None:
+            try:
+                self._shadow_sink(rec)
+            except Exception:
+                pass
 
     # -------------------------------------------------- 候选构建
 

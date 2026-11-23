@@ -41,6 +41,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from travel_agent.pending import PENDING_OPEN, _ConsumeOutcome, _epoch
+# R-01（I-2）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
+from travel_agent.retention import (LIM_ID, LIM_REASON, LIM_UTTERANCE,
+                                    SHADOW_CAPACITY, RetentionInvariantError,
+                                    append_bounded, clip_evidence,
+                                    coerce_text, new_stats)
 
 # ---- 九类互斥 verdict（P2.3 冻结契约） ----
 V_CONSUME = "consume"                       # 可靠选择定位唯一候选
@@ -227,6 +232,9 @@ class PendingInterceptor:
         self._store = store
         self.shadow_sink = shadow_sink       # 可选回调：record(dict)
         self.shadow_log: list[dict] = []     # 影子判定记录（纯记录）
+        # ---- R-01（I-2）：S3 容量治理状态（_v 与 gate 共用同一池）----
+        self.shadow_dead = False             # 容器不可判定后不再写入
+        self.shadow_stats = None             # 首次成功追加后才就位
         if reselect_window is None:
             reselect_window = int(
                 os.environ.get("TRAVEL_PENDING_RESELECT_WINDOW",
@@ -468,13 +476,39 @@ class PendingInterceptor:
         return _epoch(now)
 
     def _v(self, verdict, ut, now_e, **kw) -> InterceptVerdict:
-        v = InterceptVerdict(verdict=verdict, **kw)
-        rec = {"utterance": ut, "verdict": v.verdict,
-               "pending_id": v.pending_id,
-               "candidate_id": v.candidate_id, "reason": v.reason,
-               "evidence": dict(v.evidence), "ts": now_e}
-        self.shadow_log.append(rec)
-        if self.shadow_sink is not None:
+        """构造 verdict 并写一条影子判定记录（R-01：有界 + 失效标记）。
+
+        ``v`` 的构造、返回值和业务分支完全在观察支路之外——记录侧任何
+        失败都不改变判定结果。写入顺序（评审 2026-11-23 修订 1/2）：
+        ``append_bounded`` 成功 → 提交 stats → 调用 sink；sink 是否调用
+        由独立 ``append_succeeded`` 决定，**不再**依据 ``rec is not None``
+        （rec 在追加前已赋值，追加失败时仍非 None）。
+        """
+        v = InterceptVerdict(verdict=verdict, **kw)   # 业务：保护范围外
+        rec = None
+        append_succeeded = False
+        if not self.shadow_dead:
+            try:
+                rec = {"utterance": coerce_text(ut, LIM_UTTERANCE),
+                       "verdict": coerce_text(v.verdict, LIM_ID),
+                       "pending_id": coerce_text(v.pending_id, LIM_ID),
+                       "candidate_id": coerce_text(v.candidate_id, LIM_ID),
+                       "reason": coerce_text(v.reason, LIM_REASON),
+                       "evidence": clip_evidence(v.evidence),
+                       "ts": now_e}
+                stats = self.shadow_stats
+                if stats is None:
+                    stats = new_stats(self.shadow_log, SHADOW_CAPACITY)
+                append_bounded(self.shadow_log, rec, stats)
+                if self.shadow_stats is None:
+                    self.shadow_stats = stats         # 先于 sink 提交
+                append_succeeded = True
+            except RetentionInvariantError:
+                # 顺序不可交换：先置失效，再吞掉（不重试、不追 warning）
+                self.shadow_dead = True
+            except Exception:
+                pass
+        if append_succeeded and self.shadow_sink is not None:
             try:
                 self.shadow_sink(rec)
             except Exception:

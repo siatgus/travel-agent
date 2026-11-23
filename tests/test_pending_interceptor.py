@@ -570,6 +570,250 @@ def test_dual_impl_parity() -> None:
           mem == sql, f"mem={mem}\nsql={sql}")
 
 
+# ------------------------------------------------ R-01（I-2）：S3 有界化
+
+def _probe_nodes(obj) -> int:
+    if isinstance(obj, dict):
+        return sum(1 + _probe_nodes(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(1 + _probe_nodes(v) for v in obj)
+    return 1
+
+
+def test_r01_s3_bounded_shared_pool() -> None:
+    """T24 / T29 / T38：``_v`` 与 gate 两写入点共用同一容器与容量——
+    60 + 60 次 → 容器 100（不按 schema 各留 100）、计数 120、淘汰 20；
+    stats 首次成功前 None，成功后就位且复用同一对象。"""
+    from types import SimpleNamespace
+    from travel_agent.orchestrator.orchestrator import Orchestrator
+    from travel_agent.retention import SHADOW_CAPACITY
+    st, it = make("memory")
+    st.create_pending("排海贝皇大排档", "plan_modify", "must_visit", SNAP2)
+    check("[T38·S3] 首次追加前 stats is None",
+          it.shadow_stats is None, str(it.shadow_stats))
+    check("[T38·S3] dead 初值 False", it.shadow_dead is False, "")
+    for _ in range(60):
+        it.evaluate("第一个")
+    rt = SimpleNamespace(interceptor=it)
+    for i in range(60):
+        Orchestrator._shadow_gate(rt, "consume", "gate-%02d" % i,
+                                  detail="d", pending_id="p1")
+    check("[T24] 共用池封顶 100", len(it.shadow_log) == SHADOW_CAPACITY,
+          str(len(it.shadow_log)))
+    check("[T24] total_appended == 120",
+          it.shadow_stats.total_appended == 120,
+          str(it.shadow_stats.total_appended))
+    check("[T24] total_evicted == 20",
+          it.shadow_stats.total_evicted == 20,
+          str(it.shadow_stats.total_evicted))
+    check("[T29·S3] current_size == len",
+          it.shadow_stats.current_size == len(it.shadow_log),
+          f"{it.shadow_stats.current_size} != {len(it.shadow_log)}")
+    ts = [r["ts"] for r in it.shadow_log if "ts" in r]
+    check("[T24] _v 记录 ts 序不减（未被重排）",
+          ts == sorted(ts), str(ts[:5]))
+    check("[T24] gate 记录仍在同一容器（stage=gate 可见）",
+          any(r.get("stage") == "gate" for r in it.shadow_log),
+          str(it.shadow_log[-1]))
+    stats_before = it.shadow_stats
+    it._v(V_NONE, "u", 1)
+    check("[T38·S3] 后续追加复用同一 stats 对象",
+          it.shadow_stats is stats_before, "")
+    check("[T38·S3] capacity 为冻结常量 100",
+          it.shadow_stats.capacity == SHADOW_CAPACITY,
+          str(it.shadow_stats.capacity))
+
+
+def test_r01_s3_field_clip() -> None:
+    """T25 / T37：7 键集不变；超长字段按冻结上限裁剪；非 str 字段收敛为
+    占位；返回的 verdict 字段**原样**（裁剪只作用于记录副本）。"""
+    from travel_agent.retention import LIM_ID, LIM_REASON, LIM_UTTERANCE
+    st, it = make("memory")
+    long_ut = "海" * 500
+    v = it._v(V_HAND_BACK, long_ut, 1000, pending_id="p" * 100,
+              reason="r" * 500, evidence={"k": "v"})
+    rec = it.shadow_log[-1]
+    check("[T25] 记录仍为 7 键",
+          set(rec) == {"utterance", "verdict", "pending_id",
+                       "candidate_id", "reason", "evidence", "ts"},
+          str(sorted(rec)))
+    check("[T25] utterance 裁剪到 200",
+          len(rec["utterance"]) == LIM_UTTERANCE,
+          str(len(rec["utterance"])))
+    check("[T25] pending_id 裁剪到 64",
+          len(rec["pending_id"]) == LIM_ID, str(len(rec["pending_id"])))
+    check("[T25] reason 裁剪到 200",
+          len(rec["reason"]) == LIM_REASON, str(len(rec["reason"])))
+    check("[T25] verdict 原值", rec["verdict"] == V_HAND_BACK, "")
+    check("[T25] 返回的 verdict 字段不变（未被裁剪回写）",
+          v.pending_id == "p" * 100 and v.reason == "r" * 500,
+          str(v.as_dict()))
+    # ---- T37：非 str 注入 ----
+    v2 = it._v(V_NONE, 123, 1001, reason=123)
+    rec2 = it.shadow_log[-1]
+    check("[T37·S3] utterance 非 str → <non-str:int>",
+          rec2["utterance"] == "<non-str:int>", str(rec2["utterance"]))
+    check("[T37·S3] reason 非 str → <non-str:int>",
+          rec2["reason"] == "<non-str:int>", str(rec2["reason"]))
+    check("[T37·S3] verdict 返回值保持原对象值",
+          v2.reason == 123 and v2.verdict == V_NONE, str(v2.as_dict()))
+
+
+def test_r01_s3_evidence_clip() -> None:
+    """T26：evidence 深嵌套/超量裁剪生效（根恒 dict、键数/深度/预算有界），
+    且 ``v.evidence`` 原样不被回写。"""
+    from travel_agent.retention import (EVID_BUDGET_MARK, EVID_MAX_KEYS,
+                                        EVID_NODE_BUDGET, EVID_STR_MAX)
+    st, it = make("memory")
+    deep = {"a": {"b": {"c": {"d": 1}}},
+            "s": "x" * 300,
+            "l": [[1, 2], [3]],
+            "n": {"k%02d" % i: i for i in range(40)}}
+    v = it._v(V_NONE, "u", 1, evidence=deep)
+    rec = it.shadow_log[-1]["evidence"]
+    check("[T26] 根仍为 dict", isinstance(rec, dict), str(type(rec)))
+    check("[T26] 键数 ≤ 16", len(rec) <= EVID_MAX_KEYS, str(len(rec)))
+    check("[T26] 字符串按 200 裁剪", len(rec["s"]) == EVID_STR_MAX,
+          str(len(rec["s"])))
+    check("[T26] 深度 3 的容器被摘要替换（<dict>）",
+          rec["a"]["b"]["c"] == "<dict>", str(rec["a"]["b"]))
+    check("[T26] 节点预算未被突破",
+          _probe_nodes(rec) <= EVID_NODE_BUDGET, str(_probe_nodes(rec)))
+    check("[T26] v.evidence 原样（未回写裁剪结果）",
+          v.evidence == deep and v.evidence is deep, str(v.evidence))
+    check("[T26] 记录 evidence 不是原对象（副本）",
+          rec is not v.evidence, "")
+    big = {"big": [{"k%02d" % j: "v" * 10 for j in range(20)}
+                   for _ in range(10)]}
+    it._v(V_NONE, "u2", 2, evidence=big)
+    rec2 = it.shadow_log[-1]["evidence"]
+    check("[T26] 预算耗尽 → 根层插入终止标记",
+          rec2.get(EVID_BUDGET_MARK) is True, str(sorted(rec2))[:120])
+    check("[T26] 预算耗尽后仍是有界 dict",
+          isinstance(rec2, dict) and len(rec2) <= EVID_MAX_KEYS,
+          str(len(rec2)))
+
+
+def test_r01_s3_sink_only_after_append() -> None:
+    """修订 1 验收（四情形）：① 追加成功 → sink 1 次；② RIE → dead=True、
+    sink 0 次；③ 普通 Exception → 不崩、sink 0 次；④ dead 后再调用 →
+    append 与 sink 均 0 次。"""
+    import travel_agent.pending_interceptor as pi_mod
+    from travel_agent.retention import RetentionInvariantError
+    st, _unused = make("memory")
+    orig = pi_mod.append_bounded
+    calls = []
+
+    def sink(rec):
+        calls.append(rec)
+
+    # ① 成功
+    it1 = PendingInterceptor(st, shadow_sink=sink)
+    v1 = it1._v(V_NONE, "u1", 1)
+    check("[T-S3Sink①] 追加成功 → sink 恰 1 次", len(calls) == 1,
+          str(len(calls)))
+    check("[T-S3Sink①] 记录已入容器", len(it1.shadow_log) == 1, "")
+    check("[T-S3Sink①] stats 已提交",
+          it1.shadow_stats is not None
+          and it1.shadow_stats.total_appended == 1, str(it1.shadow_stats))
+    check("[T-S3Sink①] 返回 verdict 正常", v1.verdict == V_NONE, "")
+
+    # ② RIE
+    def rie(*a, **kw):
+        raise RetentionInvariantError("mutation")
+
+    pi_mod.append_bounded = rie
+    try:
+        it2 = PendingInterceptor(st, shadow_sink=sink)
+        v2 = it2._v(V_NONE, "u2", 2)
+    finally:
+        pi_mod.append_bounded = orig
+    check("[T-S3Sink②] RIE → dead=True", it2.shadow_dead is True, "")
+    check("[T-S3Sink②] RIE → sink 0 次（总数仍 1）", len(calls) == 1,
+          str(len(calls)))
+    check("[T-S3Sink②] RIE → 容器无新增", len(it2.shadow_log) == 0, "")
+    check("[T-S3Sink②] RIE → 业务判定不受影响", v2.verdict == V_NONE, "")
+
+    # ③ 普通 Exception
+    def boom(*a, **kw):
+        raise RuntimeError("append boom")
+
+    pi_mod.append_bounded = boom
+    try:
+        it3 = PendingInterceptor(st, shadow_sink=sink)
+        v3 = it3._v(V_NONE, "u3", 3)
+    finally:
+        pi_mod.append_bounded = orig
+    check("[T-S3Sink③] 普通异常整轮不崩（verdict 正常返回）",
+          v3.verdict == V_NONE, "")
+    check("[T-S3Sink③] 普通异常 → sink 0 次", len(calls) == 1,
+          str(len(calls)))
+    check("[T-S3Sink③] 普通异常不置 dead", it3.shadow_dead is False, "")
+    check("[T-S3Sink③] 普通异常 → 容器无新增", len(it3.shadow_log) == 0, "")
+
+    # ④ dead 后再调用
+    counter = {"n": 0}
+
+    def counting(*a, **kw):
+        counter["n"] += 1
+        raise AssertionError("dead 后不得再调用 append_bounded")
+
+    pi_mod.append_bounded = counting
+    try:
+        v4 = it2._v(V_NONE, "u4", 4)
+    finally:
+        pi_mod.append_bounded = orig
+    check("[T-S3Sink④] dead 后 append 调用 0 次", counter["n"] == 0,
+          str(counter))
+    check("[T-S3Sink④] dead 后 sink 仍 0 次（总数仍 1）", len(calls) == 1,
+          str(len(calls)))
+    check("[T-S3Sink④] dead 后返回值正常", v4.verdict == V_NONE, "")
+
+
+def test_r01_s3_dead_persistent() -> None:
+    """T45（S3）：注入 RIE 后 dead 跨轮保持，后续 3 轮 append 与 sink 均
+    0 次；`_v` 返回值字段与干净实例逐字段一致（业务零影响）。"""
+    import travel_agent.pending_interceptor as pi_mod
+    from travel_agent.retention import RetentionInvariantError
+    st, it = make("memory")
+    calls = []
+    it.shadow_sink = lambda rec: calls.append(rec)
+    orig = pi_mod.append_bounded
+
+    def rie(*a, **kw):
+        raise RetentionInvariantError("commit")
+
+    pi_mod.append_bounded = rie
+    try:
+        v_bad = it._v(V_NONE, "u", 1, pending_id="p1")
+    finally:
+        pi_mod.append_bounded = orig
+    check("[T45·S3] RIE 后 dead=True", it.shadow_dead is True, "")
+    check("[T45·S3] RIE 轮 sink 0 次", len(calls) == 0, str(len(calls)))
+
+    counter = {"n": 0}
+
+    def counting(*a, **kw):
+        counter["n"] += 1
+        raise AssertionError("dead 后不得再调用 append_bounded")
+
+    pi_mod.append_bounded = counting
+    try:
+        for i in range(3):
+            it._v(V_NONE, "u", 100 + i, pending_id="p1")
+    finally:
+        pi_mod.append_bounded = orig
+    check("[T45·S3] 后续 3 轮 append 调用 0 次", counter["n"] == 0,
+          str(counter))
+    check("[T45·S3] 后续 3 轮 sink 调用 0 次", len(calls) == 0,
+          str(len(calls)))
+    check("[T45·S3] 容器仍为空", len(it.shadow_log) == 0, "")
+    st2, it2 = make("memory")
+    v_ok = it2._v(V_NONE, "u", 1, pending_id="p1")
+    check("[T45·S3] 返回值与干净实例逐字段一致",
+          v_bad.as_dict() == v_ok.as_dict(), str(v_bad.as_dict()))
+
+
 def main() -> int:
     for fn in (test_order_selection, test_name_city_selection,
                test_conservative_red_lines, test_clear_new_question,
@@ -578,7 +822,13 @@ def main() -> int:
                test_explicit_cancel, test_duplicate_selection,
                test_duplicate_cross_session_sqlite,
                test_evaluate_purity, test_act_honesty,
-               test_verdict_contract_and_shadow, test_dual_impl_parity):
+               test_verdict_contract_and_shadow, test_dual_impl_parity,
+               # ---- R-01（I-2）：S3 有界化（5 个）----
+               test_r01_s3_bounded_shared_pool,
+               test_r01_s3_field_clip,
+               test_r01_s3_evidence_clip,
+               test_r01_s3_sink_only_after_append,
+               test_r01_s3_dead_persistent):
         fn()
     print(f"\npending interceptor: {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

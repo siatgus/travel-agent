@@ -3670,6 +3670,388 @@ def test_p26_switch_freeze() -> None:
     _p26_env()
 
 
+# ================================================== R-01（I-2 + I-3）：S1/S2 有界化
+
+def _s2_fill(engine, count, start=1):
+    """直接驱动 S2 观察写入（不经 decide）——容量/计数断言的最小装具。
+
+    记录内容用 ``reason=round-NNNN`` 做轮次指纹，便于断言「末条是本轮
+    最新」而不是陈旧记录。"""
+    for i in range(start, start + count):
+        res = SimpleNamespace(action="clarify",
+                              reason="round-%04d" % i,
+                              entity=None, city_source="query_city",
+                              confidence=0.5)
+        engine._shadow(res, "poi_query", [], False, True)
+
+
+def _shadow_parse(tag):
+    """无候选轮的解析对象（decide 恒返回 None，但仍产生一条记录）。"""
+    return SimpleNamespace(shadow_resolved_objs=[], intent=tag,
+                           intent_coarse="", query_city="",
+                           destination="")
+
+
+def test_r01_s2_bounded_and_counter() -> None:
+    """T19 / T29 / T38（S2）：250 次追加 → 容器 100、计数 250、淘汰 150；
+    stats 首次成功前为 None、成功后就位且复用同一对象。"""
+    from travel_agent.decision import DecisionEngine as _DE
+    from travel_agent.retention import SHADOW_CAPACITY
+    eng = _DE()
+    check("[T38·S2] 首次追加前 shadow_stats is None",
+          eng.shadow_stats is None, str(eng.shadow_stats))
+    check("[T38·S2] dead 初值 False", eng.shadow_dead is False, "")
+    _s2_fill(eng, 250)
+    check("[T19] 容器封顶 100", len(eng.shadow_log) == SHADOW_CAPACITY,
+          str(len(eng.shadow_log)))
+    check("[T19] total_appended == 250",
+          eng.shadow_stats.total_appended == 250,
+          str(eng.shadow_stats.total_appended))
+    check("[T19] total_evicted == 150",
+          eng.shadow_stats.total_evicted == 150,
+          str(eng.shadow_stats.total_evicted))
+    check("[T29·S2] current_size == len(shadow_log)",
+          eng.shadow_stats.current_size == len(eng.shadow_log),
+          f"{eng.shadow_stats.current_size} != {len(eng.shadow_log)}")
+    check("[T19] 末条来自第 250 轮（不是最早记录）",
+          eng.shadow_log[-1]["reason"] == "round-0250",
+          str(eng.shadow_log[-1]["reason"]))
+    check("[T19] 首条为第 151 轮",
+          eng.shadow_log[0]["reason"] == "round-0151",
+          str(eng.shadow_log[0]["reason"]))
+    stats_before = eng.shadow_stats
+    _s2_fill(eng, 1, start=251)
+    check("[T38·S2] 后续追加复用同一 stats 对象",
+          eng.shadow_stats is stats_before, "")
+    check("[T38·S2] capacity 为冻结常量 100",
+          eng.shadow_stats.capacity == SHADOW_CAPACITY,
+          str(eng.shadow_stats.capacity))
+
+
+def test_r01_s2_field_clip_non_str() -> None:
+    """T37（S2）：声明为 str 的字段注入非 str → 固定占位，不改字段集。"""
+    from travel_agent.decision import DecisionEngine as _DE
+    eng = _DE()
+    res = SimpleNamespace(action="clarify", reason=123,
+                          entity={"city": 456}, city_source=None,
+                          confidence=0.1)
+    eng._shadow(res, "poi_query", [SimpleNamespace(status=789)], False, True)
+    rec = eng.shadow_log[-1]
+    check("[T37·S2] reason 非 str → <non-str:int>",
+          rec["reason"] == "<non-str:int>", str(rec["reason"]))
+    check("[T37·S2] entity_city 非 str → <non-str:int>",
+          rec["entity_city"] == "<non-str:int>", str(rec["entity_city"]))
+    check("[T37·S2] statuses 元素非 str → <non-str:int>",
+          rec["statuses"] == ["<non-str:int>"], str(rec["statuses"]))
+    check("[T37·S2] 记录仍为 11 键",
+          len(rec) == 11 and set(rec) == set(SHADOW_RECORD_KEYS),
+          str(sorted(rec)))
+
+
+def test_r01_s1_projection_beyond_s2_capacity() -> None:
+    """T20 / T21（I-3 关键判据）：S2 达容量 100 后，S1 仍须收到第 250 轮
+    的记录——旧实现以 len 判据会在第 101 轮起静默漏投影。"""
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        for i in range(1, 251):
+            ctx = SimpleNamespace(parse=_shadow_parse("batch-%03d" % i))
+            orc._decision_shadow(s, ctx)
+        eng = orc._decider
+        check("[T20] S2 容器封顶 100", len(eng.shadow_log) == 100,
+              str(len(eng.shadow_log)))
+        check("[T20] S2 计数仍为 250（不因封顶冻结）",
+              eng.shadow_stats.total_appended == 250,
+              str(eng.shadow_stats.total_appended))
+        check("[T21] S1 容器同样封顶 100",
+              len(orc._decision_shadow_log) == 100,
+              str(len(orc._decision_shadow_log or [])))
+        check("[T21] S1 计数 250",
+              orc._decision_shadow_stats.total_appended == 250,
+              str(orc._decision_shadow_stats.total_appended))
+        check("[T21] S1 末条来自第 250 轮（len 判据会停在第 100 轮）",
+              orc._decision_shadow_log[-1]["intent"] == "batch-250",
+              str(orc._decision_shadow_log[-1]["intent"]))
+        check("[T21] S1 首条为第 151 轮",
+              orc._decision_shadow_log[0]["intent"] == "batch-151",
+              str(orc._decision_shadow_log[0]["intent"]))
+        check("[T29·S1] current_size == len",
+              orc._decision_shadow_stats.current_size
+              == len(orc._decision_shadow_log),
+              str(orc._decision_shadow_stats.current_size))
+    finally:
+        _p26_env()
+
+
+def test_r01_s1_lazy_no_record() -> None:
+    """T22 / T23：无记录轮（parse 缺失）容器与 stats 均保持 None；
+    首次成功投影后两者同时就位，记录恰 1 条。"""
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        orc._decision_shadow(s, SimpleNamespace(parse=None))
+        check("[T22] parse 缺失 → 容器仍 None",
+              orc._decision_shadow_log is None,
+              str(orc._decision_shadow_log))
+        check("[T22] parse 缺失 → stats 仍 None",
+              orc._decision_shadow_stats is None,
+              str(orc._decision_shadow_stats))
+        check("[T22] parse 缺失 → dead 仍 False",
+              orc._decision_shadow_dead is False, "")
+        ctx = SimpleNamespace(parse=_shadow_parse("first"))
+        orc._decision_shadow(s, ctx)
+        check("[T23] 首次成功 → 容器就位且恰 1 条",
+              isinstance(orc._decision_shadow_log, list)
+              and len(orc._decision_shadow_log) == 1,
+              str(orc._decision_shadow_log))
+        check("[T23] 首次成功 → stats 同时就位（非 None）",
+              orc._decision_shadow_stats is not None, "")
+        check("[T23] 记录为 11 键白名单投影",
+              set(orc._decision_shadow_log[0]) == set(SHADOW_RECORD_KEYS),
+              str(sorted(orc._decision_shadow_log[0])))
+    finally:
+        _p26_env()
+
+
+def test_r01_s1_first_append_atomic() -> None:
+    """T39：S1 首次投影失败 → 容器与 stats 均仍为 None、dead=True、
+    恰 1 条 warning（复用既有外层 except，不新增第 13 个写入点）。"""
+    from travel_agent.retention import RetentionInvariantError
+    orig = _orch_mod.append_bounded
+
+    def boom(records, record, stats):
+        raise RetentionInvariantError("mutation")
+
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        _orch_mod.append_bounded = boom
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        orc._decision_shadow(s, SimpleNamespace(parse=_shadow_parse("x")))
+        check("[T39] 容器仍 None（未留半成品）",
+              orc._decision_shadow_log is None,
+              str(orc._decision_shadow_log))
+        check("[T39] stats 仍 None",
+              orc._decision_shadow_stats is None,
+              str(orc._decision_shadow_stats))
+        check("[T39] dead 已置 True",
+              orc._decision_shadow_dead is True, "")
+        warns = [w for w in orc._pending_warnings
+                 if w.startswith("decision shadow:")]
+        check("[T39] 恰 1 条 warning（既有站点）", len(warns) == 1,
+              str(orc._pending_warnings))
+        check("[T39] S2 侧记录不受影响（decide 已执行）",
+              orc._decider is not None
+              and len(orc._decider.shadow_log) == 1,
+              str(orc._decider.shadow_log if orc._decider else None))
+    finally:
+        _orch_mod.append_bounded = orig
+        _p26_env()
+
+
+def test_r01_s1_dead_persistent() -> None:
+    """T45（S1）：dead 后 3 轮投影阶段零 append 调用；decide 契约不变
+    （Q2：dead 只停投影不停 decide），warning 仍只 1 条。"""
+    from travel_agent.retention import RetentionInvariantError
+    orig = _orch_mod.append_bounded
+    calls = {"n": 0}
+
+    def boom(records, record, stats):
+        raise RetentionInvariantError("commit")
+
+    def counting(records, record, stats):
+        calls["n"] += 1
+        raise AssertionError("dead 后不得再调用 append_bounded")
+
+    _p26_env(shadow="1", channel=None, takeover=None)
+    try:
+        _orch_mod.append_bounded = boom
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        orc._decision_shadow(s, SimpleNamespace(parse=_shadow_parse("r1")))
+        _orch_mod.append_bounded = counting
+        for i in (2, 3, 4):
+            orc._decision_shadow(
+                s, SimpleNamespace(parse=_shadow_parse("r%d" % i)))
+        check("[T45·S1] dead 跨轮保持", orc._decision_shadow_dead is True, "")
+        check("[T45·S1] 后续 3 轮 S1 append 调用 0 次", calls["n"] == 0,
+              str(calls))
+        check("[T45·S1] decide 未被 dead 阻断（S2 仍 4 条）",
+              len(orc._decider.shadow_log) == 4,
+              str(len(orc._decider.shadow_log)))
+        warns = [w for w in orc._pending_warnings
+                 if w.startswith("decision shadow:")]
+        check("[T45·S1] warning 仍恰 1 条（dead 后早退不重复记）",
+              len(warns) == 1, str(orc._pending_warnings))
+        check("[T45·S1] 容器未被 dead 后写入",
+              orc._decision_shadow_log is None,
+              str(orc._decision_shadow_log))
+    finally:
+        _orch_mod.append_bounded = orig
+        _p26_env()
+
+
+def test_r01_sink_after_commit_s2_s4_s5() -> None:
+    """修订 2 验收：S2/S4/S5 的 stats 必须在 sink 之前提交——sink 内可见
+    已提交 stats 与已入容器记录；sink 抛异常不回滚记录、不丢计数。"""
+    from travel_agent.decision import DecisionEngine as _DE
+    from travel_agent.pending_producer import PendingProducer
+    from travel_agent.pending_revalidator import PendingRevalidator
+
+    seen = {}
+
+    def sink(tag, owner):
+        def _sink(rec):
+            seen[tag] = {
+                "stats": owner.shadow_stats is not None,
+                "n": len(owner.shadow_log),
+            }
+            raise RuntimeError("sink boom")
+        return _sink
+
+    eng = _DE(shadow_sink=None)
+    eng.shadow_sink = sink("S2", eng)
+    res = SimpleNamespace(action="clarify", reason="r", entity=None,
+                          city_source=None, confidence=0.0)
+    eng._shadow(res, "poi_query", [], False, True)
+    check("[修订2·S2] sink 内 stats 已提交", seen["S2"]["stats"] is True,
+          str(seen.get("S2")))
+    check("[修订2·S2] sink 内记录已入容器", seen["S2"]["n"] == 1,
+          str(seen.get("S2")))
+    check("[修订2·S2] sink 抛异常不回滚记录", len(eng.shadow_log) == 1, "")
+    check("[修订2·S2] sink 抛异常不丢计数",
+          eng.shadow_stats.total_appended == 1,
+          str(eng.shadow_stats.total_appended))
+
+    prod = PendingProducer()
+    prod._shadow_sink = sink("S4", prod)
+    prod._shadow("produce_skip", detail="d")
+    check("[修订2·S4] sink 内 stats 已提交", seen["S4"]["stats"] is True,
+          str(seen.get("S4")))
+    check("[修订2·S4] sink 内记录已入容器", seen["S4"]["n"] == 1, "")
+    check("[修订2·S4] sink 异常不丢计数",
+          prod.shadow_stats.total_appended == 1,
+          str(prod.shadow_stats.total_appended))
+
+    rev = PendingRevalidator()
+    rev._shadow_sink = sink("S5", rev)
+    rev._shadow("revalidate_backfilled", detail="d")
+    check("[修订2·S5] sink 内 stats 已提交", seen["S5"]["stats"] is True,
+          str(seen.get("S5")))
+    check("[修订2·S5] sink 内记录已入容器", seen["S5"]["n"] == 1, "")
+    check("[修订2·S5] sink 异常不丢计数",
+          rev.shadow_stats.total_appended == 1,
+          str(rev.shadow_stats.total_appended))
+
+
+def test_r01_s4_s5_bounded() -> None:
+    """S4 / S5 容量与字段裁剪（同构验收）：120 次 → 100 / 120 / 20；
+    detail 与 ID 字段按冻结上限裁剪。"""
+    from travel_agent.retention import (LIM_DETAIL, LIM_ID, SHADOW_CAPACITY)
+    from travel_agent.pending_producer import PendingProducer
+    from travel_agent.pending_revalidator import PendingRevalidator
+
+    prod = PendingProducer()
+    check("[S4] 首次追加前 stats is None", prod.shadow_stats is None, "")
+    for i in range(120):
+        prod._shadow("act-%03d" % i, detail="d" * 300, pending_id="p" * 80)
+    check("[S4] 容器封顶 100", len(prod.shadow_log) == SHADOW_CAPACITY,
+          str(len(prod.shadow_log)))
+    check("[S4] total_appended == 120",
+          prod.shadow_stats.total_appended == 120,
+          str(prod.shadow_stats.total_appended))
+    check("[S4] total_evicted == 20",
+          prod.shadow_stats.total_evicted == 20,
+          str(prod.shadow_stats.total_evicted))
+    check("[S4] detail 裁剪到 256",
+          len(prod.shadow_log[-1]["detail"]) == LIM_DETAIL,
+          str(len(prod.shadow_log[-1]["detail"])))
+    check("[S4] pending_id 裁剪到 64",
+          len(prod.shadow_log[-1]["pending_id"]) == LIM_ID,
+          str(len(prod.shadow_log[-1]["pending_id"])))
+    check("[S4] current_size == len（T29）",
+          prod.shadow_stats.current_size == len(prod.shadow_log), "")
+
+    rev = PendingRevalidator()
+    check("[S5] 首次追加前 stats is None", rev.shadow_stats is None, "")
+    for i in range(120):
+        rev._shadow("revalidate-%03d" % i, detail="e" * 300,
+                    pending_id="p" * 80, candidate_id="c" * 80,
+                    revalidate_status="confirmed")
+    check("[S5] 容器封顶 100", len(rev.shadow_log) == SHADOW_CAPACITY,
+          str(len(rev.shadow_log)))
+    check("[S5] total_appended == 120 / evicted == 20",
+          rev.shadow_stats.total_appended == 120
+          and rev.shadow_stats.total_evicted == 20,
+          str(rev.shadow_stats))
+    check("[S5] detail / candidate_id 按上限裁剪",
+          len(rev.shadow_log[-1]["detail"]) == LIM_DETAIL
+          and len(rev.shadow_log[-1]["candidate_id"]) == LIM_ID,
+          str(len(rev.shadow_log[-1]["detail"])))
+    check("[S5] current_size == len（T29）",
+          rev.shadow_stats.current_size == len(rev.shadow_log), "")
+
+
+def test_r01_channel1_s2_still_bounded() -> None:
+    """T12 / T43：``CHANNEL=1 ∧ SHADOW=0`` 时 S2 仍被构造且受 100 约束
+    （该组合走 `_pending_produce` 的决策链，不经过影子触达）。"""
+    from travel_agent.retention import SHADOW_CAPACITY
+    old = _orch_mod._resolve_entities
+    set_env(channel="1", store_kind="memory")
+    _p26_env(shadow="0", channel="1", takeover=None)
+    try:
+        stub = _StubResolver([ResolveResult(resolved=[
+            _amb_rc("海贝皇大排档（南京店）", "南京",
+                    "海贝皇大排档（上海店）", "上海")])])
+        _orch_mod._resolve_entities = stub
+        orc = Orchestrator()
+        s = _produce_session(orc, "r01-t12")
+        orc.handle(s, "海贝皇大排档哪家好")
+        eng = orc._decider
+        check("[T12] channel=1 路径构造了 S2", eng is not None, "")
+        check("[T12] S1 观察容器未创建（SHADOW=0）",
+              orc._decision_shadow_log is None and
+              orc._decision_shadow_stats is None, "")
+        check("[T38·S2] 首次成功追加后 stats 就位",
+              eng.shadow_stats is not None
+              and eng.shadow_stats.capacity == SHADOW_CAPACITY,
+              str(eng.shadow_stats))
+        base = eng.shadow_stats.total_appended
+        _s2_fill(eng, 250)
+        check("[T12] 同一 S2 仍封顶 100",
+              len(eng.shadow_log) == SHADOW_CAPACITY,
+              str(len(eng.shadow_log)))
+        check("[T12] 计数按追加次数累加",
+              eng.shadow_stats.total_appended == base + 250,
+              f"{eng.shadow_stats.total_appended} != {base + 250}")
+    finally:
+        _orch_mod._resolve_entities = old
+        set_env()
+        _p26_env()
+
+
+def test_r01_switch_matrix_laziness() -> None:
+    """T43：四种 SHADOW/CHANNEL 组合下，构造期一律零容器、零 stats、
+    dead=False（开关关闭不产生任何容量治理状态）。"""
+    for shadow, channel in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
+        set_env(channel=channel, store_kind="memory")
+        _p26_env(shadow=shadow, channel=channel, takeover=None)
+        orc = Orchestrator()
+        tag = f"[T43 shadow={shadow} channel={channel}]"
+        check(f"{tag} 决策引擎未构造", orc._decider is None, "")
+        check(f"{tag} producer / revalidator 未构造",
+              orc._producer is None and orc._revalidator is None, "")
+        check(f"{tag} S1 容器 / stats 均 None",
+              orc._decision_shadow_log is None
+              and orc._decision_shadow_stats is None, "")
+        check(f"{tag} S1 dead 初值 False",
+              orc._decision_shadow_dead is False, "")
+    set_env()
+    _p26_env()
+
+
 # ================================================== main
 
 
@@ -3732,7 +4114,18 @@ def main() -> int:
                test_p26_shadow_input_boundary_missing_field,
                test_p26_shadow_zero_network_and_no_reparse,
                test_p26_shadow_channel1_no_double_decide,
-               test_p26_switch_freeze):
+               test_p26_switch_freeze,
+               # ---- R-01（I-2 + I-3）：S1/S2 有界化（10 个）----
+               test_r01_s2_bounded_and_counter,
+               test_r01_s2_field_clip_non_str,
+               test_r01_s1_projection_beyond_s2_capacity,
+               test_r01_s1_lazy_no_record,
+               test_r01_s1_first_append_atomic,
+               test_r01_s1_dead_persistent,
+               test_r01_sink_after_commit_s2_s4_s5,
+               test_r01_s4_s5_bounded,
+               test_r01_channel1_s2_still_bounded,
+               test_r01_switch_matrix_laziness):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b+P2.6): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

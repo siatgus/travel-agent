@@ -34,6 +34,10 @@ from ..pending_interceptor import (PendingInterceptor, V_CANCEL_DEST_CHANGED,
 from ..pending_producer import PendingProducer
 from ..pending_revalidator import PendingRevalidator
 from ..pending_runtime import PendingRuntimeManager
+# R-01（I-2 + I-3）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
+from ..retention import (LIM_DETAIL, LIM_ID, SHADOW_CAPACITY,
+                         RetentionInvariantError, append_bounded,
+                         coerce_text, new_stats)
 from .context import TurnContext
 from .guard import GuardPipeline
 from .handlers import QA_HANDLERS
@@ -86,6 +90,10 @@ class Orchestrator:
         # 零容器、零记录）。纯内存：不落盘、不落原文、无跨进程语义
         # （生命周期见 PHASE5_P25_PLAN §25.4.4）
         self._decision_shadow_log: list[dict] | None = None
+        # R-01（I-2 + I-3）：S1 容量治理状态（与 _decision_shadow_log 同族，
+        # 惰性——首次成功投影后才创建容器与 stats）
+        self._decision_shadow_dead = False
+        self._decision_shadow_stats = None
 
     # -------------------------------------------------- P2.4a pending gate
 
@@ -233,12 +241,31 @@ class Orchestrator:
                      detail: str = "", store_status: str | None = None,
                      pending_id: str | None = None) -> None:
         """装配层影子记录（评审冻结约束 ③，B5）：shadow 是观察记录，
-        绝不影响主链路——记录本身的一切异常在此吞掉。"""
+        绝不影响主链路——记录本身的一切异常在此吞掉。
+
+        R-01（I-2）：与 ``_v`` 共用同一个 ``shadow_log`` / ``shadow_stats``
+        / ``shadow_dead``（同一容器两 schema，容量 100 为**共用池**上限，
+        不按 schema 各留一份）。追加成功后才提交 stats，不改任何业务分支。
+        """
         try:
-            rt.interceptor.shadow_log.append({
-                "stage": "gate", "verdict": verdict_name,
-                "action": action, "detail": detail,
-                "store_status": store_status, "pending_id": pending_id})
+            interceptor = rt.interceptor
+            if interceptor.shadow_dead:
+                return
+            rec = {"stage": "gate", "verdict": verdict_name,
+                   "action": action,
+                   "detail": coerce_text(detail, LIM_DETAIL),
+                   "store_status": store_status,
+                   "pending_id": coerce_text(pending_id, LIM_ID)}
+            stats = interceptor.shadow_stats
+            if stats is None:
+                stats = new_stats(interceptor.shadow_log, SHADOW_CAPACITY)
+            try:
+                append_bounded(interceptor.shadow_log, rec, stats)
+            except RetentionInvariantError:
+                interceptor.shadow_dead = True     # 先置失效，再吞掉
+                return
+            if interceptor.shadow_stats is None:
+                interceptor.shadow_stats = stats
         except Exception:
             pass
 
@@ -598,17 +625,47 @@ class Orchestrator:
                     "trip_dest": (getattr(parse, "destination", "") or ""),
                     "last_city": (getattr(session, "query_city", "") or "")}
             engine = self._ensure_decider()
-            before = len(engine.shadow_log)
+            # ---- I-3：以 S2 单调计数器判定「本轮是否产生新记录」----
+            # 旧判据 len(shadow_log) 在 S2 达容量 100 后不再增长，会把
+            # 第 101 轮起的记录全部漏投影（静默停在最早 100 条）；
+            # total_appended 只在实际追加成功后 +1，边界语义严格对齐
+            # 「本轮确有新记录」。
+            before_seq = (engine.shadow_stats.total_appended
+                          if engine.shadow_stats is not None else 0)
             engine.decide(parse, list(objs), rctx,
                           intent=getattr(parse, "intent", "") or None)
-            if len(engine.shadow_log) > before:
-                if self._decision_shadow_log is None:
-                    self._decision_shadow_log = []
+            post_seq = (engine.shadow_stats.total_appended
+                        if engine.shadow_stats is not None else 0)
+            if post_seq > before_seq:
+                # 容器有界：末条恒为本轮最新记录（不是最早的陈旧记录）
                 rec = engine.shadow_log[-1]
+                if self._decision_shadow_dead:
+                    return                 # dead 只停投影，不停 decide()
                 # 白名单投影（评审 2026-11-20 实施约束）：只取契约
                 # 声明的 11 键，绝不整条复制、绝不序列化原文
-                self._decision_shadow_log.append(
-                    {k: rec.get(k) for k in SHADOW_RECORD_KEYS})
+                projected = {k: rec.get(k) for k in SHADOW_RECORD_KEYS}
+                try:
+                    if self._decision_shadow_log is None:
+                        # 首次：局部 list + 局部 stats，全部成功才同时就位
+                        # （失败时容器与 stats 保持 None——原子惰性）
+                        new_list: list[dict] = []
+                        fresh_stats = new_stats([], SHADOW_CAPACITY)
+                        append_bounded(new_list, projected, fresh_stats)
+                        self._decision_shadow_log = new_list
+                        self._decision_shadow_stats = fresh_stats
+                    else:
+                        stats = (self._decision_shadow_stats
+                                 or new_stats(self._decision_shadow_log,
+                                              SHADOW_CAPACITY))
+                        append_bounded(self._decision_shadow_log,
+                                       projected, stats)
+                        if self._decision_shadow_stats is None:
+                            self._decision_shadow_stats = stats
+                except RetentionInvariantError:
+                    # Q1：置失效后复用既有外层 except 记一条 warning
+                    # （不新增第 13 个 _pending_warnings.append 站点）
+                    self._decision_shadow_dead = True
+                    raise
         except Exception as exc:
             try:                           # 契约 6：警告追加失败也不外抛
                 self._pending_warnings.append(
