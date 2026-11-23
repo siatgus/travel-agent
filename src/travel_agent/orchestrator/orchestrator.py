@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 from .. import llm
+from .. import retention
 from ..candidate_extractor import extract as _extract_candidates
 from ..decision import (ACTION_CLARIFY, ACTION_EXECUTE, DEFAULT_BATCHES,
                         SHADOW_RECORD_KEYS, DecisionEngine)
@@ -35,9 +36,9 @@ from ..pending_producer import PendingProducer
 from ..pending_revalidator import PendingRevalidator
 from ..pending_runtime import PendingRuntimeManager
 # R-01（I-2 + I-3）：影子容器有界化共享机制（纯标准库模块，无反向依赖）
-from ..retention import (LIM_DETAIL, LIM_ID, SHADOW_CAPACITY,
-                         RetentionInvariantError, append_bounded,
-                         coerce_text, new_stats)
+from ..retention import (LIM_DETAIL, LIM_ID, LIM_WARNING, SHADOW_CAPACITY,
+                         WARNING_CAPACITY, RetentionInvariantError,
+                         append_bounded, coerce_text, new_stats)
 from .context import TurnContext
 from .guard import GuardPipeline
 from .handlers import QA_HANDLERS
@@ -94,6 +95,11 @@ class Orchestrator:
         # 惰性——首次成功投影后才创建容器与 stats）
         self._decision_shadow_dead = False
         self._decision_shadow_stats = None
+        # R-01（I-4）：W（_pending_warnings）容量治理状态（与 S1–S5 同构，
+        # 惰性）。dead：容器不可判定后不再写入（跨轮持久，不重置）；
+        # stats：首次**成功**追加后才就位（失败时不提交）
+        self._pending_warnings_dead = False
+        self._pending_warnings_stats = None
 
     # -------------------------------------------------- P2.4a pending gate
 
@@ -156,7 +162,7 @@ class Orchestrator:
         sid = getattr(session, "pending_session_id", None)
         if not sid or not str(sid).strip():
             # 会话身份缺失 → 旁路 + shadow 警告（绝不猜测身份，§2.3）
-            self._pending_warnings.append(
+            self._warn(
                 "pending gate bypass: session 身份未注入（pending_session_id 缺失）")
             return None
         rt = self._pending_runtime(str(sid))
@@ -196,7 +202,7 @@ class Orchestrator:
                     return None                # 确认未迁移 → 安全失败
                 # 无法判定（pending 不存在或状态查询失败）→ 保守拦截
                 self._sync_active_hint(session, name, False)
-                self._pending_warnings.append(
+                self._warn(
                     "pending gate: act 异常且无法判定 store 状态"
                     "（保守拦截，hint 保留）")
                 return answer_reply(session, _UNDETERMINED_NOTICE)
@@ -407,20 +413,20 @@ class Orchestrator:
                                  .get("destination") or "")),
                 reply_builder=lambda t: answer_reply(session, t))
         except Exception as exc:               # 防御（revalidate 不抛出）
-            self._pending_warnings.append(
+            self._warn(
                 f"pending revalidate 异常 {type(exc).__name__}: {exc}")
             return self._fallback_confirm_reply(session, cname, ccity)
         if re_out.status == "":
             # B3 兜底（§4.1）：重验证未产出业务结论（归属校验失败 /
             # resolve 异常 / 话术构造异常）→ 冻结确认短路，消费事实
             # 不撤销，shadow 归因已由 revalidator 记录
-            self._pending_warnings.append(
+            self._warn(
                 "pending revalidate: " + (re_out.detail or "未产出结论"))
             return self._fallback_confirm_reply(session, cname, ccity)
         if re_out.backfill_ok is False:
             # D3 契约 3：rowcount=0 不当作成功（shadow 已记录）+ 警告
             # （任何分支的回填失败都告警，业务流不变——F4）
-            self._pending_warnings.append(
+            self._warn(
                 "pending revalidate 回填失败: " + (re_out.detail or ""))
         if re_out.status == "confirmed":
             if re_out.decision is not None:
@@ -504,7 +510,7 @@ class Orchestrator:
             # 新增 ecity 条件 = 原链 POIHandler.handle「resolve_city
             # 为空 → 泛推荐兜底」前置的等价映射——消费轮语义下更
             # 保守：绝不泛答（§22 等价性证明表）
-            self._pending_warnings.append(
+            self._warn(
                 "pending consume execute: 注入前置缺失（kind/utterance/city）")
             return confirm()
 
@@ -540,7 +546,7 @@ class Orchestrator:
             else:
                 text = session._spot_qa(ecity, ename)
         except Exception as exc:
-            self._pending_warnings.append(
+            self._warn(
                 f"pending consume execute 注入失败 "
                 f"{type(exc).__name__}: {exc}")
             return confirm()                  # 注入失败 → 回退确认话术
@@ -558,7 +564,7 @@ class Orchestrator:
         #   正则、非回复文本猜测；误报方向 = 保守 confirm（安全侧），
         #   模板漂移由 other_city 注入测试锁定暴露（可复现）。
         if ename not in text or f"不在{ecity}" in text:
-            self._pending_warnings.append(
+            self._warn(
                 "pending consume execute: 验收位回退"
                 "（fresh 实体未见于回复 / other_city 冲突信号）→ 确认话术")
             return confirm()
@@ -580,6 +586,40 @@ class Orchestrator:
         if self._decider is None:
             self._decider = DecisionEngine()
         return self._decider
+
+    # ---------------------------------------- R-01（I-4）诊断通道
+
+    def _warn(self, msg) -> None:
+        """W（_pending_warnings）的唯一写入通道（R-01-I-4）。
+
+        有界 + 失效隔离 + 单条长度约束；与 S1–S5 同构的写入顺序：
+        append 成功 → 提交 stats。无 sink。诊断通道绝不影响主链路——
+        普通异常均在内部消化，不向调用方抛出。
+
+        - 容量：WARNING_CAPACITY(50)，FIFO 淘汰最旧
+        - 单条：LIM_WARNING(300)，前缀截断（站点标识在消息前部，保留可用）
+        - None 入参：直接丢弃（保持 list[str] 不出现 None）
+        - RIE：置 dead 后静默（容器不可判定，禁止继续写入/修补/重试）
+        - 其他异常：静默，但**不**置 dead（容器本身未必失效）
+        """
+        if self._pending_warnings_dead:
+            return
+        try:
+            text = coerce_text(msg, LIM_WARNING)
+            if text is None:
+                return
+            stats = self._pending_warnings_stats
+            if stats is None:
+                stats = new_stats(self._pending_warnings, WARNING_CAPACITY)
+            # 模块属性调用（非局部符号）：与 S1 / _shadow_gate 使用的
+            # append_bounded 解耦，避免任一容器的失败面串到另一个
+            retention.append_bounded(self._pending_warnings, text, stats)
+            if self._pending_warnings_stats is None:
+                self._pending_warnings_stats = stats
+        except RetentionInvariantError:
+            self._pending_warnings_dead = True       # 先置失效，再吞掉
+        except Exception:
+            pass                                     # 诊断通道静默失败
 
     # ---------------------------------------- P2.6 增量 1 影子触达
 
@@ -668,7 +708,7 @@ class Orchestrator:
                     raise
         except Exception as exc:
             try:                           # 契约 6：警告追加失败也不外抛
-                self._pending_warnings.append(
+                self._warn(
                     f"decision shadow: {type(exc).__name__}: {exc}")
             except Exception:
                 pass
@@ -694,7 +734,7 @@ class Orchestrator:
             return None                        # 完全旁路（零决策链开销）
         sid = getattr(session, "pending_session_id", None)
         if not sid or not str(sid).strip():
-            self._pending_warnings.append(
+            self._warn(
                 "pending produce bypass: session 身份未注入"
                 "（pending_session_id 缺失）")
             return None
@@ -717,7 +757,7 @@ class Orchestrator:
                     ctx.parse, rr.resolved, rctx,
                     intent=getattr(ctx.parse, "intent", "") or None)
             except Exception as exc:
-                self._pending_warnings.append(
+                self._warn(
                     f"pending produce: 决策链异常 "
                     f"{type(exc).__name__}: {exc}")
                 return None                    # 保守交回原链路
@@ -725,7 +765,7 @@ class Orchestrator:
                 return None                    # 非 clarify → 原链路
             top = self._ensure_producer().pick_ambiguous(rr.resolved)
             if top is None:
-                self._pending_warnings.append(
+                self._warn(
                     "pending produce: clarify 但 HC-4 排除后无可入快照候选")
                 return None
             out = self._ensure_producer().produce(
