@@ -4032,10 +4032,11 @@ def test_r01_channel1_s2_still_bounded() -> None:
         _p26_env()
 
 
-def test_r01_switch_matrix_laziness() -> None:
-    """T43：四种 SHADOW/CHANNEL 组合下，构造期一律零容器、零 stats、
-    dead=False（开关关闭不产生任何容量治理状态）。"""
-    for shadow, channel in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
+def _t43_matrix(raise_at: int | None = None) -> None:
+    """T43 组合矩阵本体。``raise_at`` 为组合序号，用于注入循环中途异常
+    （F-01：验证 finally 恢复而不是仅靠顺序执行到底）。"""
+    for idx, (shadow, channel) in enumerate((("0", "0"), ("1", "0"),
+                                             ("0", "1"), ("1", "1"))):
         set_env(channel=channel, store_kind="memory")
         _p26_env(shadow=shadow, channel=channel, takeover=None)
         orc = Orchestrator()
@@ -4048,8 +4049,420 @@ def test_r01_switch_matrix_laziness() -> None:
               and orc._decision_shadow_stats is None, "")
         check(f"{tag} S1 dead 初值 False",
               orc._decision_shadow_dead is False, "")
-    set_env()
-    _p26_env()
+        if raise_at is not None and idx == raise_at:
+            raise RuntimeError("mid-loop injection")
+
+
+def test_r01_switch_matrix_laziness() -> None:
+    """T43：四种 SHADOW/CHANNEL 组合下，构造期一律零容器、零 stats、
+    dead=False（开关关闭不产生任何容量治理状态）。
+
+    F-01 修复（评审 2026-11-23）：环境设置与恢复整体放进 try/finally，
+    并在循环中途注入异常，单独断言「异常后环境已恢复」——不再依赖
+    「循环顺序执行到底」这一隐含前提。
+    """
+    try:
+        # --- 先注入中途异常：验证 finally 生效（异常必须在恢复前抛出）---
+        try:
+            _t43_matrix(raise_at=2)
+        except RuntimeError:
+            injected = True
+        else:
+            injected = False
+        finally:
+            # F-01 的实质：恢复动作无条件执行，而不是「循环跑完才恢复」
+            set_env()
+            _p26_env()
+        check("[T43·F01] 中途异常注入生效", injected, "未抛出")
+        check("[T43·F01] 中途异常后 CHANNEL 已恢复",
+              "TRAVEL_PENDING_CHANNEL" not in os.environ,
+              str(os.environ.get("TRAVEL_PENDING_CHANNEL")))
+        check("[T43·F01] 中途异常后 SHADOW 已恢复",
+              "TRAVEL_DECISION_SHADOW" not in os.environ,
+              str(os.environ.get("TRAVEL_DECISION_SHADOW")))
+        check("[T43·F01] 中途异常后 TAKEOVER 已恢复",
+              "TRAVEL_DECISION_TAKEOVER" not in os.environ,
+              str(os.environ.get("TRAVEL_DECISION_TAKEOVER")))
+        # --- 异常路径跑完后，正常矩阵仍须逐项成立 ---
+        _t43_matrix()
+        check("[T43·F01] 异常后重跑矩阵仍通过（状态无残留）", True, "")
+    finally:
+        set_env()
+        _p26_env()
+
+
+# ================================================== 补测（评审 2026-11-23 授权）
+# 授权范围：仅本测试文件；五个生产文件 / retention.py / test_retention.py
+# 全部零 diff。本节补的是「有界化接入后新增的不变量」，不重复已通过项。
+
+
+def _mk_res(reason="r", action="clarify"):
+    return SimpleNamespace(action=action, reason=reason, entity=None,
+                           city_source=None, confidence=0.0)
+
+
+def _s45_specs():
+    """S4 / S5 的同构装具表：(标签, 模块, 工厂, 单条写入)。"""
+    import travel_agent.pending_producer as pp_mod
+    import travel_agent.pending_revalidator as pr_mod
+    from travel_agent.pending_producer import PendingProducer
+    from travel_agent.pending_revalidator import PendingRevalidator
+
+    return (
+        ("S4", pp_mod,
+         lambda sink=None: PendingProducer(shadow_sink=sink),
+         lambda o, i=0: o._shadow("act-%d" % i, detail="d",
+                                  pending_id="p")),
+        ("S5", pr_mod,
+         lambda sink=None: PendingRevalidator(shadow_sink=sink),
+         lambda o, i=0: o._shadow("rv-%d" % i, detail="d",
+                                  pending_id="p", candidate_id="c",
+                                  revalidate_status="confirmed")),
+    )
+
+
+def test_r01_s2_rie_and_dead() -> None:
+    """S2 补测（评审第 2 项）：append 抛 RIE 的三条不变量。
+
+    ① 首次追加即失败 → dead=True、stats 仍 None、容器零新增、sink 零调用；
+    ② 已有 stats 时失败 → 三计数与容器均不得误增（stats 是冻结快照语义）；
+    ③ dead 后永久停止 → 后续 append 调用 0 次。
+    另含「非 RIE 异常仍按原边界吞掉、不置 dead」。
+    """
+    import travel_agent.decision as d_mod
+    from travel_agent.decision import DecisionEngine as _DE
+    from travel_agent.retention import RetentionInvariantError
+
+    orig = d_mod.append_bounded
+    calls = []
+
+    def rie(records, record, stats):
+        raise RetentionInvariantError("mutation")
+
+    # ---- ① 首次追加即失败 ----
+    eng = _DE(shadow_sink=lambda rec: calls.append(rec))
+    d_mod.append_bounded = rie
+    try:
+        eng._shadow(_mk_res(), "poi_query", [], False, True)
+    finally:
+        d_mod.append_bounded = orig
+    check("[S2·RIE①] dead=True", eng.shadow_dead is True, "")
+    check("[S2·RIE①] stats 仍 None（未提交）",
+          eng.shadow_stats is None, str(eng.shadow_stats))
+    check("[S2·RIE①] 容器零新增", len(eng.shadow_log) == 0,
+          str(len(eng.shadow_log)))
+    check("[S2·RIE①] sink 零调用", len(calls) == 0, str(len(calls)))
+
+    # ---- ② 已有 stats 时失败：计数不误增 ----
+    eng2 = _DE()
+    _s2_fill(eng2, 3)
+    before = (eng2.shadow_stats.total_appended,
+              eng2.shadow_stats.total_evicted, len(eng2.shadow_log))
+    d_mod.append_bounded = rie
+    try:
+        eng2._shadow(_mk_res("r2"), "poi_query", [], False, True)
+    finally:
+        d_mod.append_bounded = orig
+    check("[S2·RIE②] total_appended 不误增",
+          eng2.shadow_stats.total_appended == before[0],
+          f"{eng2.shadow_stats.total_appended} != {before[0]}")
+    check("[S2·RIE②] total_evicted 不误增",
+          eng2.shadow_stats.total_evicted == before[1],
+          str(eng2.shadow_stats.total_evicted))
+    check("[S2·RIE②] 容器与 current_size 均不变",
+          len(eng2.shadow_log) == before[2]
+          and eng2.shadow_stats.current_size == before[2],
+          f"{len(eng2.shadow_log)} / {eng2.shadow_stats.current_size}")
+    check("[S2·RIE②] dead=True", eng2.shadow_dead is True, "")
+
+    # ---- ③ dead 后永久停止 ----
+    counter = {"n": 0}
+
+    def counting(*a, **kw):
+        counter["n"] += 1
+        raise AssertionError("dead 后不得再调用 append_bounded")
+
+    d_mod.append_bounded = counting
+    try:
+        for _ in range(3):
+            eng2._shadow(_mk_res("r3"), "poi_query", [], False, True)
+    finally:
+        d_mod.append_bounded = orig
+    check("[S2·dead③] 后续 3 轮 append 调用 0 次", counter["n"] == 0,
+          str(counter))
+    check("[S2·dead③] 容器仍为 dead 前 3 条",
+          len(eng2.shadow_log) == 3, str(len(eng2.shadow_log)))
+
+    # ---- ④ 非 RIE 异常：S2 原有边界是「不外吞」----
+    # decision._shadow 只捕获 RetentionInvariantError；改造前它也没有
+    # try/except 包住 append，故非 RIE 异常照旧外抛（冻结语义，不是缺陷）。
+    # 该异常由调用方边界接住：orchestrator._decision_shadow 的 try /
+    # _pending_produce 的 try，两处均为 except Exception → 记 warning 并
+    # 继续，业务返回值不受影响。
+    def boom(*a, **kw):
+        raise RuntimeError("append boom")
+
+    eng3 = _DE()
+    _s2_fill(eng3, 2)
+    d_mod.append_bounded = boom
+    raised = None
+    try:
+        eng3._shadow(_mk_res("r4"), "poi_query", [], False, True)
+    except Exception as exc:                     # noqa: BLE001
+        raised = exc
+    finally:
+        d_mod.append_bounded = orig
+    check("[S2·边界④] 非 RIE 仍外抛（与改造前一致）",
+          isinstance(raised, RuntimeError), repr(raised))
+    check("[S2·边界④] 不置 dead（RIE 专属语义）",
+          eng3.shadow_dead is False, "")
+    check("[S2·边界④] 计数不误增",
+          eng3.shadow_stats.total_appended == 2,
+          str(eng3.shadow_stats.total_appended))
+    check("[S2·边界④] 容器不变", len(eng3.shadow_log) == 2,
+          str(len(eng3.shadow_log)))
+
+
+def test_r01_s4_s5_rie_and_dead() -> None:
+    """S4 / S5 补测（评审第 3 项）：首次失败、已有 stats 时失败、
+    dead 后永久停止，两容器同构各断言一遍。"""
+    from travel_agent.retention import RetentionInvariantError
+
+    for tag, mod, factory, emit in _s45_specs():
+        orig = mod.append_bounded
+
+        def rie(*a, **kw):
+            raise RetentionInvariantError("mutation")
+
+        # ---- ① 首次追加即失败 ----
+        calls = []
+        obj = factory(lambda rec: calls.append(rec))
+        mod.append_bounded = rie
+        try:
+            emit(obj)
+        finally:
+            mod.append_bounded = orig
+        check(f"[{tag}·RIE①] dead=True", obj.shadow_dead is True, "")
+        check(f"[{tag}·RIE①] stats 仍 None",
+              obj.shadow_stats is None, str(obj.shadow_stats))
+        check(f"[{tag}·RIE①] 容器零新增", len(obj.shadow_log) == 0,
+              str(len(obj.shadow_log)))
+        check(f"[{tag}·RIE①] sink 零调用", len(calls) == 0, str(len(calls)))
+
+        # ---- ② 已有 stats 时失败 ----
+        calls2 = []
+        obj2 = factory(lambda rec: calls2.append(rec))
+        for i in range(3):
+            emit(obj2, i)
+        before = (obj2.shadow_stats.total_appended,
+                  obj2.shadow_stats.total_evicted, len(obj2.shadow_log))
+        mod.append_bounded = rie
+        try:
+            emit(obj2, 9)
+        finally:
+            mod.append_bounded = orig
+        check(f"[{tag}·RIE②] total_appended 不误增",
+              obj2.shadow_stats.total_appended == before[0],
+              f"{obj2.shadow_stats.total_appended} != {before[0]}")
+        check(f"[{tag}·RIE②] total_evicted 不误增",
+              obj2.shadow_stats.total_evicted == before[1],
+              str(obj2.shadow_stats.total_evicted))
+        check(f"[{tag}·RIE②] 容器 / current_size 不变",
+              len(obj2.shadow_log) == before[2]
+              and obj2.shadow_stats.current_size == before[2],
+              f"{len(obj2.shadow_log)} / {obj2.shadow_stats.current_size}")
+        check(f"[{tag}·RIE②] sink 未收到失败记录", len(calls2) == 3,
+              str(len(calls2)))
+        check(f"[{tag}·RIE②] dead=True", obj2.shadow_dead is True, "")
+
+        # ---- ③ dead 后永久停止 ----
+        counter = {"n": 0}
+
+        def counting(*a, **kw):
+            counter["n"] += 1
+            raise AssertionError("dead 后不得再调用 append_bounded")
+
+        mod.append_bounded = counting
+        try:
+            for i in range(3):
+                emit(obj2, 100 + i)
+        finally:
+            mod.append_bounded = orig
+        check(f"[{tag}·dead③] 后续 3 轮 append 调用 0 次",
+              counter["n"] == 0, str(counter))
+        check(f"[{tag}·dead③] sink 也未再被调用", len(calls2) == 3,
+              str(len(calls2)))
+        check(f"[{tag}·dead③] 容器仍为 3 条", len(obj2.shadow_log) == 3,
+              str(len(obj2.shadow_log)))
+
+        # ---- ④ 非 RIE 异常：原有「记录侧一切异常吞掉」边界不变 ----
+        def boom(*a, **kw):
+            raise RuntimeError("append boom")
+
+        calls3 = []
+        obj3 = factory(lambda rec: calls3.append(rec))
+        emit(obj3, 0)
+        n0 = obj3.shadow_stats.total_appended
+        mod.append_bounded = boom
+        raised = None
+        try:
+            emit(obj3, 1)
+        except Exception as exc:                 # noqa: BLE001
+            raised = exc
+        finally:
+            mod.append_bounded = orig
+        check(f"[{tag}·边界④] 不外抛（原吞噬边界不变）",
+              raised is None, repr(raised))
+        check(f"[{tag}·边界④] 不置 dead", obj3.shadow_dead is False, "")
+        check(f"[{tag}·边界④] 计数不误增",
+              obj3.shadow_stats.total_appended == n0,
+              f"{obj3.shadow_stats.total_appended} != {n0}")
+        check(f"[{tag}·边界④] sink 未收到失败记录", len(calls3) == 1,
+              str(len(calls3)))
+
+
+def test_r01_s4_s5_sink_exception_isolated() -> None:
+    """S4 / S5 补测（评审第 4 项）：sink 抛异常 → 记录与 stats 不回滚、
+    异常不外抛（原「记录异常全吞」边界不变），且不影响后续追加。"""
+    for tag, mod, factory, emit in _s45_specs():
+        def boom(rec):
+            raise RuntimeError("sink boom")
+
+        obj = factory(boom)
+        raised = None
+        try:
+            emit(obj)
+        except Exception as exc:                 # noqa: BLE001
+            raised = exc
+        check(f"[{tag}·sink] 不外抛", raised is None, repr(raised))
+        check(f"[{tag}·sink] 记录保留（不回滚）",
+              len(obj.shadow_log) == 1, str(len(obj.shadow_log)))
+        check(f"[{tag}·sink] stats 已提交（不丢计数）",
+              obj.shadow_stats is not None
+              and obj.shadow_stats.total_appended == 1,
+              str(obj.shadow_stats))
+        emit(obj, 1)
+        check(f"[{tag}·sink] 后续追加不受影响",
+              len(obj.shadow_log) == 2
+              and obj.shadow_stats.total_appended == 2,
+              str(obj.shadow_stats))
+        check(f"[{tag}·sink] dead 保持 False", obj.shadow_dead is False, "")
+
+
+def test_r01_s4_s5_non_str_fields() -> None:
+    """S4 / S5 补测（评审第 5 项）：非 str 的 ID / detail 字段收敛为
+    固定占位；超长仍按冻结上限裁剪；None 原样保留（coerce_text 契约）。"""
+    from travel_agent.retention import LIM_DETAIL, LIM_ID
+    from travel_agent.pending_producer import PendingProducer
+    from travel_agent.pending_revalidator import PendingRevalidator
+
+    prod = PendingProducer()
+    prod._shadow("act", detail=456, pending_id=789)
+    rec = prod.shadow_log[-1]
+    check("[S4·非str] detail → <non-str:int>",
+          rec["detail"] == "<non-str:int>", str(rec["detail"]))
+    check("[S4·非str] pending_id → <non-str:int>",
+          rec["pending_id"] == "<non-str:int>", str(rec["pending_id"]))
+    check("[S4·非str] 记录仍为 4 键",
+          set(rec) == {"stage", "action", "detail", "pending_id"},
+          str(sorted(rec)))
+
+    prod._shadow("act", detail="d" * 400, pending_id="p" * 200)
+    rec2 = prod.shadow_log[-1]
+    check("[S4·超长] detail 裁到 256",
+          len(rec2["detail"]) == LIM_DETAIL, str(len(rec2["detail"])))
+    check("[S4·超长] pending_id 裁到 64",
+          len(rec2["pending_id"]) == LIM_ID, str(len(rec2["pending_id"])))
+
+    prod._shadow("act", detail=None, pending_id=None)
+    rec3 = prod.shadow_log[-1]
+    check("[S4·None] detail / pending_id 原样 None",
+          rec3["detail"] is None and rec3["pending_id"] is None,
+          str(rec3))
+
+    rev = PendingRevalidator()
+    rev._shadow("rv", detail=123, pending_id=321, candidate_id=654,
+                revalidate_status="confirmed")
+    rec4 = rev.shadow_log[-1]
+    check("[S5·非str] detail → <non-str:int>",
+          rec4["detail"] == "<non-str:int>", str(rec4["detail"]))
+    check("[S5·非str] pending_id → <non-str:int>",
+          rec4["pending_id"] == "<non-str:int>", str(rec4["pending_id"]))
+    check("[S5·非str] candidate_id → <non-str:int>",
+          rec4["candidate_id"] == "<non-str:int>", str(rec4["candidate_id"]))
+    check("[S5·非str] revalidate_status 原值（非裁剪字段）",
+          rec4["revalidate_status"] == "confirmed", str(rec4))
+
+    rev._shadow("rv", detail="e" * 400, pending_id="p" * 200,
+                candidate_id="c" * 200, revalidate_status="confirmed")
+    rec5 = rev.shadow_log[-1]
+    check("[S5·超长] 三字段按上限裁剪",
+          len(rec5["detail"]) == LIM_DETAIL
+          and len(rec5["pending_id"]) == LIM_ID
+          and len(rec5["candidate_id"]) == LIM_ID,
+          str((len(rec5["detail"]), len(rec5["pending_id"]),
+               len(rec5["candidate_id"]))))
+
+
+def test_r01_real_handle_250_rounds() -> None:
+    """I-3 接入点补测（评审第 6 项）：经 ``Orchestrator.handle`` 真实决策
+    链跑 250 轮，验证 S2 封顶后 S1 仍在第 101 轮起持续投影，且两者保留
+    的是**最新** 100 条（逐条逐字段相等），不是最早 100 条。"""
+    from travel_agent.retention import SHADOW_CAPACITY
+
+    old_autofetch = os.environ.get("TRAVEL_AUTOFETCH")
+    old_real = os.environ.get("USE_REAL_DATA")
+    _p26_env(shadow="1", channel=None, takeover=None)
+    os.environ["TRAVEL_AUTOFETCH"] = "0"          # 不触发后台抓取
+    os.environ["USE_REAL_DATA"] = "0"             # mock tools（无网络）
+    try:
+        orc = Orchestrator()
+        s = Session(use_llm=False)
+        rounds = 250
+        for _ in range(rounds):
+            orc.handle(s, "西湖附近有什么好吃的")   # 真实链路：parse→resolve→decide
+        eng = orc._decider
+        s1 = orc._decision_shadow_stats
+        s2 = eng.shadow_stats
+        check("[I-3·250] 每轮恰好一次 decide（S2 计数 == 轮数）",
+              s2.total_appended == rounds, str(s2.total_appended))
+        check("[I-3·250] S2 容器封顶 100 / current_size == len",
+              len(eng.shadow_log) == SHADOW_CAPACITY
+              and s2.current_size == len(eng.shadow_log),
+              f"{len(eng.shadow_log)} / {s2.current_size}")
+        check("[I-3·250] S2 total_evicted == 150",
+              s2.total_evicted == rounds - SHADOW_CAPACITY,
+              str(s2.total_evicted))
+        check("[I-3·250] S1 total_appended == 250（第 101 轮起仍投影）",
+              s1.total_appended == rounds, str(s1.total_appended))
+        check("[I-3·250] S1 容器封顶 100 / current_size == len",
+              len(orc._decision_shadow_log) == SHADOW_CAPACITY
+              and s1.current_size == len(orc._decision_shadow_log),
+              f"{len(orc._decision_shadow_log)} / {s1.current_size}")
+        check("[I-3·250] S1 total_evicted == 150",
+              s1.total_evicted == rounds - SHADOW_CAPACITY,
+              str(s1.total_evicted))
+        projected = [{k: r.get(k) for k in SHADOW_RECORD_KEYS}
+                     for r in eng.shadow_log[-SHADOW_CAPACITY:]]
+        check("[I-3·250] S1 保留记录 == S2 末 100 条投影（逐条逐字段）",
+              orc._decision_shadow_log == projected,
+              "首条不一致" if orc._decision_shadow_log[:1] != projected[:1]
+              else "长度不一致")
+        check("[I-3·250] S1 记录键集恒为 11 键白名单",
+              all(set(r) == set(SHADOW_RECORD_KEYS)
+                  for r in orc._decision_shadow_log), "")
+        check("[I-3·250] 末条为本轮产物（与 S2 末条同源）",
+              orc._decision_shadow_log[-1]
+              == {k: eng.shadow_log[-1].get(k) for k in SHADOW_RECORD_KEYS},
+              str(orc._decision_shadow_log[-1])[:120])
+    finally:
+        for key, val in (("TRAVEL_AUTOFETCH", old_autofetch),
+                         ("USE_REAL_DATA", old_real)):
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        _p26_env()
 
 
 # ================================================== main
@@ -4125,7 +4538,13 @@ def main() -> int:
                test_r01_sink_after_commit_s2_s4_s5,
                test_r01_s4_s5_bounded,
                test_r01_channel1_s2_still_bounded,
-               test_r01_switch_matrix_laziness):
+               test_r01_switch_matrix_laziness,
+               # ---- 补测（评审 2026-11-23 授权，仅测试文件）----
+               test_r01_s2_rie_and_dead,
+               test_r01_s4_s5_rie_and_dead,
+               test_r01_s4_s5_sink_exception_isolated,
+               test_r01_s4_s5_non_str_fields,
+               test_r01_real_handle_250_rounds):
         fn()
     print(f"\npending channel P2.4a(+R1+P2.4b+P2.5a+P2.5b+P2.6): {_PASS} pass / {_FAIL} fail")
     return 1 if _FAIL else 0

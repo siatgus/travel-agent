@@ -694,6 +694,87 @@ def test_r01_s3_evidence_clip() -> None:
           str(len(rec2)))
 
 
+def _ref_nodes(obj) -> int:
+    """**冻结定义同构**的参考计数（评审 2026-11-23 第 7 项）。
+
+    冻结语义（``retention._Budget`` 注释 + ``EVID_NODE_BUDGET``）：
+    「dict 键值对 1 个 / list 元素 1 个；容器本身不计数」，预算终止标记
+    ``EVID_BUDGET_MARK`` 不占业务节点预算。
+
+    与既有 ``_probe_nodes`` 的区别：后者对每个标量叶子额外 +1，属**更严
+    但不同源**的上界探针；本函数只按定义计数，用于等值断言。
+    """
+    from travel_agent.retention import EVID_BUDGET_MARK
+    n = 0
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == EVID_BUDGET_MARK:
+                continue
+            n += 1
+            n += _ref_nodes(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            n += 1
+            n += _ref_nodes(v)
+    return n
+
+
+def test_r01_s3_evidence_budget_definition() -> None:
+    """T26 补强（评审第 7 项）：断言与冻结的 128 节点定义**同构**。
+
+    ① 深嵌套耗尽且根键数 < 16（不触发让位删除）→ 消耗节点数**恰等于**
+       128：由实现「循环头 budget.used >= 128 才返回 exhausted」可知，
+       进入 exhausted 时 used 必为 128 整，输出节点数与之一致，故等值
+       断言同时否证「少算」与「多算」。
+    ② 宽根 + 深末值：触发「满 16 键末位让位」，被删键的整棵子树不计入，
+       因此只断言 ≤128 + 标记存在 + 让位后仍 ≤16 键。
+    ③ 未耗尽：无标记，且节点数等于定义口径的确定值。
+    """
+    from travel_agent.retention import (EVID_BUDGET_MARK, EVID_MAX_KEYS,
+                                        EVID_NODE_BUDGET)
+    st, it = make("memory")
+
+    # ① 深嵌套耗尽、无让位删除 → 等值 128
+    deep = {"big": [{"k%02d" % j: "v" * 10 for j in range(20)}
+                    for _ in range(10)]}
+    it._v(V_NONE, "u", 1, evidence=deep)
+    rec = it.shadow_log[-1]["evidence"]
+    check("[T26·同构①] 预算终止标记存在",
+          rec.get(EVID_BUDGET_MARK) is True, str(sorted(rec))[:120])
+    check("[T26·同构①] 根键数未达 16（未触发让位删除）",
+          len(rec) - 1 < EVID_MAX_KEYS, str(len(rec)))
+    check("[T26·同构①] 消耗节点数恰为 128（等值，非上界）",
+          _ref_nodes(rec) == EVID_NODE_BUDGET, str(_ref_nodes(rec)))
+
+    # ② 宽根 + 深末值 → 触发让位
+    wide = {("k%02d" % i): 0 for i in range(15)}
+    wide["m"] = [[j for j in range(16)] for _ in range(16)]
+    it._v(V_NONE, "u", 2, evidence=wide)
+    rec2 = it.shadow_log[-1]["evidence"]
+    check("[T26·同构②] 标记存在", rec2.get(EVID_BUDGET_MARK) is True,
+          str(sorted(rec2))[:120])
+    check("[T26·同构②] 让位后仍 ≤16 键（根恒 dict）",
+          isinstance(rec2, dict) and len(rec2) <= EVID_MAX_KEYS,
+          str(len(rec2)))
+    check("[T26·同构②] 让位丢弃整棵子树（业务节点仅剩 15 个标量）",
+          _ref_nodes(rec2) == 15, str(_ref_nodes(rec2)))
+    check("[T26·同构②] 未突破预算", _ref_nodes(rec2) <= EVID_NODE_BUDGET,
+          str(_ref_nodes(rec2)))
+
+    # ③ 未耗尽：定义口径的确定值
+    ok = {"s": ["x"] * 40, "n": {"a": 1}}
+    it._v(V_NONE, "u", 3, evidence=ok)
+    rec3 = it.shadow_log[-1]["evidence"]
+    check("[T26·同构③] 无终止标记", EVID_BUDGET_MARK not in rec3,
+          str(sorted(rec3)))
+    check("[T26·同构③] list 元素封顶 16", len(rec3["s"]) == 16,
+          str(len(rec3["s"])))
+    check("[T26·同构③] 节点数 == 1+16+1+1（定义口径）",
+          _ref_nodes(rec3) == 19, str(_ref_nodes(rec3)))
+    check("[T26·同构③] v.evidence 原样（裁剪只作用于副本）",
+          it.shadow_log[-1]["evidence"] is not ok, "")
+
+
 def test_r01_s3_sink_only_after_append() -> None:
     """修订 1 验收（四情形）：① 追加成功 → sink 1 次；② RIE → dead=True、
     sink 0 次；③ 普通 Exception → 不崩、sink 0 次；④ dead 后再调用 →
@@ -827,6 +908,7 @@ def main() -> int:
                test_r01_s3_bounded_shared_pool,
                test_r01_s3_field_clip,
                test_r01_s3_evidence_clip,
+               test_r01_s3_evidence_budget_definition,
                test_r01_s3_sink_only_after_append,
                test_r01_s3_dead_persistent):
         fn()
