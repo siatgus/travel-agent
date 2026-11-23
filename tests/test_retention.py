@@ -14,14 +14,18 @@
   T34     键规则（非 str 丢弃 / 截断冲突 ~2 / 根层预算标记预占改名）
   T35     数值边界（big-int / non-finite-float / bool 保真）
   T36     深度与列表（depth2 展开 / depth3 摘要 / 交错嵌套 / 根非 dict）
+          + 深度摘要受 EVID_SUMMARY_MAX 约束（常量置小验证生效）
   T38     new_stats 的 current_size 取真实 len、capacity 透传
   T41     节点计数与预算终止（嵌套耗尽 / 根层耗尽 / 根满 16 键让位）
   T44(a)  前置区全分支：a1 非 list 可取长度 / a2 非 list 不可取 / a3 __len__ 抛
           / a3b list 子类 __len__ 抛（边界补充）/ a4 capacity<1
           / a5 size-drift + over-capacity / a6 bad-stats
+          / a7 capacity 合法但 current_size 缺失（单次读取）/ a8 current_size 类型非法
   T44(b1) 删除部分元素后抛（不回滚）
   T44(b2) 删除成功、追加失败（不回滚）
   T44(c)  提交区失败（只断言 RIE 现场属性）
+  T44(d1) M 区原异常 __str__ 抛 → 仍为 RIE，且未调用原异常 __str__
+  T44(d2) C 区原异常 __str__ 抛 → 同上
 
 **不覆盖**（归 I-2~I-5，本文件不得声称通过）：T07、T11-T28、T31、T32、
 T37、T39、T40、T42、T43、T45。
@@ -32,7 +36,6 @@ T44(b1)/(b2) 不断言失败后容器恢复；T44(c) 不把部分写入的 stats
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 import threading
@@ -330,6 +333,23 @@ def test_evidence_depth() -> None:
           {"a": [{"x": 1, "y": 2}, {"z": 3}]}
           and node_count({"a": [{"x": 1, "y": 2}, {"z": 3}]}) == 6)
 
+    # 深度摘要必须真正受 EVID_SUMMARY_MAX 约束（临时改小常量验证生效）
+    saved = nw.EVID_SUMMARY_MAX
+    try:
+        nw.EVID_SUMMARY_MAX = 3
+        got_dict = nw.clip_evidence({"a": {"b": {"c": {"d": 1}}}})
+        got_list = nw.clip_evidence({"a": {"b": {"c": [1, 2]}}})
+    finally:
+        nw.EVID_SUMMARY_MAX = saved
+    check("T36 深度摘要受 EVID_SUMMARY_MAX 裁剪（常量置 3 时截为 3 字符）",
+          got_dict == {"a": {"b": {"c": "<di"}}}
+          and got_list == {"a": {"b": {"c": "<li"}}},
+          repr((got_dict, got_list)))
+    check("T36 EVID_SUMMARY_MAX 复原后默认摘要不变",
+          nw.EVID_SUMMARY_MAX == saved
+          and nw.clip_evidence({"a": {"b": {"c": {"d": 1}}}}) ==
+          {"a": {"b": {"c": "<dict>"}}})
+
 
 # ---------------------------------------------------------------- T38
 
@@ -433,6 +453,30 @@ class _BoomLenList(list):
         raise TypeError("no len")
 
 
+class _StatsNoCurrentSize:
+    """capacity 合法、current_size 缺失；记录缺失属性的访问次数。"""
+
+    def __init__(self):
+        self.capacity = 5
+        self.total_appended = 0
+        self.total_evicted = 0
+        self.reads = []
+
+    def __getattr__(self, name):
+        self.reads.append(name)      # 仅缺失属性会走到这里
+        raise AttributeError(name)
+
+
+class _StatsBadCurrentSize:
+    """capacity 合法、current_size 类型非法（bool / str / float）。"""
+
+    def __init__(self, current_size):
+        self.capacity = 5
+        self.current_size = current_size
+        self.total_appended = 0
+        self.total_evicted = 0
+
+
 def test_precondition_branches() -> None:
     st = nw.new_stats([], 5)
     tup = ("x", "y", "z")
@@ -495,10 +539,12 @@ def test_precondition_branches() -> None:
     st2 = nw.RetentionStats(capacity=2, current_size=3)
     recs3 = [o1, o2, o1]
     exc = catch(nw.append_bounded, recs3, "r", st2)
-    check("T44(a5b) over-capacity → RIE，容器不变",
+    check("T44(a5b) over-capacity → RIE，容器逐项身份/顺序不变",
           isinstance(exc, nw.RetentionInvariantError)
           and "over-capacity" in str(exc) and exc.size == 3
-          and recs3 == [o1, o2, o1] and state(st2) == (2, 3, 0, 0),
+          and len(recs3) == 3
+          and recs3[0] is o1 and recs3[1] is o2 and recs3[2] is o1
+          and state(st2) == (2, 3, 0, 0),
           repr((getattr(exc, "size", None), state(st2))))
 
     exc = catch(nw.append_bounded, recs, "r", None)
@@ -507,6 +553,31 @@ def test_precondition_branches() -> None:
           and exc.stage == "precondition" and "bad-stats" in str(exc)
           and exc.size == 2 and exc.capacity is None,
           repr((getattr(exc, "size", None), getattr(exc, "capacity", "x"))))
+
+    # a7/a8：bad-stats 必须覆盖 current_size（不得误报为 size-drift）
+    probe = _StatsNoCurrentSize()
+    exc = catch(nw.append_bounded, [o1, o2], "r", probe)
+    check("T44(a7) capacity 合法/current_size 缺失 → bad-stats（非 size-drift）",
+          isinstance(exc, nw.RetentionInvariantError)
+          and exc.stage == "precondition" and "bad-stats" in str(exc)
+          and "size-drift" not in str(exc)
+          and exc.size == 2 and exc.capacity == 5,
+          repr((str(exc), getattr(exc, "size", None))))
+    check("T44(a7) current_size 只被读取 1 次（缓存复用，无重复访问）",
+          probe.reads == ["current_size"], repr(probe.reads))
+
+    bad_cases = []
+    for bad_cur in (True, "3", 2.0):
+        st_bad = _StatsBadCurrentSize(bad_cur)
+        e = catch(nw.append_bounded, [o1, o2], "r", st_bad)
+        bad_cases.append((bad_cur,
+                          isinstance(e, nw.RetentionInvariantError)
+                          and e.stage == "precondition"
+                          and "bad-stats" in str(e)
+                          and "size-drift" not in str(e)
+                          and e.size == 2 and e.capacity == 5))
+    check("T44(a8) current_size 类型非法（bool/str/float）→ bad-stats",
+          all(ok for _v, ok in bad_cases), repr(bad_cases))
 
 
 # ---------------------------------------------------------------- T44(b)
@@ -584,6 +655,67 @@ def test_commit_failure() -> None:
           repr((exc.capacity, exc.total_appended, exc.total_evicted)))
 
 
+# ---------------------------------------------------------------- T44(d)
+
+class _BoomStr(Exception):
+    """__str__ 自身抛错：用于验证 M/C 转换不依赖原异常的 __str__。"""
+
+    calls = 0
+
+    def __str__(self):
+        type(self).calls += 1
+        raise RuntimeError("boom-str")
+
+
+class _RaisingAppend(list):
+    def append(self, item):
+        raise _BoomStr()
+
+
+class _RaisingCommitStats:
+    """capacity/current_size/total_appended 可读，写 total_evicted 抛 _BoomStr。"""
+
+    def __init__(self):
+        self.capacity = 3
+        self.current_size = 0
+        self.total_appended = 0
+
+    @property
+    def total_evicted(self):
+        return 0
+
+    @total_evicted.setter
+    def total_evicted(self, value):
+        raise _BoomStr()
+
+
+def test_exc_str_failure() -> None:
+    _BoomStr.calls = 0
+    recs = _RaisingAppend()
+    st = nw.new_stats(recs, 5)               # cap 5：不触发 del
+    exc = catch(nw.append_bounded, recs, "r", st)
+    check("T44(d1) M 区原异常 __str__ 抛 → 仍为 RIE(mutation)",
+          isinstance(exc, nw.RetentionInvariantError)
+          and exc.stage == "mutation" and exc.size == 0
+          and isinstance(exc.__cause__, _BoomStr),
+          repr((type(exc).__name__, getattr(exc, "stage", None))))
+    check("T44(d1) 未调用原异常 __str__，RIE 自身可 str()",
+          _BoomStr.calls == 0 and str(exc).startswith("append_bounded[mutation]"),
+          repr((_BoomStr.calls, str(exc))))
+
+    recs = []
+    st = _RaisingCommitStats()
+    exc = catch(nw.append_bounded, recs, "r", st)
+    check("T44(d2) C 区原异常 __str__ 抛 → 仍为 RIE(commit)",
+          isinstance(exc, nw.RetentionInvariantError)
+          and exc.stage == "commit" and exc.size == 1
+          and isinstance(exc.__cause__, _BoomStr) and list(recs) == ["r"],
+          repr((type(exc).__name__, getattr(exc, "stage", None))))
+    check("T44(d2) 未调用原异常 __str__，RIE 自身可 str()",
+          _BoomStr.calls == 0 and str(exc).startswith("append_bounded[commit]"),
+          repr((_BoomStr.calls, str(exc))))
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -601,6 +733,7 @@ def main() -> int:
     test_precondition_branches()
     test_mutation_failures()
     test_commit_failure()
+    test_exc_str_failure()
 
     total = len(RESULTS)
     passed = sum(1 for _n, ok, _d in RESULTS if ok)

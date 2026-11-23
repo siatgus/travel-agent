@@ -14,7 +14,8 @@ I-2 / I-4 的生产接入引用，自身**不 import 任何 travel_agent 业务�
 - 六个容器的 ``*_dead`` 失效标记属 owner 职责（I-2），不在本模块。
 - ``clip_evidence``：只接受 JSON-like 类型白名单；根对象恒为 dict；节点预算
   128 全局共享，耗尽后沿调用栈向上传播并在**根**插入唯一标记；``"<dict>"`` /
-  ``"<list:N>"`` 摘要**仅**由深度限制触发，预算耗尽不走深度摘要。
+  ``"<list:N>"`` 摘要**仅**由深度限制触发、长度经 ``EVID_SUMMARY_MAX`` 裁剪，
+  预算耗尽不走深度摘要。
 - ``clip_text`` 是**类型兼容策略**，不是容量保证；声明为 str 的字段必须走
   ``coerce_text``。
 
@@ -106,6 +107,23 @@ def _safe_getattr(obj, name):
         return None
 
 
+def _exc_label(exc):
+    """异常标签：只取类型名，**绝不**调用 ``exc.__str__`` / ``repr()``。
+
+    M/C 转换现场的原始异常可能自定义了会抛错的 ``__str__``；若在此处
+    调用它，本该转为 ``RetentionInvariantError`` 的路径会被第二次异常
+    覆盖，导致"对外只抛 RIE"的契约出现缝隙。原始异常仍通过
+    ``raise ... from exc`` 保留在 ``__cause__`` 中供排查。
+    """
+    try:
+        name = type(exc).__name__
+    except Exception:
+        return "Exception"
+    if not isinstance(name, str) or not name:
+        return "Exception"
+    return name[:_MAX_CLASS_NAME]
+
+
 class RetentionInvariantError(RuntimeError):
     """容器与统计无法保持一致；禁止静默修补，禁止继续向该容器追加。
 
@@ -153,9 +171,11 @@ def append_bounded(records, record, stats):
     """向 ``records`` 追加 ``record``，超容量时淘汰最旧，返回淘汰条数。
 
     未满时返回 0（``total_evicted`` 只累计实际淘汰条数，不累计负 overflow）。
-    P 区（零变更）校验顺序固定：not-list → capacity<1 → over-capacity →
-    size-drift（len 取值失败单列 len-unavailable）。M 区失败不回滚，
-    C 区失败不回退；两者都抛 ``RetentionInvariantError``。
+    P 区（零变更）校验顺序固定：not-list → bad-stats（``capacity`` 与
+    ``current_size`` 均须为非 bool 的 int）→ capacity<1 → len-unavailable
+    → over-capacity → size-drift。M 区失败不回滚，C 区失败不回退；两者都
+    抛 ``RetentionInvariantError``，且 M/C 的 detail 只含原异常类型名
+    （不调用原异常 ``__str__``）。
     """
     # ---- P：前置校验（零变更，O(1)）----
     size = _safe_len(records)                       # P-0：唯一一次 len
@@ -164,11 +184,15 @@ def append_bounded(records, record, stats):
             "precondition:not-list", size=size, stats=stats,
             detail="records 必须是 list（含子类），实际 %r"
                    % type(records).__name__)
+    # P-2：capacity 与 current_size 同点读取并各自只读一次（缓存复用，
+    # 避免重复访问带副作用的自定义属性）。任一缺失/不可读/非 int（bool
+    # 亦非法）都判 bad-stats——不得把 current_size 的缺陷误报为 size-drift。
     cap = _as_int(_safe_getattr(stats, "capacity"))
-    if cap is None:
+    cur = _as_int(_safe_getattr(stats, "current_size"))
+    if cap is None or cur is None:
         raise RetentionInvariantError(
             "precondition:bad-stats", size=size, stats=stats,
-            detail="stats.capacity 不可读")
+            detail="stats.capacity/current_size 不可读或类型非法")
     if cap < 1:
         raise RetentionInvariantError(
             "precondition:capacity<1", size=size, stats=stats,
@@ -181,11 +205,10 @@ def append_bounded(records, record, stats):
         raise RetentionInvariantError(
             "precondition:over-capacity", size=size, stats=stats,
             detail="len=%d capacity=%d" % (size, cap))
-    if _as_int(_safe_getattr(stats, "current_size")) != size:
+    if cur != size:
         raise RetentionInvariantError(
             "precondition:size-drift", size=size, stats=stats,
-            detail="len=%d stats.current_size=%r"
-                   % (size, _safe_getattr(stats, "current_size")))
+            detail="len=%d stats.current_size=%d" % (size, cur))
 
     # ---- M：变更区（唯一可能产生副作用的地方）----
     overflow = size + 1 - cap                       # 先算，后改
@@ -197,7 +220,7 @@ def append_bounded(records, record, stats):
     except Exception as exc:
         raise RetentionInvariantError(
             "mutation", size=_safe_len(records), stats=stats,
-            detail="%s: %s" % (type(exc).__name__, exc)) from exc
+            detail=_exc_label(exc)) from exc
 
     # ---- C：提交区（全部成功后才写计数）----
     try:
@@ -207,7 +230,7 @@ def append_bounded(records, record, stats):
     except Exception as exc:
         raise RetentionInvariantError(
             "commit", size=_safe_len(records), stats=stats,
-            detail="%s: %s" % (type(exc).__name__, exc)) from exc
+            detail=_exc_label(exc)) from exc
     return evicted
 
 
@@ -299,11 +322,11 @@ def _clip_value(value, depth, budget):
         return scalar, False
     if isinstance(value, dict):
         if depth + 1 > EVID_DEPTH_MAX:
-            return "<dict>", False
+            return clip_text("<dict>", EVID_SUMMARY_MAX), False
         return _clip_mapping(value, depth + 1, budget)
     if isinstance(value, list):
         if depth + 1 > EVID_DEPTH_MAX:
-            return "<list:%d>" % len(value), False
+            return clip_text("<list:%d>" % len(value), EVID_SUMMARY_MAX), False
         return _clip_list(value, depth + 1, budget)
     return "<unsupported:%s>" % type(value).__name__[:_MAX_CLASS_NAME], False
 
