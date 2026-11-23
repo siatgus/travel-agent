@@ -3063,6 +3063,33 @@ def _p26_env(shadow=None, channel=None, takeover=None) -> None:
             os.environ[key] = val
 
 
+# ---- F-01（评审 2026-11-23 §三-1）：环境「精确恢复」而非「恢复默认态」----
+# set_env() / _p26_env() 不带参数时是**归零到默认态**（逐键 pop），不是
+# 恢复调用前的值：若外部环境本来设了某键，测试结束就会把它抹掉。
+# 下面两个助手以快照为准还原，并区分「原先未设置」与「原先有值」两种状态
+# （前者 pop 回去、后者写回原字符串），供 T43 与 250 轮用例使用。
+_ENV_KEYS = ("TRAVEL_PENDING_CHANNEL", "TRAVEL_PENDING_STORE",
+             "TRAVEL_PENDING_RUNTIME_MAX", "TRAVEL_DECISION_SHADOW",
+             "TRAVEL_DECISION_TAKEOVER")
+
+
+def _env_snapshot(extra=()) -> dict:
+    """对 ``_ENV_KEYS``（外加 ``extra``）逐键取值快照。
+
+    未设置的键记 ``None``（区别于空字符串），恢复时据此 pop。
+    """
+    return {k: os.environ.get(k) for k in tuple(_ENV_KEYS) + tuple(extra)}
+
+
+def _env_restore(snap: dict) -> None:
+    """按快照逐键恢复：``None`` → pop，其他 → 写回原字符串。"""
+    for key, val in snap.items():
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
 class _CountingEngine(DecisionEngine):
     """decide() 计数 + 入参/返回值捕获装具（S2/S3/S5/附加检查二）。"""
 
@@ -4032,6 +4059,15 @@ def test_r01_channel1_s2_still_bounded() -> None:
         _p26_env()
 
 
+class _T43Injection(RuntimeError):
+    """T43 中途异常注入**专用类型**（F-01）。
+
+    专用子类而非裸 ``RuntimeError("...")``：注入点的 ``except`` 只认这个
+    类型，不会把被测代码或其它辅助逻辑抛出的同名内置异常误当成「注入生
+    效」，从而让 ``injected`` 的判定具有唯一归因。
+    """
+
+
 def _t43_matrix(raise_at: int | None = None) -> None:
     """T43 组合矩阵本体。``raise_at`` 为组合序号，用于注入循环中途异常
     （F-01：验证 finally 恢复而不是仅靠顺序执行到底）。"""
@@ -4050,45 +4086,58 @@ def _t43_matrix(raise_at: int | None = None) -> None:
         check(f"{tag} S1 dead 初值 False",
               orc._decision_shadow_dead is False, "")
         if raise_at is not None and idx == raise_at:
-            raise RuntimeError("mid-loop injection")
+            raise _T43Injection("mid-loop injection")
 
 
 def test_r01_switch_matrix_laziness() -> None:
     """T43：四种 SHADOW/CHANNEL 组合下，构造期一律零容器、零 stats、
     dead=False（开关关闭不产生任何容量治理状态）。
 
-    F-01 修复（评审 2026-11-23）：环境设置与恢复整体放进 try/finally，
-    并在循环中途注入异常，单独断言「异常后环境已恢复」——不再依赖
-    「循环顺序执行到底」这一隐含前提。
+    F-01 修订（评审 2026-11-23 §三-1）：恢复目标由「默认态」改为「测试前
+    的真实环境」。做法是先把外部环境置成一组可辨识的非默认值（三个键有
+    值、两个键显式不存在），再快照，然后跑注入路径，最后断言快照逐键相
+    等——既证明「有值键被写回原值、没被清掉」，也证明「原本未设置的键没
+    被补成空串」。整个用例结束后无条件还原真实原始环境。
     """
+    outer = _env_snapshot()               # 真实原始环境（最后无条件还原）
     try:
-        # --- 先注入中途异常：验证 finally 生效（异常必须在恢复前抛出）---
+        # --- 构造可辨识的前置环境：有值 / 不存在 两种状态都要覆盖 ---
+        os.environ["TRAVEL_PENDING_CHANNEL"] = "pre-channel-9"
+        os.environ["TRAVEL_PENDING_STORE"] = "pre-store-9"
+        os.environ["TRAVEL_PENDING_RUNTIME_MAX"] = "pre-max-9"
+        os.environ.pop("TRAVEL_DECISION_SHADOW", None)
+        os.environ.pop("TRAVEL_DECISION_TAKEOVER", None)
+        before = _env_snapshot()
+
+        # --- ① 中途异常注入：finally 必须还原到 before（不是默认态）---
+        injected = False
         try:
             _t43_matrix(raise_at=2)
-        except RuntimeError:
+        except _T43Injection:              # 只认专用类型，避免误判
             injected = True
-        else:
-            injected = False
         finally:
-            # F-01 的实质：恢复动作无条件执行，而不是「循环跑完才恢复」
-            set_env()
-            _p26_env()
-        check("[T43·F01] 中途异常注入生效", injected, "未抛出")
-        check("[T43·F01] 中途异常后 CHANNEL 已恢复",
-              "TRAVEL_PENDING_CHANNEL" not in os.environ,
-              str(os.environ.get("TRAVEL_PENDING_CHANNEL")))
-        check("[T43·F01] 中途异常后 SHADOW 已恢复",
-              "TRAVEL_DECISION_SHADOW" not in os.environ,
-              str(os.environ.get("TRAVEL_DECISION_SHADOW")))
-        check("[T43·F01] 中途异常后 TAKEOVER 已恢复",
-              "TRAVEL_DECISION_TAKEOVER" not in os.environ,
-              str(os.environ.get("TRAVEL_DECISION_TAKEOVER")))
-        # --- 异常路径跑完后，正常矩阵仍须逐项成立 ---
+            _env_restore(before)
+        check("[T43·F01] 中途异常注入生效（专用异常类型）", injected, "未抛出")
+        check("[T43·F01] 恢复目标 == 测试前快照（逐键相等）",
+              _env_snapshot() == before, str(_env_snapshot()))
+        check("[T43·F01] 原已设置键写回原值（未被清成默认态）",
+              os.environ.get("TRAVEL_PENDING_CHANNEL") == "pre-channel-9"
+              and os.environ.get("TRAVEL_PENDING_STORE") == "pre-store-9"
+              and os.environ.get("TRAVEL_PENDING_RUNTIME_MAX") == "pre-max-9",
+              str(_env_snapshot()))
+        check("[T43·F01] 原未设置键仍不存在（未被补成空串）",
+              "TRAVEL_DECISION_SHADOW" not in os.environ
+              and "TRAVEL_DECISION_TAKEOVER" not in os.environ,
+              str(_env_snapshot()))
+        # --- ② 异常路径跑完后，正常矩阵仍须逐项成立 ---
         _t43_matrix()
         check("[T43·F01] 异常后重跑矩阵仍通过（状态无残留）", True, "")
+        # --- ③ 正常路径同样按快照还原（不靠 set_env()/_p26_env() 归零）---
+        _env_restore(before)
+        check("[T43·F01] 正常路径结束后亦逐键还原到 before",
+              _env_snapshot() == before, str(_env_snapshot()))
     finally:
-        set_env()
-        _p26_env()
+        _env_restore(outer)
 
 
 # ================================================== 补测（评审 2026-11-23 授权）
@@ -4126,8 +4175,10 @@ def test_r01_s2_rie_and_dead() -> None:
 
     ① 首次追加即失败 → dead=True、stats 仍 None、容器零新增、sink 零调用；
     ② 已有 stats 时失败 → 三计数与容器均不得误增（stats 是冻结快照语义）；
-    ③ dead 后永久停止 → 后续 append 调用 0 次。
-    另含「非 RIE 异常仍按原边界吞掉、不置 dead」。
+    ③ dead 后永久停止 → 后续 append 调用 0 次；
+    ④ 非 RIE 异常仍按**改造前既有边界外抛**（``_shadow`` 只捕
+    ``RetentionInvariantError``，且改造前也未用 try 包住 append），
+    外抛后不置 dead、计数不误增。
     """
     import travel_agent.decision as d_mod
     from travel_agent.decision import DecisionEngine as _DE
@@ -4410,12 +4461,15 @@ def test_r01_real_handle_250_rounds() -> None:
     的是**最新** 100 条（逐条逐字段相等），不是最早 100 条。"""
     from travel_agent.retention import SHADOW_CAPACITY
 
-    old_autofetch = os.environ.get("TRAVEL_AUTOFETCH")
-    old_real = os.environ.get("USE_REAL_DATA")
-    _p26_env(shadow="1", channel=None, takeover=None)
-    os.environ["TRAVEL_AUTOFETCH"] = "0"          # 不触发后台抓取
-    os.environ["USE_REAL_DATA"] = "0"             # mock tools（无网络）
+    # F-01（评审 2026-11-23 §三-1）：``_p26_env(...)`` 的初值设置原在 try
+    # 之前，若它本身或后续的 Orchestrator() 在进入 try 前抛错，环境就会
+    # 残留。现改为「先快照 → 保护区覆盖全部改写 → finally 按快照还原」，
+    # 快照额外包含本用例改写的 TRAVEL_AUTOFETCH / USE_REAL_DATA。
+    before = _env_snapshot(extra=("TRAVEL_AUTOFETCH", "USE_REAL_DATA"))
     try:
+        _p26_env(shadow="1", channel=None, takeover=None)
+        os.environ["TRAVEL_AUTOFETCH"] = "0"      # 不触发后台抓取
+        os.environ["USE_REAL_DATA"] = "0"         # mock tools（无网络）
         orc = Orchestrator()
         s = Session(use_llm=False)
         rounds = 250
@@ -4456,13 +4510,7 @@ def test_r01_real_handle_250_rounds() -> None:
               == {k: eng.shadow_log[-1].get(k) for k in SHADOW_RECORD_KEYS},
               str(orc._decision_shadow_log[-1])[:120])
     finally:
-        for key, val in (("TRAVEL_AUTOFETCH", old_autofetch),
-                         ("USE_REAL_DATA", old_real)):
-            if val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = val
-        _p26_env()
+        _env_restore(before)         # 含 _p26_env 三键与 autofetch / real 两键
 
 
 # ================================================== main
