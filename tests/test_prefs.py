@@ -8,8 +8,8 @@
   T02  开关解析（大小写/空白/空串/非法值的兜底口径）
   T03  条目规整 clip_item（去空白/换行压平/超长截断/非字符串丢弃）
   T04  列表清洗 _clean_list（白名单/去重/保持顺序/有界 LIM_PREFS）
-  T05  写闸关闭：产品写入路径（merge_list/remove_item/clear）全部 False 且不落盘；
-       底层原语 set 不受闸门（旧契约：调用即落盘）
+  T05  写闸关闭：set/merge_list/remove_item/clear 全部 False 且不落盘
+        （set 不设例外口子：播种档案必须显式开闸）
   T06  写闸打开：并集追加、无新增不写、删除、清键的真实落盘
   T07  按 uid 隔离：A 的偏好不进 B 的档案（同一 .app.db）
   T08  PreferenceMemory(store=) 读出即用：apply_to / all 副本语义
@@ -124,18 +124,11 @@ def test_store_write_gate():
     db = _fresh_db("gate")
     _env(TRAVEL_APP_DB=db, TRAVEL_PREFS_WRITE="0")
     s = prefs.PrefStore(1)
-    check("T05a merge_list 被拒", s.merge_list("hard_prefs", ["不吃辣"]) is False)
-    check("T05b remove_item 被拒", s.remove_item("hard_prefs", "不吃辣") is False)
-    check("T05c clear 被拒", s.clear() is False)
-    check("T05d 档案仍为空", s.all() == {} and s.get("hard_prefs") is None, repr(s.all()))
-
-    # set() 是底层整键写入原语，不设闸门（旧契约：PreferenceMemory.set 调用即落盘）
-    db2 = _fresh_db("prim")
-    _env(TRAVEL_APP_DB=db2)
-    s2 = prefs.PrefStore(1)
-    check("T05e set 作为底层原语不受闸门", s2.set("hard_prefs", ["不吃辣"]) is True
-          and s2.get("hard_prefs") == ["不吃辣"], repr(s2.get("hard_prefs")))
-    _env(TRAVEL_APP_DB=db)
+    check("T05a set 被拒", s.set("hard_prefs", ["不吃辣"]) is False)
+    check("T05b merge_list 被拒", s.merge_list("hard_prefs", ["不吃辣"]) is False)
+    check("T05c remove_item 被拒", s.remove_item("hard_prefs", "不吃辣") is False)
+    check("T05d clear 被拒", s.clear() is False)
+    check("T05e 档案仍为空", s.all() == {} and s.get("hard_prefs") is None, repr(s.all()))
 
     _env(TRAVEL_PREFS_WRITE="1")
     check("T06a 首次并集追加", s.merge_list("hard_prefs", ["不吃辣", "素食"]) is True)
@@ -232,6 +225,7 @@ def test_memory_json():
     check("T11b 关闸后写不进去", m.merge_hard_prefs(["素食"]) is False)
     check("T11c 关闸后 remove 无效", m.remove_hard_pref("怕晒") is False)
     check("T11d 关闸后 clear 无效", m.clear() is False)
+    check("T11g 关闸后底层 set 也无效", m.set("hard_prefs", ["素食"]) is False)
     check("T11e 文件内容未变", open(p, encoding="utf-8").read() == before)
     check("T11f 内存内仍可见", m.get("hard_prefs") == ["怕晒"], repr(m.get("hard_prefs")))
 

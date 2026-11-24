@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -50,6 +51,28 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def session() -> Session:
     return Session(today=TODAY)
+
+
+@contextmanager
+def prefs_write(value: str = "1"):
+    """临时把偏好写侧总闸设成 value（默认 "1" = 开）。
+
+    偏好档案的写入（含底层 set 播种）一律受这个闸门管，默认是关的；
+    要用 set() 预置档案的用例必须显式开闸，不再走「set 可以绕过」的口子。
+
+    退出时逐键精确恢复：区分「原本没设置」与「原本设成某值」，
+    不得用归零/删除当万能恢复手段——那会抹掉外部（CI/终端）已设的值。
+    """
+    present = "TRAVEL_PREFS_WRITE" in os.environ
+    prev = os.environ.get("TRAVEL_PREFS_WRITE")
+    os.environ["TRAVEL_PREFS_WRITE"] = value
+    try:
+        yield
+    finally:
+        if present:
+            os.environ["TRAVEL_PREFS_WRITE"] = prev if prev is not None else ""
+        else:
+            os.environ.pop("TRAVEL_PREFS_WRITE", None)
 
 
 # ------------------------------------------------------------------ 一次说全
@@ -796,7 +819,7 @@ def test_origin_without_route_noted() -> None:
 
 
 def test_session_uses_memory_prefs() -> None:
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, prefs_write("1"):
         mem = PreferenceMemory(Path(d) / "p.json")
         mem.set("hard_prefs", ["不吃辣"])
         s = Session(today=TODAY, memory=mem)
@@ -810,14 +833,27 @@ def test_session_uses_memory_prefs() -> None:
 
 
 def test_preference_memory_persists() -> None:
+    had, before = ("TRAVEL_PREFS_WRITE" in os.environ,
+                   os.environ.get("TRAVEL_PREFS_WRITE"))
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "prefs.json"
-        m1 = PreferenceMemory(path)
-        m1.set("hard_prefs", ["不吃辣", "忌高海拔"])
-        m2 = PreferenceMemory(path)          # 新实例，模拟进程重启
-        slots = m2.apply_to({"hard_prefs": ["带幼儿"]})
-        ok = set(slots["hard_prefs"]) == {"不吃辣", "忌高海拔", "带幼儿"}
-        check("偏好跨进程持久化并并入新槽位", ok, f"prefs={slots.get('hard_prefs')}")
+        # 写闸默认关闭：连底层 set 也不落盘——这就是本用例必须开闸的前提
+        with prefs_write("0"):
+            check("写闸关闭时 set 不落盘（偏好 P0 前置）",
+                  PreferenceMemory(path).set("hard_prefs", ["素食"]) is False
+                  and not path.exists())
+        with prefs_write("1"):
+            m1 = PreferenceMemory(path)
+            m1.set("hard_prefs", ["不吃辣", "忌高海拔"])
+            m2 = PreferenceMemory(path)          # 新实例，模拟进程重启
+            slots = m2.apply_to({"hard_prefs": ["带幼儿"]})
+            ok = set(slots["hard_prefs"]) == {"不吃辣", "忌高海拔", "带幼儿"}
+            check("偏好跨进程持久化并并入新槽位", ok, f"prefs={slots.get('hard_prefs')}")
+        after_had, after = ("TRAVEL_PREFS_WRITE" in os.environ,
+                            os.environ.get("TRAVEL_PREFS_WRITE"))
+        check("用例退出后环境逐键恢复（不抹外部值）",
+              (had, before) == (after_had, after),
+              f"before={(had, before)} after={(after_had, after)}")
 
 
 def test_context_retention_and_switch() -> None:

@@ -12,8 +12,8 @@
 两个开关，默认都关闭 = 与旧行为逐字节一致：
 - TRAVEL_PREFS_SCOPE=global|user   默认 global：沿用全局 JSON 档案；
                                    user：按 uid 读写 user_prefs 表（推荐）
-- TRAVEL_PREFS_WRITE=0|1           默认 0：只读不写。无论聊天里自动记、还是
-                                   面板手动改，关闭时一律不落盘（返回 False）
+- TRAVEL_PREFS_WRITE=0|1           默认 0：只读不写。聊天里自动记、面板手动改、
+                                   底层 set() 播种，关闭时一律不落盘（返回 False）
 
 容量：列表键最多 LIM_PREFS 条、单条最长 LIM_ITEM_CHARS 字符，防脏输入把
 档案撑大（与 R-01 容量治理同一口径：写入即有界，不做无上限追加）。
@@ -151,13 +151,14 @@ class PrefStore:
         return out
 
     # ---------------- 写
-    # 闸门位置说明：TRAVEL_PREFS_WRITE 管的是「产品写入路径」——聊天自动记
-    # （merge_list）与面板增删（merge_list / remove_item / clear）。
-    # set() 是底层整键写入原语，不设闸门：它同时是测试/运维播种档案的入口，
-    # 旧契约（PreferenceMemory.set 调用即落盘）依赖这一点。
+    # 写入一律过 TRAVEL_PREFS_WRITE 总闸，没有例外口子：聊天自动记、面板增删、
+    # 以及底层整键 set() 都受管。测试/运维要播种档案必须显式开闸
+    # （os.environ["TRAVEL_PREFS_WRITE"]="1"），不再有「set 可以绕过」的路径。
 
     def set(self, key: str, value) -> bool:
-        """整键覆盖（底层原语）。写成功返回 True，落盘失败返回 False。"""
+        """整键覆盖（底层原语）。写成功返回 True；闸门关闭或落盘失败返回 False。"""
+        if not write_enabled():
+            return False
         try:
             payload = json.dumps(value, ensure_ascii=False)
         except (TypeError, ValueError):

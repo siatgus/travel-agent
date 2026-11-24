@@ -1612,15 +1612,15 @@ class PreferenceMemory:
         return dict(self._data)
 
     def set(self, key: str, value) -> bool:
-        """整键覆盖。返回是否真的落了盘（写失败时 False）。
+        """整键覆盖。返回是否真的落了盘（写侧总闸关闭或写失败时 False）。
 
-        底层原语，不设 TRAVEL_PREFS_WRITE 闸门：产品写入一律走
-        merge_hard_prefs / remove_hard_pref / clear（那三个才受闸门管）；
-        set 保留旧契约「调用即落盘」，测试与运维用它播种档案。
+        写侧总闸 TRAVEL_PREFS_WRITE 管住所有写入，set() 也不例外：想用它
+        播种档案（测试/运维）必须先显式开闸。
         """
         if self.store is not None:
             return self.store.set(key, value)
-        if self.path is None:
+        from . import prefs as _prefs
+        if not _prefs.write_enabled() or self.path is None:
             return False
         import json
         self._data[key] = value
