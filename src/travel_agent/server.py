@@ -13,7 +13,9 @@
   （conversations / conv_messages 表，与账号库同文件）：重启后按存档续聊，
   登录用户可在「历史行程」里回看每次对话的完整内容并继续。
 - 上下文范围 = 用户产生的一次对话（一个 sid 一个 Session），跨对话不串味；
-  跨会话的硬约束偏好（不吃辣等）持久化到 data/.user_prefs.json（PreferenceMemory）。
+  跨会话的硬约束偏好（不吃辣等）默认仍存 data/.user_prefs.json（PreferenceMemory）；
+  置 TRAVEL_PREFS_SCOPE=user 则按 uid 存进 .app.db 的 user_prefs 表（多账号不串味），
+  写侧（聊天自动记 / 面板手动改）另需 TRAVEL_PREFS_WRITE=1，默认只读不写。
 - /api/chat 每次调用持全局锁：编排器会打真实 API（天气/OSRM），并发编排没有收益，
   还会让 OSRM 触发限流。
 
@@ -29,6 +31,9 @@
     GET  /api/conversations         历史行程列表（需登录）
     GET  /api/conversations/{sid}   一次对话的完整内容（需登录）
     DELETE /api/conversations/{sid}   删除一次对话（需登录）
+    GET  /api/prefs        我的偏好：该账号记住的硬约束（需登录，只读）
+    POST /api/prefs        {"op":"add|remove|clear","key","value"} 改偏好
+                           （需登录且 TRAVEL_PREFS_WRITE=1，否则 403）
     POST /api/reset        {"sid"} 彻底删除该会话（内存 + 存档 + 行程页）
     GET  /plan/{sid}       该会话最近一次方案的完整 HTML 行程页（内存没有就从库里捞）
     GET  /api/lan          手机互通：返回局域网访问地址（供顶栏扫码弹窗用）
@@ -60,6 +65,7 @@ from . import conversations
 from . import llm as llm_layer
 from . import moderation
 from . import paths
+from . import prefs
 from . import ratelimit
 from . import progress
 from .dialogue import Session, PreferenceMemory
@@ -75,6 +81,7 @@ _LAST_PLAN: dict[str, tuple[dict, str]] = {}   # sid -> (plan result, utterance)
 _DRIVE_CACHE: dict[str, dict] = {}             # "orig|dest" -> 规划结果（路径基本不变）
 _PREFETCHED: set[str] = set()                  # 已启动过预热的 sid，防重复
 _MEM: PreferenceMemory | None = None
+_MEM_BY_UID: dict[int, PreferenceMemory] = {}   # 按用户隔离时 uid -> 档案
 _LLM = "unset"                                  # 延迟初始化的 LLM 客户端（或 None）
 _LLM_SIG = None                                 # 设置文件指纹 (mtime_ns, size)，变更即重建客户端
 
@@ -364,15 +371,44 @@ def _llm_state() -> dict:
             "key_masked": info.get("key_masked", "")}
 
 
-def _get_memory() -> PreferenceMemory:
-    """跨会话偏好档案，全服务共享一份（本地单用户）。"""
+def _get_memory(uid: int | None = None) -> PreferenceMemory:
+    """跨会话偏好档案。
+
+    TRAVEL_PREFS_SCOPE=user 时按 uid 各取一份（.app.db 的 user_prefs 表）——
+    同一台机器上多账号互不串味；否则全服务共享一份全局 JSON（旧行为）。
+    """
     global _MEM
+    if uid is not None and prefs.scope() == "user":
+        with _LOCK:
+            m = _MEM_BY_UID.get(int(uid))
+            if m is None:
+                m = PreferenceMemory(store=prefs.get_store(int(uid)))
+                _MEM_BY_UID[int(uid)] = m
+            return m
     if _MEM is None:
         try:
             _MEM = PreferenceMemory(paths.user_prefs())
         except OSError:                       # 只读目录（.pyz）→ 退到工作目录
             _MEM = PreferenceMemory(Path.cwd() / ".user_prefs.json")
     return _MEM
+
+
+def _prefs_view(uid: int) -> dict:
+    """偏好档案 → 前端视图：只回已知列表键，值按白名单/去重/有界过一遍。
+
+    读侧不设总闸（TRAVEL_PREFS_WRITE 只管写）：面板要能看到"已记住什么"，
+    看不到就没法删。空列表不出现在结果里，前端据此渲染空态。
+    """
+    data = _get_memory(uid).all()
+    out: dict = {}
+    for k in prefs.LIST_KEYS:
+        vals = data.get(k)
+        if not isinstance(vals, list):
+            continue
+        cleaned = [v for v in (prefs.clip_item(x) for x in vals) if v]
+        if cleaned:
+            out[k] = cleaned[:prefs.LIM_PREFS]
+    return out
 
 
 def _metered(uid: int):
@@ -385,7 +421,7 @@ def _get_session(uid: int, sid: str) -> Session:
     key = f"u{uid}:{sid}"
     s = _SESSIONS.get(key)
     if s is None:
-        s = Session(client=_metered(uid), memory=_get_memory())
+        s = Session(client=_metered(uid), memory=_get_memory(uid))
         snap = conversations.get_state(uid, sid)
         if snap:                        # 重启/换设备后按存档续聊，上下文不断
             s.restore(snap)
@@ -563,7 +599,23 @@ PAGE_SRC = """<!DOCTYPE html>
        font-size:12.5px;color:var(--dim);cursor:pointer;background:var(--card);
        transition:color .12s,border-color .12s}
   .quit:hover{border-color:#ffc4b3;color:#e05c3d}
-  #btn-hist{position:relative}
+  #btn-hist,#btn-prefs{position:relative}
+  #btn-prefs .lbl-short{display:none}      /* 手机上换成「偏好」，顶栏才放得下一行 */
+  /* ---------- 我的偏好抽屉 ---------- */
+  .prefrow{display:flex;align-items:center;gap:8px;border:1.5px solid var(--line);
+       border-radius:12px;padding:8px 11px;margin-bottom:7px;background:#fbfcff}
+  .prefrow:hover{border-color:var(--blue)}
+  .prefrow .pname{flex:1;font-size:13.5px;color:var(--ink)}
+  .prefrow button{border:none;background:transparent;color:var(--dim);cursor:pointer;
+       font-size:12px}
+  .prefrow button:hover{color:#e05c3d}
+  #prefadd{display:flex;gap:8px;margin:10px 2px 14px}
+  #prefadd select{flex:1;border:1.5px solid var(--line);border-radius:10px;
+       padding:7px 9px;font-size:13px;color:var(--ink);background:#fff}
+  #prefadd button{border:1.5px solid var(--blue);background:#eef4ff;color:var(--blue-deep);
+       border-radius:10px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer}
+  #prefnote{font-size:12px;color:var(--dim);line-height:1.8;padding:0 4px 10px}
+  #prefnote b{color:#c26a1a;font-weight:600}
   /* ---------- 退出确认 ---------- */
   #logoutmask{position:fixed;inset:0;background:rgba(29,35,51,.4);display:none;
        align-items:center;justify-content:center;z-index:40}
@@ -648,8 +700,8 @@ PAGE_SRC = """<!DOCTYPE html>
        cursor:pointer;font-weight:600}
   #guestbar:hover{border-color:var(--blue)}
   /* ---------- 历史行程抽屉 ---------- */
-  #histmask{position:fixed;inset:0;background:rgba(29,35,51,.35);display:none;z-index:14}
-  #histpanel{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:92vw;
+  #histmask,#prefmask{position:fixed;inset:0;background:rgba(29,35,51,.35);display:none;z-index:14}
+  #histpanel,#prefpanel{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:92vw;
        background:var(--card);border-left:1px solid var(--line);z-index:15;
        display:none;flex-direction:column;box-shadow:-12px 0 40px rgba(29,35,51,.14)}
   .hhead{display:flex;align-items:center;justify-content:space-between;
@@ -657,7 +709,7 @@ PAGE_SRC = """<!DOCTYPE html>
   .hhead h2{font-size:15px}
   .hhead button{border:1.5px solid var(--line);background:#fff;border-radius:10px;
        padding:5px 13px;font-size:12.5px;cursor:pointer;color:var(--ink)}
-  #histlist{flex:1;overflow-y:auto;padding:10px}
+  #histlist,#preflist{flex:1;overflow-y:auto;padding:10px}
   .hitem{border:1.5px solid var(--line);border-radius:13px;padding:10px 12px;margin-bottom:8px;
        cursor:pointer;position:relative;background:#fbfcff}
   .hitem:hover{border-color:var(--blue)}
@@ -742,6 +794,8 @@ PAGE_SRC = """<!DOCTYPE html>
        .userbox{padding:3px 8px;font-size:11px;white-space:nowrap}
        #ub-phone,#userbox .sep{display:none}
        #btn-qr{display:none}          /* 手机上再显示「手机访问」没有意义 */
+       #btn-prefs .lbl-full{display:none}
+       #btn-prefs .lbl-short{display:inline}
        #chat{padding:12px 10px;gap:12px}
        .msg{max-width:88%;padding:11px 14px}
        /* 行程面板收紧：标题/页签/备注间距全面缩小 */
@@ -801,6 +855,8 @@ PAGE_SRC = """<!DOCTYPE html>
   </div>
   <button id="btn-hist" onclick="openHist()" style="display:none"
           title="你保存的历次行程，含与助手的完整对话，点开可继续">历史行程</button>
+  <button id="btn-prefs" onclick="openPrefs()" style="display:none"
+          title="我记住的旅行偏好（不吃辣、需无障碍等），每轮排行程自动带入"><span class="lbl-full">我的偏好</span><span class="lbl-short">偏好</span></button>
   <button id="btn-new" onclick="newChat()">＋ 新对话</button>
   <button id="btn-qr" onclick="openQr()" title="手机连同一 Wi-Fi，扫码即可打开">📱 手机访问</button>
 </header>
@@ -808,6 +864,17 @@ PAGE_SRC = """<!DOCTYPE html>
 <div id="histpanel">
   <div class="hhead"><h2>历史行程</h2><button onclick="closeHist()">关闭</button></div>
   <div id="histlist"></div>
+</div>
+<div id="prefmask" onclick="closePrefs()"></div>
+<div id="prefpanel">
+  <div class="hhead"><h2>我的偏好</h2><button onclick="closePrefs()">关闭</button></div>
+  <div id="preflist"></div>
+  <div id="prefadd">
+    <select id="pref-sel"></select>
+    <button onclick="addPref()">添加</button>
+  </div>
+  <div id="prefnote">这里记住的硬约束会在之后每一份行程里自动生效。<br>
+    <b id="pref-warn"></b></div>
 </div>
 <div id="login">
   <div class="lg-inner">
@@ -1121,6 +1188,7 @@ function showUser(phone){
   document.getElementById('userwrap').style.display = '';
   document.getElementById('guestbar').style.display = 'none';
   document.getElementById('btn-hist').style.display = '';
+  document.getElementById('btn-prefs').style.display = '';
 }
 
 // 访客态：不弹窗，只在顶栏留一个登录入口
@@ -1128,6 +1196,7 @@ function showGuest(){
   document.getElementById('userwrap').style.display = 'none';
   document.getElementById('guestbar').style.display = '';
   document.getElementById('btn-hist').style.display = 'none';
+  document.getElementById('btn-prefs').style.display = 'none';
 }
 
 async function loadMe(){
@@ -1703,6 +1772,66 @@ async function refreshHistHint(){
   }catch(e){}
 }
 
+// ---------------- 我的偏好 ----------------
+// 档案里可改的只有硬约束：软偏好/想避开是「这一趟」的口味，进长期档案容易过期。
+function closePrefs(){
+  document.getElementById('prefpanel').style.display='none';
+  document.getElementById('prefmask').style.display='none';
+}
+async function openPrefs(){
+  if(!token){ showLogin('登录后可查看你的偏好'); return; }
+  document.getElementById('prefpanel').style.display='flex';
+  document.getElementById('prefmask').style.display='block';
+  document.getElementById('pref-warn').textContent='';
+  await refreshPrefs();
+}
+function prefItemsOf(data){ return ((data && data.items) || {}).hard_prefs || []; }
+function renderPrefs(data){
+  const cur = prefItemsOf(data);
+  const ro = !data.write_enabled;            // 写闸关闭 → 只读
+  const box = document.getElementById('preflist');
+  const rows = cur.map(v=>'<div class="prefrow"><span class="pname">'+esc(v)+'</span>'+
+      (ro?'':'<button onclick="removePref(this)" data-v="'+esc(v)+'">删除</button>')+'</div>');
+  box.innerHTML = rows.length ? rows.join('')
+      : '<div class="hempty">还没有记住的偏好。<br>聊天里说「不吃辣」「带孩子」，或从下面直接添加。</div>';
+  // 下拉只列还没记住的内置项，避免重复添加
+  const sel = document.getElementById('pref-sel');
+  const rest = (data.known||[]).filter(v=>cur.indexOf(v)<0);
+  sel.innerHTML = rest.length ? rest.map(v=>'<option>'+esc(v)+'</option>').join('')
+      : '<option value="">（都记住了）</option>';
+  sel.disabled = ro || !rest.length;
+  document.getElementById('prefadd').style.display = ro ? 'none' : 'flex';
+  document.getElementById('pref-warn').textContent = ro
+      ? '当前未开启偏好写入（TRAVEL_PREFS_WRITE=0），只能查看，不能修改。'
+      : (data.scope === 'user' ? ''
+         : '当前为共享档案模式（TRAVEL_PREFS_SCOPE=global），本机各账号看到同一份。');
+}
+async function refreshPrefs(){
+  try{
+    const r = await fetch('/api/prefs', {headers: authHeaders()});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(j.ok) renderPrefs(j);
+  }catch(e){}
+}
+async function prefPost(body){
+  try{
+    const r = await fetch('/api/prefs', {method:'POST',
+      headers: Object.assign({'Content-Type':'application/json'}, authHeaders()),
+      body: JSON.stringify(body)});
+    const j = await r.json().catch(()=>({}));
+    if(!j.ok){ addBotStream(mdBlocks(j.message || '偏好没保存成功，稍后再试。')); return; }
+    renderPrefs(j);
+  }catch(e){ addBotStream(mdBlocks('偏好没保存成功：网络异常。')); }
+}
+function addPref(){
+  const sel = document.getElementById('pref-sel');
+  if(!sel.value) return;
+  prefPost({op:'add', key:'hard_prefs', value: sel.value});
+}
+function removePref(btn){ prefPost({op:'remove', key:'hard_prefs', value: btn.dataset.v}); }
+function clearPrefs(){ prefPost({op:'clear', key:'hard_prefs'}); }
+
 (async function boot(){
   if(token){
     const ok = await loadMe();
@@ -2202,6 +2331,19 @@ class Handler(BaseHTTPRequestHandler):
                             "message": "请先登录"}, 401)
                 return
             self._json({"ok": True, "phone": auth.mask_phone(user["phone"])})
+        elif path == "/api/prefs":
+            # 我的偏好：只回该账号自己的档案（按 uid 隔离时天然隔离；
+            # 全局模式下所有人看到同一份，前端会提示"当前为共享档案"）
+            user = self._auth_user()
+            if user is None:
+                self._json({"ok": False, "error": "unauthorized",
+                            "message": "请先登录后再使用"}, 401)
+                return
+            self._json({"ok": True,
+                        "items": _prefs_view(user["uid"]),
+                        "scope": prefs.scope(),
+                        "write_enabled": prefs.write_enabled(),
+                        "known": list(prefs.KNOWN_HARD_PREFS)})
         elif path == "/api/conversations":
             user = self._auth_user()
             if user is None:
@@ -2358,6 +2500,48 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = str(data.get("sid") or "")[:64]
+        if path == "/api/prefs":
+            # 我的偏好 · 写：新增/删除/清空硬约束。写闸关闭时一律 403，
+            # 不做"部分生效"——前端据此把编辑态置灰。
+            user = self._auth_user()
+            if user is None:
+                self._json({"ok": False, "error": "unauthorized",
+                            "message": "请先登录后再使用"}, 401)
+                return
+            uid = user["uid"]
+            if not prefs.write_enabled():
+                self._json({"ok": False, "error": "prefs_write_disabled",
+                            "message": "偏好写入未开启（TRAVEL_PREFS_WRITE=0）"}, 403)
+                return
+            op = str(data.get("op") or "").strip()
+            key = str(data.get("key") or "hard_prefs").strip()
+            if key not in prefs.LIST_KEYS:
+                self._json({"ok": False, "error": "unknown_key",
+                            "message": "不支持的偏好类别"}, 400)
+                return
+            mem = _get_memory(uid)
+            if op == "add":
+                # 只收白名单里的硬约束：自由文本进 prompt 会污染抽取
+                v = prefs.clip_item(data.get("value"))
+                if key != "hard_prefs" or v not in prefs.KNOWN_HARD_PREFS:
+                    self._json({"ok": False, "error": "unsupported_pref",
+                                "message": "只能添加内置的硬约束选项"}, 400)
+                    return
+                changed = mem.merge_hard_prefs([v])
+            elif op == "remove":
+                changed = mem.remove_hard_pref(prefs.clip_item(data.get("value")))
+            elif op == "clear":
+                changed = mem.clear(key)
+            else:
+                self._json({"ok": False, "error": "unknown_op"}, 400)
+                return
+            auditlog.write("prefs_update", uid=uid, ip=ip, op=op, key=key,
+                           changed=bool(changed))
+            self._json({"ok": True, "changed": bool(changed),
+                        "items": _prefs_view(uid),
+                        "scope": prefs.scope(), "write_enabled": True})
+            return
+
         if path == "/api/chat":
             _t0 = time.time()          # 审计用：本轮端到端耗时
             user = self._auth_user()

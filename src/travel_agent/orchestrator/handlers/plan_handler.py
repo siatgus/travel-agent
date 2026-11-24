@@ -324,9 +324,17 @@ class PlanHandler:
             session.slots["_source"] = delta.get("_source", "rules")
 
         # 跨会话记住的硬约束（不吃辣等）每轮并入；之前 Session 收了 memory
-        # 却从未使用，--memory 参数实际是摆设
+        # 却从未使用，--memory 参数实际是摆设。
+        # 两个方向都要写清：档案 → 本轮槽位（apply_to）；本轮新识别出的 →
+        # 档案（merge_hard_prefs）。写侧受 TRAVEL_PREFS_WRITE 总闸控制，默认
+        # 关闭时 merge_hard_prefs 直接返回 False，一个字节都不落盘。
         if session.memory is not None:
+            _mem_hp = set(session.memory.get("hard_prefs") or [])
             session.slots = session.memory.apply_to(session.slots)
+            _new_hp = [p for p in (session.slots.get("hard_prefs") or [])
+                       if p not in _mem_hp]
+            if _new_hp:
+                session.memory.merge_hard_prefs(_new_hp)
 
         # 节奏词不能当兴趣流通：抽取侧（llm.coerce_slots / agent.extract_slots）
         # 已经拦了一道，这里再清一次是为了历史槽位与跨轮继承——否则上一轮留下的

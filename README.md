@@ -82,6 +82,18 @@ PYTHONPATH=src python -m travel_agent.server   # 默认 http://127.0.0.1:8787，
 登录后每轮对话自动存档到 SQLite（首轮建档 = 自动保存为一次行程，含完整对话内容与方案）；
 顶栏「历史行程」可回看任意一次对话、点开继续聊、或删除。重启后按存档续聊，行程页从库里兜底。
 
+**我的偏好（跨会话硬约束）**：不吃辣、需无障碍、带幼儿这类硬约束，一旦在对话里说过，
+就会被记进档案、之后每份行程自动带上；顶栏「我的偏好」可查看与增删。
+两个开关默认都关，行为与旧版一致：
+
+```bash
+TRAVEL_PREFS_SCOPE=user    # 按账号隔离，存 .app.db 的 user_prefs 表；默认 global（共享 data/.user_prefs.json）
+TRAVEL_PREFS_WRITE=1       # 打开写侧（聊天自动记 + 面板手动改）；默认 0 = 只读不写
+```
+
+接口：`GET /api/prefs`（本账号的偏好，需登录）、`POST /api/prefs`（`{op:"add|remove|clear",key,value}`，
+需登录且 `TRAVEL_PREFS_WRITE=1`，否则 403）。
+
 
 ### 数据管理后端
 

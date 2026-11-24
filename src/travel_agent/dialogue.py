@@ -1571,36 +1571,123 @@ class Session:
 
 
 class PreferenceMemory:
-    """跨会话的用户偏好。写本地 JSON，进程重启仍有效。
+    """跨会话的用户偏好档案，进程重启仍有效。
+
+    两种后端，构造时二选一：
+    - `path`：全局 JSON（data/.user_prefs.json）。默认模式，单用户行为与旧版一致。
+    - `store`：prefs.PrefStore（.app.db 的 user_prefs 表，按 uid 隔离）。
+      读写全部回源 sqlite，进程内不缓存——改完立刻在下一个会话生效。
 
     与 `mock_tools.save_preference` 的区别：那个是工具层的内存字典（供 Agent 调用），
-    这个是编排层直接读写的持久化档案。真实产品里两者会合并成一个带用户 ID 的存储。
+    这个是编排层直接读写的持久化档案。
+
+    写侧受 TRAVEL_PREFS_WRITE 总闸控制（默认关）：关着时 merge_hard_prefs /
+    remove_hard_pref / set 都返回 False 且不落盘，读侧照常。
     """
 
-    def __init__(self, path):
+    def __init__(self, path=None, store=None):
         import json
         import pathlib
-        self.path = pathlib.Path(path)
+        self.store = store
+        self.uid = getattr(store, "uid", None)
+        self.path = pathlib.Path(path) if path is not None else None
         self._data: dict = {}
-        if self.path.exists():
+        if self.store is not None:
+            return                      # 按用户档案：每次读都回源，不建本地副本
+        if self.path is not None and self.path.exists():
             try:
                 self._data = json.loads(self.path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 self._data = {}
 
     def get(self, key: str, default=None):
+        if self.store is not None:
+            return self.store.get(key, default)
         return self._data.get(key, default)
 
-    def set(self, key: str, value) -> None:
+    def all(self) -> dict:
+        """档案全量副本（调用方改动不会影响底层存储）。"""
+        if self.store is not None:
+            return self.store.all()
+        return dict(self._data)
+
+    def set(self, key: str, value) -> bool:
+        """整键覆盖。返回是否真的落了盘（写失败时 False）。
+
+        底层原语，不设 TRAVEL_PREFS_WRITE 闸门：产品写入一律走
+        merge_hard_prefs / remove_hard_pref / clear（那三个才受闸门管）；
+        set 保留旧契约「调用即落盘」，测试与运维用它播种档案。
+        """
+        if self.store is not None:
+            return self.store.set(key, value)
+        if self.path is None:
+            return False
         import json
         self._data[key] = value
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
+            return True
         except OSError:
             # 只读环境（打成 .pyz 运行）落盘失败：本次进程内仍然生效
-            pass
+            return False
+
+    def merge_hard_prefs(self, items) -> bool:
+        """把本轮新识别出的硬约束并进档案（去重、白名单、有界）。
+
+        返回是否写入成功。没有新增项时返回 False（不产生写操作）。
+        """
+        from . import prefs as _prefs
+        if self.store is not None:
+            return self.store.merge_list("hard_prefs", items)
+        if not _prefs.write_enabled():
+            return False
+        add = _prefs._clean_list(items)
+        if not add:
+            return False
+        cur = [x for x in (self.get("hard_prefs") or []) if isinstance(x, str)]
+        merged = (cur + [x for x in add if x not in cur])[:_prefs.LIM_PREFS]
+        if merged == cur:
+            return False
+        return self.set("hard_prefs", merged)
+
+    def remove_hard_pref(self, item) -> bool:
+        from . import prefs as _prefs
+        if self.store is not None:
+            return self.store.remove_item("hard_prefs", item)
+        if not _prefs.write_enabled():
+            return False
+        v = _prefs.clip_item(item)
+        cur = self.get("hard_prefs") or []
+        if not isinstance(cur, list) or v not in cur:
+            return False
+        return self.set("hard_prefs", [x for x in cur if x != v])
+
+    def clear(self, key: str | None = None) -> bool:
+        """清空档案（key=None 全清，否则只清该键）。"""
+        from . import prefs as _prefs
+        if self.store is not None:
+            return self.store.clear(key)
+        if not _prefs.write_enabled():
+            return False
+        if key is None:
+            self._data = {}
+        elif key in self._data:
+            self._data.pop(key, None)
+        else:
+            return False
+        return self._flush()
+
+    def _flush(self) -> bool:
+        import json
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+            return True
+        except OSError:
+            return False
 
     def apply_to(self, slots: dict) -> dict:
         """把记住的硬约束并进新一轮的槽位。"""
